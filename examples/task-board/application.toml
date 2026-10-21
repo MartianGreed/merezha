@@ -7,6 +7,7 @@ version = 1
 # Finite in-memory store and dispatch bounds. These are the host defaults,
 # spelled out; the host rejects any value above its hard ceiling.
 [limits]
+timeout_ms = 5000
 max_events = 4096
 max_streams = 256
 max_store_bytes = 8388608

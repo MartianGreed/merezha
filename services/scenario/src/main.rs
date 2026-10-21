@@ -456,7 +456,10 @@ impl Scenario {
 
         step("Queries never append: the next command continues at position 12");
         for _ in 0..3 {
-            self.query("TaskSummary", json!({}))?;
+            expect(
+                &self.query("TaskSummary", json!({}))?,
+                ok(json!({ "value": { "total": 6, "open": 5, "completed": 1 }, "checkpoint": 11 })),
+            )?;
         }
         expect(
             &send(&command("CompleteTask", "task-1", json!({})))?,

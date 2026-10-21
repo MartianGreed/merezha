@@ -193,6 +193,13 @@ content for deduplication and tests. It is not a security checksum.
 3. Add native contract tests, a `build` line in `scripts/build-services.sh`
    and a `[[services]]` entry in a manifest, then reload the host.
 
+An application component follows the same steps with a `merezha-domain`
+dependency instead of the kit: its `handle` calls
+`merezha_domain::handle(input, dispatch)` and matches the protocol's
+`Operation`, as `services/task-domain` and `services/task-view` do. Route its
+messages in an application TOML file; changing routes needs a host restart,
+while replacing the component only needs a reload.
+
 ## Task board application
 
 The task board shows Structure-style application building blocks running as
@@ -373,8 +380,8 @@ they do not own still pass through as raw JSON text, numbers included.
 
 Everything the task board stores is bounded and lives in host memory only;
 nothing survives a host restart and nothing is durable. The example's
-`application.toml` spells out the host's default store limits: at most 4096
-events, 256 streams, 8 MiB of stored events, 1024 idempotency records, 16 KiB
+`application.toml` spells out the host's default limits: a 5 second deadline
+per dispatch, at most 4096 events, 256 streams, 8 MiB of stored events, 1024 idempotency records, 16 KiB
 per payload, 64 KiB of read-model state, 16 events per catch-up batch and 16
 concurrent dispatches. The host refuses work that would exceed them instead
 of evicting history. The components add their own bounds: titles of at most
@@ -397,8 +404,8 @@ of effects outside the store.
 | `viewmodel` | One projection as the single writer of its read model, eventually consistent queries | SQL tables, generated migrations, typed stores |
 | `fixtures` | A scenario that creates its data only through commands, on an isolated store | Fixture catalogs, run identifiers, the fixtures CLI |
 
-The complete map of all 27 Structure packages is in the host's architecture
-documentation.
+The complete map of all 27 Structure packages, with the delivered subsets and
+what remains, is [`docs/architecture/structure-parity.md`](../architecture/structure-parity.md).
 
 ## Limitations
 
