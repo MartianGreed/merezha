@@ -459,3 +459,11 @@ fn expired_admission_and_store_byte_capacity_fail_without_history_or_lost_claims
     }
     assert_eq!(store.head().unwrap(), 0);
 }
+
+#[test]
+fn aggregate_namespace_cannot_alias_another_aggregate_stream_pair() {
+    // "Counter/child" + "one" would collide with "Counter" + "child/one".
+    let mut c = config();
+    c.commands[0].aggregate = id("Counter/child");
+    assert!(c.validate().is_err());
+}

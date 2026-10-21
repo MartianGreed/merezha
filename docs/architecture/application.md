@@ -83,7 +83,10 @@ cargo run --locked -p merezha-cli -- serve --manifest runtime.toml --application
 Read the ephemeral port from stderr's `listener.ready`. POST JSON to
 `/v1/application/commands` with `tag`, `stream`, `payload`, `metadata`, optional
 `idempotency_key` and optional `expected_version`. The host namespaces the stream
-as `aggregate/stream`. It returns `{stream, version, position, events}`. Query
+as `aggregate/stream`. Configured aggregate labels cannot contain `/`, which
+prevents two aggregate/stream pairs from aliasing one history. The composed
+stream must still fit the 128-byte identity limit. It returns
+`{stream, version, position, events}`. Query
 JSON at `/v1/application/queries` has `tag`, `payload`, `metadata` and returns
 `{value, checkpoint}`. Both accept at most 64 KiB of request bytes. Errors have
 `{error: {code, classification}}` without guest text.

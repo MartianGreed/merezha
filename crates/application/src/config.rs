@@ -111,6 +111,10 @@ impl Config {
         let queries: BTreeSet<_> = self.queries.iter().map(|r| &r.tag).collect();
         let projections: BTreeSet<_> = self.projections.iter().map(|r| &r.name).collect();
         if commands.len() != self.commands.len()
+            || self
+                .commands
+                .iter()
+                .any(|r| r.aggregate.as_str().contains('/'))
             || queries.len() != self.queries.len()
             || projections.len() != self.projections.len()
             || !commands.is_disjoint(&queries)
