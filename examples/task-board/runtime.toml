@@ -1,0 +1,31 @@
+# The task board application: domain and view components next to the stateless
+# welcome services. Component paths are relative to this manifest.
+version = 1
+
+[limits]
+memory_bytes = 16777216
+fuel = 200000000
+max_input_bytes = 262144
+max_output_bytes = 262144
+timeout_ms = 2000
+max_concurrent_invocations = 8
+
+[[services]]
+id = "task-domain"
+path = "components/task-domain.wasm"
+
+[[services]]
+id = "task-view"
+path = "components/task-view.wasm"
+
+[[services]]
+id = "normalize"
+path = "components/text-normalize.wasm"
+
+[[services]]
+id = "greet"
+path = "components/greeting.wasm"
+
+[[pipelines]]
+id = "welcome"
+steps = ["normalize", "greet"]

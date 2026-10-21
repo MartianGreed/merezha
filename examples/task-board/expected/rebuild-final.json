@@ -1,0 +1,13 @@
+{
+  "state": {
+    "tasks": {
+      "Task/task-1": { "title": "Write the user guide", "status": "open", "version": 2 },
+      "Task/task-2": { "title": "Review the release notes", "status": "completed", "version": 2 },
+      "Task/task-3": { "title": "set by the scenario: the winning concurrent rename", "status": "open", "version": 3 },
+      "Task/task-4": { "title": "Record the final demo", "status": "open", "version": 2 },
+      "Task/task-5": { "title": "Edit the video", "status": "open", "version": 1 },
+      "Task/task-6": { "title": "Publish the post", "status": "open", "version": 1 }
+    }
+  },
+  "checkpoint": 11
+}

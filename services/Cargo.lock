@@ -128,14 +128,24 @@ dependencies = [
 name = "merezha-service-contract-tests"
 version = "0.1.0"
 dependencies = [
+ "merezha-domain",
  "merezha-greeting",
  "merezha-json-envelope",
+ "merezha-task-domain",
+ "merezha-task-view",
  "merezha-text-normalize",
  "serde_json",
 ]
 
 [[package]]
 name = "merezha-service-kit"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "merezha-task-board-scenario"
 version = "0.1.0"
 dependencies = [
  "serde_json",
