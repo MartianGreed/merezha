@@ -422,14 +422,13 @@ impl Admission {
             &payload,
             &query.metadata,
         )?;
-        let current = self.inner.projections[&route.projection]
-            .try_lock()
-            .map_err(|_| Failure::conflict("projection_in_flight"))?;
         let snapshot = match &self.inner.store {
             Storage::Sqlite(store) => store.projection(&route.projection, self.deadline)?.0,
-            Storage::Volatile(_) => current.clone(),
+            Storage::Volatile(_) => self.inner.projections[&route.projection]
+                .try_lock()
+                .map_err(|_| Failure::conflict("projection_in_flight"))?
+                .clone(),
         };
-        drop(current);
         let reply = invoke(
             session.as_ref(),
             self.deadline,

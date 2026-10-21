@@ -9,9 +9,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
+    ops::{Deref, DerefMut},
     path::Path,
     sync::{
-        Mutex, MutexGuard,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -27,10 +28,86 @@ const APPLICATION_ID: i64 = 0x4d525a41;
 
 pub(crate) struct SqliteStore {
     // Connection closes before the OS owner lock is released.
-    connection: Mutex<Connection>,
-    _owner: File,
+    connection: ConnectionSlot,
+    _owner: Arc<OwnerLock>,
     limits: Limits,
     poisoned: AtomicBool,
+}
+struct OwnerLock {
+    file: File,
+}
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        // A pre-exec child may temporarily retain a duplicate descriptor.
+        // End the shared flock when the last logical owner ends, rather than
+        // waiting for every incidental descriptor reference to close.
+        let _ = self.file.unlock();
+    }
+}
+struct ConnectionSlot {
+    // This mutex covers only take/return bookkeeping, never SQL or guest work.
+    available: Mutex<Option<Connection>>,
+    returned: Condvar,
+}
+impl ConnectionSlot {
+    fn new(connection: Connection) -> Self {
+        Self {
+            available: Mutex::new(Some(connection)),
+            returned: Condvar::new(),
+        }
+    }
+    fn acquire(&self, deadline: Instant) -> Result<ConnectionGuard<'_>, Failure> {
+        let mut slot = self
+            .available
+            .lock()
+            .map_err(|_| Failure::transient("storage_unavailable"))?;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| Failure::transient("timeout"))?;
+            if let Some(connection) = slot.take() {
+                return Ok(ConnectionGuard {
+                    slot: self,
+                    connection: Some(connection),
+                });
+            }
+            let (next, _) = self
+                .returned
+                .wait_timeout(slot, remaining)
+                .map_err(|_| Failure::transient("storage_unavailable"))?;
+            slot = next;
+        }
+    }
+    #[cfg(test)]
+    fn lock(&self) -> Result<ConnectionGuard<'_>, Failure> {
+        self.acquire(Instant::now() + Duration::from_secs(5))
+    }
+}
+struct ConnectionGuard<'a> {
+    slot: &'a ConnectionSlot,
+    connection: Option<Connection>,
+}
+impl Deref for ConnectionGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.connection.as_ref().expect("checked-out connection")
+    }
+}
+impl DerefMut for ConnectionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.connection.as_mut().expect("checked-out connection")
+    }
+}
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        let mut slot = self
+            .slot
+            .available
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *slot = self.connection.take();
+        self.slot.returned.notify_one();
+    }
 }
 pub(crate) type Recovered = (BTreeMap<Key, Record>, BTreeMap<Identity, ProjectionState>);
 
@@ -39,6 +116,16 @@ fn invalid() -> Failure {
 }
 fn sql(error: rusqlite::Error) -> Failure {
     use rusqlite::ErrorCode;
+    if matches!(
+        error,
+        rusqlite::Error::FromSqlConversionFailure(..)
+            | rusqlite::Error::IntegralValueOutOfRange(..)
+            | rusqlite::Error::Utf8Error(..)
+            | rusqlite::Error::InvalidColumnType(..)
+            | rusqlite::Error::QueryReturnedNoRows
+    ) {
+        return invalid();
+    }
     match error.sqlite_error_code() {
         Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => {
             Failure::transient("storage_busy")
@@ -105,16 +192,28 @@ impl SqliteStore {
         if !path.is_absolute() {
             return Err(Failure::permanent("storage_path"));
         }
-        let database_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(initialize)
-            .open(path)
-            .map_err(|_| Failure::permanent("storage_open"))?;
-        if !database_file.metadata().map_err(|_| invalid())?.is_file() {
-            return Err(Failure::permanent("storage_path"));
-        }
-        let canonical = path.canonicalize().map_err(|_| invalid())?;
+        let canonical = if initialize {
+            if path.symlink_metadata().is_ok() {
+                return Err(Failure::permanent("storage_open"));
+            }
+            let parent = path
+                .parent()
+                .ok_or_else(|| Failure::permanent("storage_path"))?
+                .canonicalize()
+                .map_err(|_| Failure::permanent("storage_path"))?;
+            parent.join(
+                path.file_name()
+                    .ok_or_else(|| Failure::permanent("storage_path"))?,
+            )
+        } else {
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| Failure::permanent("storage_open"))?;
+            if !canonical.metadata().map_err(|_| invalid())?.is_file() {
+                return Err(Failure::permanent("storage_path"));
+            }
+            canonical
+        };
         let mut lock_path = canonical.as_os_str().to_os_string();
         lock_path.push(".owner");
         let lock_path = std::path::PathBuf::from(lock_path);
@@ -140,13 +239,36 @@ impl SqliteStore {
             std::fs::TryLockError::WouldBlock => Failure::conflict("storage_owned"),
             _ => Failure::permanent("storage_lock"),
         })?;
+        let owner = Arc::new(OwnerLock { file: owner });
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if owner.file.metadata().map_err(|_| invalid())?.nlink() != 1 {
+                return Err(Failure::permanent("storage_path"));
+            }
+        }
+        // Acquire ownership before exclusive creation. A normal lock conflict
+        // must not strand a new zero-byte database at the configured path.
+        let database_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(initialize)
+            .open(&canonical)
+            .map_err(|_| Failure::permanent("storage_open"))?;
+        if !database_file.metadata().map_err(|_| invalid())?.is_file() {
+            return Err(Failure::permanent("storage_path"));
+        }
+        #[cfg(test)]
+        if initialize {
+            crash_cut("bootstrap_after_create");
+        }
         let metadata = database_file.metadata().map_err(|_| invalid())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             let target = canonical.metadata().map_err(|_| invalid())?;
             if metadata.nlink() != 1
-                || owner.metadata().map_err(|_| invalid())?.nlink() != 1
+                || owner.file.metadata().map_err(|_| invalid())?.nlink() != 1
                 || metadata.dev() != target.dev()
                 || metadata.ino() != target.ino()
             {
@@ -228,14 +350,18 @@ impl SqliteStore {
             tx.pragma_update(None, "user_version", 1).map_err(sql)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)
                 .map_err(sql)?;
+            #[cfg(test)]
+            crash_cut("bootstrap_before_commit");
             tx.commit().map_err(sql)?;
+            #[cfg(test)]
+            crash_cut("bootstrap_after_commit");
             // Make the newly created directory entry durable too.
             File::open(canonical.parent().ok_or_else(invalid)?)
                 .and_then(|f| f.sync_all())
                 .map_err(|_| Failure::transient("storage_sync"))?;
         }
         let store = Self {
-            connection: Mutex::new(connection),
+            connection: ConnectionSlot::new(connection),
             _owner: owner,
             limits: config.limits.clone(),
             poisoned: AtomicBool::new(false),
@@ -243,17 +369,17 @@ impl SqliteStore {
         let recovered = store.recover(config, application, deadline)?;
         Ok((store, recovered))
     }
-    fn lock(&self, deadline: Instant) -> Result<MutexGuard<'_, Connection>, Failure> {
+    fn lock(&self, deadline: Instant) -> Result<ConnectionGuard<'_>, Failure> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(Failure::transient("storage_reopen_required"));
         }
         if Instant::now() >= deadline {
             return Err(Failure::transient("timeout"));
         }
-        let connection = self
-            .connection
-            .try_lock()
-            .map_err(|_| Failure::transient("storage_busy"))?;
+        let connection = self.connection.acquire(deadline)?;
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(Failure::transient("storage_reopen_required"));
+        }
         if !connection.is_autocommit() {
             self.poisoned.store(true, Ordering::Release);
             return Err(Failure::transient("storage_reopen_required"));
@@ -794,6 +920,278 @@ initial=0
             payload: json!(3),
         }
     }
+    #[test]
+    fn owner_release_ignores_inherited_descriptor_but_retains_logical_clones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (store, _) = open_store(&path, true);
+        let inherited_descriptor = store._owner.file.try_clone().unwrap();
+        let logical = Arc::new(store);
+        let clone = logical.clone();
+        drop(logical);
+        assert_eq!(
+            SqliteStore::open(&config(&path, false), &path, &id("counter-v1"), false)
+                .err()
+                .unwrap()
+                .code,
+            "storage_owned"
+        );
+        let owner_clone = Arc::clone(&clone._owner);
+        drop(clone);
+        assert_eq!(
+            SqliteStore::open(&config(&path, false), &path, &id("counter-v1"), false)
+                .err()
+                .unwrap()
+                .code,
+            "storage_owned",
+            "the last shared logical owner guard still holds the lock"
+        );
+        drop(owner_clone);
+        let reopened = SqliteStore::open(&config(&path, false), &path, &id("counter-v1"), false);
+        assert!(
+            reopened.is_ok(),
+            "an inherited descriptor must not extend logical ownership: {:?}",
+            reopened.err()
+        );
+        drop(inherited_descriptor);
+    }
+    #[test]
+    fn connection_waits_for_release_within_the_original_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (store, _) = open_store(&path, true);
+        let held = store.lock(deadline()).unwrap();
+        std::thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let backend = &store;
+            scope.spawn(move || {
+                sent.send(backend.head(deadline())).unwrap();
+            });
+            assert!(
+                matches!(
+                    received.recv_timeout(Duration::from_millis(30)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "a short internal overlap must wait"
+            );
+            drop(held);
+            assert_eq!(
+                received
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+        });
+    }
+    #[test]
+    fn connection_deadline_expires_without_command_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (store, _) = open_store(&path, true);
+        let held = store.lock(deadline()).unwrap();
+        std::thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let backend = &store;
+            scope.spawn(move || {
+                let started = Instant::now();
+                let result = backend.commit_command(
+                    &id("Counter/one"),
+                    0,
+                    vec![event()],
+                    &metadata(),
+                    Some((&key(), &fingerprint())),
+                    started + Duration::from_millis(40),
+                );
+                sent.send((result, started.elapsed())).unwrap();
+            });
+            let (result, elapsed) = received.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(result.unwrap_err().code, "timeout");
+            assert!(elapsed >= Duration::from_millis(30) && elapsed < Duration::from_secs(1));
+            drop(held);
+        });
+        assert_eq!(store.head(deadline()).unwrap(), 0);
+        drop(store);
+        let (store, (receipts, _)) = open_store(&path, false);
+        assert!(receipts.is_empty());
+        assert_eq!(store.head(deadline()).unwrap(), 0);
+    }
+    #[test]
+    fn init_lock_contention_does_not_create_a_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let owner = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join("db.owner"))
+            .unwrap();
+        owner.try_lock().unwrap();
+        assert_eq!(
+            SqliteStore::open(&config(&path, true), &path, &id("counter-v1"), true)
+                .err()
+                .unwrap()
+                .code,
+            "storage_owned"
+        );
+        assert!(
+            !path.exists(),
+            "ordinary owner contention must leave no database file"
+        );
+        owner.unlock().unwrap();
+        drop(owner);
+        drop(open_store(&path, true));
+        drop(open_store(&path, false));
+    }
+    fn assert_rejected_unchanged(path: &Path, c: &Config) {
+        let before = std::fs::read(path).unwrap();
+        let error = SqliteStore::open(c, path, &id("counter-v1"), false)
+            .err()
+            .expect("tampered closed store must be rejected");
+        assert_eq!(
+            error.classification,
+            merezha_domain::Classification::Permanent
+        );
+        assert_eq!(error.code, "storage_invalid");
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            before,
+            "closed injected bytes must not be reset"
+        );
+    }
+    #[test]
+    fn quick_check_detects_a_constraint_violation_outside_loaded_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        drop(open_store(&path, true));
+        drop(open_store(&path, false));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON; INSERT INTO manifest SELECT 2,application,configuration,fingerprint FROM manifest WHERE id=1; PRAGMA ignore_check_constraints=OFF").unwrap();
+        let check: String = conn
+            .pragma_query_value(None, "quick_check", |r| r.get(0))
+            .unwrap();
+        assert!(check.contains("CHECK constraint failed"));
+        drop(conn);
+        assert_rejected_unchanged(&path, &config(&path, false));
+    }
+    #[test]
+    fn recovery_binds_receipt_actor_to_accepted_event_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let app = open_app(&path, true);
+        app.command(command("k")).unwrap();
+        drop(app);
+        drop(open_store(&path, false));
+        let conn = Connection::open(&path).unwrap();
+        let mut changed = key();
+        changed.actor = Some(id("bob"));
+        conn.execute("UPDATE receipts SET key=?1", [encode(&changed).unwrap()])
+            .unwrap();
+        drop(conn);
+        assert_rejected_unchanged(&path, &config(&path, false));
+    }
+    #[test]
+    fn recovery_binds_receipt_version_to_its_historical_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let app = open_app(&path, true);
+        let receipt = app.command(command("k")).unwrap();
+        let mut unkeyed = command("unused");
+        unkeyed.idempotency_key = None;
+        app.command(unkeyed).unwrap();
+        drop(app);
+        drop(open_store(&path, false));
+        let conn = Connection::open(&path).unwrap();
+        let changed = Receipt {
+            version: 2,
+            ..receipt
+        };
+        conn.execute(
+            "UPDATE receipts SET receipt=?1",
+            [encode(&changed).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+        assert_rejected_unchanged(&path, &config(&path, false));
+    }
+    #[test]
+    fn recovery_rejects_consistent_columns_and_json_with_a_global_position_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let app = open_app(&path, true);
+        for _ in 0..3 {
+            let mut c = command("unused");
+            c.idempotency_key = None;
+            app.command(c).unwrap();
+        }
+        drop(app);
+        drop(open_store(&path, false));
+        let conn = Connection::open(&path).unwrap();
+        let text: String = conn
+            .query_row("SELECT data FROM events WHERE position=3", [], |r| r.get(0))
+            .unwrap();
+        let mut changed: StoredEvent = serde_json::from_str(&text).unwrap();
+        changed.position = 4;
+        changed.event_id = id("event/4");
+        conn.execute(
+            "UPDATE events SET position=4,data=?1 WHERE position=3",
+            [encode(&changed).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.pragma_query_value(None, "quick_check", |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        drop(conn);
+        assert_rejected_unchanged(&path, &config(&path, false));
+    }
+    #[test]
+    fn preopen_budget_rejects_a_valid_database_with_excess_trailing_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut c = config(&path, true);
+        c.limits.max_store_bytes = 1024;
+        c.limits.max_idempotency = 1;
+        c.limits.max_payload_bytes = 8;
+        c.limits.max_state_bytes = 8;
+        drop(SqliteStore::open(&c, &path, &id("counter-v1"), true).unwrap());
+        drop(SqliteStore::open(&c, &path, &id("counter-v1"), false).unwrap());
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(file_budget(&c) as u64 + 4096)
+            .unwrap();
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.pragma_query_value(None, "quick_check", |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        drop(conn);
+        assert_rejected_unchanged(&path, &c);
+    }
+    #[test]
+    fn closed_corruption_is_permanent_for_header_and_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let app = open_app(&path, true);
+        for i in 0..20 {
+            app.command(command(&format!("k{i}"))).unwrap();
+        }
+        drop(app);
+        drop(open_store(&path, false));
+        let good = std::fs::read(&path).unwrap();
+        for offset in [20, good.len() - 100] {
+            let mut bad = good.clone();
+            bad[offset] ^= 0xff;
+            std::fs::write(&path, &bad).unwrap();
+            assert_rejected_unchanged(&path, &config(&path, false));
+            std::fs::write(&path, &good).unwrap();
+        }
+        drop(open_store(&path, false));
+    }
     fn metadata() -> Metadata {
         command("k").metadata
     }
@@ -816,8 +1214,8 @@ initial=0
         let connection = Connection::open(path).unwrap();
         connection.busy_timeout(Duration::ZERO).unwrap();
         SqliteStore {
-            connection: Mutex::new(connection),
-            _owner: store._owner.try_clone().unwrap(),
+            connection: ConnectionSlot::new(connection),
+            _owner: Arc::clone(&store._owner),
             limits: store.limits.clone(),
             poisoned: AtomicBool::new(false),
         }
@@ -1139,7 +1537,8 @@ initial=0
     #[ignore = "subprocess entry point, invoked only by crash recovery test"]
     fn crash_worker() {
         let path = std::env::var_os("MEREZHA_SQLITE_CRASH_DATABASE").expect("child database");
-        let app = open_app(Path::new(&path), false);
+        let bootstrap = std::env::var("MEREZHA_SQLITE_CRASH_ACTION").as_deref() == Ok("bootstrap");
+        let app = open_app(Path::new(&path), bootstrap);
         if std::env::var("MEREZHA_SQLITE_CRASH_ACTION").as_deref() == Ok("rebuild") {
             app.rebuild("total").unwrap();
         } else {
@@ -1275,6 +1674,101 @@ initial=0
             eprintln!(
                 "rebuild cut {cut}: child={status}; recovered checkpoint={}",
                 u64::from(committed)
+            );
+        }
+    }
+    #[test]
+    fn killed_fresh_bootstrap_preserves_artifacts_and_recovers_at_a_fresh_path() {
+        for cut in [
+            "bootstrap_after_create",
+            "bootstrap_before_commit",
+            "bootstrap_after_commit",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let marker = dir.path().join("cut");
+            let mut child = OwnedChild(
+                Process::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "sqlite::tests::crash_worker",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("MEREZHA_SQLITE_CRASH_DATABASE", &path)
+                    .env("MEREZHA_SQLITE_CRASH_CUT", cut)
+                    .env("MEREZHA_SQLITE_CRASH_MARKER", &marker)
+                    .env("MEREZHA_SQLITE_CRASH_ACTION", "bootstrap")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let until = Instant::now() + Duration::from_secs(10);
+            while !marker.exists() {
+                assert!(
+                    Instant::now() < until,
+                    "bootstrap child failed to reach {cut}"
+                );
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "bootstrap child exited before {cut}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            child.0.kill().unwrap();
+            let status = child.0.wait().unwrap();
+            assert!(!status.success());
+            // Preserve a closed diagnostic copy BEFORE any SQLite open: hot
+            // journal recovery can legitimately change the interrupted file.
+            let archive = dir.path().join("closed-diagnostic-copy");
+            std::fs::create_dir(&archive).unwrap();
+            std::fs::copy(&path, archive.join("db")).unwrap();
+            let journal = dir.path().join("db-journal");
+            let had_journal = journal.exists();
+            if had_journal {
+                std::fs::copy(&journal, archive.join("db-journal")).unwrap();
+            }
+            let original = std::fs::read(&path).unwrap();
+            assert_eq!(
+                SqliteStore::open(&config(&path, true), &path, &id("counter-v1"), true)
+                    .err()
+                    .unwrap()
+                    .code,
+                "storage_open"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                original,
+                "re-initialize must not touch existing bytes"
+            );
+            let reopened =
+                SqliteStore::open(&config(&path, false), &path, &id("counter-v1"), false);
+            let outcome = match reopened {
+                Ok((store, (receipts, models))) => {
+                    assert_eq!(cut, "bootstrap_after_commit");
+                    assert!(receipts.is_empty());
+                    assert_eq!(store.head(deadline()).unwrap(), 0);
+                    assert_eq!(models[&id("total")].checkpoint, 0);
+                    "verified initialized store".to_owned()
+                }
+                Err(error) => {
+                    assert_ne!(cut, "bootstrap_after_commit");
+                    assert_eq!(
+                        error.classification,
+                        merezha_domain::Classification::Permanent
+                    );
+                    error.code
+                }
+            };
+            assert_eq!(std::fs::read(archive.join("db")).unwrap(), original);
+            assert!(path.exists(), "interrupted artifact must not be deleted");
+            let fresh = dir.path().join("fresh.db");
+            drop(open_store(&fresh, true));
+            drop(open_store(&fresh, false));
+            eprintln!(
+                "bootstrap cut {cut}: child={status}; interrupted_bytes={}; journal={had_journal}; normal_open={outcome}; diagnostic copy retained before recovery; fresh path verified",
+                original.len()
             );
         }
     }

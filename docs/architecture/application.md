@@ -197,8 +197,9 @@ application = "counter-v1"
 initialize = true
 ```
 
-The parent directory must already exist and be writable. Initialization uses
-exclusive file creation and a version 1 schema transaction. After successful
+The parent directory must already exist and be writable. Initialization locks
+the intended canonical path before exclusive file creation and a version 1
+schema transaction. Ordinary owner-lock failure leaves no new database. After successful
 initialization, change `initialize` to `false`, its default, before the next
 start. Normal open never creates a missing database. Initialization never adopts
 or overwrites an existing file. An interrupted initialization can leave an
@@ -208,7 +209,10 @@ initialize a different fresh path. There is no automatic destructive repair.
 One logical application and one live host own each database. Clones share its
 backend and admission/claim registries. An OS lock on the canonical database's
 `.owner` sidecar rejects a second opener with `storage_owned` before readiness.
-Process exit or SIGKILL releases the lock. The empty sidecar stays on disk and
+The last logical backend owner closes its SQL connection and explicitly unlocks
+the sidecar, even if a spawning child temporarily inherited a descriptor.
+Backend clones retain ownership until the last clone ends. Process exit or
+SIGKILL also releases the lock. The empty sidecar stays on disk and
 must never be unlinked or replaced while a host might run. A separate sidecar
 avoids interference with SQLite's own native locks. Symlink aliases resolve to
 the same canonical path; hard-linked database/lock files are rejected on Unix.
@@ -249,11 +253,12 @@ Checkpoint equality alone is insufficient because rebuild can publish at the
 same head. Guest computation runs outside SQL. Catch-up retains earlier
 successful batches if a later one fails; rebuild publishes once after all its
 batches succeed. Queries read one persisted pair and never catch up implicitly.
-Concurrent projection work in one application still fails `projection_in_flight`;
-a stale SQL candidate fails `projection_conflict`.
+Concurrent catch-up/rebuild work in one application still fails
+`projection_in_flight`; a stale SQL candidate fails `projection_conflict`.
+SQLite queries can read the last committed pair while a guest computes a new one.
 
 SQLite uses DELETE rollback journals, `synchronous=EXTRA`, a 1024 KiB page cache,
-in-memory temporary storage, no mmap and immediate busy failure. Core journal,
+in-memory temporary storage, no mmap and immediate external busy failure. Core journal,
 synchronous, page-size and main-page-limit settings are checked on open. The
 4096-byte main-page budget is the rounded-down value of:
 
@@ -271,8 +276,11 @@ background checkpoint worker runs. Disk quotas/free-space monitoring belong to
 the host operator. Restart never reclaims event or receipt capacity; there is
 no TTL, eviction, automatic retention or snapshot compaction.
 
-Connection contention and SQLite busy/locked states fail `storage_busy` without
-sleeping. The admitted deadline is checked before storage work and before
+Requests wait for the internal connection through a condition variable, bounded
+by their original admitted deadline. Expiration reports `timeout`. No SQL or
+guest code runs while holding the connection-availability mutex. External
+SQLite busy/locked states still fail `storage_busy` immediately. The admitted
+deadline is checked before storage work and before
 commit; a progress callback checks it every 1000 SQLite VM operations. Fixed
 count/byte ceilings bound native scans and decoding. SQLite row and SQL text
 lengths are limited to 1 MiB and 64 KiB respectively. OS filesystem/fsync stalls
@@ -285,8 +293,19 @@ rollback from a lost response or timeout. A keyed retry after verified reopen
 replays any committed receipt. An unkeyed retry can duplicate accepted effects
 and must be a caller decision. No business decision is automatically rerun.
 If cleanup cannot restore autocommit, the backend also blocks use until reopen.
+These poisoned-store failures remain HTTP 429. The operator must restart;
+automatic listener shutdown and health/readiness changes are deferred.
+Detected corrupt databases, invalid stored types and invalid UTF-8 report
+permanent `storage_invalid`.
 
-For backup, stop the owner and wait for its exit. After a crash, first perform a
+For diagnosis after a crash, stop the owner and copy the closed database and any
+matching rollback journal before probing it. Normal reopen may roll back a hot
+journal and change the original files even if verification later rejects them.
+Interrupted bootstrap files are never reinitialized: preserve the diagnostic
+copy and initialize a different fresh path. A bootstrap that committed can pass
+normal verified reopen.
+
+For backup, stop the owner and wait for its exit. After a crash, perform a
 successful verified reopen and close to recover any hot journal. Then copy the
 closed main database and keep the matching application config. To restore,
 copy the backup to a new owned local path, use the same application identity,
@@ -297,6 +316,9 @@ compare exact events/metadata, original receipts and persisted checkpoints.
 
 The host pins [rusqlite 0.40.2](https://docs.rs/crate/rusqlite/0.40.2), MIT,
 with default features disabled and `bundled`, `hooks`, `limits`, `fallible_uint`.
+`rusqlite` still enables the transitive `libsqlite3-sys` default build features,
+including `min_sqlite_version_3_14_0`, `pkg-config` and `vcpkg`. They are build
+configuration dependencies; bundled mode compiles the pinned SQLite source.
 The locked `libsqlite3-sys` 0.38.2 is MIT and bundles SQLite 3.53.2, which is
 [public domain](https://sqlite.org/copyright.html). Bundled compilation requires
 a C compiler and archiver; it uses prebuilt bindings, without runtime system

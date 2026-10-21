@@ -171,6 +171,84 @@ revision=1
     path
 }
 #[test]
+fn owner_host_mixed_2_4_8_clients_wait_for_internal_sql_instead_of_storage_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    fs::write(dir.join("protocol.wasm"), component()).unwrap();
+    fs::write(
+        dir.join("runtime.toml"),
+        r#"version=1
+[limits]
+memory_bytes=16777216
+fuel=1000000
+max_input_bytes=65536
+max_output_bytes=65536
+timeout_ms=1000
+max_concurrent_invocations=16
+[[services]]
+id="protocol"
+path="protocol.wasm"
+"#,
+    )
+    .unwrap();
+    // Native and application admission both allow 16. These 2/4/8 clients
+    // stay inside that configured budget; no global default is enlarged.
+    let db = dir.join("application.db");
+    let init = config(dir, &db, true, "initialize");
+    let mut host = Host::spawn(dir, &init, "mixed-owner-host");
+    let address = host.ready();
+    let query =
+        json!({"tag":"Total","payload":{},"metadata":{"message_id":"q","correlation_id":"c"}})
+            .to_string();
+    let mut accepted = Vec::new();
+    for clients in [2, 4, 8] {
+        let results = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for client in 0..clients {
+                let query = &query;
+                workers.push(scope.spawn(move || {
+                    let mut replies = Vec::new();
+                    for request in 0..20 {
+                        if request % 2 == 0 {
+                            let command = json!({
+                                "tag": "Add",
+                                "stream": format!("c{clients}-{client}"),
+                                "payload": {"amount": 1},
+                                "idempotency_key": format!("k{clients}-{client}-{request}"),
+                                "metadata": {"message_id": "m", "correlation_id": "c", "actor": "alice"}
+                            }).to_string();
+                            replies.push((true, post(address, "/v1/application/commands", &command)));
+                        } else {
+                            replies.push((false, post(address, "/v1/application/queries", query)));
+                        }
+                    }
+                    replies
+                }));
+            }
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.len(), clients * 20);
+        for (command, (status, body)) in results {
+            assert_eq!(status, 200, "{clients} admitted clients: {body}");
+            if command {
+                accepted.push(body["position"].as_u64().unwrap());
+            } else {
+                assert_eq!(body["checkpoint"], 0, "queries must not catch up");
+            }
+        }
+        eprintln!(
+            "owner HTTP contention: clients={clients}, replies={}, all HTTP200",
+            clients * 20
+        );
+    }
+    accepted.sort_unstable();
+    assert_eq!(accepted, (1..=140).collect::<Vec<_>>());
+    host.stop();
+}
+#[test]
 fn host_process_restart_owner_exclusion_crash_and_closed_backup_restore() {
     let dir = tempfile::tempdir().unwrap();
     let dir = dir.path();

@@ -363,17 +363,15 @@ fn sqlite_clones_share_pending_keys_and_only_one_racing_stream_write_commits() {
     let app = sqlite(config(), &path, true, control.clone(), Arc::new(AllowAll)).unwrap();
     let worker = app.clone();
     let thread = std::thread::spawn(move || worker.command(command(1, None)));
-    // Ensure the first bounded load is done before starting the second. The
-    // deliberate no-wait connection policy may otherwise reject its load
-    // before it can reach a two-decision rendezvous.
+    // Ensure both decisions use the same expected version before either commits.
     gate.wait();
     let second = app.command(command(1, None));
     let first = thread.join().unwrap();
     assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
-    assert!(matches!(
-        first.err().or(second.err()).unwrap().code.as_str(),
-        "concurrency_conflict" | "storage_busy"
-    ));
+    assert_eq!(
+        first.err().or(second.err()).unwrap().code,
+        "concurrency_conflict"
+    );
     drop(app);
     let app = sqlite(config(), &path, false, control, Arc::new(AllowAll)).unwrap();
     assert_eq!(app.catch_up("total").unwrap().checkpoint, 1);
