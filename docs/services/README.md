@@ -37,7 +37,8 @@ ignored by Git. Pass another directory as the first argument to build
 elsewhere. Each service compiles to a `wasm32-unknown-unknown` core module
 carrying the component type that `wit-bindgen` embeds. `merezha-componentize`
 then encodes it as a component and fails the build unless the component
-imports nothing and exports exactly `merezha:service/handler@0.1.0`.
+imports nothing and exports exactly `merezha:service/handler@0.1.0` with the
+types of the canonical `wit/service.wit`, which it embeds at build time.
 
 Why not `wasm32-wasip2`: the host links no WASI or other imports. A Rust
 standard-library build for `wasm32-wasip2` always imports `wasi:cli`,
@@ -73,6 +74,8 @@ checks each response against `examples/welcome/expected/`:
    and `request_id` and `kind` survive.
 2. A malformed call to `normalize` returns HTTP 422 `guest_error`.
 3. Stage 2 adds `envelope` and appends it to the pipeline (reload, generation 2).
+   A payload carrying `18446744073709551617` and a 34-digit decimal comes out
+   with both numbers unchanged.
 4. Stage 3 replaces `greet` with the formal revision without restarting the
    host (generation 3): `"greeting":"Bien le bonjour, Ada Lovelace."`.
 5. `invalid-missing-service.toml` is rejected with HTTP 400
@@ -90,7 +93,9 @@ a build.
 Every service takes a JSON object and returns a JSON object. It reads and
 writes only the fields listed below and copies every other field unchanged.
 That is how `request_id` reaches the end of the pipeline. Output keys are
-sorted. Before any service-specific work, each service checks its own bounds,
+sorted. Numbers keep their exact value and digits, however large or precise;
+the only rewrite is an explicit exponent sign (`1e400` becomes `1e+400`).
+Before any service-specific work, each service checks its own bounds,
 independently of the host's limits:
 
 | Service | Max input | Max nesting | Max top-level fields |

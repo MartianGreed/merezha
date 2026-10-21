@@ -78,3 +78,23 @@ fn first_error_stops_the_pipeline() {
     assert_eq!(error["error"]["service"], "text-normalize");
     assert_eq!(error["error"]["code"], "missing_field");
 }
+
+#[test]
+fn large_and_precise_numbers_survive_every_step_and_change_the_digest() {
+    // Regression for verifier finding V1-F1.
+    let first =
+        r#"{"amount":0.1000000000000000055511151231257827,"id":18446744073709551617,"text":"ada"}"#;
+    let second =
+        r#"{"amount":0.1000000000000000055511151231257827,"id":18446744073709551618,"text":"ada"}"#;
+    let first = run(&[NORMALIZE, GREET, ENVELOPE], first).unwrap();
+    let second = run(&[NORMALIZE, GREET, ENVELOPE], second).unwrap();
+    assert!(first.contains(r#""id":18446744073709551617"#), "{first}");
+    assert!(
+        first.contains(r#""amount":0.1000000000000000055511151231257827"#),
+        "{first}"
+    );
+    assert!(second.contains(r#""id":18446744073709551618"#), "{second}");
+    let digest =
+        |output: &str| serde_json::from_str::<Value>(output).unwrap()["meta"]["digest"].clone();
+    assert_ne!(digest(&first), digest(&second));
+}

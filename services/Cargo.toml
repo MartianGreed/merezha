@@ -20,7 +20,8 @@ merezha-service-kit = { path = "kit" }
 merezha-text-normalize = { path = "text-normalize" }
 merezha-greeting = { path = "greeting" }
 merezha-json-envelope = { path = "json-envelope" }
-serde_json = "1.0.154"
+# Numbers pass through services verbatim; without this they round through f64.
+serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
 wit-bindgen = { version = "0.63.0", default-features = false, features = ["macros", "realloc"] }
 
 [profile.release]
