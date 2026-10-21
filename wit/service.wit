@@ -1,0 +1,9 @@
+package merezha:service@0.1.0;
+
+interface handler {
+    handle: func(input: string) -> result<string, string>;
+}
+
+world service {
+    export handler;
+}
