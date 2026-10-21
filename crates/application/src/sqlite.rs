@@ -745,11 +745,17 @@ initial=0
             Ok(match op {
                 Operation::Validate { payload, .. } => Reply::Validated { payload },
                 Operation::Decide { payload, .. } => Reply::Decided {
-                    events: vec![Event {
-                        tag: id("Added"),
-                        schema_version: 1,
-                        payload,
-                    }],
+                    events: payload
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_else(|| vec![payload])
+                        .into_iter()
+                        .map(|payload| Event {
+                            tag: id("Added"),
+                            schema_version: 1,
+                            payload,
+                        })
+                        .collect(),
                 },
                 Operation::Project { state, events, .. } => Reply::Projected {
                     state: json!(
@@ -1348,6 +1354,64 @@ initial=0
         let app = open_app(&restored, false);
         assert_eq!(app.command(command("k")).unwrap(), receipt);
         assert_eq!(app.command(command("second")).unwrap().position, 2);
+    }
+    #[test]
+    fn multi_event_batches_retain_contiguous_versions_and_rollback_invalid_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (store, _) = open_store(&path, true);
+        let bad = Event {
+            schema_version: 0,
+            ..event()
+        };
+        assert_eq!(
+            store
+                .commit_command(
+                    &id("Counter/one"),
+                    0,
+                    vec![event(), bad],
+                    &metadata(),
+                    None,
+                    deadline()
+                )
+                .unwrap_err()
+                .code,
+            "invalid_event"
+        );
+        assert_eq!(store.head(deadline()).unwrap(), 0);
+        drop(store);
+        let app = open_app(&path, false);
+        let mut batch = command("batch");
+        batch.payload = json!([3, 4]);
+        let receipt = app.command(batch.clone()).unwrap();
+        assert_eq!(
+            (receipt.version, receipt.position, receipt.events),
+            (2, 2, 2)
+        );
+        assert_eq!(
+            app.catch_up("total").unwrap(),
+            ProjectionState {
+                state: json!(7),
+                checkpoint: 2
+            }
+        );
+        drop(app);
+        let (store, _) = open_store(&path, false);
+        let events = store.load(&id("Counter/one"), deadline()).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| (e.version, e.position, e.event_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, 1, "event/1"), (2, 2, "event/2")]
+        );
+        assert!(events.iter().all(|e| e.metadata == metadata()));
+        drop(store);
+        let app = open_app(&path, false);
+        assert_eq!(app.command(batch).unwrap(), receipt);
+        let mut next = command("next");
+        next.expected_version = Some(2);
+        assert_eq!(app.command(next).unwrap().position, 3);
     }
     #[cfg(unix)]
     #[test]
