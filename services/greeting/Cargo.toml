@@ -1,0 +1,25 @@
+[package]
+name = "merezha-greeting"
+description = "Adds a localized greeting for a name (Merezha example service)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "greeting"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+merezha-service-kit.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen.workspace = true
+
+[features]
+# Builds the formal revision of the service, used to demonstrate replacing a
+# running service with a new component.
+formal = []
+
+[dev-dependencies]
+serde_json.workspace = true

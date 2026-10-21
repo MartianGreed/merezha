@@ -1,0 +1,13 @@
+[package]
+name = "merezha-service-contract-tests"
+description = "Native composition tests for the Merezha example services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+merezha-text-normalize.workspace = true
+merezha-greeting.workspace = true
+merezha-json-envelope.workspace = true
+serde_json.workspace = true

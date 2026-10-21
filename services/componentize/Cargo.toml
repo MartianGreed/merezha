@@ -1,0 +1,11 @@
+[package]
+name = "merezha-componentize"
+description = "Turns a Merezha service core module into an import-free component and checks its world"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1.0.58"
+wit-component = "0.262.0"
