@@ -85,7 +85,7 @@ struct Inner {
     active: AtomicUsize,
     _ticker: Ticker,
 }
-/// Clones share the current catalog and process-wide admission counter.
+/// Clones share the current catalog and admission counter.
 #[derive(Clone)]
 pub struct Runtime(Arc<Inner>);
 #[derive(Debug, Serialize)]
@@ -101,7 +101,7 @@ pub struct Output {
 }
 
 /// An admitted invocation owns a stable registry snapshot and a deadline.
-/// Dropping it releases its process-wide concurrency slot.
+/// Dropping it releases its concurrency slot shared by runtime clones.
 pub struct Invocation {
     inner: Arc<Inner>,
     registry: Arc<Registry>,

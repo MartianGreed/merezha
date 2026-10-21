@@ -59,11 +59,13 @@ steps refer to existing services. Repeated steps are allowed.
 | `max_input_bytes` | 1 through 1048576, initial input and every step input |
 | `max_output_bytes` | 1 through 1048576, every successful or error output |
 | `timeout_ms` | 1 through 30000, whole invocation, including instantiation |
-| `max_concurrent_invocations` | 1 through 64, process-wide admission, no waiting queue |
+| `max_concurrent_invocations` | 1 through 64, admission shared by clones of one runtime, no waiting queue |
 
 Hard loader limits are 65536 manifest bytes, 64 services, 64 pipelines, 16 steps
 per pipeline, 16777216 bytes per component, and 67108864 component bytes per
-registry load. A lower concurrency limit after reload rejects new work until
+registry load. Each separately loaded library runtime has its own admission
+counter. The CLI loads one runtime, so its configured limit covers all CLI
+invocations. A lower concurrency limit after reload rejects new work until
 existing work falls below that limit. Memory limits bound guest linear memory;
 the host process and native compilation require separate OS resource controls
 for hostile multi-tenant use.
@@ -128,6 +130,9 @@ after a step carries into the next step, and all steps share the same monotonic
 deadline. There are no automatic retries.
 
 This listener is for trusted local users. Loopback is not authentication.
-Local processes can invoke services and request reload. Remote access,
-multi-tenant administration, unchanged Node application compatibility, WASIX,
-PostgreSQL and development tool execution remain outside this component host.
+Local processes can invoke services and request reload. Browser-originated
+simple requests and foreign `Host` headers are also accepted; there is no
+Origin/Host validation or DNS-rebinding defense in this local-only interface.
+Remote access, multi-tenant administration, unchanged Node application
+compatibility, WASIX, PostgreSQL and development tool execution remain outside
+this component host.
