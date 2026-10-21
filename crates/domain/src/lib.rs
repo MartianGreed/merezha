@@ -334,6 +334,14 @@ pub struct Receipt {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn numeric_compatibility_has_explicit_safe_integer_boundaries() {
+        assert!(compatible_json(&json!(9_007_199_254_740_991_u64)).is_ok());
+        assert!(compatible_json(&json!(9_007_199_254_740_992_u64)).is_err());
+        assert!(compatible_json(&json!(-9_007_199_254_740_992_i64)).is_err());
+        assert!(compatible_json(&json!({"fraction":0.1})).is_ok());
+        assert!(validate_payload::<u64>(json!(1.0)).is_err());
+    }
     struct Counter;
     impl Decider for Counter {
         type State = i64;

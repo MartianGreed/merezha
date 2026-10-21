@@ -47,6 +47,15 @@ pub fn app(runtime: Runtime) -> Router {
         .with_state(state)
 }
 
+/// Opt-in application endpoints composed with the existing raw transport.
+pub fn app_with_application(
+    runtime: Runtime,
+    application: merezha_application::Application,
+) -> Router {
+    app(runtime).merge(application_http::router(application))
+}
+mod application_http;
+
 async fn admission(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let Ok(_permit) = state.requests.try_acquire() else {
         return failure(Error::Overloaded);

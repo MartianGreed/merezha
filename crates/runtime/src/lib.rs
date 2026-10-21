@@ -88,6 +88,37 @@ struct Inner {
 /// Clones share the current catalog and admission counter.
 #[derive(Clone)]
 pub struct Runtime(Arc<Inner>);
+/// A catalog generation pinned across a multi-call application dispatch.
+#[derive(Clone)]
+pub struct Session {
+    runtime: Runtime,
+    registry: Arc<Registry>,
+}
+impl Session {
+    pub fn invoke_service_until(
+        &self,
+        id: &str,
+        input: &str,
+        deadline: Instant,
+    ) -> Result<Output, Error> {
+        if !self.registry.services.contains_key(id) {
+            return Err(Error::NotFound);
+        }
+        let mut invocation = self
+            .runtime
+            .prepare(Arc::clone(&self.registry), vec![id.to_owned()])?;
+        invocation.deadline = invocation.deadline.min(deadline);
+        invocation.run(input)
+    }
+    pub fn invoke_service(&self, id: &str, input: &str) -> Result<Output, Error> {
+        if !self.registry.services.contains_key(id) {
+            return Err(Error::NotFound);
+        }
+        self.runtime
+            .prepare(Arc::clone(&self.registry), vec![id.to_owned()])?
+            .run(input)
+    }
+}
 #[derive(Debug, Serialize)]
 pub struct Catalog {
     pub generation: u64,
@@ -109,6 +140,12 @@ pub struct Invocation {
     deadline: Instant,
 }
 impl Runtime {
+    pub fn session(&self) -> Result<Session, Error> {
+        Ok(Session {
+            runtime: self.clone(),
+            registry: self.snapshot()?,
+        })
+    }
     /// Compile portable components and validate imports, ABI and instantiation.
     /// Returns an error without exposing a partially initialized runtime.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {

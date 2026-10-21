@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
+    pub timeout_ms: u64,
     pub max_events: usize,
     pub max_streams: usize,
     pub max_store_bytes: usize,
@@ -19,6 +20,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            timeout_ms: 5000,
             max_events: 4096,
             max_streams: 256,
             max_store_bytes: 8_388_608,
@@ -32,6 +34,9 @@ impl Default for Limits {
 }
 impl Limits {
     pub fn validate(&self) -> Result<(), Failure> {
+        if !(1..=30_000).contains(&self.timeout_ms) {
+            return Err(Failure::permanent("invalid_limits"));
+        }
         for (value, max) in [
             (self.max_events, 4096),
             (self.max_streams, 256),

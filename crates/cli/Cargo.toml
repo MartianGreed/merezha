@@ -10,6 +10,8 @@ name = "merezha"
 path = "src/main.rs"
 
 [dependencies]
+merezha-application = { path = "../application" }
+merezha-domain = { path = "../domain" }
 merezha-runtime = { path = "../runtime" }
 anyhow.workspace = true
 serde_json.workspace = true

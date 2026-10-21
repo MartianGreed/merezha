@@ -2,13 +2,20 @@ use merezha_runtime::Runtime;
 use serde_json::json;
 use std::{net::SocketAddr, path::PathBuf};
 
-fn arguments() -> anyhow::Result<(PathBuf, SocketAddr)> {
+fn arguments() -> anyhow::Result<(PathBuf, Option<PathBuf>, SocketAddr)> {
     let mut args = std::env::args().skip(1);
     anyhow::ensure!(args.next().as_deref() == Some("serve"), "expected serve");
     let mut manifest = None;
     let mut listen = None;
+    let mut application = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
+            "--application" if application.is_none() => {
+                application =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("missing application config")
+                    })?));
+            }
             "--manifest" if manifest.is_none() => {
                 manifest = Some(PathBuf::from(
                     args.next()
@@ -29,17 +36,18 @@ fn arguments() -> anyhow::Result<(PathBuf, SocketAddr)> {
     anyhow::ensure!(listen.ip().is_loopback(), "listener must be loopback");
     Ok((
         manifest.ok_or_else(|| anyhow::anyhow!("missing manifest"))?,
+        application,
         listen,
     ))
 }
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    let (manifest, address) = match arguments() {
+    let (manifest, application, address) = match arguments() {
         Ok(args) => args,
         Err(_) => {
             merezha_cli::emit(
                 "startup.failed",
-                json!({"code":"invalid_arguments","usage":"merezha serve --manifest PATH [--listen 127.0.0.1:PORT]"}),
+                json!({"code":"invalid_arguments","usage":"merezha serve --manifest PATH [--application PATH] [--listen 127.0.0.1:PORT]"}),
             );
             return std::process::ExitCode::from(2);
         }
@@ -52,6 +60,55 @@ async fn main() -> std::process::ExitCode {
                 return std::process::ExitCode::from(2);
             }
         };
+    let router = if let Some(path) = application {
+        let guest = runtime.clone();
+        match tokio::task::spawn_blocking(move || -> Result<_, merezha_domain::Failure> {
+            use std::io::Read;
+            if !std::fs::metadata(&path)
+                .map_err(|_| merezha_domain::Failure::permanent("invalid_application_config"))?
+                .is_file()
+            {
+                return Err(merezha_domain::Failure::permanent(
+                    "invalid_application_config",
+                ));
+            }
+            let file = std::fs::File::open(path)
+                .map_err(|_| merezha_domain::Failure::permanent("invalid_application_config"))?;
+            if !file
+                .metadata()
+                .map_err(|_| merezha_domain::Failure::permanent("invalid_application_config"))?
+                .is_file()
+            {
+                return Err(merezha_domain::Failure::permanent(
+                    "invalid_application_config",
+                ));
+            }
+            let mut text = String::new();
+            file.take(65_537)
+                .read_to_string(&mut text)
+                .map_err(|_| merezha_domain::Failure::permanent("invalid_application_config"))?;
+            let config = merezha_application::config::Config::parse(&text)?;
+            merezha_application::Application::in_memory(
+                config,
+                std::sync::Arc::new(guest),
+                std::sync::Arc::new(merezha_application::AllowAll),
+            )
+        })
+        .await
+        {
+            Ok(Ok(application)) => merezha_cli::app_with_application(runtime, application),
+            result => {
+                let code = match &result {
+                    Ok(Err(e)) => e.code.as_str(),
+                    _ => "invalid_application_config",
+                };
+                merezha_cli::emit("startup.failed", json!({"code":code}));
+                return std::process::ExitCode::from(2);
+            }
+        }
+    } else {
+        merezha_cli::app(runtime)
+    };
     let listener = match tokio::net::TcpListener::bind(address).await {
         Ok(listener) => listener,
         Err(_) => {
@@ -66,7 +123,7 @@ async fn main() -> std::process::ExitCode {
         "listener.ready",
         json!({"address":address.to_string(),"generation":1}),
     );
-    let result = axum::serve(listener, merezha_cli::app(runtime))
+    let result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown())
         .await;
     merezha_cli::emit(

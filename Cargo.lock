@@ -717,7 +717,9 @@ dependencies = [
  "merezha-runtime",
  "serde",
  "serde_json",
+ "tempfile",
  "toml",
+ "wat",
 ]
 
 [[package]]
@@ -726,6 +728,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "merezha-application",
+ "merezha-domain",
  "merezha-runtime",
  "serde_json",
  "tempfile",
