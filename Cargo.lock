@@ -710,6 +710,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "merezha-application"
+version = "0.1.0"
+dependencies = [
+ "merezha-domain",
+ "merezha-runtime",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "merezha-cli"
 version = "0.1.0"
 dependencies = [
@@ -721,6 +732,14 @@ dependencies = [
  "tokio",
  "tower",
  "wat",
+]
+
+[[package]]
+name = "merezha-domain"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
