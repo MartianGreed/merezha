@@ -78,6 +78,8 @@ impl Board {
             return Err(gap());
         }
         match event {
+            // Only the first event of a stream creates its task.
+            TaskEvent::Created(_) if row.is_some() => return Err(gap()),
             TaskEvent::Created(TaskCreated { task_id, title }) => {
                 let row = Row {
                     title,

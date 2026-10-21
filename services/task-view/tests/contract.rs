@@ -194,6 +194,24 @@ fn gaps_and_impossible_transitions_fail_the_whole_batch() {
 }
 
 #[test]
+fn a_second_creation_cannot_reopen_or_reset_a_task() {
+    // Regression for verifier finding V1-F1.
+    let gap = Err(Failure::permanent("projection_gap"));
+    let again = |position, version| {
+        stored(
+            position,
+            version,
+            "TaskCreated",
+            json!({ "task_id": "task-1", "title": "Reopened" }),
+        )
+    };
+    let open = project(empty(), vec![created(1, "task-1", "Write docs")]).unwrap();
+    assert_eq!(project(open.clone(), vec![again(2, 2)]), gap);
+    let done = project(open, vec![completed(2, 2, "task-1")]).unwrap();
+    assert_eq!(project(done, vec![again(3, 3)]), gap);
+}
+
+#[test]
 fn unknown_events_and_states_are_rejected() {
     let mut archived = created(1, "task-1", "x");
     archived.event.tag = id("TaskArchived");

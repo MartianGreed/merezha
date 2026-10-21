@@ -96,8 +96,11 @@ checks each response against `examples/welcome/expected/`:
 6. Stage 4 removes `normalize` (generation 4). Calling it returns HTTP 404
    `not_found`, and the shorter pipeline greets an already clean name.
 
-Set `KEEP_SCRATCH=1` to keep the temporary directory and the host log. The
-stage manifests are portable: their component paths are relative, so
+Set `KEEP_SCRATCH=1` to keep the temporary directory and the host log.
+The script waits up to `MEREZHA_STARTUP_SECONDS` (default 120) for the host to
+listen while the host process is alive; a debug host compiles the catalog
+noticeably slower than a release one. The stage manifests are portable:
+their component paths are relative, so
 `merezha serve --manifest examples/welcome/stage-2.toml` works directly after
 a build.
 
@@ -364,6 +367,9 @@ port with a fresh in-memory store. The driver then checks, in order:
     appended nothing. The `welcome` pipeline still answers as in step 1.
 
 Set `KEEP_SCRATCH=1` to keep the temporary directory and the host log.
+The script waits up to `MEREZHA_STARTUP_SECONDS` (default 120) for the host to
+listen while the host process is alive; a debug host compiles the catalog
+noticeably slower than a release one.
 
 ### JSON numbers
 
