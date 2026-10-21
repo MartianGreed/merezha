@@ -202,7 +202,11 @@ the intended canonical path before exclusive file creation and a version 1
 schema transaction. Ordinary owner-lock failure leaves no new database. After successful
 initialization, change `initialize` to `false`, its default, before the next
 start. Normal open never creates a missing database. Initialization never adopts
-or overwrites an existing file. An interrupted initialization can leave an
+or overwrites an existing file. Any existing entry, including a dangling symlink,
+is a permanent `storage_open` initialization error before owner-sidecar creation
+or acquisition, even when an existing database has a live owner. This refusal
+does not change existing data, links or sidecar contents.
+An interrupted initialization can leave an
 uninitialized file; reopen rejects it. Preserve that file for diagnosis and
 initialize a different fresh path. There is no automatic destructive repair.
 
@@ -277,7 +281,8 @@ the host operator. Restart never reclaims event or receipt capacity; there is
 no TTL, eviction, automatic retention or snapshot compaction.
 
 Requests wait for the internal connection through a condition variable, bounded
-by their original admitted deadline. Expiration reports `timeout`. No SQL or
+by their original admitted deadline. Expiration reports `timeout`; an expired
+waiter forwards a wakeup if a connection is available for another caller. No SQL or
 guest code runs while holding the connection-availability mutex. External
 SQLite busy/locked states still fail `storage_busy` immediately. The admitted
 deadline is checked before storage work and before

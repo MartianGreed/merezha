@@ -48,12 +48,20 @@ struct ConnectionSlot {
     // This mutex covers only take/return bookkeeping, never SQL or guest work.
     available: Mutex<Option<Connection>>,
     returned: Condvar,
+    #[cfg(test)]
+    waiting: Mutex<usize>,
+    #[cfg(test)]
+    waiting_changed: Condvar,
 }
 impl ConnectionSlot {
     fn new(connection: Connection) -> Self {
         Self {
             available: Mutex::new(Some(connection)),
             returned: Condvar::new(),
+            #[cfg(test)]
+            waiting: Mutex::new(0),
+            #[cfg(test)]
+            waiting_changed: Condvar::new(),
         }
     }
     fn acquire(&self, deadline: Instant) -> Result<ConnectionGuard<'_>, Failure> {
@@ -62,25 +70,56 @@ impl ConnectionSlot {
             .lock()
             .map_err(|_| Failure::transient("storage_unavailable"))?;
         loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| Failure::transient("timeout"))?;
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                // An expired waiter may have consumed the return notification.
+                // Leave the connection for a live caller and forward the wakeup.
+                if slot.is_some() {
+                    self.returned.notify_one();
+                }
+                return Err(Failure::transient("timeout"));
+            };
             if let Some(connection) = slot.take() {
                 return Ok(ConnectionGuard {
                     slot: self,
                     connection: Some(connection),
                 });
             }
+            #[cfg(test)]
+            self.record_waiter(1);
             let (next, _) = self
                 .returned
                 .wait_timeout(slot, remaining)
                 .map_err(|_| Failure::transient("storage_unavailable"))?;
             slot = next;
+            #[cfg(test)]
+            self.record_waiter(-1);
         }
     }
     #[cfg(test)]
     fn lock(&self) -> Result<ConnectionGuard<'_>, Failure> {
         self.acquire(Instant::now() + Duration::from_secs(5))
+    }
+    #[cfg(test)]
+    fn record_waiter(&self, change: isize) {
+        let mut waiting = self.waiting.lock().unwrap();
+        *waiting = waiting.checked_add_signed(change).unwrap();
+        self.waiting_changed.notify_all();
+    }
+    #[cfg(test)]
+    fn wait_for_waiters(&self, count: usize) {
+        let (waiting, _) = self
+            .waiting_changed
+            .wait_timeout_while(self.waiting.lock().unwrap(), Duration::from_secs(2), |n| {
+                *n < count
+            })
+            .unwrap();
+        assert!(
+            *waiting >= count,
+            "caller did not reach the connection wait"
+        );
+        drop(waiting);
+        // Synchronize with wait_timeout releasing the availability mutex.
+        drop(self.available.lock().unwrap());
     }
 }
 struct ConnectionGuard<'a> {
@@ -1015,6 +1054,187 @@ initial=0
         let (store, (receipts, _)) = open_store(&path, false);
         assert!(receipts.is_empty());
         assert_eq!(store.head(deadline()).unwrap(), 0);
+    }
+    #[test]
+    fn queued_caller_rechecks_poison_after_an_unknown_commit_without_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (store, _) = open_store(&path, true);
+        std::thread::scope(|scope| {
+            let mut held = store.lock(deadline()).unwrap();
+            held.commit_hook(Some(|| true)).unwrap();
+            let tx = held.transaction().unwrap();
+            tx.execute("UPDATE projections SET state='99'", []).unwrap();
+            let backend = &store;
+            let queued = scope.spawn(move || backend.head(deadline()));
+            store.connection.wait_for_waiters(1);
+            assert_eq!(
+                store.commit(tx, deadline()).unwrap_err().code,
+                "commit_outcome_unknown"
+            );
+            assert!(store.poisoned.load(Ordering::Acquire));
+            drop(held);
+            assert_eq!(
+                queued.join().unwrap().unwrap_err().code,
+                "storage_reopen_required"
+            );
+        });
+        drop(store);
+        let (store, (receipts, projections)) = open_store(&path, false);
+        assert!(receipts.is_empty());
+        assert_eq!(store.head(deadline()).unwrap(), 0);
+        assert_eq!(
+            projections[&id("total")],
+            ProjectionState {
+                state: json!(0),
+                checkpoint: 0
+            }
+        );
+    }
+    #[test]
+    fn expired_caller_forwards_an_available_connection_to_an_already_waiting_caller() {
+        let slot = ConnectionSlot::new(Connection::open_in_memory().unwrap());
+        let connection = slot.available.lock().unwrap().take().unwrap();
+        std::thread::scope(|scope| {
+            let backend = &slot;
+            let (sent, received) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let value = backend
+                    .acquire(deadline())
+                    .unwrap()
+                    .query_row("SELECT 42", [], |r| r.get::<_, i64>(0))
+                    .unwrap();
+                sent.send(value).unwrap();
+            });
+            slot.wait_for_waiters(1);
+            // Construct the state after a return notification has been consumed
+            // by an expired waiter: a connection is idle and another caller is
+            // still asleep. This does not depend on condvar wake ordering.
+            *slot.available.lock().unwrap() = Some(connection);
+            let expired = slot.acquire(Instant::now() - Duration::from_millis(1));
+            assert_eq!(
+                expired.err().unwrap().code,
+                "timeout",
+                "an expired caller must not get the connection"
+            );
+            let completion = received.recv_timeout(Duration::from_millis(300));
+            // Reap the worker even if the forwarding assertion fails.
+            slot.returned.notify_all();
+            assert_eq!(
+                completion.expect(
+                    "expired caller consumed the only notification; live waiter remained asleep"
+                ),
+                42
+            );
+        });
+    }
+    #[cfg(unix)]
+    #[test]
+    fn initialize_hardlinked_owner_is_rejected_before_database_creation() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let owner = dir.path().join("db.owner");
+        let alias = dir.path().join("owner-alias");
+        std::fs::write(&owner, b"existing unheld owner sidecar").unwrap();
+        std::fs::hard_link(&owner, &alias).unwrap();
+        let before = std::fs::read(&owner).unwrap();
+        let metadata = owner.metadata().unwrap();
+        let error = SqliteStore::open(&config(&path, true), &path, &id("counter-v1"), true)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.classification,
+            merezha_domain::Classification::Permanent
+        );
+        assert_eq!(error.code, "storage_path");
+        assert!(
+            !path.exists(),
+            "hardlinked owner must be rejected before creating a database"
+        );
+        assert_eq!(std::fs::read(&owner).unwrap(), before);
+        assert_eq!(std::fs::read(&alias).unwrap(), before);
+        for entry in [&owner, &alias] {
+            let after = entry.metadata().unwrap();
+            assert_eq!(
+                (after.dev(), after.ino(), after.nlink()),
+                (metadata.dev(), metadata.ino(), 2)
+            );
+        }
+    }
+    #[test]
+    fn initialize_existing_owned_database_is_a_permanent_request_error_without_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (store, _) = open_store(&path, true);
+        let owner = dir.path().join("db.owner");
+        let data = std::fs::read(&path).unwrap();
+        let owner_data = std::fs::read(&owner).unwrap();
+        let error = SqliteStore::open(&config(&path, true), &path, &id("counter-v1"), true)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.classification,
+            merezha_domain::Classification::Permanent
+        );
+        assert_eq!(error.code, "storage_open");
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        assert_eq!(std::fs::read(&owner).unwrap(), owner_data);
+        assert_eq!(store.head(deadline()).unwrap(), 0);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn initialize_existing_dangling_symlink_does_not_create_an_owner_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dangling");
+        let missing = dir.path().join("missing");
+        std::os::unix::fs::symlink(&missing, &path).unwrap();
+        let owner = dir.path().join("dangling.owner");
+        assert!(!owner.exists());
+        let error = SqliteStore::open(&config(&path, true), &path, &id("counter-v1"), true)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.classification,
+            merezha_domain::Classification::Permanent
+        );
+        assert_eq!(error.code, "storage_open");
+        assert!(
+            !owner.exists(),
+            "refusing an existing entry must not create an owner sidecar"
+        );
+        assert_eq!(std::fs::read_link(&path).unwrap(), missing);
+        assert!(!missing.exists());
+    }
+    #[test]
+    fn closed_native_header_and_btree_corruption_are_permanent_without_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        drop(open_store(&path, true));
+        drop(open_store(&path, false));
+        let good = std::fs::read(&path).unwrap();
+        for (offset, byte, expected) in [
+            (0, b'X', rusqlite::ErrorCode::NotADatabase),
+            (100, 0, rusqlite::ErrorCode::DatabaseCorrupt),
+        ] {
+            let mut bad = good.clone();
+            bad[offset] = byte;
+            std::fs::write(&path, &bad).unwrap();
+            let independent =
+                Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let native = independent
+                .query_row("SELECT count(*) FROM sqlite_schema", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap_err();
+            assert_eq!(native.sqlite_error_code(), Some(expected));
+            eprintln!("independent native corruption at byte {offset}: {native:?}");
+            drop(independent);
+            assert_eq!(std::fs::read(&path).unwrap(), bad);
+            assert_rejected_unchanged(&path, &config(&path, false));
+            std::fs::write(&path, &good).unwrap();
+            drop(open_store(&path, false));
+        }
     }
     #[test]
     fn init_lock_contention_does_not_create_a_database() {
