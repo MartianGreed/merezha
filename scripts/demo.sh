@@ -61,6 +61,19 @@ expect() {
   echo "ok: HTTP $status $body"
 }
 
+# expect_json STATUS FRAGMENT...: checks the last response has every JSON
+# member FRAGMENT, in any order, as host listings do not promise key order.
+expect_json() {
+  local expected_status=$1 fragment
+  shift
+  [[ $status == "$expected_status" ]] || fail "expected HTTP $expected_status, got HTTP $status $body"
+  for fragment in "$@"; do
+    [[ $body == *"$fragment,"* || $body == *"$fragment}"* ]] ||
+      fail "expected $fragment in HTTP $status $body"
+  done
+  echo "ok: HTTP $status $body"
+}
+
 # expect_error STATUS CODE: checks the last response is the host error CODE.
 expect_error() {
   [[ $status == "$1" && $body == *"\"code\":\"$2\""* ]] || fail "expected HTTP $1 error $2, got HTTP $status $body"
@@ -98,9 +111,9 @@ done
 echo "ok: listening on $address"
 
 request GET /health
-expect 200 '{"status":"ok","generation":1}'
+expect_json 200 '"status":"ok"' '"generation":1'
 request GET /v1/services
-expect 200 '{"generation":1,"services":["greet","normalize"],"pipelines":["welcome"]}'
+expect_json 200 '"generation":1' '"services":["greet","normalize"]' '"pipelines":["welcome"]'
 
 step "Pipeline welcome = normalize -> greet"
 request POST /v1/pipelines/welcome/invoke "$example/fixtures/welcome.json"
@@ -114,14 +127,14 @@ expect_error 422 guest_error
 step "Add envelope: welcome = normalize -> greet -> envelope"
 install stage-2.toml
 request POST /v1/reload
-expect 200 '{"generation":2}'
+expect_json 200 '"generation":2'
 request POST /v1/pipelines/welcome/invoke "$example/fixtures/welcome.json"
 expect_file 200 stage-2-welcome.json
 
 step "Replace greet with the formal revision"
 install stage-3.toml
 request POST /v1/reload
-expect 200 '{"generation":3}'
+expect_json 200 '"generation":3'
 request POST /v1/pipelines/welcome/invoke "$example/fixtures/welcome.json"
 expect_file 200 stage-3-welcome.json
 
@@ -130,16 +143,16 @@ install invalid-missing-service.toml
 request POST /v1/reload
 expect_error 400 invalid_manifest
 request GET /health
-expect 200 '{"status":"ok","generation":3}'
+expect_json 200 '"status":"ok"' '"generation":3'
 request POST /v1/pipelines/welcome/invoke "$example/fixtures/welcome.json"
 expect_file 200 stage-3-welcome.json
 
 step "Remove normalize: welcome = greet -> envelope"
 install stage-4.toml
 request POST /v1/reload
-expect 200 '{"generation":4}'
+expect_json 200 '"generation":4'
 request GET /v1/services
-expect 200 '{"generation":4,"services":["envelope","greet"],"pipelines":["welcome"]}'
+expect_json 200 '"generation":4' '"services":["envelope","greet"]' '"pipelines":["welcome"]'
 request POST /v1/services/normalize/invoke "$example/fixtures/welcome.json"
 expect_error 404 not_found
 request POST /v1/pipelines/welcome/invoke "$example/fixtures/grace.json"
