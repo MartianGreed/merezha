@@ -1,7 +1,8 @@
-//! Bounded, process-local application orchestration. Host implementation follows
+//! Bounded application orchestration with memory or owned SQLite storage. The host follows
 //! the versioned guest contract in `merezha-domain`.
 mod application;
 pub mod config;
+mod sqlite;
 pub mod store;
 pub use application::{Application, ProjectionState, QueryResult};
 

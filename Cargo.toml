@@ -20,6 +20,7 @@ tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "net", "s
 tempfile = "3.27.0"
 wat = "1.258.3"
 tower = { version = "0.5.3", features = ["util"] }
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "hooks", "limits", "fallible_uint"] }
 
 [profile.dev]
 debug = 0

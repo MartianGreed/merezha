@@ -6,7 +6,7 @@ use crate::{
 use merezha_domain::{
     Command, Failure, Identity, MessageKind, Operation, Query, Receipt, Reply, compatible_json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -26,26 +26,60 @@ pub struct QueryResult {
     pub value: Value,
     pub checkpoint: u64,
 }
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Key {
-    tag: Identity,
-    actor: Option<Identity>,
-    key: Identity,
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Key {
+    pub(crate) tag: Identity,
+    pub(crate) actor: Option<Identity>,
+    pub(crate) key: Identity,
 }
-struct Record {
-    payload: String,
-    result: Option<Receipt>,
+pub(crate) struct Record {
+    pub(crate) payload: String,
+    pub(crate) result: Option<Receipt>,
 }
 struct Inner {
     config: Config,
     guest: Arc<dyn Guest>,
     authorizer: Arc<dyn Authorizer>,
-    store: Arc<dyn EventStore>,
+    store: Storage,
     idempotency: Mutex<BTreeMap<Key, Record>>,
     projections: BTreeMap<Identity, Mutex<ProjectionState>>,
     active: AtomicUsize,
 }
-/// Clones share finite, process-local dispatch/idempotency/projection state.
+enum Storage {
+    Volatile(Arc<dyn EventStore>),
+    Sqlite(Arc<crate::sqlite::SqliteStore>),
+}
+impl Storage {
+    fn load(
+        &self,
+        stream: &Identity,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<merezha_domain::StoredEvent>, Failure> {
+        match self {
+            Self::Volatile(s) => s.load(stream),
+            Self::Sqlite(s) => s.load(stream, deadline),
+        }
+    }
+    fn head(&self, deadline: std::time::Instant) -> Result<u64, Failure> {
+        match self {
+            Self::Volatile(s) => s.head(),
+            Self::Sqlite(s) => s.head(deadline),
+        }
+    }
+    fn read_all(
+        &self,
+        after: u64,
+        limit: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<merezha_domain::StoredEvent>, Failure> {
+        match self {
+            Self::Volatile(s) => s.read_all(after, limit),
+            Self::Sqlite(s) => s.read_all(after, limit, deadline),
+        }
+    }
+}
+/// Clones share dispatch state and, in SQLite mode, one owned database.
 #[derive(Clone)]
 pub struct Application(Arc<Inner>);
 pub struct Admission {
@@ -60,6 +94,7 @@ impl Drop for Admission {
 struct Claim {
     inner: Arc<Inner>,
     key: Key,
+    fingerprint: String,
     completed: bool,
 }
 impl Drop for Claim {
@@ -89,6 +124,35 @@ impl Claim {
     }
 }
 impl Application {
+    /// Construct the configured backend before accepting requests. SQLite
+    /// requires an absolute local path and explicit initialize or verified open.
+    pub fn open(
+        config: Config,
+        guest: Arc<dyn Guest>,
+        authorizer: Arc<dyn Authorizer>,
+    ) -> Result<Self, Failure> {
+        use crate::config::StorageConfig;
+        validate_services(&config, guest.as_ref())?;
+        if let StorageConfig::Sqlite {
+            path,
+            application,
+            initialize,
+        } = &config.storage
+        {
+            let (store, (records, recovered)) =
+                crate::sqlite::SqliteStore::open(&config, path, application, *initialize)?;
+            Self::construct(
+                config,
+                guest,
+                authorizer,
+                Storage::Sqlite(Arc::new(store)),
+                records,
+                recovered,
+            )
+        } else {
+            Self::in_memory(config, guest, authorizer)
+        }
+    }
     pub fn in_memory(
         config: Config,
         guest: Arc<dyn Guest>,
@@ -103,27 +167,40 @@ impl Application {
         authorizer: Arc<dyn Authorizer>,
         store: Arc<dyn EventStore>,
     ) -> Result<Self, Failure> {
-        config.validate()?;
-        let services = guest.services()?;
-        if config
-            .commands
-            .iter()
-            .map(|r| &r.service)
-            .chain(config.queries.iter().map(|r| &r.service))
-            .chain(config.projections.iter().map(|r| &r.service))
-            .any(|service| !services.iter().any(|s| s == service.as_str()))
-        {
-            return Err(Failure::permanent("unknown_service"));
+        if !matches!(config.storage, crate::config::StorageConfig::Memory) {
+            return Err(Failure::permanent("storage_configuration"));
         }
+        Self::construct(
+            config,
+            guest,
+            authorizer,
+            Storage::Volatile(store),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+    }
+    fn construct(
+        config: Config,
+        guest: Arc<dyn Guest>,
+        authorizer: Arc<dyn Authorizer>,
+        store: Storage,
+        records: BTreeMap<Key, Record>,
+        mut recovered: BTreeMap<Identity, ProjectionState>,
+    ) -> Result<Self, Failure> {
+        validate_services(&config, guest.as_ref())?;
         let mut projections = BTreeMap::new();
         for projection in &config.projections {
             compatible_json(&projection.initial)?;
             projections.insert(
                 projection.name.clone(),
-                Mutex::new(ProjectionState {
-                    state: projection.initial.clone(),
-                    checkpoint: 0,
-                }),
+                Mutex::new(
+                    recovered
+                        .remove(&projection.name)
+                        .unwrap_or_else(|| ProjectionState {
+                            state: projection.initial.clone(),
+                            checkpoint: 0,
+                        }),
+                ),
             );
         }
         Ok(Self(Arc::new(Inner {
@@ -132,7 +209,7 @@ impl Application {
             authorizer,
             store,
             projections,
-            idempotency: Mutex::new(BTreeMap::new()),
+            idempotency: Mutex::new(records),
             active: AtomicUsize::new(0),
         })))
     }
@@ -264,17 +341,18 @@ impl Admission {
             records.insert(
                 key.clone(),
                 Record {
-                    payload: fingerprint,
+                    payload: fingerprint.clone(),
                     result: None,
                 },
             );
             claim = Some(Claim {
                 inner: self.inner.clone(),
                 key,
+                fingerprint,
                 completed: false,
             });
         }
-        let history = self.inner.store.load(&stream)?;
+        let history = self.inner.store.load(&stream, self.deadline)?;
         if history.len() > self.inner.config.limits.max_events {
             return Err(Failure::permanent("history_limit"));
         }
@@ -303,10 +381,19 @@ impl Admission {
         if events.len() > self.inner.config.limits.batch_size {
             return Err(Failure::permanent("event_batch_limit"));
         }
-        let receipt = self
-            .inner
-            .store
-            .append(&stream, expected, events, &command.metadata)?;
+        let receipt = match &self.inner.store {
+            Storage::Sqlite(store) => store.commit_command(
+                &stream,
+                expected,
+                events,
+                &command.metadata,
+                claim.as_ref().map(|c| (&c.key, c.fingerprint.as_str())),
+                self.deadline,
+            )?,
+            Storage::Volatile(store) => {
+                store.append(&stream, expected, events, &command.metadata)?
+            }
+        };
         if let Some(claim) = claim {
             claim.complete(&receipt);
         }
@@ -335,10 +422,14 @@ impl Admission {
             &payload,
             &query.metadata,
         )?;
-        let snapshot = self.inner.projections[&route.projection]
+        let current = self.inner.projections[&route.projection]
             .try_lock()
-            .map_err(|_| Failure::conflict("projection_in_flight"))?
-            .clone();
+            .map_err(|_| Failure::conflict("projection_in_flight"))?;
+        let snapshot = match &self.inner.store {
+            Storage::Sqlite(store) => store.projection(&route.projection, self.deadline)?.0,
+            Storage::Volatile(_) => current.clone(),
+        };
+        drop(current);
         let reply = invoke(
             session.as_ref(),
             self.deadline,
@@ -371,6 +462,12 @@ impl Admission {
         let mut current = self.inner.projections[&projection.name]
             .try_lock()
             .map_err(|_| Failure::conflict("projection_in_flight"))?;
+        let mut revision = 0;
+        if let Storage::Sqlite(store) = &self.inner.store {
+            let (snapshot, stored_revision) = store.projection(&projection.name, self.deadline)?;
+            *current = snapshot;
+            revision = stored_revision;
+        }
         let mut pending = if rebuild {
             ProjectionState {
                 state: projection.initial.clone(),
@@ -381,12 +478,13 @@ impl Admission {
         };
         // Snapshot the target so continuous concurrent appends cannot keep a
         // catch-up request alive indefinitely.
-        let head = self.inner.store.head()?;
+        let head = self.inner.store.head(self.deadline)?;
         while pending.checkpoint < head {
-            let mut events = self
-                .inner
-                .store
-                .read_all(pending.checkpoint, self.inner.config.limits.batch_size)?;
+            let mut events = self.inner.store.read_all(
+                pending.checkpoint,
+                self.inner.config.limits.batch_size,
+                self.deadline,
+            )?;
             events.retain(|event| event.position <= head);
             if events.is_empty() || events.len() > self.inner.config.limits.batch_size {
                 return Err(Failure::permanent("invalid_event_feed"));
@@ -415,13 +513,39 @@ impl Admission {
             self.check_value(&state, self.inner.config.limits.max_state_bytes)?;
             pending = ProjectionState { state, checkpoint };
             if !rebuild {
+                if let Storage::Sqlite(store) = &self.inner.store {
+                    revision = store.commit_projection(
+                        &projection.name,
+                        revision,
+                        &pending,
+                        self.deadline,
+                    )?;
+                }
                 *current = pending.clone();
             }
         }
         // Rebuild swaps its entire candidate only after every batch succeeds.
+        if rebuild && let Storage::Sqlite(store) = &self.inner.store {
+            store.commit_projection(&projection.name, revision, &pending, self.deadline)?;
+        }
         *current = pending;
         Ok(current.clone())
     }
+}
+fn validate_services(config: &Config, guest: &dyn Guest) -> Result<(), Failure> {
+    config.validate()?;
+    let services = guest.services()?;
+    if config
+        .commands
+        .iter()
+        .map(|r| &r.service)
+        .chain(config.queries.iter().map(|r| &r.service))
+        .chain(config.projections.iter().map(|r| &r.service))
+        .any(|service| !services.iter().any(|s| s == service.as_str()))
+    {
+        return Err(Failure::permanent("unknown_service"));
+    }
+    Ok(())
 }
 fn invoke(
     session: &dyn GuestSession,
@@ -431,7 +555,7 @@ fn invoke(
 ) -> Result<Reply, Failure> {
     session.invoke_until(service, operation, deadline)
 }
-fn canonical(value: &Value) -> Result<String, Failure> {
+pub(crate) fn canonical(value: &Value) -> Result<String, Failure> {
     fn sorted(value: &Value) -> Value {
         match value {
             Value::Object(map) => Value::Object(

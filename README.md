@@ -61,10 +61,12 @@ reload, isolation, budgets, guest faults and an actual ephemeral HTTP listener.
 The separate services/examples contribution supplies higher-level guest recipes.
 
 For stateful applications, the opt-in [application SDK and host](docs/architecture/application.md)
-add guest deciders, command/query routing, finite in-memory event history,
+add guest deciders, command/query routing, bounded event history,
 idempotency and checkpointed read models. Start with `serve --manifest PATH
---application PATH`; the original raw endpoints remain available. This adapter
-loses all application state on restart. See the [Structure parity map](docs/architecture/structure-parity.md)
+--application PATH`; the original raw endpoints remain available. Memory mode
+loses state on restart. Opt-in SQLite mode retains events, keyed receipts and
+read models in one local database owned by one host. See the
+[Structure parity map](docs/architecture/structure-parity.md)
 for the bounded subset and deferred capabilities.
 
 ## License

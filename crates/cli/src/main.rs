@@ -88,7 +88,7 @@ async fn main() -> std::process::ExitCode {
                 .read_to_string(&mut text)
                 .map_err(|_| merezha_domain::Failure::permanent("invalid_application_config"))?;
             let config = merezha_application::config::Config::parse(&text)?;
-            merezha_application::Application::in_memory(
+            merezha_application::Application::open(
                 config,
                 std::sync::Arc::new(guest),
                 std::sync::Arc::new(merezha_application::AllowAll),

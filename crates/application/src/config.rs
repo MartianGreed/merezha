@@ -1,10 +1,10 @@
 use merezha_domain::{Failure, Identity};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
 /// Hard ceilings apply even when configuring a replaceable adapter.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub timeout_ms: u64,
@@ -54,28 +54,49 @@ impl Limits {
         Ok(())
     }
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandRoute {
     pub tag: Identity,
     pub service: Identity,
     pub aggregate: Identity,
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryRoute {
     pub tag: Identity,
     pub service: Identity,
     pub projection: Identity,
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Projection {
     pub name: Identity,
     pub service: Identity,
     pub initial: Value,
+    /// Application-owned compatibility version; changing it requires a new
+    /// database or a separately reviewed migration, never an implicit reset.
+    #[serde(default = "projection_revision")]
+    pub revision: u32,
 }
-#[derive(Clone, Debug, Deserialize)]
+fn projection_revision() -> u32 {
+    1
+}
+/// Storage is selected by the host only. Initialization never adopts an
+/// existing file; normal open never creates one.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StorageConfig {
+    #[default]
+    Memory,
+    Sqlite {
+        path: std::path::PathBuf,
+        application: Identity,
+        #[serde(default)]
+        initialize: bool,
+    },
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u16,
@@ -87,6 +108,8 @@ pub struct Config {
     pub queries: Vec<QueryRoute>,
     #[serde(default)]
     pub projections: Vec<Projection>,
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 impl Config {
     pub fn parse(input: &str) -> Result<Self, Failure> {
@@ -123,8 +146,9 @@ impl Config {
                 .iter()
                 .any(|q| !projections.contains(&q.projection))
             || self.projections.iter().any(|p| {
-                serde_json::to_vec(&p.initial)
-                    .map_or(true, |v| v.len() > self.limits.max_state_bytes)
+                p.revision == 0
+                    || serde_json::to_vec(&p.initial)
+                        .map_or(true, |v| v.len() > self.limits.max_state_bytes)
             })
         {
             return Err(Failure::permanent("invalid_routes"));
