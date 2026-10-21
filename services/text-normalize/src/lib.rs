@@ -7,7 +7,7 @@
 //! the result and copies every other field, including `case`, unchanged.
 //! See `docs/services/README.md` for the full contract.
 
-use merezha_service_kit::{ErrorCode, Limits, Object, Service, ServiceError, Value};
+use merezha_service_kit::{Document, ErrorCode, Limits, Service, ServiceError};
 
 /// Identity and work bounds of the service.
 pub const SERVICE: Service = Service {
@@ -87,9 +87,9 @@ impl Case {
     }
 }
 
-fn normalize(mut object: Object) -> Result<Value, ServiceError> {
-    let case = Case::parse(SERVICE.optional_str(&object, "case")?)?;
-    let text = normalize_text(SERVICE.required_str(&object, "text")?, case);
+fn normalize(mut document: Document) -> Result<Document, ServiceError> {
+    let case = Case::parse(SERVICE.optional_str(&document, "case")?.as_deref())?;
+    let text = normalize_text(&SERVICE.required_str(&document, "text")?, case);
     if text.is_empty() {
         return Err(SERVICE
             .error(
@@ -98,8 +98,8 @@ fn normalize(mut object: Object) -> Result<Value, ServiceError> {
             )
             .with_field("text"));
     }
-    object.insert("text".to_owned(), Value::String(text));
-    Ok(Value::Object(object))
+    document.insert_str("text", &text);
+    Ok(document)
 }
 
 fn normalize_text(text: &str, case: Case) -> String {

@@ -124,7 +124,7 @@ printf '{"text":42}' > "$scratch/bad-text.json"
 request POST /v1/services/normalize/invoke "$scratch/bad-text.json"
 expect_error 422 guest_error
 
-step "Add envelope: welcome = normalize -> greet -> envelope; numbers pass through exactly"
+step "Add envelope: welcome = normalize -> greet -> envelope; other fields pass through exactly"
 install stage-2.toml
 request POST /v1/reload
 expect_json 200 '"generation":2'

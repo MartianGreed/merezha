@@ -20,8 +20,9 @@ merezha-service-kit = { path = "kit" }
 merezha-text-normalize = { path = "text-normalize" }
 merezha-greeting = { path = "greeting" }
 merezha-json-envelope = { path = "json-envelope" }
-# Numbers pass through services verbatim; without this they round through f64.
-serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
+# Fields a service does not own are kept as raw JSON text, never decoded into
+# `Value`: no number rounding and no serde_json reserved-key interpretation.
+serde_json = { version = "1.0.154", features = ["raw_value"] }
 wit-bindgen = { version = "0.63.0", default-features = false, features = ["macros", "realloc"] }
 
 [profile.release]
