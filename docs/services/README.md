@@ -53,8 +53,9 @@ the host classifies.
 scripts/check-services.sh
 ```
 
-Runs `cargo fmt --check`, Clippy with warnings denied for native and
-component builds, the native contract tests for both greeting revisions
+Runs the demo's response-assertion tests (`scripts/test-demo-assertions.sh`),
+`cargo fmt --check`, Clippy with warnings denied for native and component
+builds, the native contract tests for both greeting revisions
 (doctests included) and a full component build in a temporary directory.
 
 ## Demo

@@ -33,6 +33,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# shellcheck source=scripts/demo-assertions.sh
+source "$root/scripts/demo-assertions.sh"
+
 step() { printf '\n== %s\n' "$*"; }
 fail() {
   echo "demo: FAILED: $*" >&2
@@ -53,31 +56,6 @@ request() {
   status=$(curl -sS -o "$scratch/body" -w '%{http_code}' -X "$method" ${data[@]+"${data[@]}"} "http://$address$path") ||
     fail "$method $path: request failed"
   body=$(cat "$scratch/body")
-}
-
-# expect STATUS BODY: compares the last response.
-expect() {
-  [[ $status == "$1" && $body == "$2" ]] || fail "expected HTTP $1 $2, got HTTP $status $body"
-  echo "ok: HTTP $status $body"
-}
-
-# expect_json STATUS FRAGMENT...: checks the last response has every JSON
-# member FRAGMENT, in any order, as host listings do not promise key order.
-expect_json() {
-  local expected_status=$1 fragment
-  shift
-  [[ $status == "$expected_status" ]] || fail "expected HTTP $expected_status, got HTTP $status $body"
-  for fragment in "$@"; do
-    [[ $body == *"$fragment,"* || $body == *"$fragment}"* ]] ||
-      fail "expected $fragment in HTTP $status $body"
-  done
-  echo "ok: HTTP $status $body"
-}
-
-# expect_error STATUS CODE: checks the last response is the host error CODE.
-expect_error() {
-  [[ $status == "$1" && $body == *"\"code\":\"$2\""* ]] || fail "expected HTTP $1 error $2, got HTTP $status $body"
-  echo "ok: HTTP $status $body"
 }
 
 # expect_file STATUS FILE: compares the last response with an expected file.
