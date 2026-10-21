@@ -1,0 +1,26 @@
+# Stage 2 adds the envelope service and appends it to the pipeline.
+version = 1
+
+[limits]
+memory_bytes = 16777216
+fuel = 200000000
+max_input_bytes = 262144
+max_output_bytes = 524288
+timeout_ms = 2000
+max_concurrent_invocations = 8
+
+[[services]]
+id = "normalize"
+path = "components/text-normalize.wasm"
+
+[[services]]
+id = "greet"
+path = "components/greeting.wasm"
+
+[[services]]
+id = "envelope"
+path = "components/json-envelope.wasm"
+
+[[pipelines]]
+id = "welcome"
+steps = ["normalize", "greet", "envelope"]
