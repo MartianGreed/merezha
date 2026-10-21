@@ -317,7 +317,7 @@ compare exact events/metadata, original receipts and persisted checkpoints.
 The host pins [rusqlite 0.40.2](https://docs.rs/crate/rusqlite/0.40.2), MIT,
 with default features disabled and `bundled`, `hooks`, `limits`, `fallible_uint`.
 `rusqlite` still enables the transitive `libsqlite3-sys` default build features,
-including `min_sqlite_version_3_14_0`, `pkg-config` and `vcpkg`. They are build
+including `min_sqlite_version_3_34_1`, `pkg-config` and `vcpkg`. They are build
 configuration dependencies; bundled mode compiles the pinned SQLite source.
 The locked `libsqlite3-sys` 0.38.2 is MIT and bundles SQLite 3.53.2, which is
 [public domain](https://sqlite.org/copyright.html). Bundled compilation requires
