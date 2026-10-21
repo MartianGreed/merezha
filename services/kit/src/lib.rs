@@ -6,16 +6,16 @@
 //!
 //! - the input is a JSON object, checked against the service's [`Limits`]
 //!   before any service-specific work starts;
-//! - a service reads and writes only its documented fields and copies every
-//!   other field unchanged, so data survives a multi-step pipeline;
+//! - a service decodes only its documented fields and copies every other
+//!   field as JSON text, without interpreting it, so data survives a
+//!   multi-step pipeline exactly (see [`Document`]);
 //! - a failure is returned as a JSON error document (see [`ServiceError`])
 //!   naming the service, a stable code, the offending field and a message
 //!   that says what was expected.
 
-pub use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
-/// A JSON object as received or produced by a service.
-pub type Object = Map<String, Value>;
+use serde_json::value::{RawValue, to_raw_value};
 
 /// Stable, machine-readable failure classes shared by the example services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,16 +98,93 @@ impl ServiceError {
 
     /// Renders the JSON error document returned through `handle`'s `err` case.
     pub fn to_json(&self) -> String {
-        let mut error = Object::new();
-        error.insert("service".to_owned(), Value::from(self.service));
-        error.insert("code".to_owned(), Value::from(self.code.as_str()));
+        let mut error = Document::new();
+        error.insert_str("service", self.service);
+        error.insert_str("code", self.code.as_str());
         if let Some(field) = &self.field {
-            error.insert("field".to_owned(), Value::from(field.as_str()));
+            error.insert_str("field", field);
         }
-        error.insert("message".to_owned(), Value::from(self.message.as_str()));
-        let mut document = Object::new();
-        document.insert("error".to_owned(), Value::Object(error));
-        Value::Object(document).to_string()
+        error.insert_str("message", &self.message);
+        let mut document = Document::new();
+        document.insert_document("error", &error);
+        document.to_json()
+    }
+}
+
+/// A JSON object whose field values are kept as JSON text.
+///
+/// Values are never decoded into a generic JSON tree, so a field a service
+/// does not own comes out with the same numbers, strings, nested key order
+/// and duplicate keys it went in with. Only insignificant whitespace between
+/// tokens is removed. Top-level keys are unique and sorted; a repeated
+/// top-level key keeps its last value.
+#[derive(Debug, Clone, Default)]
+pub struct Document {
+    fields: BTreeMap<String, Box<RawValue>>,
+}
+
+impl Document {
+    /// An empty object.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of top-level fields.
+    pub fn len(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// Whether the object has no fields.
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    /// The JSON text of `key`, if present.
+    pub fn get(&self, key: &str) -> Option<&RawValue> {
+        self.fields.get(key).map(AsRef::as_ref)
+    }
+
+    /// Removes `key` and returns its JSON text.
+    pub fn remove(&mut self, key: &str) -> Option<Box<RawValue>> {
+        self.fields.remove(key)
+    }
+
+    /// Sets `key` to the JSON string `value`.
+    pub fn insert_str(&mut self, key: impl Into<String>, value: &str) {
+        let value = to_raw_value(value).expect("a string always serializes to JSON");
+        self.fields.insert(key.into(), value);
+    }
+
+    /// Sets `key` to the JSON number `value`.
+    pub fn insert_u64(&mut self, key: impl Into<String>, value: u64) {
+        let value = to_raw_value(&value).expect("an integer always serializes to JSON");
+        self.fields.insert(key.into(), value);
+    }
+
+    /// Sets `key` to the object `value`.
+    pub fn insert_document(&mut self, key: impl Into<String>, value: &Document) {
+        let value = RawValue::from_string(value.to_json())
+            .expect("a document always serializes to valid JSON");
+        self.fields.insert(key.into(), value);
+    }
+
+    /// Serializes the object compactly, with top-level keys sorted.
+    pub fn to_json(&self) -> String {
+        let mut json = String::from("{");
+        for (index, (key, value)) in self.fields.iter().enumerate() {
+            if index > 0 {
+                json.push(',');
+            }
+            json.push_str(
+                &to_raw_value(key)
+                    .expect("a key always serializes")
+                    .to_string(),
+            );
+            json.push(':');
+            push_compact(value.get(), &mut json);
+        }
+        json.push('}');
+        json
     }
 }
 
@@ -140,11 +217,11 @@ impl Service {
     pub fn run(
         &self,
         input: &str,
-        transform: impl FnOnce(Object) -> Result<Value, ServiceError>,
+        transform: impl FnOnce(Document) -> Result<Document, ServiceError>,
     ) -> Result<String, String> {
         self.parse_object(input)
             .and_then(transform)
-            .map(|output| output.to_string())
+            .map(|output| output.to_json())
             .map_err(|error| error.to_json())
     }
 
@@ -153,9 +230,9 @@ impl Service {
     /// # Errors
     ///
     /// `limit_exceeded` when the input is too large, nests too deeply or has
-    /// too many fields; `invalid_json` when it does not parse;
-    /// `invalid_type` when it is not an object.
-    pub fn parse_object(&self, input: &str) -> Result<Object, ServiceError> {
+    /// too many fields, checked in that order; `invalid_json` when it does
+    /// not parse; `invalid_type` when it is not an object.
+    pub fn parse_object(&self, input: &str) -> Result<Document, ServiceError> {
         let limits = self.limits;
         if input.len() > limits.max_input_bytes {
             return Err(self.error(
@@ -168,41 +245,32 @@ impl Service {
                 ),
             ));
         }
-        let value: Value = serde_json::from_str(input).map_err(|error| {
-            let reason = error.to_string();
-            if reason.starts_with("recursion limit exceeded") {
-                self.depth_error()
-            } else {
-                self.error(
-                    ErrorCode::InvalidJson,
-                    format!("input is not valid JSON: {reason}"),
-                )
-            }
-        })?;
-        let object = match value {
-            Value::Object(object) => object,
-            other => {
-                return Err(self.error(
-                    ErrorCode::InvalidType,
-                    format!("input must be a JSON object, got {}", kind(&other)),
-                ));
-            }
-        };
-        if object.len() > limits.max_fields {
+        if nesting_depth(input) > limits.max_depth {
+            return Err(self.depth_error());
+        }
+        let raw: Box<RawValue> =
+            serde_json::from_str(input).map_err(|error| self.json_error(&error))?;
+        let kind = kind(&raw);
+        if kind != "an object" {
+            return Err(self.error(
+                ErrorCode::InvalidType,
+                format!("input must be a JSON object, got {kind}"),
+            ));
+        }
+        let fields: BTreeMap<String, Box<RawValue>> =
+            serde_json::from_str(raw.get()).map_err(|error| self.json_error(&error))?;
+        if fields.len() > limits.max_fields {
             return Err(self.error(
                 ErrorCode::LimitExceeded,
                 format!(
                     "input has {} top-level fields; {} accepts at most {}",
-                    object.len(),
+                    fields.len(),
                     self.name,
                     limits.max_fields
                 ),
             ));
         }
-        if nesting_exceeds(&object, limits.max_depth) {
-            return Err(self.depth_error());
-        }
-        Ok(object)
+        Ok(Document { fields })
     }
 
     /// Returns the string in `field`.
@@ -210,12 +278,8 @@ impl Service {
     /// # Errors
     ///
     /// `missing_field` when absent, `invalid_type` when not a string.
-    pub fn required_str<'a>(
-        &self,
-        object: &'a Object,
-        field: &str,
-    ) -> Result<&'a str, ServiceError> {
-        self.optional_str(object, field)?.ok_or_else(|| {
+    pub fn required_str(&self, document: &Document, field: &str) -> Result<String, ServiceError> {
+        self.optional_str(document, field)?.ok_or_else(|| {
             self.error(
                 ErrorCode::MissingField,
                 format!("field `{field}` is required and must be a string"),
@@ -228,27 +292,49 @@ impl Service {
     ///
     /// # Errors
     ///
-    /// `invalid_type` when present but not a string; `null` is not accepted.
-    pub fn optional_str<'a>(
+    /// `invalid_type` when present but not a string, `null` included;
+    /// `invalid_value` when its escapes do not form valid Unicode.
+    pub fn optional_str(
         &self,
-        object: &'a Object,
+        document: &Document,
         field: &str,
-    ) -> Result<Option<&'a str>, ServiceError> {
-        match object.get(field) {
-            None => Ok(None),
-            Some(Value::String(text)) => Ok(Some(text)),
-            Some(other) => Err(self
+    ) -> Result<Option<String>, ServiceError> {
+        let Some(raw) = document.get(field) else {
+            return Ok(None);
+        };
+        let kind = kind(raw);
+        if kind != "a string" {
+            return Err(self
                 .error(
                     ErrorCode::InvalidType,
-                    format!("field `{field}` must be a string, got {}", kind(other)),
+                    format!("field `{field}` must be a string, got {kind}"),
                 )
-                .with_field(field)),
+                .with_field(field));
         }
+        serde_json::from_str(raw.get()).map(Some).map_err(|error| {
+            self.error(
+                ErrorCode::InvalidValue,
+                format!("field `{field}` is not a valid Unicode string: {error}"),
+            )
+            .with_field(field)
+        })
     }
 
     /// Creates an error attributed to this service.
     pub fn error(&self, code: ErrorCode, message: impl Into<String>) -> ServiceError {
         ServiceError::new(self.name, code, message)
+    }
+
+    fn json_error(&self, error: &serde_json::Error) -> ServiceError {
+        let reason = error.to_string();
+        if reason.starts_with("recursion limit exceeded") {
+            self.depth_error()
+        } else {
+            self.error(
+                ErrorCode::InvalidJson,
+                format!("input is not valid JSON: {reason}"),
+            )
+        }
     }
 
     fn depth_error(&self) -> ServiceError {
@@ -263,32 +349,62 @@ impl Service {
 }
 
 /// The JSON type name of `value`, for error messages.
-pub fn kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
+pub fn kind(value: &RawValue) -> &'static str {
+    match value.get().trim_start().as_bytes().first() {
+        Some(b'{') => "an object",
+        Some(b'[') => "an array",
+        Some(b'"') => "a string",
+        Some(b't' | b'f') => "a boolean",
+        Some(b'n') => "null",
+        _ => "a number",
     }
 }
 
-/// Whether any container below `object` sits deeper than `max_depth`,
-/// counting `object` itself as depth 1. Iterative, so hostile nesting cannot
-/// exhaust the guest stack here.
-fn nesting_exceeds(object: &Object, max_depth: usize) -> bool {
-    let mut pending: Vec<(&Value, usize)> = object.values().map(|value| (value, 2)).collect();
-    while let Some((value, depth)) = pending.pop() {
-        let children: &mut dyn Iterator<Item = &Value> = match value {
-            Value::Array(items) => &mut items.iter(),
-            Value::Object(fields) => &mut fields.values(),
-            _ => continue,
-        };
-        if depth > max_depth {
-            return true;
+/// Deepest container nesting in `json`, scanning tokens outside strings.
+/// Linear and iterative, so hostile nesting is bounded before parsing.
+fn nesting_depth(json: &str) -> usize {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for byte in json.bytes() {
+        if in_string {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+            continue;
         }
-        pending.extend(children.map(|child| (child, depth + 1)));
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
     }
-    1 > max_depth
+    deepest
+}
+
+/// Appends `json` without insignificant whitespace between tokens.
+fn push_compact(json: &str, output: &mut String) {
+    let (mut in_string, mut escaped) = (false, false);
+    for character in json.chars() {
+        if in_string {
+            output.push(character);
+            match (escaped, character) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+        } else if character == '"' {
+            in_string = true;
+            output.push(character);
+        } else if !matches!(character, ' ' | '\t' | '\n' | '\r') {
+            output.push(character);
+        }
+    }
 }

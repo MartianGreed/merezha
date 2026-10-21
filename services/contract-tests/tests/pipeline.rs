@@ -98,3 +98,18 @@ fn large_and_precise_numbers_survive_every_step_and_change_the_digest() {
         |output: &str| serde_json::from_str::<Value>(output).unwrap()["meta"]["digest"].clone();
     assert_ne!(digest(&first), digest(&second));
 }
+
+#[test]
+fn serde_json_reserved_keys_survive_every_step_as_data() {
+    // Regression for the coordinator's boundary finding on the V1-F1 fix.
+    let input = r#"{"opaque":{"$serde_json::private::Number":"123","keep":"yes"},"raw":{"$serde_json::private::RawValue":"[1]"},"text":"ada"}"#;
+    let output = run(&[NORMALIZE, GREET, ENVELOPE], input).unwrap();
+    assert!(
+        output.contains(r#""opaque":{"$serde_json::private::Number":"123","keep":"yes"}"#),
+        "{output}"
+    );
+    assert!(
+        output.contains(r#""raw":{"$serde_json::private::RawValue":"[1]"}"#),
+        "{output}"
+    );
+}

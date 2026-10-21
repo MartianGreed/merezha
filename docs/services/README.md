@@ -74,8 +74,8 @@ checks each response against `examples/welcome/expected/`:
    and `request_id` and `kind` survive.
 2. A malformed call to `normalize` returns HTTP 422 `guest_error`.
 3. Stage 2 adds `envelope` and appends it to the pipeline (reload, generation 2).
-   A payload carrying `18446744073709551617` and a 34-digit decimal comes out
-   with both numbers unchanged.
+   A payload carrying `18446744073709551617`, a 34-digit decimal and an object
+   keyed `$serde_json::private::Number` comes out with all three unchanged.
 4. Stage 3 replaces `greet` with the formal revision without restarting the
    host (generation 3): `"greeting":"Bien le bonjour, Ada Lovelace."`.
 5. `invalid-missing-service.toml` is rejected with HTTP 400
@@ -93,8 +93,15 @@ a build.
 Every service takes a JSON object and returns a JSON object. It reads and
 writes only the fields listed below and copies every other field unchanged.
 That is how `request_id` reaches the end of the pipeline. Output keys are
-sorted. Numbers keep their exact value and digits, however large or precise;
-the only rewrite is an explicit exponent sign (`1e400` becomes `1e+400`).
+sorted and unique; a repeated top-level key keeps its last value.
+
+Fields a service does not own are copied as JSON text and never decoded.
+Numbers of any size or precision, strings, nested key order, repeated nested
+keys and keys that look like library internals come out exactly as they went
+in; only whitespace between tokens is removed. Because they are not decoded,
+these fields are checked for JSON syntax only: an unpaired `\ud800` escape,
+for example, passes through unchanged, while the same escape in a field the
+service reads is an `invalid_value` error.
 Before any service-specific work, each service checks its own bounds,
 independently of the host's limits:
 
@@ -157,8 +164,9 @@ normalization fails visibly instead of greeting `ada \t LOVELACE`.
 | everything else | moved into `data` | Unchanged |
 
 Output: `{"data":{…},"kind":…,"meta":{"data_bytes":…,"digest":"fnv1a64:<16 hex digits>","fields":…},"version":1}`.
-`data_bytes` and `digest` describe `data` serialized compactly with sorted
-keys, and `fields` counts its top-level fields. The FNV-1a digest identifies
+`data_bytes` and `digest` describe `data` exactly as emitted (top-level keys
+sorted, values as received without whitespace between tokens), and `fields`
+counts its top-level fields. The FNV-1a digest identifies
 content for deduplication and tests. It is not a security checksum.
 
 ## Adding a service

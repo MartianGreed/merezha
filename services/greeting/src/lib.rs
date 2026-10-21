@@ -10,7 +10,7 @@
 //! contract and different wording.
 //! See `docs/services/README.md` for the full contract.
 
-use merezha_service_kit::{ErrorCode, Limits, Object, Service, ServiceError, Value};
+use merezha_service_kit::{Document, ErrorCode, Limits, Service, ServiceError};
 
 /// Identity and work bounds of the service.
 pub const SERVICE: Service = Service {
@@ -63,10 +63,10 @@ pub fn handle(input: &str) -> Result<String, String> {
     SERVICE.run(input, greet)
 }
 
-fn greet(mut object: Object) -> Result<Value, ServiceError> {
-    let (field, raw_name) = match SERVICE.optional_str(&object, "name")? {
+fn greet(mut document: Document) -> Result<Document, ServiceError> {
+    let (field, raw_name) = match SERVICE.optional_str(&document, "name")? {
         Some(name) => ("name", name),
-        None => match SERVICE.optional_str(&object, "text")? {
+        None => match SERVICE.optional_str(&document, "text")? {
             Some(text) => ("text", text),
             None => {
                 return Err(SERVICE
@@ -78,12 +78,12 @@ fn greet(mut object: Object) -> Result<Value, ServiceError> {
             }
         },
     };
-    let name = validate_name(field, raw_name)?;
-    let (prefix, suffix) = locale(SERVICE.optional_str(&object, "locale")?.unwrap_or("en"))?;
-    let greeting = format!("{prefix}{name}{suffix}");
-    object.insert("greeting".to_owned(), Value::String(greeting));
-    object.insert("greeting_style".to_owned(), Value::from(STYLE));
-    Ok(Value::Object(object))
+    let name = validate_name(field, &raw_name)?;
+    let locale_code = SERVICE.optional_str(&document, "locale")?;
+    let (prefix, suffix) = locale(locale_code.as_deref().unwrap_or("en"))?;
+    document.insert_str("greeting", &format!("{prefix}{name}{suffix}"));
+    document.insert_str("greeting_style", STYLE);
+    Ok(document)
 }
 
 fn validate_name<'a>(field: &str, raw: &'a str) -> Result<&'a str, ServiceError> {
