@@ -1,8 +1,7 @@
 # Component and local host contract
 
 Contract checkpoint for issue #3 and the independent service examples in issue #4.
-The host implementation follows this contract. This first checkpoint defines the
-interface and recipe; it does not yet provide an executable host.
+The host implementation follows this contract.
 
 ## Component
 
@@ -13,7 +12,9 @@ UTF-8 strings, conventionally JSON, and return opaque UTF-8 strings. The host
 does not interpret JSON or embed service behavior. Pipelines pass each successful
 result to the next step in order and stop on the first error.
 
-Components must be portable binary WebAssembly components. No precompiled native
+Components must be portable binary WebAssembly components using memory32 and
+UTF-8 linear canonical ABI. UTF-16, compact UTF-16 and GC canonical options
+are rejected to bound host result allocation before guest cleanup. No precompiled native
 artifacts or Wasmtime deserialization are accepted. No WASI, filesystem,
 environment, network, clock, random or other host imports are linked.
 
