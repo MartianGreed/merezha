@@ -139,3 +139,23 @@ fn run_serializes_success_and_renders_every_failure_as_an_error_document() {
         r#"{"error":{"code":"invalid_value","message":"no","service":"probe"}}"#
     );
 }
+
+#[test]
+fn run_copies_numbers_exactly_as_written() {
+    // Regression for verifier finding V1-F1: integers beyond u64, long
+    // decimals and huge exponents must keep their exact value.
+    let input = r#"{"a":18446744073709551617,"b":18446744073709551618,"c":0.1000000000000000055511151231257827,"d":-0,"e":1e400}"#;
+    let service = Service {
+        name: "probe",
+        limits: Limits {
+            max_input_bytes: 1024,
+            max_depth: 3,
+            max_fields: 8,
+        },
+    };
+    let output = service
+        .run(input, |object| Ok(Value::Object(object)))
+        .unwrap();
+    // Digits are kept as written; only an exponent gains its explicit sign.
+    assert_eq!(output, input.replace("1e400", "1e+400"));
+}
