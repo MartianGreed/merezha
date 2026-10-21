@@ -1,0 +1,20 @@
+[package]
+name = "merezha-task-domain"
+description = "Task board business rules as a Merezha application decider (example service)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "task_domain"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+merezha-domain.workspace = true
+merezha-task-events.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen.workspace = true
