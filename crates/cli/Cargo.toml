@@ -1,0 +1,22 @@
+[package]
+name = "merezha-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "merezha"
+path = "src/main.rs"
+
+[dependencies]
+merezha-runtime = { path = "../runtime" }
+anyhow.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wat.workspace = true
+tower.workspace = true

@@ -1,0 +1,95 @@
+use merezha_runtime::Runtime;
+use serde_json::json;
+use std::{net::SocketAddr, path::PathBuf};
+
+fn arguments() -> anyhow::Result<(PathBuf, SocketAddr)> {
+    let mut args = std::env::args().skip(1);
+    anyhow::ensure!(args.next().as_deref() == Some("serve"), "expected serve");
+    let mut manifest = None;
+    let mut listen = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--manifest" if manifest.is_none() => {
+                manifest = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("missing manifest"))?,
+                ))
+            }
+            "--listen" if listen.is_none() => {
+                listen = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("missing address"))?
+                        .parse::<SocketAddr>()?,
+                )
+            }
+            _ => anyhow::bail!("invalid argument"),
+        }
+    }
+    let listen = listen.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080)));
+    anyhow::ensure!(listen.ip().is_loopback(), "listener must be loopback");
+    Ok((
+        manifest.ok_or_else(|| anyhow::anyhow!("missing manifest"))?,
+        listen,
+    ))
+}
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    let (manifest, address) = match arguments() {
+        Ok(args) => args,
+        Err(_) => {
+            merezha_cli::emit(
+                "startup.failed",
+                json!({"code":"invalid_arguments","usage":"merezha serve --manifest PATH [--listen 127.0.0.1:PORT]"}),
+            );
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let runtime =
+        match tokio::task::spawn_blocking(move || Runtime::load(manifest).map_err(|_| ())).await {
+            Ok(Ok(runtime)) => runtime,
+            _ => {
+                merezha_cli::emit("startup.failed", json!({"code":"invalid_manifest"}));
+                return std::process::ExitCode::from(2);
+            }
+        };
+    let listener = match tokio::net::TcpListener::bind(address).await {
+        Ok(listener) => listener,
+        Err(_) => {
+            merezha_cli::emit("startup.failed", json!({"code":"listener_failed"}));
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let address = listener
+        .local_addr()
+        .expect("bound listener has an address");
+    merezha_cli::emit(
+        "listener.ready",
+        json!({"address":address.to_string(),"generation":1}),
+    );
+    let result = axum::serve(listener, merezha_cli::app(runtime))
+        .with_graceful_shutdown(shutdown())
+        .await;
+    merezha_cli::emit(
+        "listener.stopped",
+        json!({"code":if result.is_ok() {"ok"} else {"listener_failed"}}),
+    );
+    if result.is_ok() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::from(1)
+    }
+}
+async fn shutdown() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    merezha_cli::emit("listener.draining", json!({}));
+}

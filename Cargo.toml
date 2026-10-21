@@ -1,0 +1,28 @@
+[workspace]
+members = ["crates/runtime", "crates/cli"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.0"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0.103"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+toml = "0.9.12"
+wasmparser = "=0.258.3"
+wasmtime = { version = "=49.0.3", default-features = false, features = ["std", "runtime", "cranelift", "component-model"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json"] }
+tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
+tempfile = "3.27.0"
+wat = "1.258.3"
+tower = { version = "0.5.3", features = ["util"] }
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
