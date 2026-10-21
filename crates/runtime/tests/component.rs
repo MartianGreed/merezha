@@ -272,7 +272,7 @@ fn invalid_utf8_and_out_of_bounds_result_are_contained() {
     }
 }
 #[test]
-fn process_admission_is_shared_and_released_after_errors_and_drop() {
+fn runtime_admission_is_shared_and_released_after_errors_and_drop() {
     let f = Fixture::new(
         &echo(),
         &HEADER.replace(
@@ -283,6 +283,11 @@ fn process_admission_is_shared_and_released_after_errors_and_drop() {
     );
     let rt = f.runtime();
     let first = rt.prepare_service("echo").unwrap();
+    assert!(
+        f.runtime()
+            .invoke_service("echo", "separate runtime")
+            .is_ok()
+    );
     assert_eq!(
         rt.clone().invoke_service("echo", "").unwrap_err(),
         Error::Overloaded
@@ -307,6 +312,7 @@ fn manifest_rejects_unknown_keys_duplicate_ids_references_and_ranges() {
         format!("{valid}[[services]]\nid=\"echo\"\npath=\"x.wasm\"\n"),
         format!("{valid}[[pipelines]]\nid=\"p\"\nsteps=[\"missing\"]\n"),
         format!("{valid}[[pipelines]]\nid=\"p\"\nsteps=[]\n"),
+        format!("{valid}[[pipelines]]\nid=\"p\"\nsteps=[\"echo\"]\nunknown=true\n"),
         valid.replace("path=\"echo.wasm\"", "path=\"../echo.wasm\""),
         valid.replace("path=\"echo.wasm\"", "path=\"/echo.wasm\""),
         valid.replace("id=\"echo\"", "id=\"bad/id\""),
@@ -345,7 +351,10 @@ fn loader_rejects_noncomponents_imports_abi_and_transcoding_before_activation() 
 fn bounded_loader_rejects_oversized_manifest_component_and_initial_memory() {
     let f = Fixture::new(&echo(), HEADER, "");
     std::fs::write(&f.path, " ".repeat(65537)).unwrap();
-    assert!(Runtime::load(&f.path).is_err());
+    let error = Runtime::load(&f.path)
+        .err()
+        .expect("manifest must fail at the bounded read before parsing");
+    assert!(error.to_string().contains("artifact byte limit"));
     let f = Fixture::new(&echo(), HEADER, "");
     std::fs::OpenOptions::new()
         .write(true)
@@ -479,10 +488,130 @@ fn loader_rejects_symlink_escape_and_nonregular_component_files() {
 
 #[test]
 fn total_component_bytes_are_bounded_even_when_paths_repeat() {
+    let bytes = padded_component(14 * 1024 * 1024);
+    let f = Fixture::new(&bytes, HEADER, "");
+    let rt = f.runtime();
+    assert!(rt.invoke_service("echo", "ok").is_ok());
+    let mut text = std::fs::read_to_string(&f.path).unwrap();
+    for i in 0..4 {
+        text.push_str(&format!(
+            "[[services]]\nid=\"copy-{i}\"\npath=\"echo.wasm\"\n"
+        ));
+    }
+    std::fs::write(&f.path, text).unwrap();
+    assert!(rt.reload().is_err());
+    assert_eq!(rt.catalog().unwrap().generation, 1);
+}
+
+#[test]
+fn component_compile_failure_rejects_the_entire_initial_and_reloaded_catalog() {
+    // This has the component header and parses structurally. Its core function
+    // is invalid only at compilation because i64 cannot satisfy an i32 result.
+    let invalid = component("i64.const 0", "", "");
+    assert!(invalid.starts_with(b"\0asm\x0d\0\x01\0"));
+    assert!(wasmtime::component::Component::new(&wasmtime::Engine::default(), &invalid).is_err());
+    let f = Fixture::new(&echo(), HEADER, "");
+    let rt = f.runtime();
+    std::fs::write(f.dir.path().join("invalid.wasm"), invalid).unwrap();
+    std::fs::write(f.dir.path().join("echo.wasm"), constant(b'B')).unwrap();
+    let manifest = std::fs::read_to_string(&f.path).unwrap();
+    std::fs::write(
+        &f.path,
+        format!("{manifest}[[services]]\nid=\"invalid\"\npath=\"invalid.wasm\"\n"),
+    )
+    .unwrap();
+    let initial_error = Runtime::load(&f.path)
+        .err()
+        .expect("compile failure must abort the entire initial load");
+    assert!(initial_error.to_string().contains("component compilation"));
+    let reload_error = rt
+        .reload()
+        .expect_err("compile failure must abort the entire reload");
+    assert!(reload_error.to_string().contains("component compilation"));
+    let catalog = rt.catalog().unwrap();
+    assert_eq!(catalog.generation, 1);
+    assert_eq!(catalog.services, ["echo"]);
+    assert_eq!(
+        rt.invoke_service("echo", "old registry").unwrap().output,
+        "old registry"
+    );
+}
+
+#[test]
+fn a_guest_that_runs_after_partial_admission_wait_keeps_the_original_deadline() {
+    let f = Fixture::new(
+        &component("(loop $forever br $forever) unreachable", "", ""),
+        &HEADER
+            .replace("fuel = 10000000", "fuel = 1000000000")
+            .replace("timeout_ms = 1000", "timeout_ms = 600"),
+        "[[pipelines]]\nid=\"looping\"\nsteps=[\"echo\",\"echo\"]\n",
+    );
+    let rt = f.runtime();
+    let admitted = Instant::now();
+    let invocation = rt.prepare_pipeline("looping").unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        Instant::now() < invocation.deadline(),
+        "guest must begin before the admission deadline"
+    );
+    assert_eq!(invocation.run("").unwrap_err(), Error::Timeout);
+    // The guest has about 200 ms left, with 250 ms scheduling tolerance. A
+    // reset to a fresh 600 ms store budget would take about 1000 ms in total.
+    assert!(
+        admitted.elapsed() < Duration::from_millis(850),
+        "guest execution reset the admission deadline: {:?}",
+        admitted.elapsed()
+    );
+}
+
+#[test]
+fn manifest_accepts_count_boundaries_and_rejects_the_next_entry() {
+    let services = |count| {
+        let mut text = HEADER.to_owned();
+        for n in 0..count {
+            text.push_str(&format!("[[services]]\nid=\"s{n}\"\npath=\"echo.wasm\"\n"));
+        }
+        text
+    };
+    assert!(Manifest::parse(&services(64)).is_ok());
+    assert!(Manifest::parse(&services(65)).is_err());
+    let pipelines = |count| {
+        let mut text = services(1);
+        for n in 0..count {
+            text.push_str(&format!("[[pipelines]]\nid=\"p{n}\"\nsteps=[\"s0\"]\n"));
+        }
+        text
+    };
+    assert!(Manifest::parse(&pipelines(64)).is_ok());
+    assert!(Manifest::parse(&pipelines(65)).is_err());
+    let steps = |count| {
+        format!(
+            "{}[[pipelines]]\nid=\"p\"\nsteps=[{}]\n",
+            services(1),
+            vec!["\"s0\""; count].join(",")
+        )
+    };
+    assert!(Manifest::parse(&steps(16)).is_ok());
+    assert!(Manifest::parse(&steps(17)).is_err());
+}
+
+#[test]
+fn oversized_valid_component_is_rejected_by_its_own_byte_bound() {
+    let bytes = padded_component(17 * 1024 * 1024);
+    // The artifact is valid and below the aggregate registry byte bound. Its
+    // rejection must depend on the per-component loader bound alone.
+    assert!(wasmtime::component::Component::new(&wasmtime::Engine::default(), &bytes).is_ok());
+    let f = Fixture::new(&bytes, HEADER, "");
+    let error = Runtime::load(&f.path)
+        .err()
+        .expect("valid oversized component must not activate");
+    assert!(error.to_string().contains("artifact byte limit"));
+}
+
+fn padded_component(size: usize) -> Vec<u8> {
     let mut bytes = echo();
     // A valid ignored custom section. It has no code or data for the compiler
     // to execute, but must still count against portable-artifact load limits.
-    let size = 14 * 1024 * 1024;
     bytes.push(0);
     let mut length = size + 1;
     loop {
@@ -498,16 +627,5 @@ fn total_component_bytes_are_bounded_even_when_paths_repeat() {
     }
     bytes.push(0);
     bytes.resize(bytes.len() + size, 0);
-    let f = Fixture::new(&bytes, HEADER, "");
-    let rt = f.runtime();
-    assert!(rt.invoke_service("echo", "ok").is_ok());
-    let mut text = std::fs::read_to_string(&f.path).unwrap();
-    for i in 0..4 {
-        text.push_str(&format!(
-            "[[services]]\nid=\"copy-{i}\"\npath=\"echo.wasm\"\n"
-        ));
-    }
-    std::fs::write(&f.path, text).unwrap();
-    assert!(rt.reload().is_err());
-    assert_eq!(rt.catalog().unwrap().generation, 1);
+    bytes
 }

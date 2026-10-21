@@ -15,6 +15,8 @@ ticker, an immutable active registry behind an `RwLock`, a reload mutex, and an
 atomic admission counter. Preparing an invocation captures its registry and
 reserves a slot. The reservation lives until completion or drop, including body
 reception and blocking executor scheduling. There is no invocation wait queue.
+A separate `Runtime::load` owns a separate counter; the CLI uses exactly one
+runtime.
 
 Reload holds the mutex for reading, validation, compilation and publication.
 It constructs a complete candidate without changing the active registry, then
@@ -113,12 +115,18 @@ version, event name, generation, request ID, elapsed time, byte counts and stabl
 error codes. They never contain guest input, output, guest-error text, artifact
 contents or environment values. HTTP errors also contain only stable codes.
 Detailed typed library load errors are available to library callers. The CLI
-reports sanitized startup and reload classifications.
+reports sanitized startup and reload classifications. Failure events currently
+use `level: info` and a broad code such as `invalid_manifest`, without a finer
+reason category. Operators needing the detailed cause must use the library.
+Finer payload-free diagnostic categories are deferred.
 
-Loopback is not authentication. Any local process can invoke and reload. HTTP
-connection count and native process RSS are not hard tenant quotas. Keep the
-listener private; do not tunnel it or treat it as a production multi-tenant
-service. Authentication, remote administration, OS sandboxing, TLS ingress,
+Loopback is not authentication. Any local process can invoke and reload.
+Browser-originated simple requests and foreign Host headers are accepted.
+There is no Origin/Host validation or DNS-rebinding defense. An untrusted page
+in a local browser can cause invocations or reloads, and DNS rebinding may
+expose responses. HTTP connection count and native process RSS are not hard
+tenant quotas. Keep the listener private; do not tunnel it or treat it as a
+production multi-tenant service. Authentication, remote administration, OS sandboxing, TLS ingress,
 metrics exporters, persistent compile caches and production SLOs are follow-up
 work outside this local foundation.
 

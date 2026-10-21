@@ -181,6 +181,17 @@ fn cli_binds_ephemeral_loopback_serves_real_http_and_logs_metadata_only() {
     socket.read_to_string(&mut response).unwrap();
     assert!(response.starts_with("HTTP/1.1 200"));
     assert!(response.ends_with("s3cr3t"));
+    // An oversized body must be rejected before buffering the complete body,
+    // even when the client keeps its write side open and stops transmitting.
+    let mut socket = std::net::TcpStream::connect(address).unwrap();
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    socket.write_all(b"POST /v1/services/echo/invoke HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10000000\r\nConnection: close\r\n\r\n123456789").unwrap();
+    let mut oversized = String::new();
+    socket.read_to_string(&mut oversized).unwrap();
+    assert!(oversized.starts_with("HTTP/1.1 413"), "{oversized}");
+    assert!(oversized.contains("input_limit"));
     // A stalled body must not hold admission indefinitely.
     let mut socket = std::net::TcpStream::connect(address).unwrap();
     socket
