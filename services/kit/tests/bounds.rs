@@ -1,4 +1,5 @@
-use merezha_service_kit::{ErrorCode, Limits, Service, Value};
+use merezha_service_kit::{Document, ErrorCode, Limits, Service};
+use serde_json::Value;
 
 const SERVICE: Service = Service {
     name: "probe",
@@ -118,10 +119,7 @@ fn error_document_is_stable_json() {
 
 #[test]
 fn run_serializes_success_and_renders_every_failure_as_an_error_document() {
-    assert_eq!(
-        SERVICE.run(r#"{"a":1}"#, |object| Ok(Value::Object(object))),
-        Ok(r#"{"a":1}"#.to_owned())
-    );
+    assert_eq!(SERVICE.run(r#"{"a":1}"#, Ok), Ok(r#"{"a":1}"#.to_owned()));
 
     let parse_failure = SERVICE
         .run("nope", |_| unreachable!("transform must not run"))
@@ -143,7 +141,7 @@ fn run_serializes_success_and_renders_every_failure_as_an_error_document() {
 #[test]
 fn run_copies_numbers_exactly_as_written() {
     // Regression for verifier finding V1-F1: integers beyond u64, long
-    // decimals and huge exponents must keep their exact value.
+    // decimals, negative zero and huge exponents keep their exact text.
     let input = r#"{"a":18446744073709551617,"b":18446744073709551618,"c":0.1000000000000000055511151231257827,"d":-0,"e":1e400}"#;
     let service = Service {
         name: "probe",
@@ -153,9 +151,76 @@ fn run_copies_numbers_exactly_as_written() {
             max_fields: 8,
         },
     };
-    let output = service
-        .run(input, |object| Ok(Value::Object(object)))
-        .unwrap();
-    // Digits are kept as written; only an exponent gains its explicit sign.
-    assert_eq!(output, input.replace("1e400", "1e+400"));
+    let output = service.run(input, Ok).unwrap();
+    assert_eq!(output, input);
+}
+
+const WIDE: Service = Service {
+    name: "probe",
+    limits: Limits {
+        max_input_bytes: 4096,
+        max_depth: 8,
+        max_fields: 16,
+    },
+};
+
+fn identity(input: &str) -> String {
+    WIDE.run(input, Ok).expect("identity transform succeeds")
+}
+
+#[test]
+fn run_keeps_serde_json_reserved_keys_as_ordinary_data() {
+    // Regression for the coordinator's boundary finding on the V1-F1 fix:
+    // serde_json's internal Number and RawValue map keys must stay data.
+    for input in [
+        r#"{"opaque":{"$serde_json::private::Number":"123"}}"#,
+        r#"{"opaque":{"$serde_json::private::Number":"123","keep":"yes"}}"#,
+        r#"{"opaque":{"$serde_json::private::RawValue":"[1]"}}"#,
+        r#"{"opaque":{"\u0024serde_json::private::Number":"7"}}"#,
+        r#"{"$serde_json::private::Number":"1"}"#,
+    ] {
+        assert_eq!(identity(input), input);
+    }
+}
+
+#[test]
+fn run_keeps_nested_values_as_received_except_whitespace() {
+    let input = "{ \"b\" : { \"z\" : [1 , \"a b\\\" c\"], \"a\":{} , \"z\":2 }, \"a\" : \"x\" }";
+    assert_eq!(
+        identity(input),
+        r#"{"a":"x","b":{"z":[1,"a b\" c"],"a":{},"z":2}}"#
+    );
+}
+
+#[test]
+fn opaque_fields_are_not_reinterpreted_but_owned_fields_are_validated() {
+    let input = r#"{"opaque":"\ud800","s":"\ud800"}"#;
+    let document = WIDE.parse_object(input).unwrap();
+    assert_eq!(document.to_json(), input);
+    let error = WIDE.required_str(&document, "s").unwrap_err();
+    assert_eq!(
+        (error.code(), error.field()),
+        (ErrorCode::InvalidValue, Some("s"))
+    );
+}
+
+#[test]
+fn documents_build_and_serialize_with_sorted_keys() {
+    let mut inner = Document::new();
+    inner.insert_u64("n", 7);
+    let mut document = Document::new();
+    document.insert_str("s", "quote \" and é");
+    document.insert_document("inner", &inner);
+    assert_eq!(document.len(), 2);
+    assert_eq!(
+        document.to_json(),
+        r#"{"inner":{"n":7},"s":"quote \" and é"}"#
+    );
+    assert_eq!(document.remove("inner").unwrap().get(), r#"{"n":7}"#);
+}
+
+#[test]
+fn brackets_inside_strings_do_not_count_as_nesting() {
+    let input = r#"{"a":"[[[[{{{{","b":"\"[[[[","c":{"d":["]]]]"]}}"#;
+    assert_eq!(identity(input), input);
 }

@@ -4,11 +4,11 @@
 //! from `a-z`, `0-9`, `.`, `_`, `-`; default `document`) is moved out of
 //! the data into the envelope. The output is
 //! `{"data":{…},"kind":…,"meta":{"data_bytes":…,"digest":"fnv1a64:…","fields":…},"version":1}`,
-//! where `data_bytes` and `digest` describe the serialized `data` with keys
-//! in sorted order. The digest identifies content; it is not a security
+//! where `data_bytes` and `digest` describe `data` exactly as emitted: top-level
+//! keys sorted, every value as received without insignificant whitespace. The digest identifies content; it is not a security
 //! checksum. See `docs/services/README.md` for the full contract.
 
-use merezha_service_kit::{ErrorCode, Limits, Object, Service, ServiceError, Value};
+use merezha_service_kit::{Document, ErrorCode, Limits, Service, ServiceError};
 
 /// Identity and work bounds of the service.
 pub const SERVICE: Service = Service {
@@ -45,36 +45,36 @@ pub fn handle(input: &str) -> Result<String, String> {
     SERVICE.run(input, wrap)
 }
 
-fn wrap(mut data: Object) -> Result<Value, ServiceError> {
-    let kind =
-        validate_kind(SERVICE.optional_str(&data, "kind")?.unwrap_or(DEFAULT_KIND))?.to_owned();
+fn wrap(mut data: Document) -> Result<Document, ServiceError> {
+    let kind = SERVICE
+        .optional_str(&data, "kind")?
+        .unwrap_or_else(|| DEFAULT_KIND.to_owned());
+    validate_kind(&kind)?;
     data.remove("kind");
-    let fields = data.len();
-    let data = Value::Object(data);
-    let serialized = data.to_string();
+    let serialized = data.to_json();
 
-    let mut meta = Object::new();
-    meta.insert("data_bytes".to_owned(), Value::from(serialized.len()));
-    meta.insert(
-        "digest".to_owned(),
-        Value::String(format!("fnv1a64:{:016x}", fnv1a64(serialized.as_bytes()))),
+    let mut meta = Document::new();
+    meta.insert_u64("data_bytes", serialized.len() as u64);
+    meta.insert_str(
+        "digest",
+        &format!("fnv1a64:{:016x}", fnv1a64(serialized.as_bytes())),
     );
-    meta.insert("fields".to_owned(), Value::from(fields));
+    meta.insert_u64("fields", data.len() as u64);
 
-    let mut envelope = Object::new();
-    envelope.insert("data".to_owned(), data);
-    envelope.insert("kind".to_owned(), Value::String(kind));
-    envelope.insert("meta".to_owned(), Value::Object(meta));
-    envelope.insert("version".to_owned(), Value::from(VERSION));
-    Ok(Value::Object(envelope))
+    let mut envelope = Document::new();
+    envelope.insert_document("data", &data);
+    envelope.insert_str("kind", &kind);
+    envelope.insert_document("meta", &meta);
+    envelope.insert_u64("version", VERSION);
+    Ok(envelope)
 }
 
-fn validate_kind(kind: &str) -> Result<&str, ServiceError> {
+fn validate_kind(kind: &str) -> Result<(), ServiceError> {
     let allowed = |byte: u8| {
         byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
     };
     if (1..=MAX_KIND_BYTES).contains(&kind.len()) && kind.bytes().all(allowed) {
-        Ok(kind)
+        Ok(())
     } else {
         Err(SERVICE
             .error(
