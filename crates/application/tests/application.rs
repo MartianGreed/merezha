@@ -10,7 +10,7 @@ use merezha_domain::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{
-    Arc, Barrier, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
@@ -61,14 +61,40 @@ initial=0
     )
     .unwrap()
 }
+// A one-shot rendezvous with a deadline. Unlike a cyclic barrier, a duplicate
+// decision cannot enter a second cycle and leave the test process hung.
+struct Gate {
+    arrived: Mutex<usize>,
+    changed: Condvar,
+}
+impl Gate {
+    fn new() -> Self {
+        Self {
+            arrived: Mutex::new(0),
+            changed: Condvar::new(),
+        }
+    }
+    fn wait(&self) {
+        let mut arrived = self.arrived.lock().unwrap();
+        *arrived += 1;
+        self.changed.notify_all();
+        let (arrived, _) = self
+            .changed
+            .wait_timeout_while(arrived, std::time::Duration::from_secs(2), |count| {
+                *count < 2
+            })
+            .unwrap();
+        assert!(*arrived >= 2, "concurrency fixture rendezvous timed out");
+    }
+}
 #[derive(Default)]
 struct Control {
     decisions: AtomicUsize,
     fail: AtomicBool,
     fail_projection: AtomicUsize,
     lives: Mutex<Vec<bool>>,
-    gate: Option<Arc<Barrier>>,
-    release: Option<Arc<Barrier>>,
+    gate: Option<Arc<Gate>>,
+    release: Option<Arc<Gate>>,
 }
 #[derive(Clone)]
 struct Fake(Arc<Control>);
@@ -231,8 +257,8 @@ fn failed_commands_release_claims_and_validation_precedes_decisions() {
 }
 #[test]
 fn concurrent_same_key_is_in_flight_then_replays() {
-    let gate = Arc::new(Barrier::new(2));
-    let release = Arc::new(Barrier::new(2));
+    let gate = Arc::new(Gate::new());
+    let release = Arc::new(Gate::new());
     let control = Arc::new(Control {
         gate: Some(gate.clone()),
         release: Some(release.clone()),
@@ -258,7 +284,7 @@ fn concurrent_same_key_is_in_flight_then_replays() {
 #[test]
 fn concurrent_aggregate_commands_cannot_overwrite_one_another() {
     let control = Arc::new(Control {
-        gate: Some(Arc::new(Barrier::new(2))),
+        gate: Some(Arc::new(Gate::new())),
         ..Control::default()
     });
     let (app, store) = setup(config(), control);
@@ -466,4 +492,119 @@ fn aggregate_namespace_cannot_alias_another_aggregate_stream_pair() {
     let mut c = config();
     c.commands[0].aggregate = id("Counter/child");
     assert!(c.validate().is_err());
+}
+
+#[test]
+fn explicit_stale_precondition_without_idempotency_cannot_append() {
+    let (app, store) = setup(config(), Arc::new(Control::default()));
+    app.command(command(1, None)).unwrap();
+    let mut stale = command(2, None);
+    stale.expected_version = Some(0);
+    assert_eq!(app.command(stale).unwrap_err().code, "concurrency_conflict");
+    assert_eq!(store.head().unwrap(), 1);
+    let mut current = command(2, None);
+    current.expected_version = Some(1);
+    assert_eq!(app.command(current).unwrap().version, 2);
+}
+
+#[test]
+fn multiple_events_have_individual_versions_and_allow_follow_up_append() {
+    let store = MemoryEventStore::new(Limits::default()).unwrap();
+    let event = |amount| Event {
+        tag: id("Added"),
+        schema_version: 1,
+        payload: json!({"amount":amount}),
+    };
+    let receipt = store
+        .append(
+            &id("one"),
+            0,
+            vec![event(1), event(2), event(3)],
+            &metadata("alice"),
+        )
+        .unwrap();
+    assert_eq!(
+        (receipt.version, receipt.position, receipt.events),
+        (3, 3, 3)
+    );
+    let history = store.load(&id("one")).unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .map(|e| (e.version, e.position))
+            .collect::<Vec<_>>(),
+        vec![(1, 1), (2, 2), (3, 3)]
+    );
+    let expected = history.last().unwrap().version;
+    assert_eq!(
+        store
+            .append(&id("one"), expected, vec![event(4)], &metadata("alice"))
+            .unwrap()
+            .version,
+        4
+    );
+    let other = store
+        .append(&id("two"), 0, vec![event(5)], &metadata("alice"))
+        .unwrap();
+    assert_eq!((other.version, other.position), (1, 5));
+    assert_eq!(
+        store
+            .read_all(0, 16)
+            .unwrap()
+            .iter()
+            .map(|e| e.position)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+}
+
+struct GappedFeed(Arc<MemoryEventStore>);
+impl EventStore for GappedFeed {
+    fn load(&self, stream: &Identity) -> Result<Vec<merezha_domain::StoredEvent>, Failure> {
+        self.0.load(stream)
+    }
+    fn head(&self) -> Result<u64, Failure> {
+        self.0.head()
+    }
+    fn read_all(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<merezha_domain::StoredEvent>, Failure> {
+        let mut events = self.0.read_all(after, limit)?;
+        if after == 0 && !events.is_empty() {
+            events.remove(0);
+        }
+        Ok(events)
+    }
+    fn append(
+        &self,
+        stream: &Identity,
+        expected: u64,
+        events: Vec<Event>,
+        metadata: &Metadata,
+    ) -> Result<merezha_domain::Receipt, Failure> {
+        self.0.append(stream, expected, events, metadata)
+    }
+}
+#[test]
+fn faulty_feed_cannot_advance_checkpoint_past_an_unprojected_event() {
+    let config = config();
+    let store = Arc::new(MemoryEventStore::new(config.limits.clone()).unwrap());
+    let app = Application::new(
+        config,
+        Arc::new(Fake(Arc::new(Control::default()))),
+        Arc::new(AllowAll),
+        Arc::new(GappedFeed(store.clone())),
+    )
+    .unwrap();
+    app.command(command(1, None)).unwrap();
+    app.command(command(2, None)).unwrap();
+    assert_eq!(
+        app.catch_up("total").unwrap_err().code,
+        "invalid_event_feed"
+    );
+    let model = app.query(query()).unwrap();
+    assert_eq!((model.value, model.checkpoint), (json!(0), 0));
+    assert_eq!(store.head().unwrap(), 2);
 }

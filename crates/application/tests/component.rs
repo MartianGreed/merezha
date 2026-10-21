@@ -70,7 +70,7 @@ path="protocol.wasm"
 }
 #[test]
 fn real_no_import_component_exercises_application_protocol_and_pinned_reload_session() {
-    let (_dir, runtime) = fixture();
+    let (dir, runtime) = fixture();
     let session = Guest::session(&runtime).unwrap();
     assert_eq!(
         session
@@ -87,7 +87,43 @@ fn real_no_import_component_exercises_application_protocol_and_pinned_reload_ses
             payload: json!({"amount":1})
         }
     );
+    let manifest = dir.path().join("runtime.toml");
+    let original = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        dir.path().join("echo.wasm"),
+        wat::parse_str(include_str!("../../runtime/tests/fixtures/echo.wat")).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &manifest,
+        original.replace("path=\"protocol.wasm\"", "path=\"echo.wasm\""),
+    )
+    .unwrap();
     runtime.reload().unwrap();
+    let validate = || Operation::Validate {
+        kind: MessageKind::Query,
+        tag: Identity::new("Total").unwrap(),
+        payload: json!({}),
+    };
+    // The new generation echoes a request instead of a protocol response.
+    assert!(
+        Guest::session(&runtime)
+            .unwrap()
+            .invoke("protocol", validate())
+            .is_err()
+    );
+    assert_eq!(
+        session
+            .invoke_until(
+                "protocol",
+                validate(),
+                std::time::Instant::now() + std::time::Duration::from_secs(1)
+            )
+            .unwrap(),
+        Reply::Validated {
+            payload: json!({"amount":1})
+        }
+    );
     assert!(
         session
             .invoke(
@@ -100,6 +136,8 @@ fn real_no_import_component_exercises_application_protocol_and_pinned_reload_ses
             )
             .is_ok()
     );
+    std::fs::write(&manifest, original).unwrap();
+    runtime.reload().unwrap();
     let config = Config::parse(
         r#"version=1
 [[commands]]
