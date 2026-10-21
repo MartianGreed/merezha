@@ -3,9 +3,10 @@
 #
 # Usage: scripts/check-services.sh
 #
-# Formatting, Clippy for native and component builds, native contract tests
-# for both greeting revisions (doctests included), then a full component
-# build into a temporary directory. Honors CARGO_TARGET_DIR.
+# The demo's response assertions, formatting, Clippy for native and
+# component builds, native contract tests for both greeting revisions
+# (doctests included), then a full component build into a temporary directory.
+# Honors CARGO_TARGET_DIR.
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -17,6 +18,7 @@ run() {
   "$@"
 }
 
+run "$root/scripts/test-demo-assertions.sh"
 run cargo fmt --manifest-path "$manifest" --all --check
 run cargo clippy --manifest-path "$manifest" --locked --workspace --all-targets -- -D warnings
 run cargo clippy --manifest-path "$manifest" --locked -p merezha-greeting --features formal --all-targets -- -D warnings
