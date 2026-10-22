@@ -1,0 +1,32 @@
+# Same catalog with the faulty task-view revision, which fails every
+# projection batch that contains TaskRenamed. Used to show that a failed
+# catch-up keeps its checkpoint and that the fixed component resumes from it.
+version = 1
+
+[limits]
+memory_bytes = 16777216
+fuel = 200000000
+max_input_bytes = 262144
+max_output_bytes = 262144
+timeout_ms = 2000
+max_concurrent_invocations = 8
+
+[[services]]
+id = "task-domain"
+path = "components/task-domain.wasm"
+
+[[services]]
+id = "task-view"
+path = "components/task-view-faulty.wasm"
+
+[[services]]
+id = "normalize"
+path = "components/text-normalize.wasm"
+
+[[services]]
+id = "greet"
+path = "components/greeting.wasm"
+
+[[pipelines]]
+id = "welcome"
+steps = ["normalize", "greet"]

@@ -1,0 +1,10 @@
+{
+  "state": {
+    "tasks": {
+      "Task/task-1": { "title": "Write the guide", "status": "open", "version": 1 },
+      "Task/task-2": { "title": "Review the release notes", "status": "open", "version": 1 },
+      "Task/task-3": { "title": "Plan the demo", "status": "open", "version": 1 }
+    }
+  },
+  "checkpoint": 3
+}

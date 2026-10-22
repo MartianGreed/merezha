@@ -12,6 +12,7 @@
 # Environment:
 #   MEREZHA_BIN    use this host binary instead of building merezha-cli
 #   KEEP_SCRATCH=1 keep the scratch directory and host log after the run
+#   MEREZHA_STARTUP_SECONDS  how long to wait for the host to listen (default 120)
 # Requires bash, curl and cargo.
 set -euo pipefail
 
@@ -79,13 +80,17 @@ install stage-1.toml
 "$host" serve --manifest "$scratch/runtime.toml" --listen 127.0.0.1:0 2>"$scratch/host.log" &
 host_pid=$!
 address=""
-for _ in $(seq 100); do
+# The host compiles every component before it listens; a debug build can
+# take several seconds per catalog, so wait as long as it is alive.
+startup_seconds=${MEREZHA_STARTUP_SECONDS:-120}
+deadline=$((SECONDS + startup_seconds))
+while true; do
   address=$(grep -o '"address":"[^"]*"' "$scratch/host.log" | head -n 1 | cut -d '"' -f 4 || true)
   [[ -n $address ]] && break
   kill -0 "$host_pid" 2>/dev/null || fail "host exited during startup"
+  ((SECONDS < deadline)) || fail "host did not report listener.ready within ${startup_seconds}s"
   sleep 0.1
 done
-[[ -n $address ]] || fail "host did not report listener.ready"
 echo "ok: listening on $address"
 
 request GET /health

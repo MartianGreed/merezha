@@ -99,6 +99,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "merezha-domain"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "merezha-greeting"
 version = "0.1.0"
 dependencies = [
@@ -120,8 +128,11 @@ dependencies = [
 name = "merezha-service-contract-tests"
 version = "0.1.0"
 dependencies = [
+ "merezha-domain",
  "merezha-greeting",
  "merezha-json-envelope",
+ "merezha-task-domain",
+ "merezha-task-view",
  "merezha-text-normalize",
  "serde_json",
 ]
@@ -131,6 +142,44 @@ name = "merezha-service-kit"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+]
+
+[[package]]
+name = "merezha-task-board-scenario"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "merezha-task-domain"
+version = "0.1.0"
+dependencies = [
+ "merezha-domain",
+ "merezha-task-events",
+ "serde",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "merezha-task-events"
+version = "0.1.0"
+dependencies = [
+ "merezha-domain",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "merezha-task-view"
+version = "0.1.0"
+dependencies = [
+ "merezha-domain",
+ "merezha-task-events",
+ "serde",
+ "serde_json",
+ "wit-bindgen",
 ]
 
 [[package]]
@@ -183,6 +232,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]

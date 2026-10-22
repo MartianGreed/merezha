@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Builds the example services as import-free Merezha components.
+# Builds the example services, stateless and application, as import-free
+# Merezha components.
 #
 # Usage: scripts/build-services.sh [OUTPUT_DIR]
 #
@@ -39,3 +40,6 @@ build merezha-text-normalize text_normalize text-normalize
 build merezha-greeting greeting greeting
 build merezha-greeting greeting greeting-formal --features formal
 build merezha-json-envelope json_envelope json-envelope
+build merezha-task-domain task_domain task-domain
+build merezha-task-view task_view task-view
+build merezha-task-view task_view task-view-faulty --features faulty

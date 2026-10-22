@@ -1,0 +1,53 @@
+# Routes of the task board application. Commands go to the task-domain
+# decider, one stream per task under aggregate Task; queries read the
+# `tasks` projection that task-view maintains. Start the host with
+#   merezha serve --manifest runtime.toml --application application.toml
+version = 1
+
+# Finite in-memory store and dispatch bounds. These are the host defaults,
+# spelled out; the host rejects any value above its hard ceiling.
+[limits]
+timeout_ms = 5000
+max_events = 4096
+max_streams = 256
+max_store_bytes = 8388608
+max_idempotency = 1024
+max_payload_bytes = 16384
+max_state_bytes = 65536
+batch_size = 16
+max_concurrent = 16
+
+[[commands]]
+tag = "CreateTask"
+service = "task-domain"
+aggregate = "Task"
+
+[[commands]]
+tag = "RenameTask"
+service = "task-domain"
+aggregate = "Task"
+
+[[commands]]
+tag = "CompleteTask"
+service = "task-domain"
+aggregate = "Task"
+
+[[queries]]
+tag = "GetTask"
+service = "task-view"
+projection = "tasks"
+
+[[queries]]
+tag = "ListTasks"
+service = "task-view"
+projection = "tasks"
+
+[[queries]]
+tag = "TaskSummary"
+service = "task-view"
+projection = "tasks"
+
+[[projections]]
+name = "tasks"
+service = "task-view"
+initial = { tasks = {} }

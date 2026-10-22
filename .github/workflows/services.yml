@@ -1,0 +1,36 @@
+name: Services
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'services/**'
+      - 'examples/**'
+      - 'scripts/**'
+      - 'docs/services/**'
+      - 'wit/**'
+      - 'crates/domain/**'
+      - '.github/workflows/services.yml'
+permissions:
+  contents: read
+jobs:
+  services:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust 1.98.0 with the core Wasm target
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal --component clippy --component rustfmt --target wasm32-unknown-unknown
+          rustup default 1.98.0
+      - run: scripts/check-services.sh
+      - name: Build the host once for both demos
+        run: cargo build --locked --release -p merezha-cli
+      - run: scripts/demo.sh
+        env:
+          MEREZHA_BIN: target/release/merezha
+      - run: scripts/task-board-demo.sh
+        env:
+          MEREZHA_BIN: target/release/merezha
