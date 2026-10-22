@@ -11,6 +11,7 @@ members = [
     "contract-tests",
     "componentize",
     "scenario",
+    "task-board-cli",
 ]
 
 [workspace.package]

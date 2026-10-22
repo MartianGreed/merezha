@@ -10,6 +10,8 @@ on:
       - 'docs/services/**'
       - 'wit/**'
       - 'crates/domain/**'
+      - 'crates/application/**'
+      - 'crates/cli/**'
       - '.github/workflows/services.yml'
 permissions:
   contents: read
@@ -32,5 +34,8 @@ jobs:
         env:
           MEREZHA_BIN: target/release/merezha
       - run: scripts/task-board-demo.sh
+        env:
+          MEREZHA_BIN: target/release/merezha
+      - run: scripts/task-board-restart-demo.sh
         env:
           MEREZHA_BIN: target/release/merezha

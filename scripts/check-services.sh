@@ -7,7 +7,8 @@
 # component builds, native contract tests for both greeting and both
 # task-view revisions (doctests included), then a full component build into a
 # temporary directory. The application scenario against the real host is
-# scripts/task-board-demo.sh.
+# scripts/task-board-demo.sh; scripts/task-board-restart-demo.sh checks the
+# durable local task board across a host crash.
 # Honors CARGO_TARGET_DIR.
 set -euo pipefail
 

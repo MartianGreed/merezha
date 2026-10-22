@@ -371,6 +371,62 @@ The script waits up to `MEREZHA_STARTUP_SECONDS` (default 120) for the host to
 listen while the host process is alive; a debug host compiles the catalog
 noticeably slower than a release one.
 
+### Local task board with durable storage
+
+To keep a task board between runs, serve it with the host's SQLite storage:
+
+```sh
+scripts/task-board-local.sh
+```
+
+The script builds the components and a release host, writes the manifests
+into `target/task-board-local` and serves on `127.0.0.1:8787` until Ctrl-C.
+The first run initializes `target/task-board-local/task-board.sqlite`; later
+runs reopen it. Pass another directory as the first argument, or set
+`MEREZHA_LISTEN` for another loopback address. Delete the directory to start
+over; reopen also refuses the database once `examples/task-board/application.toml`
+changes its routes or limits, so that needs a fresh directory too. Only one host
+can own the database at a time.
+
+From a second terminal, the `task-board` client sends commands and queries
+and prints the host's answers:
+
+```sh
+alias task-board='cargo run --manifest-path services/Cargo.toml --locked -q -p merezha-task-board-cli --'
+task-board create groceries "Buy milk"
+task-board create report "Write the report"
+task-board complete groceries
+task-board list open
+task-board summary
+task-board get groceries
+task-board rename report "Write the final report"
+```
+
+Each `TASK` (here `groceries` and `report`) is the stream of one task, so
+its `task_id` is `Task/groceries`. Queries catch the read model up first;
+`task-board catch-up` and `task-board rebuild` run those operations alone. A
+rejected command such as a second `complete groceries` prints the host's
+error, for example `task_already_completed`, and exits with status 1. Set
+`MEREZHA_ADDRESS` to reach another address and `MEREZHA_ACTOR` to record
+another actor than `local`.
+
+Stop the host, or kill it, and start the script again: the tasks and their
+full history are still there, the read model resumes from its last saved
+checkpoint, and the domain rules still see every earlier event.
+
+```sh
+scripts/task-board-restart-demo.sh
+```
+
+checks exactly that on a private scratch directory and an ephemeral port. It
+creates two tasks and completes one, kills the host with `SIGKILL`, starts it
+again on the same database, then checks the summary, the task states, that
+completing or creating again is still rejected, a rename at version 2, a
+rebuild replaying all four events and a graceful stop with status 0. It
+accepts `MEREZHA_BIN`, `KEEP_SCRATCH` and `MEREZHA_STARTUP_SECONDS` like the
+scenario. See [owned SQLite storage](../architecture/application.md#owned-sqlite-storage)
+for ownership, recovery and backup rules.
+
 ### JSON numbers
 
 The application protocol decodes values with Serde JSON's `i64`/`u64`/`f64`
