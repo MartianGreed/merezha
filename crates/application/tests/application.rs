@@ -91,6 +91,7 @@ impl Gate {
 struct Control {
     decisions: AtomicUsize,
     fail: AtomicBool,
+    no_events: AtomicBool,
     fail_projection: AtomicUsize,
     lives: Mutex<Vec<bool>>,
     gate: Option<Arc<Gate>>,
@@ -143,6 +144,9 @@ impl GuestSession for Fake {
                 if total + amount < 0 {
                     return Err(Failure::permanent("invariant_violation"));
                 }
+                if self.0.no_events.load(Ordering::SeqCst) {
+                    return Ok(Reply::Decided { events: Vec::new() });
+                }
                 Ok(Reply::Decided {
                     events: vec![Event {
                         tag: id("Added"),
@@ -186,6 +190,259 @@ fn setup(config: Config, control: Arc<Control>) -> (Application, Arc<MemoryEvent
     )
     .unwrap();
     (app, store)
+}
+#[test]
+fn restart_retains_receipt_and_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("application.db");
+    let control = Arc::new(Control::default());
+    let open = |initialize| {
+        let mut config = config();
+        config.storage = merezha_application::config::StorageConfig::Sqlite {
+            path: path.clone(),
+            application: id("counter-v1"),
+            initialize,
+        };
+        Application::open(config, Arc::new(Fake(control.clone())), Arc::new(AllowAll)).unwrap()
+    };
+    let app = open(true);
+    let receipt = app.command(command(3, Some("restart"))).unwrap();
+    app.catch_up("total").unwrap();
+    drop(app);
+    let reopened = open(false);
+    assert_eq!(reopened.query(query()).unwrap().value, json!(3));
+    assert_eq!(
+        reopened.command(command(3, Some("restart"))).unwrap(),
+        receipt
+    );
+    assert_eq!(control.decisions.load(Ordering::SeqCst), 1);
+}
+fn sqlite(
+    mut config: Config,
+    path: &std::path::Path,
+    initialize: bool,
+    control: Arc<Control>,
+    authorizer: Arc<dyn Authorizer>,
+) -> Result<Application, Failure> {
+    config.storage = merezha_application::config::StorageConfig::Sqlite {
+        path: path.into(),
+        application: id("counter-v1"),
+        initialize,
+    };
+    Application::open(config, Arc::new(Fake(control)), authorizer)
+}
+#[test]
+fn sqlite_replays_canonical_scoped_receipts_but_still_validates_and_authorizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let control = Arc::new(Control::default());
+    let app = sqlite(config(), &path, true, control.clone(), Arc::new(AllowAll)).unwrap();
+    let first = app.command(command(3, Some("k"))).unwrap();
+    let mut bob = command(3, Some("k"));
+    bob.metadata.actor = Some(id("bob"));
+    assert_eq!(app.command(bob.clone()).unwrap().version, 2);
+    control.fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        app.command(command(2, Some("retry"))).unwrap_err().code,
+        "invariant_violation"
+    );
+    control.fail.store(false, Ordering::SeqCst);
+    assert_eq!(app.command(command(2, Some("retry"))).unwrap().version, 3);
+    drop(app);
+    let app = sqlite(config(), &path, false, control.clone(), Arc::new(AllowAll)).unwrap();
+    let mut equivalent = command(3, Some("k"));
+    equivalent.payload = json!({"note":null,"amount":3});
+    let before = control.decisions.load(Ordering::SeqCst);
+    assert_eq!(app.command(equivalent).unwrap(), first);
+    assert_eq!(app.command(bob).unwrap().version, 2);
+    assert_eq!(control.decisions.load(Ordering::SeqCst), before);
+    for changed in [
+        command(4, Some("k")),
+        {
+            let mut c = command(3, Some("k"));
+            c.stream = id("other");
+            c
+        },
+        {
+            let mut c = command(3, Some("k"));
+            c.expected_version = Some(0);
+            c
+        },
+    ] {
+        assert_eq!(
+            app.command(changed).unwrap_err().code,
+            "idempotency_mismatch"
+        );
+    }
+    let mut invalid = command(3, Some("k"));
+    invalid.payload = json!({"amount":"bad"});
+    assert_eq!(app.command(invalid).unwrap_err().code, "validation_failed");
+    drop(app);
+    struct Deny;
+    impl Authorizer for Deny {
+        fn authorize(
+            &self,
+            _: MessageKind,
+            _: &str,
+            _: Option<&str>,
+            _: &Value,
+            _: &Metadata,
+        ) -> Result<(), Failure> {
+            Err(Failure::permanent("forbidden"))
+        }
+    }
+    let app = sqlite(config(), &path, false, control, Arc::new(Deny)).unwrap();
+    assert_eq!(
+        app.command(command(3, Some("k"))).unwrap_err().code,
+        "forbidden"
+    );
+}
+#[test]
+fn sqlite_zero_event_receipts_and_capacity_survive_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let control = Arc::new(Control::default());
+    control.no_events.store(true, Ordering::SeqCst);
+    let mut c = config();
+    c.limits.max_idempotency = 1;
+    let app = sqlite(c.clone(), &path, true, control.clone(), Arc::new(AllowAll)).unwrap();
+    let receipt = app.command(command(3, Some("zero"))).unwrap();
+    assert_eq!(
+        (receipt.version, receipt.position, receipt.events),
+        (0, 0, 0)
+    );
+    drop(app);
+    let app = sqlite(c, &path, false, control.clone(), Arc::new(AllowAll)).unwrap();
+    control.no_events.store(false, Ordering::SeqCst);
+    assert_eq!(app.command(command(3, Some("zero"))).unwrap(), receipt);
+    assert_eq!(
+        app.command(command(3, Some("another"))).unwrap_err().code,
+        "idempotency_capacity"
+    );
+    assert_eq!(app.command(command(3, None)).unwrap().version, 1);
+    assert_eq!(control.decisions.load(Ordering::SeqCst), 2);
+}
+#[test]
+fn sqlite_clones_share_pending_keys_and_only_one_racing_stream_write_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("key-db");
+    let gate = Arc::new(Gate::new());
+    let release = Arc::new(Gate::new());
+    let control = Arc::new(Control {
+        gate: Some(gate.clone()),
+        release: Some(release.clone()),
+        ..Control::default()
+    });
+    let app = sqlite(config(), &path, true, control.clone(), Arc::new(AllowAll)).unwrap();
+    let worker = app.clone();
+    let thread = std::thread::spawn(move || worker.command(command(1, Some("same"))));
+    gate.wait();
+    assert_eq!(
+        app.command(command(1, Some("same"))).unwrap_err().code,
+        "idempotency_in_flight"
+    );
+    assert_eq!(
+        app.command(command(2, Some("same"))).unwrap_err().code,
+        "idempotency_mismatch"
+    );
+    release.wait();
+    let receipt = thread.join().unwrap().unwrap();
+    drop(app);
+    let app = sqlite(config(), &path, false, control.clone(), Arc::new(AllowAll)).unwrap();
+    assert_eq!(app.command(command(1, Some("same"))).unwrap(), receipt);
+    assert_eq!(control.decisions.load(Ordering::SeqCst), 1);
+    drop(app);
+    let path = dir.path().join("stream-db");
+    let gate = Arc::new(Gate::new());
+    let release = Arc::new(Gate::new());
+    let control = Arc::new(Control {
+        gate: Some(gate.clone()),
+        release: Some(release),
+        ..Control::default()
+    });
+    let app = sqlite(config(), &path, true, control.clone(), Arc::new(AllowAll)).unwrap();
+    let worker = app.clone();
+    let thread = std::thread::spawn(move || worker.command(command(1, None)));
+    // Ensure both decisions use the same expected version before either commits.
+    gate.wait();
+    let second = app.command(command(1, None));
+    let first = thread.join().unwrap();
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    assert_eq!(
+        first.err().or(second.err()).unwrap().code,
+        "concurrency_conflict"
+    );
+    drop(app);
+    let app = sqlite(config(), &path, false, control, Arc::new(AllowAll)).unwrap();
+    assert_eq!(app.catch_up("total").unwrap().checkpoint, 1);
+}
+#[test]
+fn sqlite_failed_catchup_and_rebuild_preserve_the_last_persisted_pair() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let control = Arc::new(Control::default());
+    let mut c = config();
+    c.limits.batch_size = 1;
+    let app = sqlite(c.clone(), &path, true, control.clone(), Arc::new(AllowAll)).unwrap();
+    for i in 1..=3 {
+        app.command(command(i, Some(&format!("k{i}")))).unwrap();
+    }
+    control.fail_projection.store(2, Ordering::SeqCst);
+    assert_eq!(app.catch_up("total").unwrap_err().code, "projection_failed");
+    drop(app);
+    let app = sqlite(c.clone(), &path, false, control.clone(), Arc::new(AllowAll)).unwrap();
+    let pair = app.query(query()).unwrap();
+    assert_eq!((pair.value, pair.checkpoint), (json!(1), 1));
+    control.fail_projection.store(0, Ordering::SeqCst);
+    assert_eq!(app.catch_up("total").unwrap().checkpoint, 3);
+    control.fail_projection.store(2, Ordering::SeqCst);
+    assert_eq!(app.rebuild("total").unwrap_err().code, "projection_failed");
+    drop(app);
+    let app = sqlite(c, &path, false, control.clone(), Arc::new(AllowAll)).unwrap();
+    let pair = app.query(query()).unwrap();
+    assert_eq!((pair.value, pair.checkpoint), (json!(6), 3));
+    control.fail_projection.store(0, Ordering::SeqCst);
+    assert_eq!(app.rebuild("total").unwrap().state, json!(6));
+    assert!(control.lives.lock().unwrap().contains(&false));
+}
+#[test]
+fn sqlite_event_stream_byte_and_state_limits_remain_finite_across_restart() {
+    for mode in ["events", "streams", "bytes", "state"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let control = Arc::new(Control::default());
+        let mut c = config();
+        match mode {
+            "events" => c.limits.max_events = 1,
+            "streams" => c.limits.max_streams = 1,
+            "bytes" => c.limits.max_store_bytes = 1,
+            "state" => c.limits.max_state_bytes = 1,
+            _ => unreachable!(),
+        }
+        let app = sqlite(c.clone(), &path, true, control.clone(), Arc::new(AllowAll)).unwrap();
+        if mode == "bytes" {
+            assert_eq!(
+                app.command(command(1, Some("k"))).unwrap_err().code,
+                "store_capacity"
+            );
+        } else {
+            app.command(command(9, Some("k"))).unwrap();
+        }
+        drop(app);
+        let app = sqlite(c, &path, false, control, Arc::new(AllowAll)).unwrap();
+        let mut next = command(2, Some("next"));
+        if mode == "streams" {
+            next.stream = id("two");
+        }
+        let result = app.command(next);
+        if mode == "state" {
+            result.unwrap();
+            assert_eq!(app.catch_up("total").unwrap_err().code, "payload_limit");
+            assert_eq!(app.query(query()).unwrap().checkpoint, 0);
+        } else {
+            assert_eq!(result.unwrap_err().code, "store_capacity");
+        }
+    }
 }
 #[test]
 fn commands_queries_projection_catchup_and_rebuild_have_separate_effects() {

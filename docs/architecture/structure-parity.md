@@ -25,24 +25,24 @@ the separate guest example and scenario remain a services contribution.
 | `@structure-ai/cli` | `serve --application PATH` wires local application dispatch | Generic typed command DSL, direct command/query CLI subcommands and full exit-code parity are deferred. |
 | `@structure-ai/client` | Published versioned JSON shapes | Typed HttpApi client, bearer propagation, deadlines/retries require a stable client-language SDK. |
 | `@structure-ai/config` | Strict bounded application TOML and startup validation | Settings DSL, env/file/override precedence and generated settings reference require a host configuration layer. |
-| `@structure-ai/cqrs` | Unique command/query tags, guest validation, policy, metadata, total dispatch deadlines, bounded process-local idempotency | Effect layers, durable idempotency, metrics/tracing integration and cross-process transactions. |
+| `@structure-ai/cqrs` | Unique command/query tags, guest validation, policy, metadata, dispatch deadlines, bounded memory or SQLite keyed receipts | Effect layers, metrics/tracing integration and distributed transactions. |
 | `@structure-ai/domain` | Guest-safe identity, classified errors, `Decider`, deterministic replay and event envelope | Branded per-entity types, general value-object schema tooling and state-stored repository adapters. Identity validation is intentionally stricter. |
 | `@structure-ai/dotenv` | None | Cascade/expansion/lossless editing require explicit host file/environment tools; no guest imports added. |
 | `@structure-ai/eventsourcing` | Replaceable event port, finite memory adapter, atomic expected-version append, ordered metadata history, replay, batch checkpoints and atomic rebuild | Snapshots, upcasters, imports, partitions, outbox/inbox and durable effects need separate contracts and adapters. |
 | `@structure-ai/eventsourcing-nisshi` | None | Broker log and SQL sidecar require operations, Kafka compatibility and crash/recovery proof. |
 | `@structure-ai/eventsourcing-pg` | None | Durable events/checkpoints/outbox/inbox/idempotency require SQL migrations, transaction design and restart tests. |
-| `@structure-ai/eventsourcing-sqlite` | None | Durable event ports and append-with-outbox require host SQLite and schema/recovery lifecycle. |
+| `@structure-ai/eventsourcing-sqlite` | Opt-in single-owner host database, atomic event/receipt append, verified reopen and crash recovery | Append-with-outbox, retention, simultaneous hosts and full source API parity remain deferred. |
 | `@structure-ai/fixtures` | Host tests create business data through commands | Reusable fixture catalog, run receipts, readiness hooks and cleanup DSL remain separate. Guest scenario belongs to the services lane. |
 | `@structure-ai/http` | Opt-in loopback JSON command/query/projection endpoints with classified failures | Typed HttpApi/OpenAPI, static mounts, distributed rate limiting and external authentication adapters. |
 | `@structure-ai/jobs` | None | Delayed/recurring jobs, leases, retries and drain require a durable host queue and worker lifecycle. |
 | `@structure-ai/mailer` | None | SMTP/provider/template/capture ports require explicit outbound effects and delivery policy. |
 | `@structure-ai/mcp` | None | MCP tools/resources, serving and OAuth scope helpers require a separate protocol/auth bridge. JSON dispatch is not MCP parity. |
-| `@structure-ai/migrations` | None | SQL migration checksums, locking, status and readiness require a database-owning adapter. |
+| `@structure-ai/migrations` | Explicit SQLite schema v1 bootstrap, ownership lock and exact schema/configuration verification before readiness | General migration catalog, upgrades, checksums, backfills and status DSL remain deferred. |
 | `@structure-ai/observability` | Accepted message/correlation/causation/actor metadata; existing structured raw-runtime logs | Full correlation context, metrics, redaction layers, service identity and OTLP exporters. |
 | `@structure-ai/playwright` | No browser API; independent component/HTTP tests | Frontend/browser target and isolated authenticated test control plane are prerequisites. |
 | `@structure-ai/runtime` | Application registry/config startup; existing bounded runtime, shutdown and atomic raw catalog reload | Full framework readiness/finalizer/bootstrap APIs and application config reload. |
 | `@structure-ai/storage` | None | Blob keys, streaming local/S3 drivers, serving policy, readiness and metrics require explicit host capabilities. |
-| `@structure-ai/viewmodel` | Finite JSON state with ordered catch-up, query snapshots, checkpoint retry and rebuild | Schema row/SQL DDL/query DSL, migrations and durable read-model adapters. |
+| `@structure-ai/viewmodel` | Finite memory or persisted JSON state/checkpoint, ordered catch-up, query snapshots, row-revision CAS and atomic rebuild | Schema row/SQL DDL/query DSL and general migrations remain deferred. |
 
 ## Source contract decisions
 
@@ -81,8 +81,12 @@ failure. This stronger bounded contract is covered by explicit failure tests.
 Source query read-only behavior is a convention; the Rust host gives query
 guests no event-store capability and accepts only a query-shaped reply.
 
-The next dependency order is durable event/idempotency/read-model transactions
-and migrations, then snapshots/upcasters/outbox/inbox and recovery proof, then
+The SQLite stage now persists event/idempotency/read-model transactions in one
+owned local database, with explicit schema bootstrap and verified reopen. Its
+tests cover process interruption, independent-connection stale writes and
+closed-store restore. This is a bounded subset, not full source package parity.
+The next dependency order is reviewed schema upgrades and
+snapshots/upcasters/outbox/inbox, then
 external auth/policy, operational telemetry and external effects. Jobs, mail,
 storage, AI, clients and MCP each need their own host capability and failure
 contracts. None follows automatically from the application-core subset.
