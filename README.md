@@ -65,7 +65,10 @@ add guest deciders, command/query routing, bounded event history,
 idempotency and checkpointed read models. Start with `serve --manifest PATH
 --application PATH`; the original raw endpoints remain available. Memory mode
 loses state on restart. Opt-in SQLite mode retains events, keyed receipts and
-read models in one local database owned by one host. See the
+read models in one local database owned by one host. To try it,
+`scripts/task-board-local.sh` serves the example task board with SQLite storage
+on `127.0.0.1:8787`; the [task board guide](docs/services/README.md#local-task-board-with-durable-storage)
+shows the `task-board` client commands. See the
 [Structure parity map](docs/architecture/structure-parity.md)
 for the bounded subset and deferred capabilities.
 

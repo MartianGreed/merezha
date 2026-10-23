@@ -1,0 +1,15 @@
+[package]
+name = "merezha-task-events"
+description = "Event schema shared by the task board's domain and view components (Merezha example)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "task_events"
+
+[dependencies]
+merezha-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true

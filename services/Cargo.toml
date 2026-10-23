@@ -5,8 +5,13 @@ members = [
     "text-normalize",
     "greeting",
     "json-envelope",
+    "task-events",
+    "task-domain",
+    "task-view",
     "contract-tests",
     "componentize",
+    "scenario",
+    "task-board-cli",
 ]
 
 [workspace.package]
@@ -20,6 +25,12 @@ merezha-service-kit = { path = "kit" }
 merezha-text-normalize = { path = "text-normalize" }
 merezha-greeting = { path = "greeting" }
 merezha-json-envelope = { path = "json-envelope" }
+merezha-task-events = { path = "task-events" }
+merezha-task-domain = { path = "task-domain" }
+merezha-task-view = { path = "task-view" }
+# The application SDK and wire protocol, owned by the host workspace.
+merezha-domain = { path = "../crates/domain" }
+serde = { version = "1.0.228", features = ["derive"] }
 # Fields a service does not own are kept as raw JSON text, never decoded into
 # `Value`: no number rounding and no serde_json reserved-key interpretation.
 serde_json = { version = "1.0.154", features = ["raw_value"] }
