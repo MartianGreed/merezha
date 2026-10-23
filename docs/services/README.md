@@ -380,10 +380,11 @@ scripts/task-board-local.sh
 ```
 
 The script builds the components and a release host, writes the manifests
-into `target/task-board-local` and serves on `127.0.0.1:8787` until Ctrl-C.
-The first run initializes `target/task-board-local/task-board.sqlite`; later
-runs reopen it. Pass another directory as the first argument, or set
-`MEREZHA_LISTEN` for another loopback address. Delete the directory to start
+into `.merezha/task-board` (git-ignored, and kept by `cargo clean`) and serves
+on `127.0.0.1:8787` until Ctrl-C. The first run initializes
+`.merezha/task-board/task-board.sqlite`, private to your user; later runs
+reopen it. Pass another directory as the first argument, or set
+`MEREZHA_LISTEN` to another numeric loopback address such as `127.0.0.1:9000`. Delete the directory to start
 over; reopen also refuses the database once `examples/task-board/application.toml`
 changes its routes or limits, so that needs a fresh directory too. Only one host
 can own the database at a time.
@@ -403,7 +404,7 @@ task-board rename report "Write the final report"
 ```
 
 Each `TASK` (here `groceries` and `report`) is the stream of one task, so
-its `task_id` is `Task/groceries`. Queries catch the read model up first;
+its `task_id` is `Task/groceries`; it may use ASCII letters, digits and `._-:/`. Queries catch the read model up first;
 `task-board catch-up` and `task-board rebuild` run those operations alone. A
 rejected command such as a second `complete groceries` prints the host's
 error, for example `task_already_completed`, and exits with status 1. Set

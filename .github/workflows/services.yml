@@ -12,6 +12,9 @@ on:
       - 'crates/domain/**'
       - 'crates/application/**'
       - 'crates/cli/**'
+      - 'crates/runtime/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/services.yml'
 permissions:
   contents: read

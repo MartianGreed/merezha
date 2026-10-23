@@ -15,11 +15,11 @@
 //! catch-up | rebuild      run that read-model operation alone
 //! ```
 //!
-//! `TASK` is a stream name of ASCII letters, digits and `._-:`.
+//! `TASK` is a stream name of ASCII letters, digits and `._-:/`.
 //! Environment: `MEREZHA_ADDRESS` (default `127.0.0.1:8787`) and
 //! `MEREZHA_ACTOR` (default `local`), the actor recorded on each message.
 //! Exit status 1 means the host rejected the request or was unreachable;
-//! its JSON error then goes to stderr. Exit status 2 means bad usage.
+//! its JSON error, or the connection error, then goes to stderr. Exit status 2 means bad usage.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;

@@ -47,6 +47,9 @@ if [[ -z ${MEREZHA_BIN:-} ]]; then
   export MEREZHA_BIN="${CARGO_TARGET_DIR:-$root/target}/release/merezha"
 fi
 
+step "Build the components once, outside the startup deadline"
+"$root/scripts/build-services.sh" "$scratch/data/components"
+
 step "Build the task-board client"
 cargo build --manifest-path "$root/services/Cargo.toml" --locked --release -p merezha-task-board-cli
 client="${CARGO_TARGET_DIR:-$root/services/target}/release/task-board"
