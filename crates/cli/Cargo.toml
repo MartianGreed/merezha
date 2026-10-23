@@ -13,12 +13,15 @@ path = "src/main.rs"
 merezha-application = { path = "../application" }
 merezha-domain = { path = "../domain" }
 merezha-runtime = { path = "../runtime" }
+merezha-platform = { path = "../platform" }
 anyhow.workspace = true
 serde_json.workspace = true
 axum.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+merezha-postgres = { path = "../postgres" }
 tempfile.workspace = true
 wat.workspace = true
 tower.workspace = true
