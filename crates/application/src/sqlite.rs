@@ -2,6 +2,7 @@
 use crate::{
     application::{Key, ProjectionState, Record},
     config::{Config, Limits, StorageConfig},
+    durable::{CommitCommand, DurableStore, ProjectionRef},
 };
 use merezha_domain::{Event, Failure, Identity, Metadata, Receipt, StoredEvent, compatible_json};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -191,8 +192,13 @@ fn check_json(value: &serde_json::Value, max: usize) -> Result<(), Failure> {
     }
     Ok(())
 }
+/// The manifest's configuration text. The version is syntax, not meaning:
+/// every version 2 key that changes behaviour is encoded when set, so the
+/// text is normalized to version 1 and a store keeps opening when only the
+/// document's version changes.
 fn configuration(config: &Config) -> Result<String, Failure> {
     let mut copy = config.clone();
+    copy.version = 1;
     copy.storage = StorageConfig::Memory;
     encode(&copy)
 }
@@ -781,6 +787,64 @@ impl SqliteStore {
         crash_cut("after_commit");
         Ok(receipt)
     }
+    /// The stored receipt for `key`, outside any write transaction.
+    pub(crate) fn receipt(
+        &self,
+        key: &Key,
+        fingerprint: &str,
+        deadline: Instant,
+    ) -> Result<Option<Receipt>, Failure> {
+        let conn = self.lock(deadline)?;
+        let Some((stored, receipt)) = conn
+            .query_row(
+                "SELECT fingerprint,receipt FROM receipts WHERE key=?1",
+                [encode(key)?],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(sql)?
+        else {
+            return Ok(None);
+        };
+        if stored != fingerprint {
+            return Err(Failure::conflict("idempotency_mismatch"));
+        }
+        decode(&receipt, 1024).map(Some)
+    }
+    /// A second store on the same file with its own connection, sharing
+    /// this owner's lock: an independent instance for contract tests. The
+    /// production owner gate forbids two hosts on one SQLite file.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn independent(
+        &self,
+        config: &Config,
+        application: &Identity,
+    ) -> Result<(Self, Recovered), Failure> {
+        let deadline = Instant::now() + Duration::from_millis(config.limits.timeout_ms);
+        let path = {
+            let conn = self.lock(deadline)?;
+            conn.path()
+                .map(std::path::PathBuf::from)
+                .ok_or_else(invalid)?
+        };
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(sql)?;
+        connection.busy_timeout(Duration::ZERO).map_err(sql)?;
+        connection
+            .execute_batch("PRAGMA synchronous=EXTRA; PRAGMA trusted_schema=OFF;")
+            .map_err(sql)?;
+        let store = Self {
+            connection: ConnectionSlot::new(connection),
+            _owner: Arc::clone(&self._owner),
+            limits: self.limits.clone(),
+            poisoned: AtomicBool::new(false),
+        };
+        let recovered = store.recover(config, application, deadline)?;
+        Ok((store, recovered))
+    }
     fn commit(&self, tx: rusqlite::Transaction<'_>, deadline: Instant) -> Result<(), Failure> {
         if Instant::now() >= deadline {
             return Err(Failure::transient("timeout"));
@@ -835,6 +899,77 @@ impl SqliteStore {
         #[cfg(test)]
         crash_cut("projection_after_commit");
         Ok(next)
+    }
+}
+// The inherent methods keep their original signatures (the adapter tests
+// below call them directly); the seam delegates to them. Projection
+// revisions are part of the SQLite configuration fingerprint, so one row
+// per projection name suffices.
+impl DurableStore for SqliteStore {
+    fn load(&self, stream: &Identity, deadline: Instant) -> Result<Vec<StoredEvent>, Failure> {
+        SqliteStore::load(self, stream, deadline)
+    }
+    fn head(&self, deadline: Instant) -> Result<u64, Failure> {
+        SqliteStore::head(self, deadline)
+    }
+    fn read_all(
+        &self,
+        after: u64,
+        limit: usize,
+        deadline: Instant,
+    ) -> Result<Vec<StoredEvent>, Failure> {
+        SqliteStore::read_all(self, after, limit, deadline)
+    }
+    fn receipt(
+        &self,
+        key: &Key,
+        fingerprint: &str,
+        deadline: Instant,
+    ) -> Result<Option<Receipt>, Failure> {
+        SqliteStore::receipt(self, key, fingerprint, deadline)
+    }
+    fn commit_command(&self, c: CommitCommand<'_>, deadline: Instant) -> Result<Receipt, Failure> {
+        // A tenant stream carries its tenant as the stream prefix, so the
+        // stream name alone keeps tenants apart here. The host composes it;
+        // this mirrors PostgreSQL's `streams` CHECK as a backstop.
+        if c.tenant.is_some_and(|tenant| {
+            c.stream
+                .as_str()
+                .strip_prefix(tenant.as_str())
+                .is_none_or(|rest| !rest.starts_with(':'))
+        }) {
+            return Err(Failure::permanent("constraint_violation"));
+        }
+        SqliteStore::commit_command(
+            self, c.stream, c.expected, c.events, c.metadata, c.claim, deadline,
+        )
+    }
+    fn projection(
+        &self,
+        p: &ProjectionRef<'_>,
+        deadline: Instant,
+    ) -> Result<(ProjectionState, i64), Failure> {
+        SqliteStore::projection(self, p.name, deadline)
+    }
+    fn commit_projection(
+        &self,
+        p: &ProjectionRef<'_>,
+        row_revision: i64,
+        state: &ProjectionState,
+        deadline: Instant,
+    ) -> Result<i64, Failure> {
+        SqliteStore::commit_projection(self, p.name, row_revision, state, deadline)
+    }
+    #[cfg(feature = "test-support")]
+    fn independent(
+        &self,
+        config: &Config,
+    ) -> Result<(std::sync::Arc<dyn DurableStore>, Recovered), Failure> {
+        let StorageConfig::Sqlite { application, .. } = &config.storage else {
+            return Err(Failure::permanent("storage_configuration"));
+        };
+        let (store, recovered) = SqliteStore::independent(self, config, application)?;
+        Ok((Arc::new(store), recovered))
     }
 }
 #[cfg(test)]
@@ -1418,6 +1553,7 @@ initial=0
     fn key() -> Key {
         Key {
             tag: id("Add"),
+            tenant: None,
             actor: Some(id("alice")),
             key: id("k"),
         }
@@ -2147,5 +2283,148 @@ initial=0
             .err()
             .unwrap();
         assert_eq!(error.code, "storage_path");
+    }
+    /// The configuration, receipt key, fingerprint and receipt texts that
+    /// origin/main wrote for the same input, before `Key.tenant`, version 2
+    /// and `max_stream_events` existed.
+    const GOLDEN_CONFIGURATION: &str = r#"{"version":1,"limits":{"timeout_ms":5000,"max_events":4096,"max_streams":256,"max_store_bytes":8388608,"max_idempotency":1024,"max_payload_bytes":16384,"max_state_bytes":65536,"batch_size":4,"max_concurrent":16},"commands":[{"tag":"Add","service":"counter","aggregate":"Counter"}],"queries":[{"tag":"Total","service":"counter","projection":"total"}],"projections":[{"name":"total","service":"counter","initial":0,"revision":1}],"storage":{"backend":"memory"}}"#;
+    const GOLDEN_KEY: &str = r#"{"tag":"Add","actor":"alice","key":"k"}"#;
+    const GOLDEN_FINGERPRINT: &str =
+        r#"{"expected_version":null,"payload":3,"stream":"Counter/one"}"#;
+    const GOLDEN_RECEIPT: &str = r#"{"stream":"Counter/one","version":1,"position":1,"events":1}"#;
+    #[test]
+    fn stored_configuration_and_receipt_rows_encode_byte_for_byte_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut c = Config::parse(
+            r#"version=1
+[limits]
+batch_size=4
+[[commands]]
+tag="Add"
+service="counter"
+aggregate="Counter"
+[[queries]]
+tag="Total"
+service="counter"
+projection="total"
+[[projections]]
+name="total"
+service="counter"
+initial=0
+"#,
+        )
+        .unwrap();
+        c.storage = StorageConfig::Sqlite {
+            path: path.clone(),
+            application: id("counter-v1"),
+            initialize: true,
+        };
+        let (store, _) = SqliteStore::open(&c, &path, &id("counter-v1"), true).unwrap();
+        store
+            .commit_command(
+                &id("Counter/one"),
+                0,
+                vec![event()],
+                &metadata(),
+                Some((&key(), &fingerprint())),
+                deadline(),
+            )
+            .unwrap();
+        drop(store);
+        let conn = Connection::open(&path).unwrap();
+        let configuration: String = conn
+            .query_row("SELECT configuration FROM manifest", [], |r| r.get(0))
+            .unwrap();
+        let (key_text, fingerprint_text, receipt_text): (String, String, String) = conn
+            .query_row("SELECT key,fingerprint,receipt FROM receipts", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(configuration, GOLDEN_CONFIGURATION);
+        assert_eq!(key_text, GOLDEN_KEY);
+        assert_eq!(fingerprint_text, GOLDEN_FINGERPRINT);
+        assert_eq!(receipt_text, GOLDEN_RECEIPT);
+        // Old keys decode without a tenant; a tenant sits between tag and
+        // actor and round-trips.
+        assert_eq!(decode::<Key>(GOLDEN_KEY, 1024).unwrap(), key());
+        let tenant = Key {
+            tenant: Some(id("org-1")),
+            ..key()
+        };
+        let text = encode(&tenant).unwrap();
+        assert_eq!(
+            text,
+            r#"{"tag":"Add","tenant":"org-1","actor":"alice","key":"k"}"#
+        );
+        assert_eq!(decode::<Key>(&text, 1024).unwrap(), tenant);
+        let anonymous = Key {
+            actor: None,
+            ..key()
+        };
+        assert_eq!(
+            encode(&anonymous).unwrap(),
+            r#"{"tag":"Add","actor":null,"key":"k"}"#
+        );
+    }
+    #[test]
+    fn a_version_1_store_reopens_under_the_same_configuration_at_version_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        drop(open_store(&path, true));
+        let mut v2 = config(&path, false);
+        v2.version = 2;
+        drop(SqliteStore::open(&v2, &path, &id("counter-v1"), false).unwrap());
+        let mut drift = v2.clone();
+        drift.limits.max_stream_events = 8;
+        assert_eq!(
+            SqliteStore::open(&drift, &path, &id("counter-v1"), false)
+                .err()
+                .unwrap()
+                .code,
+            "storage_configuration"
+        );
+        drop(open_store(&path, false));
+    }
+    #[test]
+    fn a_tenant_commit_needs_the_tenant_as_its_stream_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (store, _) = open_store(&path, true);
+        let tenant = id("org-1");
+        let commit = |stream: &Identity, tenant: &Identity| {
+            DurableStore::commit_command(
+                &store,
+                CommitCommand {
+                    stream,
+                    tenant: Some(tenant),
+                    expected: 0,
+                    events: vec![event()],
+                    metadata: &metadata(),
+                    claim: None,
+                },
+                deadline(),
+            )
+        };
+        for (stream, tenant) in [
+            (id("Counter/one"), tenant.clone()),
+            (id("org-2:Counter/one"), tenant.clone()),
+            // A tenant that is only a prefix of the stream's tenant.
+            (id("org-1:Counter/one"), id("org")),
+            (id("org-1Counter/one"), tenant.clone()),
+        ] {
+            let refused = commit(&stream, &tenant).unwrap_err();
+            assert_eq!(
+                (refused.code.as_str(), refused.classification),
+                (
+                    "constraint_violation",
+                    merezha_domain::Classification::Permanent
+                ),
+                "{stream:?} for {tenant:?}"
+            );
+        }
+        assert_eq!(store.head(deadline()).unwrap(), 0);
+        let receipt = commit(&id("org-1:Counter/one"), &tenant).unwrap();
+        assert_eq!((receipt.position, receipt.version), (1, 1));
     }
 }

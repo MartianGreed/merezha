@@ -2,6 +2,7 @@
 //! the versioned guest contract in `merezha-domain`.
 mod application;
 pub mod config;
+mod durable;
 mod sqlite;
 pub mod store;
 pub use application::{Application, ProjectionState, QueryResult};

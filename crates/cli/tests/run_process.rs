@@ -425,6 +425,30 @@ colour = "blue"
 }
 
 #[test]
+fn an_application_using_keys_of_later_slices_stops_startup_before_the_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = project(dir.path(), "");
+    let application = dir.path().join("application.toml");
+    let text = fs::read_to_string(&application).unwrap().replacen(
+        "version=1",
+        "version=2\n[limits]\nmax_stream_events=8",
+        1,
+    );
+    fs::write(
+        &application,
+        format!("{text}[[reactors]]\nname=\"notifier\"\nservice=\"protocol\"\n"),
+    )
+    .unwrap();
+    // The application opens before the pool, so no database is needed.
+    let mut host = Host::spawn(
+        &config,
+        &[(DATABASE_ENV, "postgres://nobody:pw@127.0.0.1:1/none")],
+        "unsupported",
+    );
+    assert_eq!(host.failed()["code"], "unsupported_in_this_build");
+}
+
+#[test]
 fn an_unreachable_database_stops_startup() {
     let dir = tempfile::tempdir().unwrap();
     let config = project(dir.path(), "");
