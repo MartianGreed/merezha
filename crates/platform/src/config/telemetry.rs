@@ -168,13 +168,13 @@ pub(super) fn telemetry(
     let endpoint_origin = r.origin_of("endpoint").unwrap_or(Origin::Default);
     let endpoint = match r.string("endpoint") {
         Some((value, origin)) => match valid_endpoint(&value) {
-            Some(url) => Some(url),
+            Some(url) => Some((value, url)),
             None => {
                 r.issue("endpoint", "invalid_endpoint", origin);
                 None
             }
         },
-        None => valid_endpoint(DEFAULT_ENDPOINT),
+        None => valid_endpoint(DEFAULT_ENDPOINT).map(|url| (DEFAULT_ENDPOINT.to_owned(), url)),
     };
     let protocol = r.choice(
         "protocol",
@@ -302,7 +302,7 @@ pub(super) fn telemetry(
     let signal_endpoint = |r: &mut super::Reader<'_>| match r.string("endpoint") {
         Some((value, _)) if value.is_empty() => None,
         Some((value, origin)) => match valid_endpoint(&value) {
-            Some(url) => Some((url, origin)),
+            Some(url) => Some((value, url, origin)),
             None => {
                 r.issue("endpoint", "invalid_endpoint", origin);
                 None
@@ -352,7 +352,7 @@ pub(super) fn telemetry(
         sampler,
         ratio,
         trust_inbound,
-        endpoint: traces_endpoint.map(|(url, _)| url.to_string()),
+        endpoint: traces_endpoint.map(|(text, _, _)| text),
         max_queue,
         max_batch,
         schedule_delay,
@@ -375,7 +375,7 @@ pub(super) fn telemetry(
         interval,
         temporality,
         sample_interval,
-        endpoint: metrics_endpoint.map(|(url, _)| url.to_string()),
+        endpoint: metrics_endpoint.map(|(text, _, _)| text),
     };
     let (mut r, _) = reader(layers, "telemetry.logs", issues);
     let level = r.choice("level", LogLevel::Info, &LEVELS);
@@ -385,7 +385,7 @@ pub(super) fn telemetry(
     endpoints.extend(logs_endpoint.clone());
     let logs = LogsConfig {
         level,
-        endpoint: logs_endpoint.map(|(url, _)| url.to_string()),
+        endpoint: logs_endpoint.map(|(text, _, _)| text),
         max_queue,
         max_batch,
         schedule_delay,
@@ -411,13 +411,18 @@ pub(super) fn telemetry(
     // Header secrets never travel in clear to a remote collector unless the
     // operator says so.
     if !headers.is_empty() && !allow_plaintext_headers {
-        if endpoint.as_ref().is_some_and(plaintext_remote) {
+        if endpoint
+            .as_ref()
+            .is_some_and(|(_, url)| plaintext_remote(url))
+        {
             issues.push(ConfigIssue::new(
                 "telemetry.headers",
                 "plaintext_headers_refused",
                 endpoint_origin.clone(),
             ));
-        } else if let Some((_, origin)) = endpoints.iter().find(|(url, _)| plaintext_remote(url)) {
+        } else if let Some((_, _, origin)) =
+            endpoints.iter().find(|(_, url, _)| plaintext_remote(url))
+        {
             issues.push(ConfigIssue::new(
                 "telemetry.headers",
                 "plaintext_headers_refused",
@@ -429,7 +434,7 @@ pub(super) fn telemetry(
         log_level,
         format,
         log_buffer_lines,
-        endpoint: endpoint.map_or_else(|| DEFAULT_ENDPOINT.to_owned(), |u| u.to_string()),
+        endpoint: endpoint.map_or_else(|| DEFAULT_ENDPOINT.to_owned(), |(text, _)| text),
         protocol,
         compression,
         timeout,

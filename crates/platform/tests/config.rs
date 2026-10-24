@@ -665,7 +665,7 @@ fn telemetry_extensions_validate_and_keep_header_secrets_out_of_debug() {
     use merezha_platform::config::{Protocol, Sampler, Signal};
     let config = load("", &[], &[]).unwrap();
     let telemetry = &config.telemetry;
-    assert_eq!(telemetry.endpoint, "http://127.0.0.1:4318/");
+    assert_eq!(telemetry.endpoint, "http://127.0.0.1:4318");
     assert_eq!(telemetry.protocol, Protocol::HttpProtobuf);
     assert_eq!(
         telemetry.signals,

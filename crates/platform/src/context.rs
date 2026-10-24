@@ -152,6 +152,7 @@ pub struct AppContext {
 }
 struct Inner {
     app_id: String,
+    instance_id: String,
     database: Database,
     clock: Arc<dyn Clock>,
     random: Arc<dyn Random>,
@@ -182,6 +183,7 @@ impl AppContext {
     ) -> AppContextBuilder {
         AppContextBuilder {
             app_id: app_id.to_owned(),
+            instance_id: crate::config::default_instance_id(None),
             database,
             clock: Arc::new(SystemClock),
             random: Arc::new(OsRandom),
@@ -196,6 +198,10 @@ impl AppContext {
     }
     pub fn app_id(&self) -> &str {
         &self.inner.app_id
+    }
+    /// `app.instance_id`: this process among the application's instances.
+    pub fn instance_id(&self) -> &str {
+        &self.inner.instance_id
     }
     pub fn database(&self) -> &Database {
         &self.inner.database
@@ -243,6 +249,7 @@ impl AppContext {
 /// Replaces fallbacks with block implementations.
 pub struct AppContextBuilder {
     app_id: String,
+    instance_id: String,
     database: Database,
     clock: Arc<dyn Clock>,
     random: Arc<dyn Random>,
@@ -255,6 +262,10 @@ pub struct AppContextBuilder {
     blobs: Arc<dyn BlobStore>,
 }
 impl AppContextBuilder {
+    pub fn instance_id(mut self, instance_id: &str) -> Self {
+        self.instance_id = instance_id.to_owned();
+        self
+    }
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
@@ -295,6 +306,7 @@ impl AppContextBuilder {
         Ok(AppContext {
             inner: Arc::new(Inner {
                 app_id: self.app_id,
+                instance_id: self.instance_id,
                 database: self.database,
                 clock: self.clock,
                 random: self.random,

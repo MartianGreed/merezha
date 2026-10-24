@@ -263,6 +263,7 @@ impl Host {
             );
         }
         let ctx = AppContext::builder(&config.app.id, database.clone(), parts.authorizer)
+            .instance_id(&config.app.instance_id)
             .build()
             .map_err(|failure| StartupError {
                 failure,
