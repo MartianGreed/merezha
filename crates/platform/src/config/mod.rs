@@ -6,6 +6,20 @@
 //! as [`ConfigErrors`]; nothing is reported by value, so secrets never appear
 //! in errors. Secret settings accept `{ env = "NAME" }` or `{ file = "PATH" }`
 //! in the file, never a literal.
+mod duration;
+mod jobs;
+mod telemetry;
+
+pub use duration::parse_duration;
+pub use jobs::{
+    ApplicationAppend, ApplicationBackground, ApplicationProjections, ApplicationReactors, CatchUp,
+    JobDefaults, JobRetention, JobSchedule, JobsConfig, QueueConfig, RelayConfig, valid_queue_name,
+};
+pub use telemetry::{
+    Compression, LogsConfig, MetricsConfig, PrivacyConfig, Protocol, ResourceConfig, Sampler,
+    Signal, Temporality, TracesConfig, TrustInbound,
+};
+
 use crate::net::Cidr;
 use merezha_postgres::{DatabaseConfig, Secret, TlsMode};
 use std::{
@@ -24,15 +38,44 @@ pub const MAX_SECRET_BYTES: u64 = 65_536;
 /// Prefix of configuration environment variables. Only names that also
 /// contain `__` are configuration; `MEREZHA_TEST_DATABASE_URL` is not.
 pub const ENV_PREFIX: &str = "MEREZHA_";
-const SECTIONS: [&str; 7] = [
+const SECTIONS: [&str; 8] = [
     "app",
     "http",
     "database",
     "runtime",
     "application",
+    "jobs",
     "telemetry",
     "modules",
 ];
+/// Nested tables the kernel knows, besides `jobs.queues.<name>`.
+const SUBTABLES: [&str; 19] = [
+    "http.cors",
+    "application.projections",
+    "application.reactors",
+    "application.background",
+    "application.append",
+    "jobs.relay",
+    "jobs.scheduler",
+    "jobs.defaults",
+    "jobs.queues",
+    "jobs.retention",
+    "jobs.readiness",
+    "telemetry.headers",
+    "telemetry.resource",
+    "telemetry.resource.attributes",
+    "telemetry.traces",
+    "telemetry.metrics",
+    "telemetry.logs",
+    "telemetry.privacy",
+    "telemetry.propagation",
+];
+/// Whether `path` names a fixed nested table the kernel reads. Queue tables
+/// (`jobs.queues.<name>`) are handled where they appear, because a queue
+/// name may itself contain dots.
+fn is_subtable(path: &str) -> bool {
+    SUBTABLES.contains(&path)
+}
 
 /// Where a setting came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,6 +155,11 @@ pub struct AppConfig {
     /// Lowercase label `[a-z0-9-]`, 1 to 63 bytes, starting with a letter.
     pub id: String,
     pub name: String,
+    /// The one instance id (R12): leases, `service.instance.id`. Default
+    /// hostname plus process id; 1 to 128 bytes of `[A-Za-z0-9._:-]`.
+    pub instance_id: String,
+    /// The application's own version, TE's `service.version`.
+    pub version: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CorsConfig {
@@ -135,6 +183,10 @@ pub struct RuntimeConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApplicationConfig {
     pub path: PathBuf,
+    pub projections: ApplicationProjections,
+    pub reactors: ApplicationReactors,
+    pub background: ApplicationBackground,
+    pub append: ApplicationAppend,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogLevel {
@@ -149,10 +201,28 @@ pub enum LogFormat {
     Json,
     Text,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `[telemetry]`: the kernel's stderr log keys plus the telemetry block's
+/// OTLP settings (TE §3). `Debug` redacts header values.
+#[derive(Clone, Debug, PartialEq)]
 pub struct TelemetryConfig {
     pub log_level: LogLevel,
     pub format: LogFormat,
+    pub log_buffer_lines: u32,
+    pub endpoint: String,
+    pub protocol: Protocol,
+    pub compression: Compression,
+    pub timeout: Duration,
+    pub headers: BTreeMap<String, Secret>,
+    pub ca_file: Option<PathBuf>,
+    pub allow_plaintext_headers: bool,
+    pub shutdown_timeout: Duration,
+    pub signals: Vec<Signal>,
+    pub resource: ResourceConfig,
+    pub traces: TracesConfig,
+    pub metrics: MetricsConfig,
+    pub logs: LogsConfig,
+    pub privacy: PrivacyConfig,
+    pub propagation: Vec<String>,
 }
 
 /// A module's opaque `[modules.<name>]` table, validated by that module.
@@ -222,6 +292,7 @@ pub struct ProjectConfig {
     pub database: DatabaseConfig,
     pub runtime: RuntimeConfig,
     pub application: Option<ApplicationConfig>,
+    pub jobs: JobsConfig,
     pub modules: BTreeMap<String, ModuleSection>,
     pub telemetry: TelemetryConfig,
 }
@@ -355,18 +426,73 @@ impl Reader<'_> {
             }
         }
     }
-    fn millis(
+    /// A duration: a string such as `"500ms"`, `"30s"`, `"15m"`, `"7d"`,
+    /// or integer milliseconds when `key` ends `_ms`.
+    fn duration(
         &mut self,
         key: &str,
         default: Duration,
         (min, max): (Duration, Duration),
     ) -> Duration {
-        Duration::from_millis(self.integer(
-            key,
-            default.as_millis() as u64,
-            min.as_millis() as u64,
-            max.as_millis() as u64,
-        ))
+        self.optional_duration(key, (min, max)).unwrap_or(default)
+    }
+    fn optional_duration(
+        &mut self,
+        key: &str,
+        (min, max): (Duration, Duration),
+    ) -> Option<Duration> {
+        let entry = self.take(key)?;
+        let millis_key = key.ends_with("_ms");
+        let value = match (&entry.value, &entry.origin) {
+            (toml::Value::Integer(ms), _) if millis_key => {
+                u64::try_from(*ms).ok().map(Duration::from_millis)
+            }
+            (toml::Value::String(text), origin) => match text.parse::<u64>() {
+                Ok(ms) if millis_key && matches!(origin, Origin::Env(_) | Origin::Flag) => {
+                    Some(Duration::from_millis(ms))
+                }
+                _ => parse_duration(text),
+            },
+            _ => None,
+        };
+        match value {
+            Some(value) if (min..=max).contains(&value) => Some(value),
+            Some(_) => {
+                self.issue(key, "out_of_range", entry.origin);
+                None
+            }
+            None => {
+                self.issue(key, "expected_duration", entry.origin);
+                None
+            }
+        }
+    }
+    fn float(&mut self, key: &str, default: f64, min: f64, max: f64) -> f64 {
+        let Some(entry) = self.take(key) else {
+            return default;
+        };
+        let value = match (&entry.value, &entry.origin) {
+            (toml::Value::Float(value), _) => Some(*value),
+            (toml::Value::Integer(value), _) => Some(*value as f64),
+            (toml::Value::String(value), Origin::Env(_) | Origin::Flag) => value.parse().ok(),
+            _ => None,
+        }
+        .filter(|v: &f64| v.is_finite());
+        match value {
+            Some(value) if (min..=max).contains(&value) => value,
+            Some(_) => {
+                self.issue(key, "out_of_range", entry.origin);
+                default
+            }
+            None => {
+                self.issue(key, "expected_number", entry.origin);
+                default
+            }
+        }
+    }
+    /// The layer that supplied `key`, if present.
+    fn origin_of(&self, key: &str) -> Option<Origin> {
+        self.entries.get(key).map(|e| e.origin.clone())
     }
     fn list(&mut self, key: &str, max: usize) -> Vec<(String, Origin)> {
         let Some(entry) = self.take(key) else {
@@ -459,6 +585,41 @@ fn valid_app_id(id: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
+fn valid_instance_id(id: &str) -> bool {
+    (1..=128).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+}
+fn valid_version(version: &str) -> bool {
+    (1..=64).contains(&version.len()) && version.bytes().all(|b| b.is_ascii_graphic())
+}
+/// Hostname plus process id, as `<host>-<pid>`. The host name comes from
+/// `HOSTNAME`, then `/proc/sys/kernel/hostname` and `/etc/hostname`, else
+/// `localhost`; characters outside `[A-Za-z0-9.-]` are dropped.
+pub fn default_instance_id(hostname: Option<&str>) -> String {
+    let read = |path: &str| {
+        let file = std::fs::File::open(path).ok()?;
+        let mut text = String::new();
+        file.take(256).read_to_string(&mut text).ok()?;
+        Some(text)
+    };
+    let host = hostname
+        .map(str::to_owned)
+        .or_else(|| read("/proc/sys/kernel/hostname"))
+        .or_else(|| read("/etc/hostname"))
+        .unwrap_or_default();
+    let mut host: String = host
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+        .take(100)
+        .collect();
+    if host.is_empty() {
+        host = "localhost".to_owned();
+    }
+    format!("{host}-{}", std::process::id())
+}
 /// Module names are section names, route segments and migration keys.
 pub fn valid_module_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
@@ -495,6 +656,30 @@ struct Layers {
     modules: BTreeMap<String, (toml::Table, BTreeMap<String, Origin>)>,
 }
 impl Layers {
+    /// Record the file's `table` at `path`, descending into the nested
+    /// tables the kernel knows; any other table is a value.
+    fn flatten(&mut self, path: &str, table: toml::Table, issues: &mut Vec<ConfigIssue>) {
+        self.sections.entry(path.to_owned()).or_default();
+        for (key, value) in table {
+            let child = format!("{path}.{key}");
+            match value {
+                toml::Value::Table(table) if path == "jobs.queues" => {
+                    if jobs::valid_queue_name(&key) {
+                        self.flatten(&child, table, issues);
+                    } else {
+                        issues.push(ConfigIssue::new(child, "invalid_queue_name", Origin::File));
+                    }
+                }
+                toml::Value::Table(table) if is_subtable(&child) => {
+                    self.flatten(&child, table, issues);
+                }
+                _ if is_subtable(&child) || path == "jobs.queues" => {
+                    issues.push(ConfigIssue::new(child, "expected_table", Origin::File));
+                }
+                value => self.set_entry(path, key, value, Origin::File),
+            }
+        }
+    }
     fn set_entry(&mut self, section: &str, key: String, value: toml::Value, origin: Origin) {
         self.sections
             .entry(section.to_owned())
@@ -518,15 +703,16 @@ impl Layers {
                 table.insert(key.clone(), module_value(&value));
                 overridden.insert(key.clone(), origin);
             }
-            [http, cors, key] if http == "http" && cors == "cors" && !key.is_empty() => {
-                self.set_entry("http.cors", key.clone(), toml::Value::String(value), origin);
-            }
-            [section, key]
-                if SECTIONS.contains(&section.as_str())
-                    && section != "modules"
-                    && !key.is_empty() =>
-            {
-                self.set_entry(section, key.clone(), toml::Value::String(value), origin);
+            [section @ .., key] if !key.is_empty() && !section.is_empty() => {
+                let queue = matches!(section, [jobs, queues, name]
+                    if jobs == "jobs" && queues == "queues" && jobs::valid_queue_name(name));
+                let section = section.join(".");
+                let top = SECTIONS.contains(&section.as_str()) && section != "modules";
+                if top || queue || is_subtable(&section) {
+                    self.set_entry(&section, key.clone(), toml::Value::String(value), origin);
+                } else {
+                    issues.push(ConfigIssue::new(dotted, "unknown_key", origin));
+                }
             }
             _ => issues.push(ConfigIssue::new(dotted, "unknown_key", origin)),
         }
@@ -663,26 +849,7 @@ fn parse_parts(
                     }
                 }
                 section if SECTIONS.contains(&section) => {
-                    for (key, value) in table {
-                        let (target, key, value) = match (section, key.as_str(), value) {
-                            ("http", "cors", toml::Value::Table(cors)) => {
-                                for (key, value) in cors {
-                                    layers.set_entry("http.cors", key, value, Origin::File);
-                                }
-                                continue;
-                            }
-                            ("http", "cors", _) => {
-                                issues.push(ConfigIssue::new(
-                                    "http.cors",
-                                    "expected_table",
-                                    Origin::File,
-                                ));
-                                continue;
-                            }
-                            (_, _, value) => (section, key, value),
-                        };
-                        layers.set_entry(target, key, value, Origin::File);
-                    }
+                    layers.flatten(section, table, &mut issues);
                 }
                 _ => issues.push(ConfigIssue::new(name, "unknown_section", Origin::File)),
             }
@@ -762,6 +929,22 @@ fn build(
         }
         None => id.clone(),
     };
+    let instance_id = match r.string("instance_id") {
+        Some((value, _)) if valid_instance_id(&value) => value,
+        Some((_, origin)) => {
+            r.issue("instance_id", "invalid_instance_id", origin);
+            String::new()
+        }
+        None => default_instance_id(resolver.env.get("HOSTNAME").map(String::as_str)),
+    };
+    let version = match r.string("version") {
+        Some((value, _)) if valid_version(&value) => Some(value),
+        Some((_, origin)) => {
+            r.issue("version", "invalid_version", origin);
+            None
+        }
+        None => None,
+    };
     r.finish();
 
     // [http] and [http.cors]
@@ -829,17 +1012,17 @@ fn build(
         merezha_postgres::limits::POOL_SIZE.0 as u64,
         merezha_postgres::limits::POOL_SIZE.1 as u64,
     ) as usize;
-    let connect_timeout = r.millis(
+    let connect_timeout = r.duration(
         "connect_timeout_ms",
         defaults.connect_timeout,
         merezha_postgres::limits::CONNECT_TIMEOUT,
     );
-    let acquire_timeout = r.millis(
+    let acquire_timeout = r.duration(
         "acquire_timeout_ms",
         defaults.acquire_timeout,
         merezha_postgres::limits::ACQUIRE_TIMEOUT,
     );
-    let statement_timeout = r.millis(
+    let statement_timeout = r.duration(
         "statement_timeout_ms",
         defaults.statement_timeout,
         merezha_postgres::limits::STATEMENT_TIMEOUT,
@@ -878,36 +1061,31 @@ fn build(
     let manifest = r.required("manifest", manifest.clone(), manifest.is_some());
     r.finish();
 
-    // [application], optional as a whole
-    let (mut r, present) = reader(layers, "application", issues);
-    let application = if present {
+    // [application], optional as a whole; any of its tables enables it.
+    let present = layers
+        .sections
+        .keys()
+        .any(|k| k == "application" || k.starts_with("application."));
+    let (mut r, _) = reader(layers, "application", issues);
+    let path = if present {
         let path = r.path("path", base_dir);
-        let path = r.required("path", path.clone(), path.is_some());
-        path.map(|path| ApplicationConfig { path })
+        r.required("path", path.clone(), path.is_some())
     } else {
         None
     };
     r.finish();
+    let extensions = jobs::application_extensions(layers, issues);
+    let application = path.map(|path| ApplicationConfig {
+        path,
+        projections: extensions.projections,
+        reactors: extensions.reactors,
+        background: extensions.background,
+        append: extensions.append,
+    });
 
-    // [telemetry]
-    let (mut r, _) = reader(layers, "telemetry", issues);
-    let log_level = r.choice(
-        "log_level",
-        LogLevel::Info,
-        &[
-            ("error", LogLevel::Error),
-            ("warn", LogLevel::Warn),
-            ("info", LogLevel::Info),
-            ("debug", LogLevel::Debug),
-            ("trace", LogLevel::Trace),
-        ],
-    );
-    let format = r.choice(
-        "format",
-        LogFormat::Json,
-        &[("json", LogFormat::Json), ("text", LogFormat::Text)],
-    );
-    r.finish();
+    let jobs = jobs::jobs(layers, issues);
+
+    let telemetry = telemetry::telemetry(layers, base_dir, resolver, issues);
 
     // Sections created only by overrides for unknown names were already
     // reported; anything left is a nested table the schema does not know.
@@ -940,6 +1118,8 @@ fn build(
             app: AppConfig {
                 id: id?,
                 name: name?,
+                instance_id,
+                version,
             },
             http: HttpConfig {
                 listen: listen?.0,
@@ -953,8 +1133,9 @@ fn build(
                 manifest: manifest?,
             },
             application,
+            jobs,
             modules: modules.clone(),
-            telemetry: TelemetryConfig { log_level, format },
+            telemetry,
         })
     })();
     (config, modules)

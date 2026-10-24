@@ -84,8 +84,8 @@ impl ErrorReply {
     pub fn failure(&self) -> &Failure {
         &self.failure
     }
-    /// The JSON body bytes. Without details they equal
-    /// `{"error":{"code":..,"classification":..}}`.
+    /// The JSON body bytes. Without details they are byte for byte the
+    /// kernel's earlier `{"error":{"classification":..,"code":..}}`.
     pub fn body(&self) -> Vec<u8> {
         let body = json!({ "error": ErrorBody {
             code: &self.failure.code,
@@ -683,9 +683,14 @@ mod tests {
         let plain = error_response(&Failure::permanent("not_found"));
         assert_eq!(plain.status(), 404);
         let bytes = axum::body::to_bytes(plain.into_body(), 1024).await.unwrap();
+        // Byte for byte what `json!({"error": failure})` always produced.
         assert_eq!(
             &bytes[..],
-            br#"{"error":{"code":"not_found","classification":"permanent"}}"#
+            serde_json::to_vec(&json!({"error": Failure::permanent("not_found")})).unwrap()
+        );
+        assert_eq!(
+            &bytes[..],
+            br#"{"error":{"classification":"permanent","code":"not_found"}}"#
         );
         let invalid = ErrorReply::new(Failure::permanent("validation_failed"))
             .details(vec![
