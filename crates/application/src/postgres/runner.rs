@@ -14,9 +14,11 @@ use crate::{
     Application,
     application::{ProjectionState, check_value},
     config::{MAX_STATE_BYTES, Projection},
+    instrument::{ProjectionRun, RunFailure},
 };
 use merezha_domain::{Failure, Operation, Reply, StoredEvent, compatible_json};
 use merezha_postgres::DetachedClient;
+use merezha_telemetry::{names::dispatch::Trigger, propagation::StoredContext};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -238,6 +240,38 @@ impl Shared {
     }
     pub(crate) fn publish(&self) {
         self.published.send_modify(|n| *n = n.wrapping_add(1));
+    }
+}
+/// The sources of `merezha.projection.lock.held` and `.contended` (TE
+/// §1.3): one series per configured projection, live and rebuild locks
+/// together.
+impl crate::instrument::LockSource for Shared {
+    fn held(&self) -> Vec<(String, f64)> {
+        let mut held = Vec::new();
+        for ((name, _), lane) in &self.lanes {
+            let longest = lane
+                .held
+                .iter()
+                .filter_map(|slot| *slot.lock().unwrap_or_else(|e| e.into_inner()))
+                .map(|since| since.elapsed().as_secs_f64())
+                .reduce(f64::max);
+            if let Some(seconds) = longest {
+                held.push((name.clone(), seconds));
+            }
+        }
+        held
+    }
+    fn contended(&self) -> Vec<(String, u64)> {
+        self.lanes
+            .iter()
+            .map(|((name, _), lane)| {
+                (
+                    name.clone(),
+                    lane.contended[0].load(Ordering::Relaxed)
+                        + lane.contended[1].load(Ordering::Relaxed),
+                )
+            })
+            .collect()
     }
 }
 /// Clears the lock-held time when the run ends, however it ends.
@@ -486,8 +520,9 @@ impl Session<'_> {
         })?;
         unsigned(row.get(0))
     }
-    /// At most `limit` events after `after`, contiguous.
-    fn feed(&self, after: u64, limit: u64) -> Result<Vec<StoredEvent>, Failure> {
+    /// At most `limit` events after `after`, contiguous, with their stored
+    /// trace contexts for span links.
+    fn feed(&self, after: u64, limit: u64) -> Result<Feed, Failure> {
         let from = signed(after)?;
         let count = signed(limit)?;
         let rows = self.store.step(self.bounds, async {
@@ -506,7 +541,7 @@ impl Session<'_> {
         {
             return Err(Failure::transient("event_feed_gap"));
         }
-        Ok(events)
+        Ok((events, PostgresStore::traces(&rows)))
     }
     /// One guest `project` call within the run's bounds.
     fn project(
@@ -516,25 +551,27 @@ impl Session<'_> {
         state: serde_json::Value,
         events: Vec<StoredEvent>,
         live: bool,
-    ) -> Result<serde_json::Value, Failure> {
+    ) -> Result<serde_json::Value, RunFailure> {
         let limits = &app.config().limits;
         let deadline = self
             .bounds
             .hard
             .min(Instant::now() + Duration::from_millis(limits.timeout_ms));
         let session = app.guest().session()?;
-        let reply = session.invoke_until(
-            projection.service.as_str(),
-            Operation::Project {
-                projection: projection.name.clone(),
-                state,
-                events,
-                live,
-            },
-            deadline,
-        )?;
+        let reply = session
+            .invoke_until(
+                projection.service.as_str(),
+                Operation::Project {
+                    projection: projection.name.clone(),
+                    state,
+                    events,
+                    live,
+                },
+                deadline,
+            )
+            .map_err(RunFailure::from_guest_call)?;
         let Reply::Projected { state } = reply else {
-            return Err(Failure::permanent("invalid_response"));
+            return Err(Failure::permanent("invalid_response").into());
         };
         check_value(&state, limits.max_state_bytes)?;
         Ok(state)
@@ -609,6 +646,16 @@ impl Pause {
     }
 }
 
+/// Feed events and their stored trace contexts.
+type Feed = (Vec<StoredEvent>, Vec<Option<StoredContext>>);
+/// A feed batch into the run's span: lag, links.
+fn record_batch(run: &mut ProjectionRun<'_>, feed: &Feed) {
+    run.batch(
+        feed.0.first().map(|e| (e.position, e.accepted_unix_ms)),
+        &feed.1,
+    );
+}
+
 /// Which head a live run works towards.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Until {
@@ -630,53 +677,37 @@ pub(crate) fn live(
     projection: &Projection,
     bounds: &Bounds,
     until: Until,
-) -> Result<Outcome, Failure> {
+) -> Result<Outcome, RunFailure> {
     let Some(mut session) = store.lock(bounds, projection, Kind::Live)? else {
         return Ok(Outcome::Contended);
     };
     let lane = store.shared.lane(projection)?;
-    let batch = app.config().limits.batch_size as u64;
     let mut row = session.row()?;
     let from = row.pair.checkpoint;
     note_warm(lane, projection, &row);
+    // A scheduler run or an explicit request: either way a root span per
+    // stretch of batches up to one target (TE §1.2).
+    let trigger = if bounds.background {
+        Trigger::Background
+    } else {
+        Trigger::Admin
+    };
     loop {
         let target = match until {
             Until::Head => session.head()?,
             Until::Position(position) => position,
         };
-        while row.pair.checkpoint < target {
-            if Instant::now() >= bounds.soft {
-                return match until {
-                    Until::Position(_) => Err(Failure::transient("timeout")),
-                    Until::Head => Ok(Outcome::Finished {
-                        pair: row.pair,
-                        behind: true,
-                    }),
-                };
-            }
-            let checkpoint = row.pair.checkpoint;
-            let live = checkpoint >= row.warm_position;
-            let mut limit = batch.min(target - checkpoint);
-            if !live {
-                limit = limit.min(row.warm_position - checkpoint);
-            }
-            let events = session.feed(checkpoint, limit)?;
-            let last = events.last().map_or(checkpoint, |e| e.position);
-            let state = session.project(app, projection, row.pair.state.clone(), events, live)?;
-            let pair = ProjectionState {
-                state,
-                checkpoint: last,
+        app.instruments().observe_head(target);
+        let mut run = app
+            .instruments()
+            .catch_up(projection.name.as_str(), trigger);
+        let stretch = advance(app, &mut session, projection, &mut row, target, &mut run);
+        run.finish(stretch.as_ref().map(|_| ()));
+        if let Some(early) = stretch? {
+            return match until {
+                Until::Position(_) => Err(Failure::transient("timeout").into()),
+                Until::Head => Ok(early),
             };
-            match session.commit(row.row_revision, &pair) {
-                Ok(row_revision) => {
-                    row.row_revision = row_revision;
-                    row.pair = pair;
-                    store.shared.publish();
-                    note_warm(lane, projection, &row);
-                }
-                Err(failure) if failure.code == "projection_conflict" => row = session.row()?,
-                Err(failure) => return Err(failure),
-            }
         }
         if let Until::Position(_) = until {
             break;
@@ -694,8 +725,9 @@ pub(crate) fn live(
     }
     let head = session.head()?;
     if row.pair.checkpoint > from {
-        tracing::debug!(
-            event = "projection.caught_up",
+        merezha_telemetry::event!(
+            DEBUG,
+            "projection.caught_up",
             projection = projection.name.as_str(),
             from,
             to = row.pair.checkpoint
@@ -706,11 +738,66 @@ pub(crate) fn live(
         pair: row.pair,
     })
 }
+/// Batches of a live run up to `target`, inside `run`'s span. `Some` when
+/// the run's soft deadline stopped it first, with the pair it reached.
+fn advance(
+    app: &Application,
+    session: &mut Session<'_>,
+    projection: &Projection,
+    row: &mut Row,
+    target: u64,
+    run: &mut ProjectionRun<'_>,
+) -> Result<Option<Outcome>, RunFailure> {
+    let store = session.store;
+    let lane = store.shared.lane(projection)?;
+    let batch = app.config().limits.batch_size as u64;
+    while row.pair.checkpoint < target {
+        if Instant::now() >= session.bounds.soft {
+            return Ok(Some(Outcome::Finished {
+                pair: row.pair.clone(),
+                behind: true,
+            }));
+        }
+        let checkpoint = row.pair.checkpoint;
+        let live = checkpoint >= row.warm_position;
+        let mut limit = batch.min(target - checkpoint);
+        if !live {
+            limit = limit.min(row.warm_position - checkpoint);
+        }
+        let feed = session.feed(checkpoint, limit)?;
+        record_batch(run, &feed);
+        let span = run.span().clone();
+        let _entered = span.enter();
+        let events = feed.0;
+        let (count, last) = (
+            events.len(),
+            events.last().map_or(checkpoint, |e| e.position),
+        );
+        let state = session.project(app, projection, row.pair.state.clone(), events, live)?;
+        let pair = ProjectionState {
+            state,
+            checkpoint: last,
+        };
+        match session.commit(row.row_revision, &pair) {
+            Ok(row_revision) => {
+                row.row_revision = row_revision;
+                row.pair = pair;
+                store.shared.publish();
+                run.published(count, Some(last));
+                note_warm(lane, projection, row);
+            }
+            Err(failure) if failure.code == "projection_conflict" => *row = session.row()?,
+            Err(failure) => return Err(failure.into()),
+        }
+    }
+    Ok(None)
+}
 /// Record warmth, logging `projection.warmed` once per instance.
 fn note_warm(lane: &Lane, projection: &Projection, row: &Row) {
     if row.pair.checkpoint >= row.warm_position && !lane.warm.swap(true, Ordering::SeqCst) {
-        tracing::info!(
-            event = "projection.warmed",
+        merezha_telemetry::event!(
+            INFO,
+            "projection.warmed",
             projection = projection.name.as_str(),
             revision = projection.revision,
             checkpoint = row.pair.checkpoint
@@ -853,10 +940,26 @@ pub(crate) fn rebuild(
     store: &PostgresStore,
     projection: &Projection,
     bounds: &Bounds,
-) -> Result<Outcome, Failure> {
+) -> Result<Outcome, RunFailure> {
     let Some(mut session) = store.lock(bounds, projection, Kind::Rebuild)? else {
         return Ok(Outcome::Contended);
     };
+    let mut run = app
+        .instruments()
+        .catch_up(projection.name.as_str(), Trigger::Rebuild);
+    let result = rebuild_batches(app, &mut session, projection, bounds, &mut run);
+    run.finish(result.as_ref().map(|_| ()));
+    result
+}
+/// The batches and the swap of one rebuild run, inside `run`'s span.
+fn rebuild_batches(
+    app: &Application,
+    session: &mut Session<'_>,
+    projection: &Projection,
+    bounds: &Bounds,
+    run: &mut ProjectionRun<'_>,
+) -> Result<Outcome, RunFailure> {
+    let store = session.store;
     let batch = app.config().limits.batch_size as u64;
     loop {
         let Some(candidate) = session.candidate()? else {
@@ -873,6 +976,7 @@ pub(crate) fn rebuild(
             };
             #[cfg(test)]
             super::tests::crash_cut("rebuild_after_swap");
+            run.published(0, Some(pair.checkpoint));
             store.shared.publish();
             store.shared.lane(projection)?.live.notify_one();
             return Ok(Outcome::Swapped(pair));
@@ -887,12 +991,19 @@ pub(crate) fn rebuild(
             });
         }
         let limit = batch.min(candidate.target - candidate.checkpoint);
-        let events = session.feed(candidate.checkpoint, limit)?;
-        let last = events.last().map_or(candidate.checkpoint, |e| e.position);
+        let feed = session.feed(candidate.checkpoint, limit)?;
+        record_batch(run, &feed);
+        let span = run.span().clone();
+        let _entered = span.enter();
+        let events = feed.0;
+        let (count, last) = (
+            events.len(),
+            events.last().map_or(candidate.checkpoint, |e| e.position),
+        );
         let state = match session.project(app, projection, candidate.state, events, false) {
             Ok(state) => state,
             Err(failure) => {
-                session.fail_candidate(candidate.row_revision, &failure)?;
+                session.fail_candidate(candidate.row_revision, &failure.failure)?;
                 return Err(failure);
             }
         };
@@ -902,6 +1013,7 @@ pub(crate) fn rebuild(
         {
             return Ok(Outcome::Idle);
         }
+        run.published(count, None);
     }
 }
 
@@ -950,7 +1062,8 @@ impl PostgresStore {
             if Instant::now() >= next_try {
                 next_try = Instant::now() + RETRY_LOCK;
                 if let Ok(_slot) = self.shared.explicit.clone().try_acquire_owned() {
-                    let ran = live(app, self, projection, &bounds, Until::Position(target))?;
+                    let ran = live(app, self, projection, &bounds, Until::Position(target))
+                        .map_err(Failure::from)?;
                     if let Outcome::Finished { pair, .. } = ran {
                         return Ok(pair);
                     }
@@ -986,7 +1099,7 @@ impl PostgresStore {
             if Instant::now() >= next_try {
                 next_try = Instant::now() + RETRY_LOCK;
                 if let Ok(_slot) = self.shared.explicit.clone().try_acquire_owned() {
-                    match rebuild(app, self, projection, &bounds)? {
+                    match rebuild(app, self, projection, &bounds).map_err(Failure::from)? {
                         Outcome::Swapped(pair) => return Ok(pair),
                         Outcome::Finished { .. } => return Err(Failure::transient("timeout")),
                         Outcome::Idle | Outcome::Contended => {}

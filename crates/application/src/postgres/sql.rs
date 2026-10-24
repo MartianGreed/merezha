@@ -49,14 +49,15 @@ pub const LOAD: Statement = Statement::new(
         " FROM merezha_app.events WHERE stream = $1 ORDER BY version LIMIT $2"
     ),
 );
-/// The feed after a position.
+/// The feed after a position, with each event's stored trace context
+/// (host-only, for span links; never part of a `StoredEvent`).
 pub const READ_ALL: Statement = Statement::new(
     "app.events.read_all",
     "SELECT merezha_app.events",
     concat!(
         "SELECT ",
         event_columns!(),
-        " FROM merezha_app.events WHERE position > $1 ORDER BY position LIMIT $2"
+        ", trace_parent, trace_state FROM merezha_app.events WHERE position > $1 ORDER BY position LIMIT $2"
     ),
 );
 

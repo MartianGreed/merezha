@@ -240,56 +240,64 @@ async fn dispatch(state: Routes, request: Request, action: Action) -> Response {
         Ok(Err(_)) => return failure_response(Failure::permanent("input_limit")),
         Err(_) => return failure_response(Failure::transient("timeout")),
     };
-    let result = tokio::task::spawn_blocking(move || -> Result<(StatusCode, Value), Failure> {
-        let input = std::str::from_utf8(&bytes).map_err(|_| Failure::permanent("invalid_input"))?;
-        let encoded = |value: Result<Value, serde_json::Error>| {
-            value.map_err(|_| Failure::permanent("serialization_failed"))
-        };
-        let ok = StatusCode::OK;
-        Ok(match action {
-            Action::Command => (
-                ok,
-                encoded(serde_json::to_value(
-                    admission.command(merezha_domain::decode(input)?)?,
-                ))?,
-            ),
-            Action::Query => (
-                ok,
-                encoded(serde_json::to_value(
-                    admission.query(merezha_domain::decode(input)?)?,
-                ))?,
-            ),
-            Action::Project { name, rebuild } => (
-                ok,
-                encoded(serde_json::to_value(admission.project(&name, rebuild)?))?,
-            ),
-            Action::RequestRebuild { name } => {
-                let requested =
-                    admission.request_rebuild(&name, resume(input)?, requested_by.as_deref())?;
-                (
-                    StatusCode::ACCEPTED,
-                    json!({"rebuild": encoded(serde_json::to_value(requested))?}),
-                )
-            }
-            Action::AbandonRebuild { name } => {
-                admission.abandon_rebuild(&name)?;
-                (StatusCode::NO_CONTENT, Value::Null)
-            }
-            Action::Projections => (ok, encoded(serde_json::to_value(admission.projections()?))?),
-            Action::Projection { name } => (
-                ok,
-                encoded(serde_json::to_value(admission.projection(&name)?))?,
-            ),
-            Action::DeleteRevision { name, revision } => {
-                let revision = revision
-                    .parse()
-                    .map_err(|_| Failure::permanent("projection_not_found"))?;
-                admission.delete_revision(&name, revision)?;
-                (StatusCode::NO_CONTENT, Value::Null)
-            }
-            Action::Status => (ok, encoded(serde_json::to_value(admission.status()?))?),
-        })
-    })
+    let result = merezha_telemetry::spawn_blocking_in_span(
+        move || -> Result<(StatusCode, Value), Failure> {
+            let input =
+                std::str::from_utf8(&bytes).map_err(|_| Failure::permanent("invalid_input"))?;
+            let encoded = |value: Result<Value, serde_json::Error>| {
+                value.map_err(|_| Failure::permanent("serialization_failed"))
+            };
+            let ok = StatusCode::OK;
+            Ok(match action {
+                Action::Command => (
+                    ok,
+                    encoded(serde_json::to_value(
+                        admission.command(merezha_domain::decode(&with_host_ids(input)?)?)?,
+                    ))?,
+                ),
+                Action::Query => (
+                    ok,
+                    encoded(serde_json::to_value(
+                        admission.query(merezha_domain::decode(&with_host_ids(input)?)?)?,
+                    ))?,
+                ),
+                Action::Project { name, rebuild } => (
+                    ok,
+                    encoded(serde_json::to_value(admission.project(&name, rebuild)?))?,
+                ),
+                Action::RequestRebuild { name } => {
+                    let requested = admission.request_rebuild(
+                        &name,
+                        resume(input)?,
+                        requested_by.as_deref(),
+                    )?;
+                    (
+                        StatusCode::ACCEPTED,
+                        json!({"rebuild": encoded(serde_json::to_value(requested))?}),
+                    )
+                }
+                Action::AbandonRebuild { name } => {
+                    admission.abandon_rebuild(&name)?;
+                    (StatusCode::NO_CONTENT, Value::Null)
+                }
+                Action::Projections => {
+                    (ok, encoded(serde_json::to_value(admission.projections()?))?)
+                }
+                Action::Projection { name } => (
+                    ok,
+                    encoded(serde_json::to_value(admission.projection(&name)?))?,
+                ),
+                Action::DeleteRevision { name, revision } => {
+                    let revision = revision
+                        .parse()
+                        .map_err(|_| Failure::permanent("projection_not_found"))?;
+                    admission.delete_revision(&name, revision)?;
+                    (StatusCode::NO_CONTENT, Value::Null)
+                }
+                Action::Status => (ok, encoded(serde_json::to_value(admission.status()?))?),
+            })
+        },
+    )
     .await;
     match result {
         Ok(Ok((StatusCode::NO_CONTENT, _))) => StatusCode::NO_CONTENT.into_response(),
@@ -297,6 +305,45 @@ async fn dispatch(state: Routes, request: Request, action: Action) -> Response {
         Ok(Err(error)) => failure_response(error),
         Err(_) => failure_response(Failure::transient("internal")),
     }
+}
+/// Fill the ids a command or query body leaves out (AP4, TE §2.2) and
+/// return the body to decode: a missing `metadata` object, `message_id`
+/// (128 random bits in hex) or `correlation_id` (the current trace id as 32
+/// lowercase hex, or 128 random bits when no trace is recorded).
+/// Caller-supplied ids are kept. Fails `input_limit` past the wire limit
+/// and `validation_failed` for a body that is not a JSON object.
+pub fn with_host_ids(input: &str) -> Result<String, Failure> {
+    if input.len() > merezha_domain::MAX_WIRE_BYTES {
+        return Err(Failure::permanent("input_limit"));
+    }
+    let invalid = || Failure::permanent("validation_failed");
+    let mut body: Value = serde_json::from_str(input).map_err(|_| invalid())?;
+    let Value::Object(fields) = &mut body else {
+        return Err(invalid());
+    };
+    let metadata = fields
+        .entry("metadata")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Value::Object(metadata) = metadata {
+        if !metadata.contains_key("message_id") {
+            metadata.insert("message_id".into(), Value::String(random_id()?));
+        }
+        if !metadata.contains_key("correlation_id") {
+            let correlation = match merezha_telemetry::propagation::StoredContext::current() {
+                Some(context) => context.span_context().trace_id().to_string(),
+                None => random_id()?,
+            };
+            metadata.insert("correlation_id".into(), Value::String(correlation));
+        }
+    }
+    Ok(body.to_string())
+}
+/// 128 bits from the CSPRNG as 32 lowercase hex digits.
+fn random_id() -> Result<String, Failure> {
+    use merezha_platform::Random;
+    let mut bytes = [0u8; 16];
+    merezha_platform::OsRandom.fill(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 fn failure_response(error: Failure) -> Response {
     let status = match error.code.as_str() {

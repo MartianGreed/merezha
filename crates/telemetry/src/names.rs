@@ -1723,6 +1723,152 @@ pub mod db {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Runtime and application dispatch (TE-T3): closed attribute values, span
+// keys and typed constructors. Kept in its own module so the edge (T2) and
+// PostgreSQL (T4) rows evolve beside it.
+// ---------------------------------------------------------------------------
+
+/// Names, closed values and constructors of the runtime and application
+/// boundaries: guest calls (`guest {service} {operation}`), raw pipelines,
+/// command and query dispatch and projection catch-up (TE §1.2, §1.3).
+pub mod dispatch {
+    use super::{KeyValue, key};
+    use std::sync::Arc;
+
+    /// The value recorded for a tag, name or service the configuration does
+    /// not declare (TE §1.4 rule 4): unknown names never reach a metric.
+    pub const UNKNOWN: &str = "_unknown";
+
+    /// Span keys of a guest call. Every `merezha.guest.*` key is allowlisted
+    /// for spans (§1.5); none of these is a metric attribute.
+    pub const GUEST_FUEL_CONSUMED: &str = "merezha.guest.fuel.consumed";
+    pub const GUEST_FUEL_LIMIT: &str = "merezha.guest.fuel.limit";
+    pub const GUEST_MEMORY_PEAK: &str = "merezha.guest.memory.peak";
+    pub const GUEST_MEMORY_LIMIT: &str = "merezha.guest.memory.limit";
+    pub const GUEST_INPUT_BYTES: &str = "merezha.guest.input.bytes";
+    pub const GUEST_OUTPUT_BYTES: &str = "merezha.guest.output.bytes";
+    /// The pipeline id on a `pipeline {id}` span.
+    pub const GUEST_PIPELINE: &str = "merezha.guest.pipeline";
+
+    /// The `{operation}` of `guest {service} {operation}` and the
+    /// `merezha.guest.operation` values.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum GuestOperation {
+        Validate,
+        Decide,
+        Project,
+        Query,
+        React,
+        /// The raw runtime transport and pipelines.
+        Raw,
+    }
+    impl GuestOperation {
+        pub const ALL: [Self; 6] = [
+            Self::Validate,
+            Self::Decide,
+            Self::Project,
+            Self::Query,
+            Self::React,
+            Self::Raw,
+        ];
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Validate => "validate",
+                Self::Decide => "decide",
+                Self::Project => "project",
+                Self::Query => "query",
+                Self::React => "react",
+                Self::Raw => "raw",
+            }
+        }
+    }
+
+    /// `merezha.guest.outcome` values: `ok` plus the runtime's
+    /// `Error::code()` set (§1.3).
+    pub const GUEST_OUTCOMES: [&str; 12] = [
+        "ok",
+        "guest_error",
+        "invalid_input",
+        "input_limit",
+        "output_limit",
+        "fuel_exhausted",
+        "memory_limit",
+        "timeout",
+        "trap",
+        "overloaded",
+        "internal",
+        "not_found",
+    ];
+
+    /// `merezha.projection.trigger` values.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Trigger {
+        /// Post-commit catch-up inside the command's request.
+        Commit,
+        Interval,
+        /// A scheduler run (local commit, notification or interval wake).
+        Background,
+        /// An explicit catch-up request.
+        Admin,
+        Rebuild,
+    }
+    impl Trigger {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Commit => "commit",
+                Self::Interval => "interval",
+                Self::Background => "background",
+                Self::Admin => "admin",
+                Self::Rebuild => "rebuild",
+            }
+        }
+    }
+
+    /// Most distinct source traces a projection or reactor span links to
+    /// (TE §2.2).
+    pub const MAX_SOURCE_LINKS: usize = 8;
+
+    /// A configured service id. Pass a shared `Arc<str>` built once (at
+    /// catalog load) to record without allocating.
+    pub fn guest_service(service: impl Into<Arc<str>>) -> KeyValue {
+        KeyValue::new(key::GUEST_SERVICE, service.into())
+    }
+    pub fn guest_operation(operation: GuestOperation) -> KeyValue {
+        KeyValue::new(key::GUEST_OPERATION, operation.as_str())
+    }
+    /// `outcome` must be one of [`GUEST_OUTCOMES`]; anything else records
+    /// `internal`.
+    pub fn guest_outcome(outcome: &'static str) -> KeyValue {
+        let value = if GUEST_OUTCOMES.contains(&outcome) {
+            outcome
+        } else {
+            "internal"
+        };
+        KeyValue::new(key::GUEST_OUTCOME, value)
+    }
+    /// A configured command tag, or [`UNKNOWN`].
+    pub fn command_tag(tag: impl Into<Arc<str>>) -> KeyValue {
+        KeyValue::new(key::COMMAND_TAG, tag.into())
+    }
+    /// A configured query tag, or [`UNKNOWN`].
+    pub fn query_tag(tag: impl Into<Arc<str>>) -> KeyValue {
+        KeyValue::new(key::QUERY_TAG, tag.into())
+    }
+    /// A configured projection name.
+    pub fn projection_name(name: impl Into<Arc<str>>) -> KeyValue {
+        KeyValue::new(key::PROJECTION_NAME, name.into())
+    }
+    pub fn projection_trigger(trigger: Trigger) -> KeyValue {
+        KeyValue::new(key::PROJECTION_TRIGGER, trigger.as_str())
+    }
+    /// The attribute of a link from a projection or reactor span to the
+    /// trace of a source event (`merezha.link.reason=source_event`).
+    pub fn source_event_link() -> KeyValue {
+        KeyValue::new(key::LINK_REASON, "source_event")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1947,5 +2093,36 @@ mod tests {
             attr::signal(TelemetrySignal::Stderr).value.as_str(),
             "stderr"
         );
+    }
+
+    #[test]
+    fn dispatch_keys_and_values_follow_the_catalog() {
+        use dispatch::*;
+        for key in [
+            GUEST_FUEL_CONSUMED,
+            GUEST_FUEL_LIMIT,
+            GUEST_MEMORY_PEAK,
+            GUEST_MEMORY_LIMIT,
+            GUEST_INPUT_BYTES,
+            GUEST_OUTPUT_BYTES,
+            GUEST_PIPELINE,
+            key::GUEST_ERROR_CODE,
+        ] {
+            assert!(attribute(key).unwrap().span, "{key}");
+        }
+        // The exact guest error code is a span attribute only (§1.4 rule 3).
+        assert!(!attribute(key::GUEST_ERROR_CODE).unwrap().metric);
+        assert_eq!(guest_outcome("not_a_code").value.as_str(), "internal");
+        assert_eq!(
+            guest_outcome("fuel_exhausted").value.as_str(),
+            "fuel_exhausted"
+        );
+        assert_eq!(
+            metric::GUEST_INVOCATION_DURATION.attributes,
+            [key::GUEST_SERVICE, key::GUEST_OPERATION, key::GUEST_OUTCOME]
+        );
+        assert_eq!(source_event_link().key.as_str(), key::LINK_REASON);
+        let operations: BTreeSet<_> = GuestOperation::ALL.iter().map(|o| o.as_str()).collect();
+        assert_eq!(operations.len(), 6);
     }
 }

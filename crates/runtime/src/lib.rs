@@ -2,9 +2,21 @@
 //!
 //! [`Runtime::load`] validates the entire catalog before accepting work.
 //! Prepare an invocation before receiving an HTTP body to reserve admission.
+//!
+//! Guests get no telemetry API; the host observes them from outside (TE
+//! §2.4). Every guest call runs in a `guest {service} {operation}` span
+//! with fuel, peak memory, input and output bytes, the outcome and the
+//! catalog generation, and feeds the `merezha.guest.*` instruments built
+//! from the [`Meters`] given to [`Runtime::load_with_meters`].
 mod bounded;
 mod execution;
 pub mod manifest;
+mod metrics;
+
+use merezha_telemetry::Meters;
+pub use merezha_telemetry::names::dispatch::GuestOperation;
+pub use metrics::SCOPE;
+use metrics::{Labels, Metrics, PipelineLabels};
 
 use execution::{StoreState, Ticker, create_store, handle};
 use manifest::{Limits, MAX_COMPONENT_BYTES, MAX_MANIFEST_BYTES, MAX_REGISTRY_BYTES, Manifest};
@@ -16,7 +28,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -70,12 +82,17 @@ impl std::error::Error for Error {}
 struct Service {
     pre: InstancePre<StoreState>,
     function: ComponentExportIndex,
+    labels: Labels,
+}
+struct Pipeline {
+    steps: Vec<String>,
+    labels: PipelineLabels,
 }
 struct Registry {
     generation: u64,
     limits: Limits,
     services: BTreeMap<String, Service>,
-    pipelines: BTreeMap<String, Vec<String>>,
+    pipelines: BTreeMap<String, Pipeline>,
 }
 struct Inner {
     engine: Engine,
@@ -85,6 +102,10 @@ struct Inner {
     active: AtomicUsize,
     /// The least `max_concurrent_invocations` a reload may install.
     floor: AtomicUsize,
+    /// The active generation, read by the `merezha.catalog.generation`
+    /// gauge without touching the registry lock.
+    generation: Arc<AtomicU64>,
+    metrics: Metrics,
     _ticker: Ticker,
 }
 /// Clones share the current catalog and admission counter.
@@ -97,30 +118,50 @@ pub struct Session {
     registry: Arc<Registry>,
 }
 impl Session {
+    /// A raw call ([`GuestOperation::Raw`]) bounded by `deadline` too.
     pub fn invoke_service_until(
         &self,
         id: &str,
         input: &str,
         deadline: Instant,
     ) -> Result<Output, Error> {
+        self.invoke_operation_until(id, GuestOperation::Raw, input, deadline)
+    }
+    /// Call service `id` for `operation` (the span's and the metrics'
+    /// `merezha.guest.operation`), bounded by the generation's timeout and
+    /// by `deadline`.
+    pub fn invoke_operation_until(
+        &self,
+        id: &str,
+        operation: GuestOperation,
+        input: &str,
+        deadline: Instant,
+    ) -> Result<Output, Error> {
         if !self.registry.services.contains_key(id) {
+            self.runtime.0.metrics.refused(
+                None,
+                self.registry.generation,
+                operation,
+                Error::NotFound,
+            );
             return Err(Error::NotFound);
         }
-        let mut invocation = self
-            .runtime
-            .prepare(Arc::clone(&self.registry), vec![id.to_owned()])?;
+        let mut invocation = self.runtime.prepare(
+            Arc::clone(&self.registry),
+            vec![id.to_owned()],
+            operation,
+            None,
+        )?;
         invocation.deadline = invocation.deadline.min(deadline);
         invocation.run(input)
     }
     pub fn invoke_service(&self, id: &str, input: &str) -> Result<Output, Error> {
-        if !self.registry.services.contains_key(id) {
-            return Err(Error::NotFound);
-        }
-        self.runtime
-            .prepare(Arc::clone(&self.registry), vec![id.to_owned()])?
-            .run(input)
+        self.invoke_operation_until(id, GuestOperation::Raw, input, Instant::now() + MAX_WAIT)
     }
 }
+/// Longer than any generation's `timeout_ms`: the generation's own deadline
+/// always comes first.
+const MAX_WAIT: Duration = Duration::from_secs(24 * 3600);
 #[derive(Debug, Serialize)]
 pub struct Catalog {
     pub generation: u64,
@@ -131,6 +172,9 @@ pub struct Catalog {
 pub struct Output {
     pub generation: u64,
     pub output: String,
+    /// Fuel the whole invocation consumed: the limit minus what remained,
+    /// summed over a pipeline's steps, which share one budget.
+    pub fuel_consumed: u64,
 }
 
 /// An admitted invocation owns a stable registry snapshot and a deadline.
@@ -140,6 +184,9 @@ pub struct Invocation {
     registry: Arc<Registry>,
     steps: Vec<String>,
     deadline: Instant,
+    operation: GuestOperation,
+    /// The pipeline's labels, for the `pipeline {id}` span around the steps.
+    pipeline: Option<PipelineLabels>,
 }
 impl Runtime {
     pub fn session(&self) -> Result<Session, Error> {
@@ -150,7 +197,14 @@ impl Runtime {
     }
     /// Compile portable components and validate imports, ABI and instantiation.
     /// Returns an error without exposing a partially initialized runtime.
+    /// It records spans but no metrics; see [`Runtime::load_with_meters`].
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with_meters(path, &Meters::noop())
+    }
+    /// [`Runtime::load`] with the `merezha.guest.*` and `merezha.catalog.*`
+    /// instruments built once from `meters` (scope [`SCOPE`], TE §1.3).
+    /// With disabled meters no instrument is built.
+    pub fn load_with_meters(path: impl AsRef<Path>, meters: &Meters) -> Result<Self> {
         let path = path.as_ref().canonicalize().context("manifest path")?;
         let mut config = Config::new();
         config
@@ -163,6 +217,7 @@ impl Runtime {
         let engine = Engine::new(&config)?;
         let ticker = Ticker::start(engine.clone())?;
         let registry = Arc::new(load_registry(&engine, &path, 1)?);
+        let generation = Arc::new(AtomicU64::new(registry.generation));
         Ok(Self(Arc::new(Inner {
             engine,
             manifest: path,
@@ -170,12 +225,19 @@ impl Runtime {
             reload: Mutex::new(()),
             active: AtomicUsize::new(0),
             floor: AtomicUsize::new(0),
+            metrics: Metrics::new(meters, generation.clone()),
+            generation,
             _ticker: ticker,
         })))
     }
     /// Serialize the entire reload transaction. Failure preserves the previous
     /// generation. Requests already admitted retain their original snapshot.
     pub fn reload(&self) -> Result<u64> {
+        let result = self.reload_locked();
+        self.0.metrics.reloaded(result.is_ok());
+        result
+    }
+    fn reload_locked(&self) -> Result<u64> {
         let _load = self
             .0
             .reload
@@ -196,6 +258,7 @@ impl Runtime {
             .registry
             .write()
             .map_err(|_| wasmtime::format_err!("registry lock poisoned"))? = candidate;
+        self.0.generation.store(generation, Ordering::SeqCst);
         Ok(generation)
     }
     pub fn catalog(&self) -> Result<Catalog, Error> {
@@ -228,31 +291,68 @@ impl Runtime {
             .map(|r| Arc::clone(&r))
             .map_err(|_| Error::Internal)
     }
+    /// Admit a raw call of service `id`.
     pub fn prepare_service(&self, id: &str) -> Result<Invocation, Error> {
         let registry = self.snapshot()?;
         if !registry.services.contains_key(id) {
+            self.0.metrics.refused(
+                None,
+                registry.generation,
+                GuestOperation::Raw,
+                Error::NotFound,
+            );
             return Err(Error::NotFound);
         }
-        self.prepare(registry, vec![id.to_owned()])
+        self.prepare(registry, vec![id.to_owned()], GuestOperation::Raw, None)
     }
+    /// Admit a raw pipeline: its steps run in one `pipeline {id}` span.
     pub fn prepare_pipeline(&self, id: &str) -> Result<Invocation, Error> {
         let registry = self.snapshot()?;
-        let steps = registry.pipelines.get(id).ok_or(Error::NotFound)?.clone();
-        self.prepare(registry, steps)
+        let Some(pipeline) = registry.pipelines.get(id) else {
+            self.0.metrics.refused(
+                None,
+                registry.generation,
+                GuestOperation::Raw,
+                Error::NotFound,
+            );
+            return Err(Error::NotFound);
+        };
+        let (steps, labels) = (pipeline.steps.clone(), pipeline.labels.clone());
+        self.prepare(registry, steps, GuestOperation::Raw, Some(labels))
     }
-    fn prepare(&self, registry: Arc<Registry>, steps: Vec<String>) -> Result<Invocation, Error> {
-        self.0
+    fn prepare(
+        &self,
+        registry: Arc<Registry>,
+        steps: Vec<String>,
+        operation: GuestOperation,
+        pipeline: Option<PipelineLabels>,
+    ) -> Result<Invocation, Error> {
+        if self
+            .0
             .active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < registry.limits.max_concurrent_invocations).then_some(active + 1)
             })
-            .map_err(|_| Error::Overloaded)?;
+            .is_err()
+        {
+            let labels = steps
+                .first()
+                .and_then(|id| registry.services.get(id))
+                .map(|service| &service.labels);
+            self.0
+                .metrics
+                .refused(labels, registry.generation, operation, Error::Overloaded);
+            return Err(Error::Overloaded);
+        }
+        self.0.metrics.active(1);
         let deadline = Instant::now() + Duration::from_millis(registry.limits.timeout_ms);
         Ok(Invocation {
             inner: Arc::clone(&self.0),
             registry,
             steps,
             deadline,
+            operation,
+            pipeline,
         })
     }
     pub fn invoke_service(&self, id: &str, input: &str) -> Result<Output, Error> {
@@ -272,25 +372,31 @@ impl Invocation {
     pub fn generation(&self) -> u64 {
         self.registry.generation
     }
+    /// Run every step in order, each in its `guest {service} {operation}`
+    /// span; a pipeline's steps share one fuel budget and one deadline.
     pub fn run(self, input: &str) -> Result<Output, Error> {
+        let pipeline = self
+            .pipeline
+            .as_ref()
+            .map(|labels| metrics::pipeline_span(labels, self.registry.generation));
+        let _entered = pipeline.as_ref().map(tracing::Span::enter);
+        let result = self.run_steps(input);
+        if let Some(span) = &pipeline {
+            metrics::settle_span(span, result.as_ref().map(|_| ()).map_err(|e| *e));
+        }
+        result
+    }
+    fn run_steps(&self, input: &str) -> Result<Output, Error> {
         let limits = &self.registry.limits;
-        if input.len() > limits.max_input_bytes {
+        if self.steps.is_empty() && input.len() > limits.max_input_bytes {
             return Err(Error::InputLimit);
         }
         let mut value = input.to_owned();
         let mut fuel = limits.fuel;
         for id in &self.steps {
-            if Instant::now() >= self.deadline {
-                return Err(Error::Timeout);
-            }
-            if value.len() > limits.max_input_bytes {
-                return Err(Error::InputLimit);
-            }
-            let service = &self.registry.services[id];
-            let mut store = create_store(&self.inner.engine, limits, fuel, self.deadline)
-                .map_err(|_| Error::Internal)?;
-            value = execution::call(&mut store, service, &value, limits.max_output_bytes)?;
-            fuel = store.get_fuel().map_err(|_| Error::Internal)?;
+            let (result, remaining) = self.step(id, &value, fuel);
+            value = result?;
+            fuel = remaining;
         }
         if Instant::now() >= self.deadline {
             return Err(Error::Timeout);
@@ -298,12 +404,50 @@ impl Invocation {
         Ok(Output {
             generation: self.registry.generation,
             output: value,
+            fuel_consumed: limits.fuel - fuel,
         })
+    }
+    /// One guest call with `fuel` left of the budget, inside its span,
+    /// instantiation included. Returns the output and the fuel left.
+    fn step(&self, id: &str, input: &str, fuel: u64) -> (Result<String, Error>, u64) {
+        let limits = &self.registry.limits;
+        let service = &self.registry.services[id];
+        let mut call = self.inner.metrics.call(
+            &service.labels,
+            self.operation,
+            self.registry.generation,
+            limits,
+            fuel,
+            input.len(),
+        );
+        let _entered = call.span().clone().entered();
+        let result = if Instant::now() >= self.deadline {
+            Err(Error::Timeout)
+        } else if input.len() > limits.max_input_bytes {
+            Err(Error::InputLimit)
+        } else {
+            match create_store(&self.inner.engine, limits, fuel, self.deadline) {
+                Err(_) => Err(Error::Internal),
+                Ok(mut store) => {
+                    let output =
+                        execution::call(&mut store, service, input, limits.max_output_bytes);
+                    // Fuel is readable after a trap too; an exhausted
+                    // budget reads 0.
+                    let remaining = store.get_fuel().unwrap_or(0).min(fuel);
+                    call.ran(fuel - remaining, store.data().peak_memory);
+                    output
+                }
+            }
+        };
+        let remaining = fuel - call.consumed();
+        call.finish(result.as_ref().map(String::len).map_err(|e| *e));
+        (result, remaining)
     }
 }
 impl Drop for Invocation {
     fn drop(&mut self) {
         self.inner.active.fetch_sub(1, Ordering::AcqRel);
+        self.inner.metrics.active(-1);
     }
 }
 fn read_bounded(path: &Path, maximum: usize) -> Result<Vec<u8>> {
@@ -384,7 +528,11 @@ fn load_registry(engine: &Engine, path: &Path, generation: u64) -> Result<Regist
             .get_export_index(Some(&interface), "handle")
             .context("missing handle")?;
         let pre = Linker::<StoreState>::new(engine).instantiate_pre(&component)?;
-        let service = Service { pre, function };
+        let service = Service {
+            pre,
+            function,
+            labels: Labels::service(&spec.id),
+        };
         let deadline = Instant::now() + Duration::from_millis(manifest.limits.timeout_ms);
         let mut store = create_store(engine, &manifest.limits, manifest.limits.fuel, deadline)?;
         let instance = service
@@ -402,7 +550,16 @@ fn load_registry(engine: &Engine, path: &Path, generation: u64) -> Result<Regist
         pipelines: manifest
             .pipelines
             .into_iter()
-            .map(|p| (p.id, p.steps))
+            .map(|p| {
+                let labels = PipelineLabels::new(&p.id);
+                (
+                    p.id,
+                    Pipeline {
+                        steps: p.steps,
+                        labels,
+                    },
+                )
+            })
             .collect(),
     })
 }

@@ -52,8 +52,17 @@ pub(crate) trait DurableStore: Send + Sync {
         deadline: Instant,
     ) -> Result<Option<Receipt>, Failure>;
     /// Commit the batch and the receipt atomically, rechecking the stream
-    /// version and the key inside the store's transaction.
-    fn commit_command(&self, c: CommitCommand<'_>, deadline: Instant) -> Result<Receipt, Failure>;
+    /// version and the key inside the store's transaction. `true` when the
+    /// key's stored receipt was replayed instead.
+    fn commit(&self, c: CommitCommand<'_>, deadline: Instant) -> Result<(Receipt, bool), Failure>;
+    /// [`DurableStore::commit`] without the replay flag.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the store contract tests use it")
+    )]
+    fn commit_command(&self, c: CommitCommand<'_>, deadline: Instant) -> Result<Receipt, Failure> {
+        self.commit(c, deadline).map(|(receipt, _)| receipt)
+    }
     /// The persisted pair and its row revision.
     fn projection(
         &self,

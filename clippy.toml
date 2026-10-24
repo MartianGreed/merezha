@@ -1,0 +1,10 @@
+# Blocking work must keep its telemetry context (TE §2.4): the tracing
+# dispatcher and the current span. `merezha_telemetry::spawn_blocking_in_span`
+# is the only sanctioned way to reach Tokio's blocking pool.
+disallowed-methods = [
+    { path = "tokio::task::spawn_blocking", reason = "use merezha_telemetry::spawn_blocking_in_span (TE §2.4)" },
+    { path = "tokio::runtime::Handle::spawn_blocking", reason = "use merezha_telemetry::spawn_blocking_in_span (TE §2.4)" },
+    { path = "tokio::runtime::Runtime::spawn_blocking", reason = "use merezha_telemetry::spawn_blocking_in_span (TE §2.4)" },
+    { path = "tokio::task::JoinSet::spawn_blocking", reason = "use merezha_telemetry::spawn_blocking_in_span (TE §2.4)" },
+    { path = "tokio::task::JoinSet::spawn_blocking_on", reason = "use merezha_telemetry::spawn_blocking_in_span (TE §2.4)" },
+]

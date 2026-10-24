@@ -193,6 +193,7 @@ struct Inner {
     notifications: Arc<dyn NotifierFactory>,
     directory: Arc<dyn Directory>,
     blobs: Arc<dyn BlobStore>,
+    telemetry: merezha_telemetry::Meters,
 }
 impl std::fmt::Debug for AppContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -226,6 +227,7 @@ impl AppContext {
             notifications: Arc::new(CaptureNotifications::default()),
             directory: Arc::new(EmptyDirectory),
             blobs: Arc::new(UnavailableBlobStore),
+            telemetry: merezha_telemetry::Meters::noop(),
         }
     }
     pub fn app_id(&self) -> &str {
@@ -329,6 +331,12 @@ impl AppContext {
     pub fn blobs(&self) -> &Arc<dyn BlobStore> {
         &self.inner.blobs
     }
+    /// The host's meters (TE §0): `ctx.telemetry().meter(module)` for a
+    /// module's instruments, built once at start. No-op meters unless the
+    /// host exports metrics.
+    pub fn telemetry(&self) -> &merezha_telemetry::Meters {
+        &self.inner.telemetry
+    }
 }
 /// Replaces fallbacks with block implementations.
 pub struct AppContextBuilder {
@@ -346,6 +354,7 @@ pub struct AppContextBuilder {
     notifications: Arc<dyn NotifierFactory>,
     directory: Arc<dyn Directory>,
     blobs: Arc<dyn BlobStore>,
+    telemetry: merezha_telemetry::Meters,
 }
 impl AppContextBuilder {
     pub fn instance_id(mut self, instance_id: &str) -> Self {
@@ -393,6 +402,11 @@ impl AppContextBuilder {
         self.blobs = blobs;
         self
     }
+    /// See [`AppContext::telemetry`]; no-op meters by default.
+    pub fn telemetry(mut self, telemetry: merezha_telemetry::Meters) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
     pub fn build(self) -> Result<AppContext, Failure> {
         let http = match self.http {
             Some(http) => http,
@@ -417,6 +431,7 @@ impl AppContextBuilder {
                 notifications: self.notifications,
                 directory: self.directory,
                 blobs: self.blobs,
+                telemetry: self.telemetry,
             }),
         })
     }

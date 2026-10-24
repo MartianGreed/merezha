@@ -65,3 +65,33 @@ fn libraries_with_default_features_link_no_sdk_or_exporter() {
         assert!(links(&binary, krate), "the binary should link {krate}");
     }
 }
+
+/// T3: `merezha-runtime` gains no dependency beyond `tracing`, the
+/// `opentelemetry` API and `merezha-telemetry` default features.
+#[test]
+fn the_runtime_depends_only_on_the_telemetry_apis() {
+    let direct = tree(&["-p", "merezha-runtime", "--depth", "1"]);
+    let mut names: Vec<&str> = direct
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split(" v").next())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(
+        names,
+        [
+            "merezha-telemetry",
+            "opentelemetry",
+            "serde",
+            "toml",
+            "tracing",
+            "wasmparser",
+            "wasmtime"
+        ]
+    );
+    let full = tree(&["-p", "merezha-runtime"]);
+    for krate in ["tracing-opentelemetry", "tracing-subscriber", "reqwest"] {
+        assert!(!links(&full, krate), "the runtime links {krate}");
+    }
+}

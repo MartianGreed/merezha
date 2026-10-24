@@ -7,7 +7,7 @@
 use crate::application_module::ApplicationModule;
 use merezha_application::{
     config::StorageConfig,
-    postgres::{BackgroundOptions, CatchUp, MODULE, PostgresOptions},
+    postgres::{BackgroundOptions, CatchUp, CurrentSpan, MODULE, PostgresOptions},
 };
 use merezha_domain::Failure;
 use merezha_platform::config::CatchUp as ConfiguredCatchUp;
@@ -17,7 +17,7 @@ use merezha_platform::{
     ports::{Authorizer, DenyAll, LoopbackAllowAll},
 };
 use merezha_runtime::Runtime;
-use merezha_telemetry::{Service, Telemetry, names, pipeline};
+use merezha_telemetry::{Service, Telemetry, names, pipeline, spawn_blocking_in_span};
 use serde_json::{Value, json};
 use std::{
     future::Future,
@@ -171,7 +171,7 @@ pub async fn run(
     let code = serve(config, modules, shutdown, options).await;
     // Flush traces, logs and metrics within `shutdown_timeout_ms`, then the
     // stderr writer.
-    let _ = tokio::task::spawn_blocking(move || telemetry.shutdown()).await;
+    let _ = spawn_blocking_in_span(move || telemetry.shutdown()).await;
     code
 }
 
@@ -297,11 +297,19 @@ async fn start(
     mut options: HostOptions,
 ) -> Result<Host, String> {
     let manifest = config.runtime.manifest.clone();
-    let runtime =
-        match tokio::task::spawn_blocking(move || Runtime::load(manifest).map_err(|_| ())).await {
-            Ok(Ok(runtime)) => runtime,
-            _ => return Err("invalid_manifest".to_owned()),
-        };
+    let meters = options.meters.clone();
+    let runtime_meters = meters.clone();
+    let loaded = spawn_blocking_in_span(move || {
+        Runtime::load_with_meters(manifest, &runtime_meters).map_err(|_| ())
+    })
+    .await;
+    let runtime = match loaded {
+        Ok(Ok(runtime)) => runtime,
+        _ => return Err("invalid_manifest".to_owned()),
+    };
+    // Database-backed gauges (the projection lag) refresh at this interval,
+    // and only while metrics are exported.
+    let sample_interval = config.telemetry.metrics.sample_interval;
     options.status.push(Arc::new(CatalogSection {
         runtime: runtime.clone(),
         loaded_at: jiff::Timestamp::now(),
@@ -322,8 +330,7 @@ async fn start(
     let application = match config.application.clone() {
         Some(section) => {
             let path = section.path.clone();
-            let read =
-                tokio::task::spawn_blocking(move || crate::read_application_config(&path)).await;
+            let read = spawn_blocking_in_span(move || crate::read_application_config(&path)).await;
             let application = match read {
                 Ok(Ok(application)) => application,
                 Ok(Err(failure)) => return Err(failure.code),
@@ -339,7 +346,8 @@ async fn start(
                     authorizer.clone(),
                     PostgresOptions {
                         lock_timeout_max: section.append.lock_timeout_max,
-                        trace: None,
+                        // Events carry the command span's context (TE §2.2).
+                        trace: Some(Arc::new(CurrentSpan)),
                         background: BackgroundOptions {
                             catch_up: match section.projections.catch_up {
                                 ConfiguredCatchUp::Auto => CatchUp::Auto,
@@ -355,7 +363,8 @@ async fn start(
                     },
                     // The jobs runtime's pool needs (AP §B.10).
                     2 + config.jobs.queues.len(),
-                );
+                )
+                .sample_interval(sample_interval);
                 application_failure = Some(module.failure());
                 options
                     .status
@@ -363,12 +372,19 @@ async fn start(
                 modules.insert(0, Box::new(module) as Box<dyn Module>);
                 None
             } else {
-                match tokio::task::spawn_blocking(move || {
+                let app_meters = meters.clone();
+                match spawn_blocking_in_span(move || {
                     merezha_application::Application::open(application, Arc::new(guest), policy)
+                        .map(|application| application.with_meters(&app_meters))
                 })
                 .await
                 {
                     Ok(Ok(application)) => {
+                        if meters.enabled() {
+                            application
+                                .spawn_lag_sampler(sample_interval)
+                                .map_err(|failure| failure.code)?;
+                        }
                         options.status.push(Arc::new(ApplicationSection(Arc::new(
                             OnceLock::from(application.clone()),
                         ))));

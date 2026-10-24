@@ -109,7 +109,7 @@ async fn serve() -> std::process::ExitCode {
         }
     };
     let code = serve_with(manifest, application, address).await;
-    let _ = tokio::task::spawn_blocking(move || telemetry.shutdown()).await;
+    let _ = merezha_telemetry::spawn_blocking_in_span(move || telemetry.shutdown()).await;
     code
 }
 async fn serve_with(
@@ -121,14 +121,17 @@ async fn serve_with(
         merezha_telemetry::event!(ERROR, "startup.failed", code);
         std::process::ExitCode::from(2)
     };
-    let runtime =
-        match tokio::task::spawn_blocking(move || Runtime::load(manifest).map_err(|_| ())).await {
-            Ok(Ok(runtime)) => runtime,
-            _ => return failed("invalid_manifest"),
-        };
+    let runtime = match merezha_telemetry::spawn_blocking_in_span(move || {
+        Runtime::load(manifest).map_err(|_| ())
+    })
+    .await
+    {
+        Ok(Ok(runtime)) => runtime,
+        _ => return failed("invalid_manifest"),
+    };
     let router = if let Some(path) = application {
         let guest = runtime.clone();
-        match tokio::task::spawn_blocking(move || {
+        match merezha_telemetry::spawn_blocking_in_span(move || {
             merezha_cli::open_application(
                 &path,
                 guest,

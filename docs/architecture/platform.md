@@ -341,8 +341,9 @@ the OTLP pipeline (TE §3). Every value is checked at startup and all
 problems are reported together. `traces.trust_inbound` decides which
 callers' `traceparent` the edge honors (see [The HTTP edge](#the-http-edge)).
 `metrics.sample_interval_ms` takes effect with the database-backed gauges
-(TE-T3, TE-T5) and `propagation.outbound_hosts` with the outbound client
-(TE-T6); they validate now.
+(the projection lag sampler now, the jobs and outbox gauges with TE-T5) and
+`propagation.outbound_hosts` with the outbound client (TE-T6); they validate
+now.
 
 Standard `OTEL_*` variables are never read: `merezha` removes them from its
 environment before any thread starts and logs their names once as
@@ -373,7 +374,7 @@ status remain.
 | --- | --- |
 | `[telemetry.resource]` | `service_name` (default `app.id`), `service_version` (default `app.version`), `service_namespace`, `environment`: 1 to 128 printable bytes, `""` for unset; `attributes`: at most 16 strings whose keys start with `cloud.`, `container.`, `deployment.`, `host.`, `k8s.` or `os.` |
 | `[telemetry.traces]` | `sampler` (`parent_based_ratio`, `always_off`), `ratio` (0.0 to 1.0, default 1.0, root decisions only), `trust_inbound` (`trusted_proxies`, `always`, `never`), `endpoint` (used verbatim), `max_queue` (2048 spans queued plus in flight; more are dropped and counted), `max_batch` (512, at most `max_queue`), `schedule_delay_ms` (5000) |
-| `[telemetry.metrics]` | `interval_ms` (30000, at least 1 s), `temporality` (`cumulative`, `delta`), `sample_interval_ms` (15000), `endpoint` |
+| `[telemetry.metrics]` | `interval_ms` (30000, at least 1 s), `temporality` (`cumulative`, `delta`), `sample_interval_ms` (15000: how often the database-backed gauges are refreshed while metrics are exported), `endpoint` |
 | `[telemetry.logs]` | `level` (`info`), `endpoint`, `max_queue`, `max_batch`, `schedule_delay_ms` (1000) |
 | `[telemetry.privacy]` | `record_tenant_id` (`true`), `record_subject_id` (`false`), `record_client_address` (`false`; no signal carries `client.address` yet, so `true` has no effect) |
 | `[telemetry.propagation]` | `outbound_hosts`: at most 64 exact lowercase host names |
@@ -671,6 +672,71 @@ The raw runtime (`merezha serve`) writes the same JSON lines to stderr with
 `service = merezha`, logs at `debug` so each `invocation.completed` appears
 as before, and runs no OTLP pipeline.
 
+### Runtime and application telemetry
+
+Guest calls, dispatch and projections are instrumented (TE-T3; TE §1.2,
+§1.3, §2.2, §2.4):
+
+- **Spans.** `guest {service} {operation}` around every guest call, as a
+  child of the dispatch span (or of `pipeline {id}` for raw pipelines,
+  see [runtime](runtime.md)); `command {tag}` and `query {tag}` around each
+  dispatch, a child of the HTTP request span, with
+  `merezha.correlation_id`, `merezha.message_id`, `merezha.causation_id`,
+  the stream, expected version, position and event count;
+  `projection {name}` around each catch-up stretch that processed events,
+  always a root, linked to at most 8 distinct traces of the events it
+  processed (`merezha.link.reason = source_event`). Tags, names and
+  services the configuration does not declare record `_unknown`.
+- **Outcome.** `merezha.outcome` is `accepted` (`ok` for queries),
+  `replayed`, `rejected` (permanent: validation, guest rejection, unknown
+  handler or projection, input limit), `denied` (`unauthorized`),
+  `conflict` or `failed` (transient, internal, timeout, trap, fuel or memory
+  limit, malformed guest reply, storage failure). Only `failed` sets the
+  span status to error. A code the guest replied itself is kept only as the
+  span attribute `merezha.guest.error_code`; `error.type`, logs
+  (`command.completed`, `projection.failed`, `projection.rebuild_failed`)
+  and metrics say `guest_error`, for dispatch and projection runs alike.
+  Guest output that is not a protocol response is `invalid_response`
+  (`failed`); `validation_failed`, the domain's own refusal, is
+  `rejected`.
+- **Instruments.** `merezha.guest.*` and `merezha.catalog.*` from the
+  runtime; `merezha.command.duration`, `merezha.query.duration`,
+  `merezha.events.appended`, `merezha.command.receipts.replayed`,
+  `merezha.events.head`, `merezha.projection.lag.events`,
+  `merezha.projection.lag.age`, `merezha.projection.catch_up.duration`
+  (trigger `background` for scheduler runs, `admin` for explicit catch-ups,
+  `rebuild`), `merezha.projection.events.processed` and, on PostgreSQL,
+  `merezha.projection.warm`, `merezha.projection.rebuild.remaining`,
+  `merezha.projection.lock.held` (the age of this host's longest-held run
+  lock) and `merezha.projection.lock.contended` (lock attempts that found
+  another holder). Modules build their instruments from
+  `AppContext::telemetry().meter(module)`.
+- **Lag.** Gauge callbacks read an in-memory cache only: local commits move
+  the head, catch-ups move the checkpoint and record the first unprocessed
+  event's age, and while metrics are exported a sampler re-reads the head,
+  every checkpoint, warmth and rebuild progress every
+  `telemetry.metrics.sample_interval_ms`, so other hosts' writes and runs
+  count. Lag age is 0 when the checkpoint equals the head. Lag feeds alerts
+  and status, never readiness.
+- **Logs.** `command.completed` and `query.completed` at debug (warn for
+  `failed`) with `tag`, `outcome`, `code` and `duration_ms`;
+  `projection.caught_up`, `projection.failed`, `projection.warmed`,
+  `projection.rebuild_completed`, `projection.rebuild_failed`,
+  `db.pool_undersized`, `db.listener_lost` and `db.listener_restored` go
+  through the catalog macro.
+- **Stored context.** On PostgreSQL every appended event stores the command
+  span's W3C context in `merezha_app.events.trace_parent`/`trace_state`,
+  sampled or not (the flags travel in the `traceparent`); it never reaches a
+  guest or a `StoredEvent`. Without traces exported the columns stay NULL.
+- **Correlation.** The HTTP adapter fills a missing `metadata`,
+  `message_id` (128 random bits, hex) or `correlation_id` (the current trace
+  id, 32 lowercase hex; 128 random bits when no trace is recorded) on
+  `/v1/application/commands` and `/queries`; caller-supplied ids are kept.
+- **Blocking threads.** Blocking work goes through
+  `merezha_telemetry::spawn_blocking_in_span`, which carries the dispatcher
+  and the current span; `clippy.toml` bans `tokio::task::spawn_blocking` and
+  `Handle::spawn_blocking` everywhere but `merezha-telemetry`.
+
 ## Module contract
 
 `Module` (`crates/platform/src/module.rs`) is what every block implements:
@@ -739,10 +805,14 @@ register blocks.
   `module.source_refused`. `application` is never granted: only the host's
   own context binds it.
 - `directory()`, `authenticator()`, `authorizer()`, `blobs()`: the ports below.
+- `telemetry()`: the host's `Meters`; `telemetry().meter(module)` gives the
+  meter a module builds its instruments from once, a no-op meter unless
+  metrics are exported (`enabled()`). The host passes `HostOptions.meters`
+  (no-op meters by default).
 
 `AppContext::builder` starts from the disabled-block fallbacks; blocks replace
 them through the builder (`outbox`, `jobs`, `notifications`, `directory`,
-`authenticator`, `blobs`).
+`authenticator`, `blobs`, `telemetry`).
 
 ## Ports
 
@@ -1729,9 +1799,11 @@ itself.
   work.
 - `Host::start` installs no `Authenticator` yet, so the edge never
   authenticates until identity's block registers one.
-- The events, outbox and jobs `trace_parent`/`trace_state` columns exist
-  but stay empty until the telemetry block fills them from the current span
-  (TE-T3 for events, TE-T5 for the outbox and jobs).
+- The outbox and jobs `trace_parent`/`trace_state` columns stay empty until
+  TE-T5 fills them; the events columns are filled from the command span.
+- Reactor lag, lock and batch instruments arrive with the reactors (AP-C3);
+  the `application` section of `/v1/admin/status` (TE-T2's route) embeds
+  `Application::status()` once both are on main.
 - Job attempts open no `process` span and the `merezha.job.*`
   instruments, `merezha.job.schedule.fired` included, do not exist yet
   (TE-T5).

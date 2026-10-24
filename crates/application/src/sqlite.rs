@@ -659,6 +659,7 @@ impl SqliteStore {
             limit,
         )
     }
+    #[cfg(test)]
     pub(crate) fn commit_command(
         &self,
         stream: &Identity,
@@ -668,6 +669,20 @@ impl SqliteStore {
         claim: Option<(&Key, &str)>,
         deadline: Instant,
     ) -> Result<Receipt, Failure> {
+        self.commit_replayed(stream, expected, events, metadata, claim, deadline)
+            .map(|(receipt, _)| receipt)
+    }
+    /// [`SqliteStore::commit_command`], `true` when the key's stored receipt
+    /// was replayed.
+    pub(crate) fn commit_replayed(
+        &self,
+        stream: &Identity,
+        expected: u64,
+        events: Vec<Event>,
+        metadata: &Metadata,
+        claim: Option<(&Key, &str)>,
+        deadline: Instant,
+    ) -> Result<(Receipt, bool), Failure> {
         let mut conn = self.lock(deadline)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -685,7 +700,7 @@ impl SqliteStore {
                 if stored != fingerprint {
                     return Err(Failure::conflict("idempotency_mismatch"));
                 }
-                return decode(&receipt, 1024);
+                return decode(&receipt, 1024).map(|receipt| (receipt, true));
             }
             let count: usize = tx
                 .query_row("SELECT count(*) FROM receipts", [], |r| r.get(0))
@@ -785,7 +800,7 @@ impl SqliteStore {
         self.commit(tx, deadline)?;
         #[cfg(test)]
         crash_cut("after_commit");
-        Ok(receipt)
+        Ok((receipt, false))
     }
     /// The stored receipt for `key`, outside any write transaction.
     pub(crate) fn receipt(
@@ -928,7 +943,7 @@ impl DurableStore for SqliteStore {
     ) -> Result<Option<Receipt>, Failure> {
         SqliteStore::receipt(self, key, fingerprint, deadline)
     }
-    fn commit_command(&self, c: CommitCommand<'_>, deadline: Instant) -> Result<Receipt, Failure> {
+    fn commit(&self, c: CommitCommand<'_>, deadline: Instant) -> Result<(Receipt, bool), Failure> {
         // A tenant stream carries its tenant as the stream prefix, so the
         // stream name alone keeps tenants apart here. The host composes it;
         // this mirrors PostgreSQL's `streams` CHECK as a backstop.
@@ -940,7 +955,7 @@ impl DurableStore for SqliteStore {
         }) {
             return Err(Failure::permanent("constraint_violation"));
         }
-        SqliteStore::commit_command(
+        SqliteStore::commit_replayed(
             self, c.stream, c.expected, c.events, c.metadata, c.claim, deadline,
         )
     }

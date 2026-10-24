@@ -134,11 +134,13 @@ pub fn check_catalogued(events: &[Recorded]) -> Result<(), String> {
 }
 
 /// One metric point: attributes and the value (sum or gauge value,
-/// histogram count).
+/// histogram count), plus a histogram's sum of recorded values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Point {
     pub attributes: BTreeMap<String, String>,
     pub value: f64,
+    /// Histograms only: the sum of the recorded values.
+    pub sum: Option<f64>,
 }
 /// The points of one metric in the latest collection.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -158,6 +160,22 @@ impl MetricPoints {
             })
             .map(|p| p.value)
     }
+    /// The histogram sum of the point whose attributes include every
+    /// `(key, value)`.
+    pub fn sum(&self, attributes: &[(&str, &str)]) -> Option<f64> {
+        self.0
+            .iter()
+            .find(|p| {
+                attributes
+                    .iter()
+                    .all(|(k, v)| p.attributes.get(*k).map(String::as_str) == Some(*v))
+            })
+            .and_then(|p| p.sum)
+    }
+    /// The sum of every point's value (counts for histograms).
+    pub fn total(&self) -> f64 {
+        self.0.iter().map(|p| p.value).sum()
+    }
 }
 
 fn attributes<'a>(
@@ -166,6 +184,14 @@ fn attributes<'a>(
     kvs.map(|kv| (kv.key.to_string(), kv.value.to_string()))
         .collect()
 }
+/// The value of `key` on an exported span, as text.
+pub fn span_attribute(span: &SpanData, key: &str) -> Option<String> {
+    span.attributes
+        .iter()
+        .find(|kv| kv.key.as_str() == key)
+        .map(|kv| kv.value.to_string())
+}
+
 /// Signals, stderr and events of one test, in memory.
 pub struct Harness {
     telemetry: Option<Telemetry>,
@@ -196,6 +222,14 @@ impl Harness {
     /// The harness for `config` and `service`. Endpoints, protocol and
     /// headers are ignored: signals go to memory.
     pub fn with(config: TelemetryConfig, service: Service) -> Self {
+        // With a single registered dispatcher, `tracing-core` computes a new
+        // callsite's interest from the *current thread's* default only, so a
+        // callsite first hit on a thread without this harness (another test)
+        // would be cached as never and disappear from this harness too. A
+        // second, inert dispatcher for the whole process makes every
+        // callsite consult all live dispatchers.
+        static ANCHOR: std::sync::OnceLock<Dispatch> = std::sync::OnceLock::new();
+        ANCHOR.get_or_init(|| Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         let memory = MemorySinks {
             spans: InMemorySpanExporter::default(),
             metrics: InMemoryMetricExporter::default(),
@@ -239,6 +273,13 @@ impl Harness {
             .into_iter()
             .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("no span named {name}"))
+    }
+    /// Every exported span named `name`, in end order.
+    pub fn spans_named(&self, name: &str) -> Vec<SpanData> {
+        self.spans()
+            .into_iter()
+            .filter(|s| s.name == name)
+            .collect()
     }
     /// Collect metrics now and return the points of `name`.
     pub fn metric(&self, name: &str) -> MetricPoints {
@@ -334,18 +375,22 @@ fn collect_any<T: Copy>(data: &MetricData<T>, out: &mut Vec<Point>, f: impl Fn(T
         MetricData::Gauge(g) => out.extend(g.data_points().map(|p| Point {
             attributes: attributes(p.attributes()),
             value: f(p.value()),
+            sum: None,
         })),
         MetricData::Sum(s) => out.extend(s.data_points().map(|p| Point {
             attributes: attributes(p.attributes()),
             value: f(p.value()),
+            sum: None,
         })),
         MetricData::Histogram(h) => out.extend(h.data_points().map(|p| Point {
             attributes: attributes(p.attributes()),
             value: p.count() as f64,
+            sum: Some(f(p.sum())),
         })),
         MetricData::ExponentialHistogram(h) => out.extend(h.data_points().map(|p| Point {
             attributes: attributes(p.attributes()),
             value: p.count() as f64,
+            sum: Some(f(p.sum())),
         })),
     }
 }

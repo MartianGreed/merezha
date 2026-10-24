@@ -535,13 +535,20 @@ fn killing_the_lock_holders_session_lets_the_other_instance_take_over() {
             .iter()
             .any(|(_, n)| n == "merezha p:count:1")
     });
-    // The holder reports its lock age (TE's `merezha.projection.lock.held`).
-    let held = first.store.held_locks();
-    assert!(
-        held.iter().any(
-            |(kind, name, revision, _)| (*kind, name.as_str(), *revision) == ("live", "count", 1)
-        ),
-        "{held:?}"
+    // The holder reports its lock age (TE's `merezha.projection.lock.held`)
+    // once the lock call returned to it; `pg_locks` shows the grant first.
+    until(
+        Duration::from_secs(5),
+        "the holder records its lock",
+        || {
+            first
+                .store
+                .held_locks()
+                .iter()
+                .any(|(kind, name, revision, _)| {
+                    (*kind, name.as_str(), *revision) == ("live", "count", 1)
+                })
+        },
     );
     let second = pg.start(
         c,

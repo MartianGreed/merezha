@@ -2,11 +2,13 @@ use crate::{
     Authorizer, Guest, GuestSession,
     config::Config,
     durable::{CommitCommand, DurableStore, ProjectionRef},
+    instrument::{Dispatch, Instruments, Sample, SampledProjection, Settled},
     store::{EventStore, MemoryEventStore},
 };
 use merezha_domain::{
     Command, Failure, Identity, MessageKind, Operation, Query, Receipt, Reply, compatible_json,
 };
+use merezha_telemetry::names::dispatch::Trigger;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -57,6 +59,8 @@ struct Inner {
     retain_receipts: bool,
     projections: BTreeMap<Identity, Mutex<ProjectionState>>,
     active: AtomicUsize,
+    /// Spans, instruments and the lag cache (TE §1.3).
+    instruments: Instruments,
     /// The typed PostgreSQL store behind `store`, for background runs,
     /// explicit catch-ups and the admin API.
     #[cfg(feature = "postgres")]
@@ -97,6 +101,9 @@ impl Storage {
         }
     }
 }
+/// The bound of one lag sample (and of the head read at open).
+const SAMPLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Clones share dispatch state and, in SQLite mode, one owned database.
 #[derive(Clone)]
 pub struct Application(Arc<Inner>);
@@ -259,6 +266,33 @@ impl Application {
                 ),
             );
         }
+        // Memory and SQLite know their head and checkpoints at open; a
+        // PostgreSQL application learns them from its first sample or run,
+        // since other instances write too.
+        let instruments = if !retain_receipts {
+            Instruments::new(
+                &config,
+                None,
+                config
+                    .projections
+                    .iter()
+                    .map(|p| (p.name.as_str().to_owned(), None))
+                    .collect(),
+            )
+        } else {
+            let deadline = std::time::Instant::now() + SAMPLE_BUDGET;
+            Instruments::new(
+                &config,
+                store.head(deadline).ok(),
+                projections
+                    .iter()
+                    .map(|(name, state)| {
+                        let checkpoint = state.lock().map(|s| s.checkpoint).ok();
+                        (name.as_str().to_owned(), checkpoint)
+                    })
+                    .collect(),
+            )
+        };
         Ok(Self(Arc::new(Inner {
             config,
             guest,
@@ -268,9 +302,121 @@ impl Application {
             idempotency: Mutex::new(records),
             retain_receipts,
             active: AtomicUsize::new(0),
+            instruments,
             #[cfg(feature = "postgres")]
             postgres,
         })))
+    }
+    /// Build the `merezha.command.*`, `merezha.query.*`, `merezha.events.*`
+    /// and `merezha.projection.*` instruments once from `meter`, with the
+    /// run-lock instruments of a PostgreSQL store. Call it before the first
+    /// dispatch; later calls keep the first meter. Without it spans are
+    /// still recorded and no instrument exists, as with disabled `meters`.
+    pub fn with_meters(self, meters: &merezha_telemetry::Meters) -> Self {
+        #[cfg(feature = "postgres")]
+        let locks = self
+            .0
+            .postgres
+            .as_ref()
+            .map(|store| store.lock_source() as Arc<dyn crate::instrument::LockSource>);
+        #[cfg(not(feature = "postgres"))]
+        let locks = None;
+        self.0.instruments.install(meters, locks);
+        self
+    }
+    /// Refresh the lag gauges from the store: the head, every configured
+    /// projection's checkpoint and the age of its first unprocessed event
+    /// (and on PostgreSQL its warmth and rebuild progress). Blocking, like
+    /// any dispatch, and bounded by 2 s. It takes no admission slot.
+    pub fn sample_lag(&self) -> Result<(), Failure> {
+        let sample = self.sample(std::time::Instant::now() + SAMPLE_BUDGET)?;
+        self.0.instruments.apply(sample);
+        Ok(())
+    }
+    /// Run [`Application::sample_lag`] every `interval` on blocking threads
+    /// of the current runtime, until the application is dropped or the
+    /// returned handle aborts it. A failed sample keeps the last values.
+    /// Start it only when metrics are exported: each sample reads the store.
+    pub fn spawn_lag_sampler(
+        &self,
+        interval: std::time::Duration,
+    ) -> Result<tokio::task::AbortHandle, Failure> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| Failure::permanent("storage_configuration"))?;
+        let weak = Arc::downgrade(&self.0);
+        let task = handle.spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                let app = Application(inner);
+                let _ = merezha_telemetry::spawn_blocking_in_span(move || app.sample_lag()).await;
+            }
+        });
+        Ok(task.abort_handle())
+    }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn instruments(&self) -> &Instruments {
+        &self.0.instruments
+    }
+    /// What [`Application::sample_lag`] reads.
+    fn sample(&self, deadline: std::time::Instant) -> Result<Sample, Failure> {
+        #[cfg(feature = "postgres")]
+        if let Some(store) = &self.0.postgres {
+            let projections: Vec<_> = self.0.config.projections.iter().collect();
+            let (head, rows) = store.overview(&projections, deadline)?;
+            return Ok(Sample {
+                head,
+                projections: rows
+                    .into_iter()
+                    .map(|row| SampledProjection {
+                        name: row.entry.name.as_str().to_owned(),
+                        checkpoint: row.entry.checkpoint,
+                        oldest_ms: row.oldest.and_then(|ms| u64::try_from(ms).ok()),
+                        warm: Some(row.entry.warm),
+                        rebuild_remaining: row
+                            .entry
+                            .rebuild
+                            .map(|r| r.target.saturating_sub(r.checkpoint)),
+                    })
+                    .collect(),
+            });
+        }
+        let head = self.0.store.head(deadline)?;
+        let mut projections = Vec::with_capacity(self.0.config.projections.len());
+        for projection in &self.0.config.projections {
+            let checkpoint = match &self.0.store {
+                Storage::Durable(store) => {
+                    store
+                        .projection(&projection_ref(projection), deadline)?
+                        .0
+                        .checkpoint
+                }
+                // A running catch-up updates the cache itself.
+                Storage::Volatile(_) => match self.0.projections[&projection.name].try_lock() {
+                    Ok(state) => state.checkpoint,
+                    Err(_) => continue,
+                },
+            };
+            let oldest_ms = if checkpoint < head {
+                self.0
+                    .store
+                    .read_all(checkpoint, 1, deadline)?
+                    .first()
+                    .map(|e| e.accepted_unix_ms)
+            } else {
+                None
+            };
+            projections.push(SampledProjection {
+                name: projection.name.as_str().to_owned(),
+                checkpoint,
+                oldest_ms,
+                warm: None,
+                rebuild_remaining: None,
+            });
+        }
+        Ok(Sample { head, projections })
     }
     #[cfg(feature = "postgres")]
     pub(crate) fn config(&self) -> &Config {
@@ -359,6 +505,7 @@ impl Admission {
         service: &str,
         tag: &Identity,
         payload: Value,
+        trace: &Dispatch<'_>,
     ) -> Result<Value, Failure> {
         self.check_value(&payload, self.inner.config.limits.max_payload_bytes)?;
         match invoke(
@@ -370,6 +517,7 @@ impl Admission {
                 tag: tag.clone(),
                 payload,
             },
+            Some(trace),
         )? {
             Reply::Validated { payload } => {
                 self.check_value(&payload, self.inner.config.limits.max_payload_bytes)?;
@@ -396,7 +544,29 @@ impl Admission {
             .map_err(|_| Failure::transient("internal"))?;
         Ok(records.get(key).map(|record| replay(record, fingerprint)))
     }
+    /// Dispatch a command inside its `command {tag}` span, recording its
+    /// outcome, duration and appended events (TE §1.2, §1.3).
     pub fn command(self, command: Command) -> Result<Receipt, Failure> {
+        let inner = self.inner.clone();
+        let trace = inner
+            .instruments
+            .command(command.tag.as_str(), &command.metadata);
+        let span = trace.span().clone();
+        let result = span.in_scope(|| self.decide(command, &trace));
+        trace.finish(match &result {
+            Ok((receipt, true)) => Ok(Settled::Replayed {
+                position: receipt.position,
+            }),
+            Ok((receipt, false)) => Ok(Settled::Committed {
+                position: receipt.position,
+                events: receipt.events,
+            }),
+            Err(failure) => Err(failure),
+        });
+        result.map(|(receipt, _)| receipt)
+    }
+    /// The command flow; `true` with a stored receipt replayed.
+    fn decide(self, command: Command, trace: &Dispatch<'_>) -> Result<(Receipt, bool), Failure> {
         let route = self
             .inner
             .config
@@ -409,6 +579,7 @@ impl Admission {
             route.aggregate.as_str(),
             command.stream.as_str()
         ))?;
+        trace.stream(stream.as_str(), command.expected_version);
         let session = self.inner.guest.session()?;
         let payload = self.validate(
             session.as_ref(),
@@ -416,6 +587,7 @@ impl Admission {
             route.service.as_str(),
             &command.tag,
             command.payload,
+            trace,
         )?;
         self.inner.authorizer.authorize(
             MessageKind::Command,
@@ -438,7 +610,7 @@ impl Admission {
                 &serde_json::json!({"stream":stream,"payload":payload,"expected_version":command.expected_version}),
             )?;
             if let Some(replay) = self.local_record(&key, &fingerprint)? {
-                return replay;
+                return replay.map(|receipt| (receipt, true));
             }
             // Fast-path replay of a key another instance (or an earlier
             // process) committed, before the guest decides. It runs before
@@ -447,7 +619,7 @@ impl Admission {
             if let Storage::Durable(store) = &self.inner.store
                 && let Some(receipt) = store.receipt(&key, &fingerprint, self.deadline)?
             {
-                return Ok(receipt);
+                return Ok((receipt, true));
             }
             let mut records = self
                 .inner
@@ -456,7 +628,7 @@ impl Admission {
                 .map_err(|_| Failure::transient("internal"))?;
             // A same-key caller on this instance may have claimed meanwhile.
             if let Some(record) = records.get(&key) {
-                return replay(record, &fingerprint);
+                return replay(record, &fingerprint).map(|receipt| (receipt, true));
             }
             if records.len() >= self.inner.config.limits.max_idempotency {
                 return Err(Failure::transient("idempotency_capacity"));
@@ -489,7 +661,7 @@ impl Admission {
                 && let Some(receipt) =
                     store.receipt(&pending.key, &pending.fingerprint, self.deadline)?
             {
-                return Ok(receipt);
+                return Ok((receipt, true));
             }
             return Err(Failure::conflict("concurrency_conflict"));
         }
@@ -504,6 +676,7 @@ impl Admission {
                 history,
                 metadata: command.metadata.clone(),
             },
+            Some(trace),
         )?;
         let Reply::Decided { events } = reply else {
             return Err(Failure::permanent("invalid_response"));
@@ -514,8 +687,8 @@ impl Admission {
         if events.len() > self.inner.config.limits.batch_size {
             return Err(Failure::permanent("event_batch_limit"));
         }
-        let receipt = match &self.inner.store {
-            Storage::Durable(store) => store.commit_command(
+        let (receipt, replayed) = match &self.inner.store {
+            Storage::Durable(store) => store.commit(
                 CommitCommand {
                     stream: &stream,
                     tenant: None,
@@ -526,16 +699,31 @@ impl Admission {
                 },
                 self.deadline,
             )?,
-            Storage::Volatile(store) => {
-                store.append(&stream, expected, events, &command.metadata)?
-            }
+            Storage::Volatile(store) => (
+                store.append(&stream, expected, events, &command.metadata)?,
+                false,
+            ),
         };
         if let Some(claim) = claim {
             claim.complete(&receipt);
         }
-        Ok(receipt)
+        Ok((receipt, replayed))
     }
+    /// Dispatch a query inside its `query {tag}` span (TE §1.2, §1.3).
     pub fn query(self, query: Query) -> Result<QueryResult, Failure> {
+        let inner = self.inner.clone();
+        let trace = inner.instruments.query(query.tag.as_str(), &query.metadata);
+        let span = trace.span().clone();
+        let result = span.in_scope(|| self.answer(query, &trace));
+        trace.finish(match &result {
+            Ok(answer) => Ok(Settled::Answered {
+                checkpoint: answer.checkpoint,
+            }),
+            Err(failure) => Err(failure),
+        });
+        result
+    }
+    fn answer(self, query: Query, trace: &Dispatch<'_>) -> Result<QueryResult, Failure> {
         let route = self
             .inner
             .config
@@ -550,6 +738,7 @@ impl Admission {
             route.service.as_str(),
             &query.tag,
             query.payload,
+            trace,
         )?;
         self.inner.authorizer.authorize(
             MessageKind::Query,
@@ -589,6 +778,7 @@ impl Admission {
                 state: snapshot.state,
                 metadata: query.metadata,
             },
+            Some(trace),
         )?;
         let Reply::Queried { value } = reply else {
             return Err(Failure::permanent("invalid_response"));
@@ -631,6 +821,25 @@ impl Admission {
     /// stores and no run lock.
     fn project_inline(self, name: &str, rebuild: bool) -> Result<ProjectionState, Failure> {
         let projection = self.configured(name)?;
+        let trigger = if rebuild {
+            Trigger::Rebuild
+        } else {
+            Trigger::Admin
+        };
+        let mut run = self
+            .inner
+            .instruments
+            .catch_up(projection.name.as_str(), trigger);
+        let result = self.project_batches(projection, rebuild, &mut run);
+        run.finish(result.as_ref().map(|_| ()));
+        result.map_err(Failure::from)
+    }
+    fn project_batches(
+        &self,
+        projection: &crate::config::Projection,
+        rebuild: bool,
+        run: &mut crate::instrument::ProjectionRun<'_>,
+    ) -> Result<ProjectionState, crate::instrument::RunFailure> {
         let session = self.inner.guest.session()?;
         let mut current = self.inner.projections[&projection.name]
             .try_lock()
@@ -661,42 +870,61 @@ impl Admission {
             )?;
             events.retain(|event| event.position <= head);
             if events.is_empty() || events.len() > self.inner.config.limits.batch_size {
-                return Err(Failure::permanent("invalid_event_feed"));
+                return Err(Failure::permanent("invalid_event_feed").into());
             }
             let mut checkpoint = pending.checkpoint;
             for event in &events {
                 if event.position != checkpoint + 1 {
-                    return Err(Failure::permanent("invalid_event_feed"));
+                    return Err(Failure::permanent("invalid_event_feed").into());
                 }
                 checkpoint = event.position;
             }
-            let reply = invoke(
-                session.as_ref(),
-                self.deadline,
-                projection.service.as_str(),
-                Operation::Project {
-                    projection: projection.name.clone(),
-                    state: pending.state.clone(),
-                    events,
-                    live: !rebuild,
-                },
-            )?;
+            let count = events.len();
+            // Memory and SQLite store no trace context, so no links.
+            run.batch(
+                events.first().map(|e| (e.position, e.accepted_unix_ms)),
+                &[],
+            );
+            let span = run.span().clone();
+            let reply = span
+                .in_scope(|| {
+                    invoke(
+                        session.as_ref(),
+                        self.deadline,
+                        projection.service.as_str(),
+                        Operation::Project {
+                            projection: projection.name.clone(),
+                            state: pending.state.clone(),
+                            events,
+                            live: !rebuild,
+                        },
+                        None,
+                    )
+                })
+                .map_err(crate::instrument::RunFailure::from_guest_call)?;
             let Reply::Projected { state } = reply else {
-                return Err(Failure::permanent("invalid_response"));
+                return Err(Failure::permanent("invalid_response").into());
             };
             self.check_value(&state, self.inner.config.limits.max_state_bytes)?;
             pending = ProjectionState { state, checkpoint };
             if !rebuild {
                 if let Storage::Durable(store) = &self.inner.store {
-                    revision =
-                        store.commit_projection(&target, revision, &pending, self.deadline)?;
+                    revision = span.in_scope(|| {
+                        store.commit_projection(&target, revision, &pending, self.deadline)
+                    })?;
                 }
                 *current = pending.clone();
+                run.published(count, Some(checkpoint));
+            } else {
+                run.published(count, None);
             }
         }
         // Rebuild swaps its entire candidate only after every batch succeeds.
         if rebuild && let Storage::Durable(store) = &self.inner.store {
             store.commit_projection(&target, revision, &pending, self.deadline)?;
+        }
+        if rebuild {
+            run.published(0, Some(pending.checkpoint));
         }
         *current = pending;
         Ok(current.clone())
@@ -917,8 +1145,13 @@ fn invoke(
     deadline: std::time::Instant,
     service: &str,
     operation: Operation,
+    trace: Option<&Dispatch<'_>>,
 ) -> Result<Reply, Failure> {
-    session.invoke_until(service, operation, deadline)
+    let result = session.invoke_until(service, operation, deadline);
+    if let (Err(failure), Some(trace)) = (&result, trace) {
+        trace.guest_failed(failure);
+    }
+    result
 }
 pub(crate) fn canonical(value: &Value) -> Result<String, Failure> {
     fn sorted(value: &Value) -> Value {

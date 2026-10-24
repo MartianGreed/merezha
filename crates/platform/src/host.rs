@@ -417,7 +417,8 @@ impl Host {
         let mut builder =
             AppContext::builder(&config.app.id, database.clone(), parts.authorizer.clone())
                 .instance_id(&config.app.instance_id)
-                .migrate(config.database.migrate);
+                .migrate(config.database.migrate)
+                .telemetry(options.meters.clone());
         if let Some(authenticator) = options.authenticator.clone() {
             builder = builder.authenticator(authenticator);
         }

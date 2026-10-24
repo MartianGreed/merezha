@@ -5,7 +5,8 @@
 //! OpenTelemetry context (activated on span enter) are both missing.
 //! [`spawn_blocking_in_span`] captures `Dispatch::current()` and
 //! `Span::current()` and re-enters both. T3 moves every CLI and application
-//! `spawn_blocking` to it and bans the raw call with clippy.
+//! `spawn_blocking` to it; `clippy.toml` bans the raw call
+//! (`disallowed-methods`) everywhere but here.
 
 /// `tokio::task::spawn_blocking` that runs `f` under the caller's
 /// dispatcher and inside the caller's current span. Must be called from a
@@ -17,6 +18,10 @@ where
 {
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let span = tracing::Span::current();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the one sanctioned spawn_blocking (TE §2.4)"
+    )]
     tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&dispatch, || span.in_scope(f))
     })

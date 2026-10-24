@@ -80,7 +80,7 @@ async fn the_host_lifecycle_emits_only_catalog_events_and_no_canary() {
     let server = tokio::spawn(host.serve(listener, async move {
         let _ = stopped.await;
     }));
-    let reply = tokio::task::spawn_blocking(move || {
+    let reply = merezha_telemetry::spawn_blocking_in_span(move || {
         let mut socket = std::net::TcpStream::connect(address).unwrap();
         write!(
             socket,
