@@ -340,10 +340,10 @@ payload = { only = ["late"] }
 the OTLP pipeline (TE §3). Every value is checked at startup and all
 problems are reported together. `traces.trust_inbound` decides which
 callers' `traceparent` the edge honors (see [The HTTP edge](#the-http-edge)).
-`metrics.sample_interval_ms` takes effect with the database-backed gauges
-(the projection lag sampler now, the jobs and outbox gauges with TE-T5) and
-`propagation.outbound_hosts` with the outbound client (TE-T6); they validate
-now.
+`metrics.sample_interval_ms` paces the database-backed gauges (the
+projection lag sampler and the jobs and outbox gauges) and
+`propagation.outbound_hosts` takes effect with the outbound client (TE-T6);
+it validates now.
 
 Standard `OTEL_*` variables are never read: `merezha` removes them from its
 environment before any thread starts and logs their names once as
@@ -656,9 +656,10 @@ and `content.index_failed`, and from the jobs runtime
 `job.admin_action`, `job.subscription_sync_failed`, `job.leased`, `job.completed`,
 `job.retry_scheduled`, `job.dead_lettered`, `job.lease_lost`,
 `job.drain_abandoned`, `job.reissue_claim_lost`, `job.worker_failed` (a lease, settle, heartbeat,
-reaper, retention, lag or release statement failing, once per failure
-streak), `job.queue_unconfigured`, `db.listener_lost`,
-`db.listener_restored`.
+reaper, retention, lag, release, scheduler or gauge `sampler` statement
+failing, once per failure streak), `job.queue_unconfigured`,
+`db.listener_lost`, `db.listener_restored`. The jobs runtime emits all of
+them through `event!` (TE-T5).
 
 Exported spans pass the attribute allowlist (TE §1.5): unknown keys are
 dropped and counted in `merezha.telemetry.attributes.dropped`, strings cut to
@@ -1570,6 +1571,63 @@ index the admin listing, the outbox count and retention read, the
 claim column (only on `cancelled` rows) with its index. Migration 0003
 adds `schedules.last_declared_at`, `retired_at`, `declared_version` and
 `definition_declared_at` and the `schedules_due` index the tick reads.
+Migration 0004 (TE-T5) adds `jobs.replay_trace_parent` and
+`replay_trace_state`, the trace a replayed job died in.
+
+**Telemetry** (TE §1.2, §1.3, §2.3; TE-T5). Spans and stored trace context:
+
+- `PgOutbox::append` opens one `send {queue}` (job record) or
+  `send {topic}` (event record) PRODUCER span per record, a child of the
+  caller's span, and stores its context in the row's `trace_parent` and
+  `trace_state`, sampled or not, so the sampling decision travels.
+  `JobsHandle::enqueue` does the same for the job it writes. The relay
+  copies a record's context into every job it fans out to.
+- Each non-empty relay batch runs in a root `relay outbox` span; an empty
+  pass opens none (the batch is locked by a first statement, so an idle
+  wake-up costs one statement as before).
+- Each attempt runs in `process {queue}`, a CONSUMER child of the stored
+  context, so retries continue the producer's trace as sibling spans (R10).
+  It carries `job.id`, `job.queue`, `job.kind`, `job.attempt`,
+  `job.max_attempts`, `messaging.message.id` and, at the end, `job.outcome`
+  (`succeeded`, `retry`, `dead_lettered`, `lease_lost`, `released`),
+  `job.code` and `job.classification`. Its status is `Error` for transient
+  failures, timeouts, panics and lost leases only. The handler runs inside
+  it, so what it issues joins the trace. A job without a stored context
+  (cron, rows written before TE-T5) starts a root.
+- A dead-letter replay (`PgJobs::replay`, `replay_dead`, the admin routes)
+  runs in `admin job.replay`, a child of the caller's span. It moves the
+  job's context to `replay_trace_parent`/`replay_trace_state` and stores its
+  own: the next attempts are its children and link to the trace the job
+  died in (`merezha.link.reason = replay`).
+
+Instruments, built from `names.rs` on the meter `PgJobs::with_telemetry`
+receives (`merezha run` passes `telemetry.meter("jobs")` when metrics are
+exported; otherwise they are no-ops):
+
+- `merezha.job.enqueued` counts every new job: enqueues, relay fan-out,
+  fired occurrences and manual triggers. `merezha.job.schedule.fired`
+  counts fired occurrences (not manual triggers, not duplicates).
+- `merezha.job.duration` has one point per attempt and outcome
+  (classification on failures), `merezha.job.queue_latency` one per lease
+  (lease start minus `run_at`), `merezha.job.attempts` one per terminal
+  outcome (`succeeded`, `dead_lettered`). `merezha.job.dead_lettered`
+  counts each dead job once, on the handler path after its fenced settle
+  and on the reaper path. `merezha.job.lease_expired`, `replayed`
+  (replays and reissues) and `cancelled` count per queue.
+- `merezha.outbox.appended` counts inserted records per module and record
+  kind at append time (a caller rolling back later still counts);
+  `merezha.outbox.relayed` (every record marked relayed, unrouted events
+  included), `merezha.outbox.unrouted` and `merezha.outbox.quarantined`
+  (with the quarantine code as `error.type`) count committed relay work.
+- The gauges `merezha.job.count` (per queue and `ready`, `delayed`,
+  `leased`, `dead`), `merezha.job.lag`, `merezha.outbox.pending` and
+  `merezha.outbox.lag` report a sample taken every
+  `telemetry.metrics.sample_interval_ms` by every instance (the same
+  database-level numbers everywhere): the queue status statements of
+  `GET queues` and `GET outbox`, in one transaction with a 1 s statement
+  timeout. A failing sample keeps the last one and logs
+  `job.worker_failed` (`task = sampler`) once per streak. The sampler runs
+  only when metrics are exported.
 
 Process tests hold the relay with `MEREZHA_JOBS_TEST_RELAY=off` (or
 `interval`, no `LISTEN`), and `MEREZHA_JOBS_TEST_HANDLER=<ms>` registers a
@@ -1799,14 +1857,16 @@ itself.
   work.
 - `Host::start` installs no `Authenticator` yet, so the edge never
   authenticates until identity's block registers one.
-- The outbox and jobs `trace_parent`/`trace_state` columns stay empty until
-  TE-T5 fills them; the events columns are filled from the command span.
+- The events, outbox and jobs `trace_parent`/`trace_state` columns are
+  filled (TE-T3, TE-T5).
 - Reactor lag, lock and batch instruments arrive with the reactors (AP-C3);
   the `application` section of `/v1/admin/status` (TE-T2's route) embeds
   `Application::status()` once both are on main.
-- Job attempts open no `process` span and the `merezha.job.*`
-  instruments, `merezha.job.schedule.fired` included, do not exist yet
-  (TE-T5).
+- The jobs runtime's SQL is not registered as `Statement`s yet, so its
+  statements open no DB spans (issue #41 routes them through TE-T4's
+  registry). Cron jobs keep the occurrence key as
+  their correlation id instead of a host-minted trace id (TE §2.3, with
+  TE-T3's host-minted ids).
 - PostgreSQL application storage (AP-A2) has no background projection
   runners, warm-up readiness or application admin API yet (AP-A3); catch-up
   and rebuild run in the request.

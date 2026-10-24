@@ -163,12 +163,26 @@ pub async fn run(
             names = otel_ignored.join(",").as_str()
         );
     }
+    // Jobs and the outbox run whenever the host does (R12). Their
+    // instruments and gauge sampler run when metrics are exported (TE §1.3).
+    let mut jobs =
+        merezha_jobs::PgJobs::new(&config.jobs).with_app_version(config.app.version.clone());
+    if config
+        .telemetry
+        .signals
+        .contains(&merezha_telemetry::Signal::Metrics)
+    {
+        jobs = jobs.with_telemetry(
+            &telemetry.meter("jobs"),
+            config.telemetry.metrics.sample_interval,
+        );
+    }
     let options = HostOptions {
         meters: telemetry.meters(),
         status: vec![Arc::new(TelemetrySection(telemetry.status_reader()))],
         ..HostOptions::default()
     };
-    let code = serve(config, modules, shutdown, options).await;
+    let code = serve(config, modules, shutdown, options, jobs).await;
     // Flush traces, logs and metrics within `shutdown_timeout_ms`, then the
     // stderr writer.
     let _ = spawn_blocking_in_span(move || telemetry.shutdown()).await;
@@ -241,6 +255,7 @@ async fn serve(
     modules: Vec<Box<dyn Module>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
     mut options: HostOptions,
+    jobs: merezha_jobs::PgJobs,
 ) -> ExitCode {
     let (signal, stopped) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
@@ -267,7 +282,7 @@ async fn serve(
     // A shutdown signal during startup interrupts it: the host shuts the
     // modules it already started down and fails `startup_interrupted`.
     options.interrupt = Some(stopped);
-    let started = start(config, modules, options)
+    let started = start(config, modules, options, jobs)
         .instrument(tracing::info_span!(names::span::STARTUP))
         .await;
     let host = match started {
@@ -295,6 +310,7 @@ async fn start(
     config: merezha_platform::ProjectConfig,
     modules: Vec<Box<dyn Module>>,
     mut options: HostOptions,
+    jobs: merezha_jobs::PgJobs,
 ) -> Result<Host, String> {
     let manifest = config.runtime.manifest.clone();
     let meters = options.meters.clone();
@@ -415,8 +431,7 @@ async fn start(
         raw_runtime = private,
         application = config.application.is_some()
     );
-    // Jobs and the outbox run whenever the host does (R12). The jobs runtime
-    // stops first; the module shutdown budget adds its drain
+    // The jobs runtime stops first; the module shutdown budget adds its drain
     // (`jobs.drain_timeout_ms`, the 2 s cancel grace and the release) to
     // the default, so the other modules keep theirs (AP §B.8).
     let defaults = Timeouts::default();
@@ -430,9 +445,7 @@ async fn start(
         routes,
         authorizer,
         timeouts,
-        jobs: Some(Arc::new(
-            merezha_jobs::PgJobs::new(&config.jobs).with_app_version(config.app.version.clone()),
-        )),
+        jobs: Some(Arc::new(jobs)),
     };
     match Host::start_with(config, modules, parts, options).await {
         Ok(host) => Ok(host),

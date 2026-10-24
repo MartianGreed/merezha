@@ -23,6 +23,7 @@
 //! occurrence strictly after `max(occurrence, now)`. A downtime spanning
 //! several occurrences therefore runs one job, then the normal cadence
 //! (the missed-run policy). Times come from the database clock.
+use crate::telemetry::Metrics;
 use crate::{admin::audit, relay::RelaySettings};
 use merezha_domain::{Failure, compatible_json};
 use merezha_platform::{
@@ -31,6 +32,7 @@ use merezha_platform::{
     ports::{MAX_PAYLOAD_BYTES, ScheduleDeclaration},
 };
 use merezha_postgres::{Database, classify};
+use merezha_telemetry::event;
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
@@ -408,11 +410,17 @@ pub(crate) async fn tick(
     database: &Database,
     settings: &RelaySettings,
     unschedulable: &std::sync::Mutex<std::collections::BTreeSet<String>>,
+    metrics: &Metrics,
 ) -> Result<TickReport, Failure> {
     let mut report = TickReport::default();
     let mut skipped: Vec<String> = Vec::new();
     for _ in 0..MAX_TICK_BATCHES {
-        let (batch, taken, names) = tick_batch(database, settings, skipped.clone()).await?;
+        let (batch, taken, names, fired) = tick_batch(database, settings, skipped.clone()).await?;
+        // Committed: one `merezha.job.schedule.fired` per new job.
+        for (schedule, queue, kind) in &fired {
+            metrics.fired(schedule);
+            metrics.enqueued(queue, kind, 1);
+        }
         report.add(batch);
         skipped.extend(names);
         // A full batch may hide more due rows behind it; skipped ones are
@@ -425,8 +433,9 @@ pub(crate) async fn tick(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     for name in skipped.iter().filter(|name| !previous.contains(*name)) {
-        tracing::warn!(
-            event = "job.worker_failed",
+        event!(
+            WARN,
+            "job.worker_failed",
             task = "scheduler",
             code = "invalid_cron",
             classification = "permanent",
@@ -437,11 +446,14 @@ pub(crate) async fn tick(
     Ok(report)
 }
 
+/// `(schedule, queue, kind)` of each occurrence that enqueued a new job.
+type Fired = Vec<(String, String, String)>;
+
 async fn tick_batch(
     database: &Database,
     settings: &RelaySettings,
     excluded: Vec<String>,
-) -> Result<(TickReport, usize, Vec<String>), Failure> {
+) -> Result<(TickReport, usize, Vec<String>, Fired), Failure> {
     let settings = settings.clone();
     database
         .transaction(deadline(), move |tx| {
@@ -458,7 +470,7 @@ async fn tick_batch(
                     .map_err(|e| classify(&e))?
                     .get(0);
                 if !ours {
-                    return Ok((TickReport::default(), 0, Vec::new()));
+                    return Ok((TickReport::default(), 0, Vec::new(), Vec::new()));
                 }
                 let rows = tx
                     .query(
@@ -478,6 +490,7 @@ async fn tick_batch(
                 let mut report = TickReport::default();
                 let mut woken: Vec<String> = Vec::new();
                 let mut skipped = Vec::new();
+                let mut fired = Fired::new();
                 for row in &rows {
                     let name: String = row.get(0);
                     let queue: String = row.get(3);
@@ -519,12 +532,14 @@ async fn tick_batch(
                         if !woken.contains(&queue) {
                             woken.push(queue.clone());
                         }
-                        tracing::debug!(
-                            event = "job.schedule_fired",
+                        event!(
+                            DEBUG,
+                            "job.schedule_fired",
                             schedule = name.as_str(),
                             job_id = id,
-                            scheduled_for = %scheduled
+                            scheduled_for = scheduled.to_string().as_str()
                         );
+                        fired.push((name.clone(), queue.clone(), kind.clone()));
                     } else {
                         report.duplicates += 1;
                     }
@@ -534,7 +549,7 @@ async fn tick_batch(
                         .await
                         .map_err(|e| classify(&e))?;
                 }
-                Ok((report, rows.len(), skipped))
+                Ok((report, rows.len(), skipped, fired))
             })
         })
         .await
@@ -667,7 +682,7 @@ pub(crate) async fn list(
 }
 
 fn logged(action: &str, schedule: &str) {
-    tracing::info!(event = "job.admin_action", action, count = 1, schedule);
+    event!(INFO, "job.admin_action", action, count = 1, schedule);
 }
 
 /// `POST schedules/{name}/pause`: `enabled = false`, with an audit row.
@@ -782,6 +797,7 @@ pub(crate) async fn trigger(
     name: &str,
     key: Option<&str>,
     principal: Option<&str>,
+    metrics: &Metrics,
 ) -> Result<Triggered, Failure> {
     if key.is_some_and(|key| !valid_trigger_key(key)) {
         return Err(Failure::permanent("validation_failed"));
@@ -831,15 +847,23 @@ pub(crate) async fn trigger(
                         .map_err(|e| classify(&e))?;
                 }
                 audit(tx, principal.as_deref(), "schedule_trigger", &name, 1).await?;
-                Ok(Triggered {
-                    name,
-                    job_id,
-                    idempotency_key: key,
-                    inserted,
-                })
+                Ok((
+                    Triggered {
+                        name,
+                        job_id,
+                        idempotency_key: key,
+                        inserted,
+                    },
+                    queue,
+                    kind,
+                ))
             })
         })
         .await?;
+    let (triggered, queue, kind) = triggered;
+    if triggered.inserted {
+        metrics.enqueued(&queue, &kind, 1);
+    }
     logged("schedule_trigger", &triggered.name);
     Ok(triggered)
 }

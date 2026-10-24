@@ -1787,11 +1787,15 @@ dependencies = [
  "merezha-jobs",
  "merezha-platform",
  "merezha-postgres",
+ "merezha-telemetry",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "serde",
  "serde_json",
  "tokio",
  "tower",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 

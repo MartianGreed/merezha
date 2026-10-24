@@ -14,6 +14,11 @@ test-hooks = []
 merezha-domain = { path = "../domain" }
 merezha-platform = { path = "../platform" }
 merezha-postgres = { path = "../postgres" }
+# Names, stored trace context and span parents and links (TE §0): the
+# APIs only, no SDK and no exporter.
+merezha-telemetry = { path = "../telemetry", features = ["propagation"] }
+opentelemetry = { workspace = true, features = ["trace"] }
+tracing-opentelemetry.workspace = true
 axum.workspace = true
 jiff.workspace = true
 serde.workspace = true
@@ -25,5 +30,8 @@ tracing.workspace = true
 # The integration tests use the test hooks (`PgJobs::without_heartbeat`).
 merezha-jobs = { path = ".", features = ["test-hooks"] }
 merezha-application = { path = "../application" }
+# The in-memory telemetry harness (TE §8).
+merezha-telemetry = { path = "../telemetry", features = ["testing"] }
+opentelemetry_sdk.workspace = true
 tower.workspace = true
 tracing-subscriber.workspace = true

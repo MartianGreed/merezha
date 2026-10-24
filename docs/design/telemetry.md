@@ -115,7 +115,7 @@ installed by the binary; tests use scoped dispatchers (§8).
 | Raw pipeline | `pipeline {id}`, with one `guest {service} raw` child per step | INTERNAL | HTTP span |
 | DB transaction | `transaction {module}` | INTERNAL | caller |
 | DB statement | `{db.query.summary}`, for example `INSERT merezha_app.events` | CLIENT | transaction or caller |
-| Outbox append | `send {queue}` (job records), `send {topic}` (event records) | PRODUCER | caller (inside its transaction) |
+| Outbox append, enqueue | `send {queue}` (job records and `JobsHandle::enqueue`), `send {topic}` (event records) | PRODUCER | caller (inside its transaction) |
 | Outbox relay | `relay outbox`, one per non-empty batch | INTERNAL | root |
 | Job attempt | `process {queue}` | CONSUMER | stored producer context (§2.3) |
 | Outbound HTTP | `{METHOD} {url.template}` | CLIENT | caller |
@@ -277,7 +277,18 @@ Job and outbox gauges belong to this block (T5), not AP-B2. They come from
 `outbox`, run once per instance every `telemetry.metrics.sample_interval_ms`
 (default 15 s) with a 1 s statement timeout and cached. Every instance reports
 the same database-level numbers; dashboards use
-`max without (service_instance_id)`.
+`max without (service_instance_id)`. The sample runs the same two
+statements as those routes in one transaction, skips their quarantined
+listing, runs only while metrics are exported, and keeps the last values
+when a read fails (`job.worker_failed` with `task = sampler`).
+
+Counting rules (TE-T5): `merezha.job.enqueued` counts every new job (enqueue,
+relay fan-out, fired occurrences, manual triggers); `merezha.job.schedule.fired`
+counts fired occurrences only. `merezha.outbox.appended` counts at append, in
+the caller's transaction, so a rollback afterwards still counts; the relay
+counters count committed batches, and `merezha.outbox.relayed` includes
+unrouted event records. `merezha.job.dead_lettered` counts the handler path
+after its fenced settle and the reaper path, so each dead job counts once.
 
 **Outbound HTTP** (AppContext client)
 
@@ -523,9 +534,14 @@ transport id. They are linked, not merged.
   context, with `job.id`, `job.attempt`, `job.max_attempts`,
   `messaging.message.id` (job id), `job.kind`, `job.outcome`. Retries continue
   the original trace, even hours later, as sibling spans (R10).
-- Dead-letter replay (an operator action) starts a new root
-  `admin job.replay`; its attempt span links to the stored context
-  (`merezha.link.reason=replay`) instead of being its child.
+- Dead-letter replay (an operator action) starts a new trace with
+  `admin job.replay` (a child of the admin request's span); its attempt
+  spans link to the stored context (`merezha.link.reason=replay`) instead
+  of being its children. The replay moves the job's stored context to
+  `replay_trace_parent`/`replay_trace_state` (`merezha_jobs` migration
+  0004, TE-T5, same formats) and stores the `admin job.replay` span's
+  context, so the attempts after a replay are children of the replay span
+  and every one of them links back to the trace the job died in.
 - Cron runs have no producer: each is a root with the ratio sampler and a
   host-minted correlation id. Commands issued by jobs follow §2.2 and are
   children of the job span.
@@ -757,7 +773,7 @@ Block events (AP's former `jobs.*` events are `job.*`):
 | `outbox.quarantined` | warn | `outbox_id`, `source`, `code` |
 | `outbox.relay_failed` (a systemic relay failure, once per failure streak; nothing is quarantined) | error | `code`, `classification` |
 | `job.subscription_sync_failed` (the start-up subscription sync, once per failure streak) | warn | `code`, `classification` |
-| `job.worker_failed` (a worker statement failing: `lease`, `settle`, `heartbeat`, `reaper`, `retention`, `lag`, `release`, or the cron tick `scheduler`; once per failure streak, except a due schedule this version cannot parse, logged per tick with `schedule`) | warn | `task`, `code`, `classification`, `schedule` |
+| `job.worker_failed` (a worker statement failing: `lease`, `settle`, `heartbeat`, `reaper`, `retention`, `lag`, `release`, the cron tick `scheduler`, or the gauge `sampler`; once per failure streak, except a due schedule this version cannot parse, logged per tick with `schedule`) | warn | `task`, `code`, `classification`, `schedule` |
 | `job.schedule_sync_failed` (declaring the instance's schedules, at start and on each heartbeat; once per failure streak) | warn | `code`, `classification` |
 | `job.schedule_fired` (one occurrence enqueued its job) | debug | `schedule`, `job_id`, `scheduled_for` |
 | `job.schedule_conflict` (this instance declares another definition for a schedule whose stored definition has precedence: a newer `app.version`, or declarers still alive; once per streak) | warn | `schedule`, `version` |

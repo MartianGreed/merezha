@@ -1869,6 +1869,184 @@ pub mod dispatch {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Jobs and outbox (TE-T5): keys, closed values, span names and typed
+// constructors for `merezha-jobs` (TE §1.2, §1.3, §2.3)
+// ---------------------------------------------------------------------------
+
+/// The jobs and outbox rows of the catalog in typed form: the `job.*` keys,
+/// their closed value sets, the `send`/`process`/`relay` span names and the
+/// constructors `merezha-jobs` records attributes with. Queue, kind and
+/// schedule values are configured or registered names (TE §1.4 rule 1);
+/// job ids and attempt numbers are span and log attributes only.
+pub mod jobs {
+    use super::{KeyValue, key};
+
+    pub const QUEUE: &str = "job.queue";
+    pub const KIND: &str = "job.kind";
+    pub const OUTCOME: &str = "job.outcome";
+    pub const CLASSIFICATION: &str = "job.classification";
+    pub const STATE: &str = "job.state";
+    pub const SCHEDULE: &str = "job.schedule";
+    pub const RECORD_KIND: &str = "job.record_kind";
+    pub const ID: &str = "job.id";
+    pub const ATTEMPT: &str = "job.attempt";
+    pub const MAX_ATTEMPTS: &str = "job.max_attempts";
+    pub const CODE: &str = "job.code";
+
+    /// `messaging.system` on jobs spans.
+    pub const MESSAGING_SYSTEM: &str = "merezha";
+    /// `messaging.operation.type` of `send` spans.
+    pub const OPERATION_SEND: &str = "send";
+    /// `messaging.operation.type` of `process` spans.
+    pub const OPERATION_PROCESS: &str = "process";
+
+    /// The relay span, one per non-empty batch (root).
+    pub const RELAY_SPAN: &str = super::span::RELAY_OUTBOX;
+    /// The operator replay span (TE §2.3), `admin {operation}`.
+    pub const REPLAY_SPAN: &str = "admin job.replay";
+
+    /// `send {queue}` or `send {topic}`: the PRODUCER span of an outbox
+    /// record or an enqueue.
+    pub fn send_span(destination: &str) -> String {
+        format!("send {destination}")
+    }
+    /// `process {queue}`: the CONSUMER span of one attempt.
+    pub fn process_span(queue: &str) -> String {
+        format!("process {queue}")
+    }
+
+    /// `job.outcome` values (TE §1.3).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Outcome {
+        Succeeded,
+        Retry,
+        DeadLettered,
+        LeaseLost,
+        Released,
+    }
+    impl Outcome {
+        pub const ALL: [Outcome; 5] = [
+            Self::Succeeded,
+            Self::Retry,
+            Self::DeadLettered,
+            Self::LeaseLost,
+            Self::Released,
+        ];
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Succeeded => "succeeded",
+                Self::Retry => "retry",
+                Self::DeadLettered => "dead_lettered",
+                Self::LeaseLost => "lease_lost",
+                Self::Released => "released",
+            }
+        }
+    }
+    /// `job.classification` values; absent on success.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Classification {
+        Permanent,
+        Transient,
+        Conflict,
+    }
+    impl Classification {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Permanent => "permanent",
+                Self::Transient => "transient",
+                Self::Conflict => "conflict",
+            }
+        }
+        /// The value named `name`, as `merezha_domain` spells
+        /// classifications.
+        pub fn from_name(name: &str) -> Option<Self> {
+            match name {
+                "permanent" => Some(Self::Permanent),
+                "transient" => Some(Self::Transient),
+                "conflict" => Some(Self::Conflict),
+                _ => None,
+            }
+        }
+    }
+    /// `job.state` values of `merezha.job.count`: `ready` and `delayed`
+    /// are `available` rows with `run_at` past or future, `leased` is
+    /// `running`, `dead` is `dead`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum State {
+        Ready,
+        Delayed,
+        Leased,
+        Dead,
+    }
+    impl State {
+        pub const ALL: [State; 4] = [Self::Ready, Self::Delayed, Self::Leased, Self::Dead];
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Ready => "ready",
+                Self::Delayed => "delayed",
+                Self::Leased => "leased",
+                Self::Dead => "dead",
+            }
+        }
+    }
+    /// `job.record_kind` values of `merezha.outbox.appended`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RecordKind {
+        Event,
+        Job,
+    }
+    impl RecordKind {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Event => "event",
+                Self::Job => "job",
+            }
+        }
+    }
+
+    /// Typed constructors for jobs and outbox metric attributes.
+    pub mod attr {
+        use super::*;
+        /// A configured or registered queue name.
+        pub fn queue(name: &str) -> KeyValue {
+            KeyValue::new(QUEUE, name.to_owned())
+        }
+        /// A registered job kind.
+        pub fn kind(name: &str) -> KeyValue {
+            KeyValue::new(KIND, name.to_owned())
+        }
+        pub fn outcome(outcome: Outcome) -> KeyValue {
+            KeyValue::new(OUTCOME, outcome.as_str())
+        }
+        pub fn classification(classification: Classification) -> KeyValue {
+            KeyValue::new(CLASSIFICATION, classification.as_str())
+        }
+        pub fn state(state: State) -> KeyValue {
+            KeyValue::new(STATE, state.as_str())
+        }
+        /// A configured or declared schedule name (at most 256).
+        pub fn schedule(name: &str) -> KeyValue {
+            KeyValue::new(SCHEDULE, name.to_owned())
+        }
+        pub fn record_kind(kind: RecordKind) -> KeyValue {
+            KeyValue::new(RECORD_KIND, kind.as_str())
+        }
+        /// `merezha.module`: an outbox record's `source`, a module name.
+        pub fn module(name: &str) -> KeyValue {
+            KeyValue::new(key::MODULE, name.to_owned())
+        }
+        /// `error.type`: a host code (the quarantine code), never text.
+        pub fn error_type(code: &str) -> KeyValue {
+            KeyValue::new(key::ERROR_TYPE, code.to_owned())
+        }
+        /// `merezha.link.reason = replay`, on a replayed attempt's link.
+        pub fn replay_link() -> KeyValue {
+            super::super::attr::link_reason(super::super::LinkReason::Replay)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2124,5 +2302,65 @@ mod tests {
         assert_eq!(source_event_link().key.as_str(), key::LINK_REASON);
         let operations: BTreeSet<_> = GuestOperation::ALL.iter().map(|o| o.as_str()).collect();
         assert_eq!(operations.len(), 6);
+    }
+
+    /// TE-T5: the jobs keys are the ones the metric rows and the allowlist
+    /// name, with the design's closed values.
+    #[test]
+    fn jobs_keys_and_values_match_the_jobs_rows() {
+        use jobs::*;
+        for (key, metric) in [
+            (QUEUE, true),
+            (KIND, true),
+            (OUTCOME, true),
+            (CLASSIFICATION, true),
+            (STATE, true),
+            (SCHEDULE, true),
+            (RECORD_KIND, true),
+            (ID, false),
+            (ATTEMPT, false),
+            (MAX_ATTEMPTS, false),
+            (CODE, false),
+        ] {
+            let row = attribute(key).unwrap_or_else(|| panic!("{key}"));
+            assert_eq!(row.metric, metric, "{key}");
+            assert!(row.span && row.log, "{key}");
+        }
+        assert_eq!(
+            metric::JOB_DURATION.attributes,
+            &[QUEUE, KIND, OUTCOME, CLASSIFICATION]
+        );
+        assert_eq!(metric::JOB_COUNT.attributes, &[QUEUE, STATE]);
+        assert_eq!(metric::JOB_SCHEDULE_FIRED.attributes, &[SCHEDULE]);
+        assert_eq!(
+            metric::OUTBOX_APPENDED.attributes,
+            &[key::MODULE, RECORD_KIND]
+        );
+        let outcomes: Vec<_> = Outcome::ALL.iter().map(|o| o.as_str()).collect();
+        assert_eq!(
+            outcomes,
+            [
+                "succeeded",
+                "retry",
+                "dead_lettered",
+                "lease_lost",
+                "released"
+            ]
+        );
+        let states: Vec<_> = State::ALL.iter().map(|s| s.as_str()).collect();
+        assert_eq!(states, ["ready", "delayed", "leased", "dead"]);
+        for name in ["permanent", "transient", "conflict"] {
+            assert_eq!(Classification::from_name(name).unwrap().as_str(), name);
+        }
+        assert!(Classification::from_name("guest_error").is_none());
+        let spans: Vec<_> = SPANS.iter().map(|s| (s.pattern, s.kind)).collect();
+        assert!(spans.contains(&("send {queue}", Kind::Producer)));
+        assert!(spans.contains(&("process {queue}", Kind::Consumer)));
+        assert!(spans.contains(&(RELAY_SPAN, Kind::Internal)));
+        assert!(spans.contains(&("admin {operation}", Kind::Internal)));
+        assert_eq!(send_span("notify.email"), "send notify.email");
+        assert_eq!(process_span("default"), "process default");
+        assert_eq!(attr::replay_link().key.as_str(), key::LINK_REASON);
+        assert_eq!(attr::module("tasks").key.as_str(), key::MODULE);
     }
 }

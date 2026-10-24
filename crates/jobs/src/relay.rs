@@ -2,18 +2,28 @@
 //! transaction per batch. Event records fan out to subscriptions, job
 //! records go to their queue, records the jobs table would refuse are
 //! quarantined, and flagged payloads are nulled as rows are marked (R3).
+use crate::telemetry::{self, Metrics, tally};
 use merezha_domain::{Classification, Failure};
 use merezha_platform::config::JobsConfig;
 use merezha_postgres::{Database, classify};
+use merezha_telemetry::event;
 use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 /// The channel dispatchers listen on (AP-B2); the payload is the queue.
 pub const JOBS_CHANNEL: &str = "merezha_jobs";
 /// Bound on one relay transaction.
 const PASS_DEADLINE: Duration = Duration::from_secs(30);
 
-/// The B.4 statement. `$5` restricts the batch to one record when a
-/// permanent failure is isolated.
+/// The batch: unrelayed records locked by this transaction. `$2`
+/// restricts it to one record when a permanent failure is isolated. An
+/// empty batch ends the pass without a span (TE §1.2).
+const LOCK: &str = "SELECT id FROM merezha_jobs.outbox
+ WHERE relayed_at IS NULL AND quarantined_at IS NULL AND ($2::bigint IS NULL OR id = $2::bigint)
+ ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED";
+
+/// The B.4 statement over the locked batch `$5`. Each record's stored
+/// trace context goes to every job it fans out to (TE §2.3).
 const RELAY: &str = r#"
 WITH queues (queue, max_attempts) AS (
     SELECT * FROM unnest($2::text[], $3::int[])
@@ -24,11 +34,10 @@ WITH queues (queue, max_attempts) AS (
              OR (queue ~ '^[a-z][a-z0-9_.-]{0,63}$' AND octet_length(job_kind) BETWEEN 1 AND 128
                  AND octet_length(source || ':' || dedupe_key) <= 200) AS routable
       FROM merezha_jobs.outbox
-     WHERE relayed_at IS NULL AND quarantined_at IS NULL
-       AND ($5::bigint IS NULL OR id = $5::bigint)
+     WHERE relayed_at IS NULL AND quarantined_at IS NULL AND id = ANY($5::bigint[])
      ORDER BY id
      LIMIT $1
-     FOR UPDATE SKIP LOCKED
+     FOR UPDATE
 ), fanned AS (
     SELECT b.id, s.queue, s.job_kind AS kind, 'outbox:' || b.id || ':' || s.job_kind AS key,
            b.priority, b.run_at, b.payload, b.contains_secret,
@@ -51,7 +60,7 @@ WITH queues (queue, max_attempts) AS (
            f.id, f.correlation_id, f.causation_id, f.tenant, f.trace_parent, f.trace_state
       FROM fanned f LEFT JOIN queues q ON q.queue = f.queue
     ON CONFLICT (queue, idempotency_key) DO NOTHING
-    RETURNING queue
+    RETURNING queue, kind
 ), marked AS (
     UPDATE merezha_jobs.outbox o
        SET relayed_at = CASE WHEN b.routable THEN now() END,
@@ -68,7 +77,13 @@ SELECT (SELECT count(*) FROM marked WHERE routable) AS relayed,
            AND NOT EXISTS (SELECT 1 FROM fanned f WHERE f.id = b.id)) AS unrouted,
        (SELECT array_agg(DISTINCT queue) FROM inserted) AS queues,
        (SELECT array_agg(id ORDER BY id) FROM marked WHERE NOT routable) AS quarantined_ids,
-       (SELECT array_agg(source ORDER BY id) FROM marked WHERE NOT routable) AS quarantined_sources
+       (SELECT array_agg(source ORDER BY id) FROM marked WHERE NOT routable) AS quarantined_sources,
+       (SELECT array_agg(source ORDER BY id) FROM marked WHERE routable) AS relayed_sources,
+       (SELECT array_agg(b.source ORDER BY b.id) FROM batch b
+         WHERE b.record_kind = 'event'
+           AND NOT EXISTS (SELECT 1 FROM fanned f WHERE f.id = b.id)) AS unrouted_sources,
+       (SELECT array_agg(queue ORDER BY queue, kind) FROM inserted) AS job_queues,
+       (SELECT array_agg(kind ORDER BY queue, kind) FROM inserted) AS job_kinds
 "#;
 
 const PENDING_IDS: &str = "SELECT id FROM merezha_jobs.outbox
@@ -158,59 +173,131 @@ fn count(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
-/// One batch transaction, optionally for one record.
+/// What one committed pass wrote, per module and queue, for the counters.
+#[derive(Default)]
+struct Tally {
+    relayed: Vec<String>,
+    unrouted: Vec<String>,
+    /// `(source, code)` of records quarantined as `unroutable`.
+    quarantined: Vec<(String, String)>,
+    /// `(queue, kind)` of every job inserted.
+    jobs: Vec<(String, String)>,
+}
+impl Tally {
+    fn record(&self, metrics: &Metrics) {
+        for (module, count) in tally(self.relayed.iter().map(String::as_str)) {
+            metrics.relayed(module, count);
+        }
+        for (module, count) in tally(self.unrouted.iter().map(String::as_str)) {
+            metrics.unrouted(module, count);
+        }
+        for (module, code) in &self.quarantined {
+            metrics.quarantined(module, code);
+        }
+        let mut jobs = std::collections::BTreeMap::new();
+        for job in &self.jobs {
+            *jobs.entry(job).or_insert(0u64) += 1;
+        }
+        for ((queue, kind), count) in jobs {
+            metrics.enqueued(queue, kind, count);
+        }
+    }
+}
+
+/// One batch transaction, optionally for one record. A batch holding
+/// records runs in a `relay outbox` span; its counters are recorded once
+/// it committed.
 async fn pass(
     database: &Database,
     settings: &RelaySettings,
     only: Option<i64>,
+    metrics: &Metrics,
 ) -> Result<RelayReport, Failure> {
     let settings = settings.clone();
-    database
+    let (report, tally) = database
         .transaction(Instant::now() + PASS_DEADLINE, move |tx| {
             Box::pin(async move {
-                let row = tx
-                    .query_one(
-                        RELAY,
-                        &[
-                            &settings.batch,
-                            &settings.queues,
-                            &settings.max_attempts,
-                            &settings.default_max_attempts,
-                            &only,
-                        ],
-                    )
+                let ids: Vec<i64> = tx
+                    .query(LOCK, &[&settings.batch, &only])
                     .await
-                    .map_err(|e| relay_failure(&e))?;
-                let queues: Option<Vec<String>> = row.get(3);
-                if let Some(queues) = queues.filter(|q| !q.is_empty()) {
-                    tx.execute(
-                        "SELECT pg_notify('merezha_jobs', q) FROM unnest($1::text[]) AS q",
-                        &[&queues],
-                    )
-                    .await
-                    .map_err(|e| relay_failure(&e))?;
-                }
-                let ids: Option<Vec<i64>> = row.get(4);
-                let sources: Option<Vec<String>> = row.get(5);
-                for (id, source) in ids
-                    .unwrap_or_default()
+                    .map_err(|e| relay_failure(&e))?
                     .iter()
-                    .zip(sources.unwrap_or_default())
-                {
-                    quarantined_log(*id, &source, "unroutable");
+                    .map(|row| row.get(0))
+                    .collect();
+                if ids.is_empty() {
+                    return Ok((RelayReport::default(), Tally::default()));
                 }
-                Ok(RelayReport {
-                    relayed: count(row.get(0)),
-                    quarantined: count(row.get(1)),
-                    unrouted: count(row.get(2)),
-                })
+                let span = telemetry::relay_span();
+                let relayed = relay_locked(tx, &settings, &ids)
+                    .instrument(span.clone())
+                    .await;
+                if matches!(&relayed, Err(f) if f.classification != Classification::Permanent) {
+                    telemetry::failed(&span);
+                }
+                relayed
             })
         })
+        .await?;
+    tally.record(metrics);
+    Ok(report)
+}
+
+/// The relay statement over the locked batch `ids`.
+async fn relay_locked(
+    tx: &mut merezha_postgres::Tx<'_>,
+    settings: &RelaySettings,
+    ids: &[i64],
+) -> Result<(RelayReport, Tally), Failure> {
+    let row = tx
+        .query_one(
+            RELAY,
+            &[
+                &settings.batch,
+                &settings.queues,
+                &settings.max_attempts,
+                &settings.default_max_attempts,
+                &ids,
+            ],
+        )
         .await
+        .map_err(|e| relay_failure(&e))?;
+    let queues: Option<Vec<String>> = row.get(3);
+    if let Some(queues) = queues.filter(|q| !q.is_empty()) {
+        tx.execute(
+            "SELECT pg_notify('merezha_jobs', q) FROM unnest($1::text[]) AS q",
+            &[&queues],
+        )
+        .await
+        .map_err(|e| relay_failure(&e))?;
+    }
+    let quarantined_ids: Option<Vec<i64>> = row.get(4);
+    let sources: Option<Vec<String>> = row.get(5);
+    let mut tally = Tally::default();
+    for (id, source) in quarantined_ids
+        .unwrap_or_default()
+        .iter()
+        .zip(sources.unwrap_or_default())
+    {
+        quarantined_log(*id, &source, "unroutable");
+        tally.quarantined.push((source, "unroutable".to_owned()));
+    }
+    let strings =
+        |at: usize| -> Vec<String> { row.get::<_, Option<Vec<String>>>(at).unwrap_or_default() };
+    tally.relayed = strings(6);
+    tally.unrouted = strings(7);
+    tally.jobs = strings(8).into_iter().zip(strings(9)).collect();
+    Ok((
+        RelayReport {
+            relayed: count(row.get(0)),
+            quarantined: count(row.get(1)),
+            unrouted: count(row.get(2)),
+        },
+        tally,
+    ))
 }
 
 fn quarantined_log(id: i64, source: &str, code: &str) {
-    tracing::warn!(event = "outbox.quarantined", outbox_id = id, source, code);
+    event!(WARN, "outbox.quarantined", outbox_id = id, source, code);
 }
 
 /// One batch, and whether it was full. A permanent failure of the whole
@@ -219,8 +306,9 @@ fn quarantined_log(id: i64, source: &str, code: &str) {
 async fn batch(
     database: &Database,
     settings: &RelaySettings,
+    metrics: &Metrics,
 ) -> Result<(RelayReport, bool), Failure> {
-    match pass(database, settings, None).await {
+    match pass(database, settings, None, metrics).await {
         Err(failure) if failure.classification == Classification::Permanent => {}
         Ok(report) => return Ok((report, report.marked() >= count(settings.batch))),
         Err(failure) => return Err(failure),
@@ -238,7 +326,7 @@ async fn batch(
     let full = ids.len() >= usize::try_from(settings.batch).unwrap_or(usize::MAX);
     let mut report = RelayReport::default();
     for id in ids {
-        match pass(database, settings, Some(id)).await {
+        match pass(database, settings, Some(id), metrics).await {
             Ok(one) => report.add(one),
             Err(failure) if failure.classification == Classification::Permanent => {
                 let code = failure.code;
@@ -256,6 +344,7 @@ async fn batch(
                     .await?;
                 if let Some(source) = set_aside {
                     quarantined_log(id, &source, &code);
+                    metrics.quarantined(&source, &code);
                     report.quarantined += 1;
                 }
             }
@@ -271,11 +360,12 @@ pub(crate) async fn drain(
     database: &Database,
     settings: &RelaySettings,
     max_batches: usize,
+    metrics: &Metrics,
 ) -> Result<(RelayReport, bool), Failure> {
     let mut total = RelayReport::default();
     let mut drained = false;
     for _ in 0..max_batches {
-        let (report, full) = batch(database, settings).await?;
+        let (report, full) = batch(database, settings, metrics).await?;
         total.add(report);
         if !full {
             drained = true;
@@ -283,8 +373,9 @@ pub(crate) async fn drain(
         }
     }
     if total.marked() > 0 {
-        tracing::debug!(
-            event = "outbox.relayed",
+        event!(
+            DEBUG,
+            "outbox.relayed",
             relayed = total.relayed,
             unrouted = total.unrouted
         );

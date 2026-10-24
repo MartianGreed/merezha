@@ -811,6 +811,8 @@ CREATE TABLE merezha_jobs.jobs (
     outbox_id bigint NULL, schedule_name text NULL, scheduled_for timestamptz NULL,
     correlation_id text NOT NULL, causation_id text NULL, tenant text NULL,
     trace_parent text NULL, trace_state text NULL,
+    -- TE-T5 (migration 0004): the trace a replayed job died in, linked from its next attempts
+    replay_trace_parent text NULL, replay_trace_state text NULL,
     replays integer NOT NULL DEFAULT 0,
     created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
     finished_at timestamptz NULL,
@@ -1323,7 +1325,8 @@ This design defines no metric or log names (R9): jobs use TE §1.3's `merezha.jo
 state names, and TE §4's `job.*` and `reactor.*` log events (`job.lease_lost`,
 `job.drain_abandoned`, `job.admin_action`, `reactor.halted`, `reactor.effect_rejected` among them),
 whose `names.rs` rows land in the emitting slice. Logs never carry payloads. Queue and outbox gauges belong to
-TE-T5, over `JobsHandle::queue_status()`.
+TE-T5, over the queue status read behind `JobsHandle::queue_status()`. TE-T5 also owns the spans
+(`send`, `relay outbox`, `process`, `admin job.replay`) and the trace columns' contents (TE §2.3).
 
 Readiness: migrations are current and the dispatchers are started. Job backlog is not a readiness
 input unless `jobs.readiness.max_lag_ms` is set; it is unset by default (R10).
@@ -1765,7 +1768,7 @@ permissions (decided in the AP-A3 review); every other write needs `application.
 | `GET queues` | `{"queues":[{"name","ready","delayed","leased","dead","oldest_ready_age_s","concurrency","global_concurrency"}]}`, TE's state names |
 | `GET jobs?queue=&state=&kind=&limit=&after=` | `{"jobs":[{"id","queue","kind","state","attempts","max_attempts","run_at","last_error_code","last_error_class","contains_secret","created_at","finished_at","replays"}],"next":cursor?}`. Payloads are never listed. |
 | `GET jobs/{id}` | as above plus `"attempt_history":[{"attempt","started_at","finished_at","outcome","error_code"}]` (named apart from the `attempts` count). `?payload=true` adds `payload` and needs `jobs.admin.payload`; a flagged job's payload is never returned, whatever its state. |
-| `POST jobs/{id}/replay` | dead to `available`: `attempts = 0`, `run_at = now()`, `replays += 1`, error fields kept; `{"id","state"}`. A flagged dead job has no payload (R3): the kind's `reissue` hook asks the owning module to issue it again (`"state":"reissued"`), else `409 secret_purged`. `409 not_dead` otherwise. A reissue claims the row in its own transaction (`cancelled`, `replays + 1`, `reissue_claimed_at = now()`, the audit row), runs the hook within 10 s, then clears the claim, or returns the job to `dead` on failure or timeout, both fenced on the claim's own `reissue_claimed_at` (a settle that matches nothing logs `job.reissue_claim_lost` and fails `409 reissue_claim_lost`); the reaper returns a claim older than 60 s to `dead`, and retention never purges a claimed row. The replay runs in a task detached from the request. |
+| `POST jobs/{id}/replay` | dead to `available`: `attempts = 0`, `run_at = now()`, `replays += 1`, error fields kept, the stored trace context moved to `replay_trace_parent`/`replay_trace_state` and replaced by the `admin job.replay` span's (TE §2.3); `{"id","state"}`. A flagged dead job has no payload (R3): the kind's `reissue` hook asks the owning module to issue it again (`"state":"reissued"`), else `409 secret_purged`. `409 not_dead` otherwise. A reissue claims the row in its own transaction (`cancelled`, `replays + 1`, `reissue_claimed_at = now()`, the audit row), runs the hook within 10 s, then clears the claim, or returns the job to `dead` on failure or timeout, both fenced on the claim's own `reissue_claimed_at` (a settle that matches nothing logs `job.reissue_claim_lost` and fails `409 reissue_claim_lost`); the reaper returns a claim older than 60 s to `dead`, and retention never purges a claimed row. The replay runs in a task detached from the request. |
 | `POST dead/replay` | body `{"queue", "kind"?, "code"?, "dead_after"?, "dead_before"?, "limit": ≤1000}`; `{"replayed":N,"reissued":R,"refused":M,"complete":true}`. Unflagged jobs replay in one transaction; flagged ones are claimed and reissued one at a time, as for a single replay, in a task detached from the request; after 30 s the route answers `202` with the counts so far and `"complete":false` while the run continues. |
 | `POST dead/purge` | body `{"queue", "before"}`; `{"purged":N}` |
 | `POST jobs/{id}/cancel` | `available` to `cancelled` (a flagged payload is nulled); `409 not_cancellable` when running or terminal |
