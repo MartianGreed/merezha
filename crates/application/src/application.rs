@@ -57,6 +57,10 @@ struct Inner {
     retain_receipts: bool,
     projections: BTreeMap<Identity, Mutex<ProjectionState>>,
     active: AtomicUsize,
+    /// The typed PostgreSQL store behind `store`, for background runs,
+    /// explicit catch-ups and the admin API.
+    #[cfg(feature = "postgres")]
+    postgres: Option<Arc<crate::postgres::PostgresStore>>,
 }
 /// A process-local `EventStore` port, or a durable store that also keeps
 /// receipts and projection pairs (SQLite or PostgreSQL).
@@ -164,6 +168,8 @@ impl Application {
                 Storage::Durable(Arc::new(store)),
                 records,
                 recovered,
+                #[cfg(feature = "postgres")]
+                None,
             )
         } else if let StorageConfig::Postgres { .. } = &config.storage {
             // PostgreSQL needs the host's pool and an async connect:
@@ -190,9 +196,10 @@ impl Application {
             config,
             guest,
             authorizer,
-            Storage::Durable(store),
+            Storage::Durable(store.clone()),
             BTreeMap::new(),
             BTreeMap::new(),
+            Some(store),
         )
     }
     pub fn in_memory(
@@ -219,6 +226,8 @@ impl Application {
             Storage::Volatile(store),
             BTreeMap::new(),
             BTreeMap::new(),
+            #[cfg(feature = "postgres")]
+            None,
         )
     }
     fn construct(
@@ -228,6 +237,7 @@ impl Application {
         store: Storage,
         records: BTreeMap<Key, Record>,
         mut recovered: BTreeMap<Identity, ProjectionState>,
+        #[cfg(feature = "postgres")] postgres: Option<Arc<crate::postgres::PostgresStore>>,
     ) -> Result<Self, Failure> {
         validate_services(&config, guest.as_ref())?;
         let retain_receipts = !matches!(
@@ -258,7 +268,21 @@ impl Application {
             idempotency: Mutex::new(records),
             retain_receipts,
             active: AtomicUsize::new(0),
+            #[cfg(feature = "postgres")]
+            postgres,
         })))
+    }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn config(&self) -> &Config {
+        &self.0.config
+    }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn guest(&self) -> &dyn Guest {
+        self.0.guest.as_ref()
+    }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn postgres(&self) -> Option<Arc<crate::postgres::PostgresStore>> {
+        self.0.postgres.clone()
     }
     /// Reserve before reading an HTTP body or submitting a blocking task.
     pub fn admit(&self) -> Result<Admission, Failure> {
@@ -286,6 +310,12 @@ impl Application {
     pub fn rebuild(&self, name: &str) -> Result<ProjectionState, Failure> {
         self.admit()?.project(name, true)
     }
+    /// The status document (AP §D.1): head, per-projection checkpoint, lag
+    /// and failure, and on PostgreSQL this instance's background runs and
+    /// listener. Call it like any dispatch, from a blocking thread.
+    pub fn status(&self) -> Result<crate::status::ApplicationStatus, Failure> {
+        self.admit()?.status()
+    }
 }
 #[cfg(feature = "test-support")]
 impl Application {
@@ -305,7 +335,17 @@ impl Application {
             Storage::Durable(store),
             records,
             recovered,
+            #[cfg(feature = "postgres")]
+            None,
         )
+    }
+    /// A catch-up or rebuild on PostgreSQL that skips the run lock and
+    /// computes on the caller's thread, publishing with row-revision CAS
+    /// only: what a run whose lock session died does. For the lost-CAS
+    /// contract tests.
+    #[doc(hidden)]
+    pub fn project_unlocked(&self, name: &str, rebuild: bool) -> Result<ProjectionState, Failure> {
+        self.admit()?.project_inline(name, rebuild)
     }
 }
 impl Admission {
@@ -339,15 +379,7 @@ impl Admission {
         }
     }
     fn check_value(&self, value: &Value, maximum: usize) -> Result<(), Failure> {
-        compatible_json(value)?;
-        if serde_json::to_vec(value)
-            .map_err(|_| Failure::permanent("serialization_failed"))?
-            .len()
-            > maximum
-        {
-            return Err(Failure::permanent("payload_limit"));
-        }
-        Ok(())
+        check_value(value, maximum)
     }
     /// The in-process record for `key`: a completed receipt replays, a
     /// pending claim is `idempotency_in_flight`, another fingerprint is
@@ -527,14 +559,13 @@ impl Admission {
             &query.metadata,
         )?;
         let snapshot = match &self.inner.store {
+            #[cfg(feature = "postgres")]
+            Storage::Durable(_) if self.inner.postgres.is_some() => {
+                let projection = self.configured(route.projection.as_str())?;
+                self.served(projection, query.min_position)?
+            }
             Storage::Durable(store) => {
-                let projection = self
-                    .inner
-                    .config
-                    .projections
-                    .iter()
-                    .find(|p| p.name == route.projection)
-                    .ok_or_else(|| Failure::permanent("projection_not_found"))?;
+                let projection = self.configured(route.projection.as_str())?;
                 store
                     .projection(&projection_ref(projection), self.deadline)?
                     .0
@@ -544,6 +575,10 @@ impl Admission {
                 .map_err(|_| Failure::conflict("projection_in_flight"))?
                 .clone(),
         };
+        // Without background runs nothing advances while waiting.
+        if query.min_position.is_some_and(|p| snapshot.checkpoint < p) {
+            return Err(Failure::transient("projection_behind"));
+        }
         let reply = invoke(
             session.as_ref(),
             self.deadline,
@@ -564,14 +599,38 @@ impl Admission {
             checkpoint: snapshot.checkpoint,
         })
     }
-    pub fn project(self, name: &str, rebuild: bool) -> Result<ProjectionState, Failure> {
-        let projection = self
-            .inner
+    fn configured(&self, name: &str) -> Result<&crate::config::Projection, Failure> {
+        self.inner
             .config
             .projections
             .iter()
             .find(|p| p.name.as_str() == name)
-            .ok_or_else(|| Failure::permanent("projection_not_found"))?;
+            .ok_or_else(|| Failure::permanent("projection_not_found"))
+    }
+    /// Catch up (`rebuild = false`) or rebuild a projection within the
+    /// admitted deadline. Memory and SQLite run it here and fail
+    /// `projection_in_flight` beside another run on this instance. On
+    /// PostgreSQL a catch-up runs to the head snapshot under the run lock,
+    /// or waits for the runner holding it; a rebuild is requested (or
+    /// resumed) and run to its swap the same way, and its progress
+    /// persists past `timeout`.
+    pub fn project(self, name: &str, rebuild: bool) -> Result<ProjectionState, Failure> {
+        #[cfg(feature = "postgres")]
+        if let Some(store) = &self.inner.postgres {
+            let projection = self.configured(name)?;
+            let app = Application(self.inner.clone());
+            return if rebuild {
+                store.rebuild_now(&app, projection, self.deadline)
+            } else {
+                store.catch_up(&app, projection, self.deadline)
+            };
+        }
+        self.project_inline(name, rebuild)
+    }
+    /// The run on the caller's thread, with row-revision CAS on durable
+    /// stores and no run lock.
+    fn project_inline(self, name: &str, rebuild: bool) -> Result<ProjectionState, Failure> {
+        let projection = self.configured(name)?;
         let session = self.inner.guest.session()?;
         let mut current = self.inner.projections[&projection.name]
             .try_lock()
@@ -642,6 +701,183 @@ impl Admission {
         *current = pending;
         Ok(current.clone())
     }
+}
+impl Admission {
+    /// The PostgreSQL served pair, refused while the revision warms
+    /// (`projection_warming`). With `min_position` it waits, woken by local
+    /// commits and polling every 50 ms, until the checkpoint reaches it,
+    /// else fails `projection_behind` at the deadline.
+    #[cfg(feature = "postgres")]
+    fn served(
+        &self,
+        projection: &crate::config::Projection,
+        min_position: Option<u64>,
+    ) -> Result<ProjectionState, Failure> {
+        let store = self
+            .inner
+            .postgres
+            .as_ref()
+            .ok_or_else(|| Failure::permanent("storage_configuration"))?;
+        let mut published = store.shared().published.subscribe();
+        loop {
+            let read = store.served(projection, self.deadline);
+            let (pair, _, warm) = match min_position {
+                Some(_) => crate::postgres::at_deadline(read, self.deadline, || {
+                    Failure::transient("projection_behind")
+                })?,
+                None => read?,
+            };
+            if pair.checkpoint < warm {
+                return Err(Failure::transient("projection_warming"));
+            }
+            if min_position.is_none_or(|position| pair.checkpoint >= position) {
+                return Ok(pair);
+            }
+            store.wait_published(&mut published, self.deadline, || {
+                Failure::transient("projection_behind")
+            })?;
+        }
+    }
+    /// See [`Application::status`].
+    pub fn status(self) -> Result<crate::status::ApplicationStatus, Failure> {
+        use crate::status::{ApplicationStatus, ProjectionStatus};
+        #[cfg(feature = "postgres")]
+        if let Some(store) = &self.inner.postgres {
+            let projections: Vec<_> = self.inner.config.projections.iter().collect();
+            return store.status(&projections, self.deadline);
+        }
+        let head = self.inner.store.head(self.deadline)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut projections = Vec::with_capacity(self.inner.config.projections.len());
+        for projection in &self.inner.config.projections {
+            let checkpoint = match &self.inner.store {
+                Storage::Durable(store) => {
+                    store
+                        .projection(&projection_ref(projection), self.deadline)?
+                        .0
+                        .checkpoint
+                }
+                Storage::Volatile(_) => {
+                    self.inner.projections[&projection.name]
+                        .lock()
+                        .map_err(|_| Failure::transient("internal"))?
+                        .checkpoint
+                }
+            };
+            let lag_events = head.saturating_sub(checkpoint);
+            let lag_seconds = if lag_events > 0 {
+                self.inner
+                    .store
+                    .read_all(checkpoint, 1, self.deadline)?
+                    .first()
+                    .map_or(0.0, |e| {
+                        now.saturating_sub(e.accepted_unix_ms) as f64 / 1000.0
+                    })
+            } else {
+                0.0
+            };
+            projections.push(ProjectionStatus {
+                name: projection.name.clone(),
+                checkpoint,
+                lag_events,
+                lag_seconds,
+                status: "active".into(),
+                failure_code: None,
+            });
+        }
+        Ok(ApplicationStatus {
+            application: match &self.inner.config.storage {
+                crate::config::StorageConfig::Memory => None,
+                crate::config::StorageConfig::Sqlite { application, .. }
+                | crate::config::StorageConfig::Postgres { application } => {
+                    Some(application.clone())
+                }
+            },
+            head,
+            projections,
+            reactors: Vec::new(),
+            instance: None,
+            listener: None,
+        })
+    }
+}
+/// The PostgreSQL admin operations (AP §D.1); other backends fail
+/// `storage_configuration`.
+#[cfg(feature = "postgres")]
+impl Admission {
+    fn pg(&self) -> Result<&crate::postgres::PostgresStore, Failure> {
+        self.inner
+            .postgres
+            .as_deref()
+            .ok_or_else(|| Failure::permanent("storage_configuration"))
+    }
+    /// Every configured revision with its lag, warmth, failure and rebuild.
+    pub fn projections(self) -> Result<crate::status::ProjectionsOverview, Failure> {
+        let projections: Vec<_> = self.inner.config.projections.iter().collect();
+        let (head, rows) = self.pg()?.overview(&projections, self.deadline)?;
+        Ok(crate::status::ProjectionsOverview {
+            head,
+            projections: rows.into_iter().map(|row| row.entry).collect(),
+        })
+    }
+    /// One configured projection, plus every revision row of its name.
+    pub fn projection(self, name: &str) -> Result<crate::status::ProjectionEntry, Failure> {
+        let projection = self.configured(name)?;
+        let store = self.pg()?;
+        let (_, rows) = store.overview(&[projection], self.deadline)?;
+        let mut entry = rows
+            .into_iter()
+            .next()
+            .ok_or_else(|| Failure::permanent("projection_not_found"))?
+            .entry;
+        entry.revisions = Some(store.revisions(&projection.name, self.deadline)?);
+        Ok(entry)
+    }
+    /// `POST .../rebuild`: start (or with `resume`, resume) a background
+    /// rebuild of the configured revision up to the current head.
+    pub fn request_rebuild(
+        self,
+        name: &str,
+        resume: bool,
+        requested_by: Option<&str>,
+    ) -> Result<crate::status::RebuildRequested, Failure> {
+        let projection = self.configured(name)?;
+        let target = self
+            .pg()?
+            .request_rebuild(projection, resume, requested_by, self.deadline)?;
+        Ok(crate::status::RebuildRequested {
+            name: projection.name.clone(),
+            revision: projection.revision,
+            target,
+        })
+    }
+    /// `DELETE .../rebuild`: abandon a failed or running rebuild.
+    pub fn abandon_rebuild(self, name: &str) -> Result<(), Failure> {
+        let projection = self.configured(name)?;
+        self.pg()?.abandon_rebuild(projection, self.deadline)
+    }
+    /// `DELETE .../revisions/{revision}`: drop a revision row this host does
+    /// not serve; `revision_active` for the configured one.
+    pub fn delete_revision(self, name: &str, revision: u32) -> Result<(), Failure> {
+        let name = Identity::new(name).map_err(|_| Failure::permanent("projection_not_found"))?;
+        self.pg()?.delete_revision(&name, revision, self.deadline)
+    }
+}
+/// `compatible_json` and at most `maximum` encoded bytes, else
+/// `payload_limit`.
+pub(crate) fn check_value(value: &Value, maximum: usize) -> Result<(), Failure> {
+    compatible_json(value)?;
+    if serde_json::to_vec(value)
+        .map_err(|_| Failure::permanent("serialization_failed"))?
+        .len()
+        > maximum
+    {
+        return Err(Failure::permanent("payload_limit"));
+    }
+    Ok(())
 }
 /// The answer an in-process record gives: its completed receipt, or
 /// `idempotency_in_flight` while pending, or `idempotency_mismatch` for

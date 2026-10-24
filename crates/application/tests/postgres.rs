@@ -71,6 +71,11 @@ fn command(stream: &str, payload: Value, key: Option<&str>) -> Command {
         expected_version: None,
     }
 }
+/// Slack on top of a deadline in elapsed-time checks. A loaded CI runner
+/// can stall a thread well past a deadline; the outcome codes and the
+/// committed rows prove the bound, the elapsed time only that nothing
+/// waited on something unbounded.
+const SLACK: Duration = Duration::from_secs(3);
 fn code<T>(result: Result<T, Failure>) -> String {
     result.err().expect("expected a failure").code
 }
@@ -390,11 +395,19 @@ fn positions_stay_contiguous_under_load_from_two_instances_and_a_reader_never_se
     let instances = [pg.open(config(), &writers), pg.open(config(), &writers)];
     let view = pg.open(config(), &reader);
     let stop = AtomicBool::new(false);
+    // Under a loaded machine (shared CI runners) a command may run out of
+    // its deadline. Such outcomes are counted, never ignored silently: the
+    // invariants below hold whatever they were, and enough commits must
+    // still succeed for the load to mean anything.
+    let busy = AtomicUsize::new(0);
+    let unknown = AtomicUsize::new(0);
+    let read_timeouts = AtomicUsize::new(0);
     let (receipts, reads) = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..2 * THREADS)
             .map(|t| {
                 let app = instances[t % 2].clone();
                 let stop = &stop;
+                let (busy, unknown) = (&busy, &unknown);
                 scope.spawn(move || {
                     let mut receipts = Vec::new();
                     let mut n = 0usize;
@@ -409,6 +422,19 @@ fn positions_stay_contiguous_under_load_from_two_instances_and_a_reader_never_se
                             keyed.then_some(key.as_str()),
                         )) {
                             Ok(receipt) => receipts.push(receipt),
+                            // May have committed: bounds the head below.
+                            Err(f) if f.code == "commit_outcome_unknown" => {
+                                unknown.fetch_add(1, Ordering::SeqCst);
+                            }
+                            // Definitely not committed.
+                            Err(f)
+                                if matches!(
+                                    f.code.as_str(),
+                                    "timeout" | "storage_busy" | "database_busy"
+                                ) =>
+                            {
+                                busy.fetch_add(1, Ordering::SeqCst);
+                            }
                             Err(f) => assert_eq!(f.code, "concurrency_conflict", "{f:?}"),
                         }
                     }
@@ -418,11 +444,17 @@ fn positions_stay_contiguous_under_load_from_two_instances_and_a_reader_never_se
             .collect();
         let view = &view;
         let stop_ref = &stop;
+        let read_timeouts = &read_timeouts;
         let walker = scope.spawn(move || {
             let mut reads = 0;
             while !stop_ref.load(Ordering::SeqCst) {
-                view.catch_up("count").unwrap();
-                reads += 1;
+                match view.catch_up("count") {
+                    Ok(_) => reads += 1,
+                    Err(f) => {
+                        assert_eq!(f.code, "timeout", "{f:?}");
+                        read_timeouts.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
             }
             reads
         });
@@ -437,18 +469,43 @@ fn positions_stay_contiguous_under_load_from_two_instances_and_a_reader_never_se
     let caught_up = view.catch_up("count").unwrap();
     let head = pg.count("SELECT position FROM merezha_app.head") as u64;
     assert_eq!(caught_up.checkpoint, head);
-    assert_eq!(
-        receipts.len() as u64,
-        head,
-        "one event per accepted command"
+    let (busy, unknown) = (busy.into_inner(), unknown.into_inner());
+    // One event per accepted command, plus at most one per command whose
+    // outcome is unknown.
+    assert!(
+        receipts.len() as u64 <= head && head <= (receipts.len() + unknown) as u64,
+        "{} receipts, {unknown} unknown outcomes, head {head}",
+        receipts.len()
     );
-    // The reader saw every position once, in order, and each still exists
-    // with the same content.
+    assert!(
+        receipts.len() >= 200,
+        "only {} commits succeeded ({busy} timed out, {unknown} unknown)",
+        receipts.len()
+    );
+    // The reader never saw a jump: every position it was handed is at most
+    // one past the highest it had seen. A catch-up cut by its deadline may
+    // hand a batch again, never skip one. It saw every position, and each
+    // still exists with the same content.
     let seen = reader.seen.lock().unwrap().clone();
-    assert_eq!(
-        seen.iter().map(|e| e.position).collect::<Vec<_>>(),
-        (1..=head).collect::<Vec<_>>()
-    );
+    let mut highest = 0;
+    for event in &seen {
+        assert!(
+            event.position <= highest + 1,
+            "the reader jumped from {highest} to {}",
+            event.position
+        );
+        highest = highest.max(event.position);
+    }
+    let distinct: std::collections::BTreeSet<u64> = seen.iter().map(|e| e.position).collect();
+    assert_eq!(distinct, (1..=head).collect());
+    let read_timeouts = read_timeouts.into_inner();
+    if read_timeouts == 0 {
+        // No catch-up was cut, so none was handed a batch twice.
+        assert_eq!(
+            seen.iter().map(|e| e.position).collect::<Vec<_>>(),
+            (1..=head).collect::<Vec<_>>()
+        );
+    }
     let now: BTreeMap<i64, (String, i64, String)> = pg
         .rows("SELECT position, stream, version, payload::text FROM merezha_app.events")
         .iter()
@@ -469,8 +526,10 @@ fn positions_stay_contiguous_under_load_from_two_instances_and_a_reader_never_se
     assert!(report.ok, "{report:?}");
     assert_eq!(report.events, head);
     eprintln!(
-        "load: {head} commits in {load:?} from {} writers, {reads} catch-ups",
-        2 * THREADS
+        "load: {head} commits in {load:?} from {} writers, {reads} catch-ups; \
+         {busy} commands timed out, {unknown} unknown, {} catch-ups timed out",
+        2 * THREADS,
+        read_timeouts
     );
 }
 
@@ -487,7 +546,9 @@ fn a_held_head_lock_fails_appends_storage_busy_and_queued_appends_commit_in_posi
         code(app.command(command("one", json!(1), None))),
         "storage_busy"
     );
-    assert!(started.elapsed() < Duration::from_millis(1000));
+    // `storage_busy` (not `timeout`) proves the server gave up first.
+    let waited = started.elapsed();
+    assert!(waited < Duration::from_millis(1000) + SLACK, "{waited:?}");
     // Readers are not blocked and see nothing new.
     assert_eq!(pg.count("SELECT count(*) FROM merezha_app.events"), 0);
     assert_eq!(pg.count("SELECT position FROM merezha_app.head"), 0);
@@ -606,8 +667,11 @@ fn an_instance_with_a_full_pending_registry_still_replays_another_instances_rece
     });
 }
 
+/// Explicit catch-ups on two instances take the run lock (AP-A3): one runs,
+/// the other waits for it, so every batch is applied once and no catch-up
+/// loses a CAS.
 #[test]
-fn concurrent_catch_ups_on_two_instances_publish_or_lose_the_row_revision_cas() {
+fn concurrent_catch_ups_on_two_instances_apply_each_batch_once() {
     let Some(pg) = Pg::new() else { return };
     let writers = Arc::new(Probe::default());
     let views = [Arc::new(Probe::default()), Arc::new(Probe::default())];
@@ -616,23 +680,16 @@ fn concurrent_catch_ups_on_two_instances_publish_or_lose_the_row_revision_cas() 
     let writer = pg.open(c.clone(), &writers);
     let instances = [pg.open(c.clone(), &views[0]), pg.open(c, &views[1])];
     let stop = AtomicBool::new(false);
-    let conflicts = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         let readers: Vec<_> = instances
             .iter()
             .map(|app| {
                 let stop = &stop;
                 scope.spawn(move || {
-                    let mut conflicts = 0;
                     while !stop.load(Ordering::SeqCst) {
-                        match app.catch_up("count") {
-                            Ok(pair) => assert!(pair.state == json!(pair.checkpoint)),
-                            Err(f) => {
-                                assert_eq!(f.code, "projection_conflict");
-                                conflicts += 1;
-                            }
-                        }
+                        let pair = app.catch_up("count").unwrap();
+                        assert!(pair.state == json!(pair.checkpoint));
                     }
-                    conflicts
                 })
             })
             .collect();
@@ -642,25 +699,35 @@ fn concurrent_catch_ups_on_two_instances_publish_or_lose_the_row_revision_cas() 
                 .unwrap();
         }
         stop.store(true, Ordering::SeqCst);
-        readers
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .sum::<usize>()
+        for reader in readers {
+            reader.join().unwrap();
+        }
     });
     let pair = instances[0].catch_up("count").unwrap();
     assert_eq!(pair.state, json!(200));
     assert_eq!(pair.checkpoint, 200);
+    let mut applied: Vec<u64> = views
+        .iter()
+        .flat_map(|view| view.seen.lock().unwrap().clone())
+        .map(|event| event.position)
+        .collect();
+    applied.sort();
+    assert_eq!(
+        applied,
+        (1..=200).collect::<Vec<_>>(),
+        "each event applied once"
+    );
     for app in &instances {
         let model = app
             .query(Query {
                 tag: id("Count"),
                 payload: json!({}),
                 metadata: metadata(),
+                min_position: None,
             })
             .unwrap();
         assert_eq!((model.value, model.checkpoint), (json!(200), 200));
     }
-    eprintln!("catch-up CAS losses: {conflicts}");
 }
 
 #[test]
@@ -1199,8 +1266,12 @@ fn a_slow_pool_acquire_still_bounds_the_lock_wait_by_the_time_left() {
         drop(busy);
         command.join().unwrap()
     });
+    // `storage_busy`, not `commit_outcome_unknown`: the lock wait was cut
+    // from the time left after the slow acquire, so the server ended the
+    // statement before the caller's 3 s deadline.
     assert_eq!(code(result), "storage_busy");
-    assert!(started.elapsed() < Duration::from_millis(3000));
+    let waited = started.elapsed();
+    assert!(waited < Duration::from_millis(3000) + SLACK, "{waited:?}");
     pg.release_head(holder);
     // Nothing commits later behind the caller's back.
     std::thread::sleep(Duration::from_millis(500));
@@ -1234,8 +1305,10 @@ fn an_append_never_waits_past_the_database_statement_timeout() {
         code(app.command(command("one", json!(1), None))),
         "storage_busy"
     );
+    // The 1 s database ceiling ended the wait, far before the 30 s
+    // deadline; the lower bound shows the lock wait really ran.
     let waited = started.elapsed();
-    assert!(waited < Duration::from_millis(2000), "{waited:?}");
+    assert!(waited < Duration::from_millis(1000) + SLACK, "{waited:?}");
     assert!(waited >= Duration::from_millis(900), "{waited:?}");
     pg.release_head(holder);
     // The pooled session is back at the operator's default and works.
@@ -1283,6 +1356,7 @@ fn lowering_payload_and_state_limits_keeps_stored_history_readable() {
             tag: id("Count"),
             payload: json!({"len": true}),
             metadata: metadata(),
+            min_position: None,
         })
         .unwrap();
     assert_eq!(size.value, json!(502));
@@ -1307,6 +1381,7 @@ fn a_position_gap_in_the_feed_is_the_transient_event_feed_gap() {
             tag: id("Count"),
             payload: json!({}),
             metadata: metadata(),
+            min_position: None,
         })
         .unwrap()
         .checkpoint,

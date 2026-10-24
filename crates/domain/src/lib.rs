@@ -320,6 +320,11 @@ pub struct Query {
     pub tag: Identity,
     pub payload: Value,
     pub metadata: Metadata,
+    /// Read-your-writes: the host waits, within the request deadline, until
+    /// the projection's checkpoint reaches this position (a command
+    /// receipt's `position`), else fails `projection_behind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_position: Option<u64>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

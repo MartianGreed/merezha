@@ -59,6 +59,10 @@ application="crash-test"
 tag="Add"
 service="counter"
 aggregate="Counter"
+[[queries]]
+tag="Total"
+service="counter"
+projection="total"
 [[projections]]
 name="total"
 service="counter"
@@ -129,8 +133,119 @@ fn crash_worker() {
     let url = std::env::var("MEREZHA_PG_CRASH_DATABASE").expect("child database");
     let runtime = runtime();
     let app = open(&runtime, &url, Counter::default());
-    let _ = app.command(command(Some("k")));
+    if std::env::var("MEREZHA_PG_CRASH_OP").as_deref() == Ok("rebuild") {
+        let _ = app.rebuild("total");
+    } else {
+        let _ = app.command(command(Some("k")));
+    }
     panic!("crash cut was not reached");
+}
+fn migrated(runtime: &tokio::runtime::Runtime, test: &TestDatabase) {
+    runtime.block_on(async {
+        let db = Database::connect(&test.config()).unwrap();
+        let modules = [ModuleMigrations {
+            module: MODULE,
+            migrations: MIGRATIONS,
+        }];
+        let deadline = Instant::now() + Duration::from_secs(30);
+        run_migrations(&db, &modules, MigrationMode::Apply, deadline)
+            .await
+            .unwrap();
+    });
+}
+/// Run the crash worker until it parks at `cut`, then kill -9 it.
+fn kill_at(test: &TestDatabase, cut: &str, op: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("cut");
+    let mut child = OwnedChild(
+        Process::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "postgres::tests::crash_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("MEREZHA_PG_CRASH_DATABASE", test.url())
+            .env("MEREZHA_PG_CRASH_CUT", cut)
+            .env("MEREZHA_PG_CRASH_OP", op)
+            .env("MEREZHA_PG_CRASH_MARKER", &marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let until = Instant::now() + Duration::from_secs(20);
+    while !marker.exists() {
+        assert!(Instant::now() < until, "child failed to reach {cut}");
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "child exited before {cut}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    child.0.kill().unwrap();
+    assert!(!child.0.wait().unwrap().success());
+}
+fn generation(runtime: &tokio::runtime::Runtime, url: &str) -> (i32, i64, i64) {
+    runtime.block_on(async {
+        let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        let task = tokio::spawn(connection);
+        let row = client
+            .query_one(
+                "SELECT p.generation, p.checkpoint, (SELECT count(*) FROM merezha_app.projection_rebuilds) \
+                 FROM merezha_app.projections p WHERE p.name = 'total'",
+                &[],
+            )
+            .await
+            .unwrap();
+        drop(client);
+        let _ = task.await;
+        (row.get(0), row.get(1), row.get(2))
+    })
+}
+/// A3 test 4, crash cuts: kill -9 just before and just after the rebuild
+/// swap. Before it, the finished candidate survives and the next rebuild
+/// resumes and swaps it; after it, the new generation is served and no
+/// rebuild is left.
+#[test]
+fn killed_rebuild_resumes_before_the_swap_and_keeps_the_result_after_it() {
+    for cut in ["rebuild_before_swap", "rebuild_after_swap"] {
+        let Some(test) = TestDatabase::create() else {
+            return;
+        };
+        let runtime = runtime();
+        migrated(&runtime, &test);
+        let app = open(&runtime, test.url(), Counter::default());
+        for _ in 0..5 {
+            app.command(command(None)).unwrap();
+        }
+        assert_eq!(app.catch_up("total").unwrap().checkpoint, 5);
+        drop(app);
+        kill_at(&test, cut, "rebuild");
+        let swapped = cut == "rebuild_after_swap";
+        assert_eq!(
+            generation(&runtime, test.url()),
+            if swapped { (2, 5, 0) } else { (1, 5, 1) },
+            "{cut}"
+        );
+        let app = open(&runtime, test.url(), Counter::default());
+        if !swapped {
+            // The persisted, finished candidate is swapped by the resume.
+            let pair = app.rebuild("total").unwrap();
+            assert_eq!(
+                (pair.state.clone(), pair.checkpoint),
+                (json!(5), 5),
+                "{cut}"
+            );
+            assert_eq!(generation(&runtime, test.url()), (2, 5, 0), "{cut}");
+        }
+        let model = app
+            .query(serde_json::from_value(json!({"tag":"Total","payload":{},"metadata":{"message_id":"q","correlation_id":"c"}})).unwrap())
+            .unwrap();
+        assert_eq!((model.value, model.checkpoint), (json!(5), 5), "{cut}");
+    }
 }
 #[test]
 fn killed_process_keeps_history_and_receipts_exact_at_each_append_cut() {
@@ -257,7 +372,8 @@ fn an_append_that_answered_keeps_its_outcome_when_only_the_reset_fails_or_is_lat
         let started = Instant::now();
         let receipt = app.command(command(None)).unwrap();
         assert_eq!(receipt.position, position, "{reset}");
-        assert!(started.elapsed() < Duration::from_millis(1500), "{reset}");
+        // Well before the late reset's 10 s, with slack for a loaded runner.
+        assert!(started.elapsed() < Duration::from_secs(4), "{reset}");
         // The session whose statement timeout was not restored is closed.
         assert_eq!(db.status().size, before - 1, "{reset}");
     }

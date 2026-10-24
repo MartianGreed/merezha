@@ -7,9 +7,10 @@
 use crate::application_module::ApplicationModule;
 use merezha_application::{
     config::StorageConfig,
-    postgres::{MODULE, PostgresOptions},
+    postgres::{BackgroundOptions, CatchUp, MODULE, PostgresOptions},
 };
 use merezha_domain::Failure;
+use merezha_platform::config::CatchUp as ConfiguredCatchUp;
 use merezha_platform::{
     ConfigInput, HostParts, Module, Timeouts,
     host::{self, Host},
@@ -232,7 +233,21 @@ async fn start(
                     PostgresOptions {
                         lock_timeout_max: section.append.lock_timeout_max,
                         trace: None,
+                        background: BackgroundOptions {
+                            catch_up: match section.projections.catch_up {
+                                ConfiguredCatchUp::Auto => CatchUp::Auto,
+                                ConfiguredCatchUp::Manual => CatchUp::Manual,
+                            },
+                            interval: section.projections.interval,
+                            run_timeout: section.projections.run_timeout,
+                            warm_readiness: section.projections.warm_readiness,
+                            max_concurrent: section.background.max_concurrent as usize,
+                            instance_id: config.app.instance_id.clone(),
+                            ..BackgroundOptions::default()
+                        },
                     },
+                    // The jobs runtime's pool needs (AP §B.10).
+                    2 + config.jobs.queues.len(),
                 );
                 application_failure = Some(module.failure());
                 modules.insert(0, Box::new(module) as Box<dyn Module>);

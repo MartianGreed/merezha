@@ -14,10 +14,11 @@ toml.workspace = true
 rusqlite.workspace = true
 merezha-postgres = { path = "../postgres", optional = true }
 tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [features]
 # PostgreSQL storage (`merezha_application::postgres`), on in `merezha-cli`.
-postgres = ["dep:merezha-postgres", "dep:tokio"]
+postgres = ["dep:merezha-postgres", "dep:tokio", "dep:tracing"]
 # Hidden hooks for the store contract tests (`tests/store_contract.rs`):
 # a second instance over the same durable data.
 test-support = []

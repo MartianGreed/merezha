@@ -1704,8 +1704,9 @@ Errors use FW's shape `{"error":{"code","classification","details"?}}` (R8). Lis
 routes require the named permission at `ResourceScope::Application` (R5); without it, they exist
 only on loopback (`AllowAll`). Durations are in seconds (R9).
 
-**Application** (`/v1/application/`; permissions `application.admin.read` and
-`application.admin.write`):
+**Application** (`/v1/application/`; permissions `application.admin.read`,
+`application.admin.write`, and for catch-up and rebuild `application.projections.catch_up` and
+`application.projections.rebuild`):
 
 | Method and path | Response |
 | --- | --- |
@@ -1720,11 +1721,13 @@ only on loopback (`AllowAll`). Durations are in seconds (R9).
 | `POST reactors/{name}/pause` and `/resume` | `{"name","status"}` |
 | `POST reactors/{name}/retry` | retries a halted reactor now |
 | `POST reactors/{name}/skip` | body `{"position":P}` with `P = checkpoint + 1` (exactly the stuck event) or `{"to":"head"}`; records `reactor_skips` with the principal; `{"name","checkpoint"}` |
-| `GET status` | `{"application","head","projections":[{"name","checkpoint","lag_events","lag_seconds","status","failure_code"}],"reactors":[{"name","status","lag_events"}],"instance":{"id","background_runs"},"listener"}`, where `listener` is `connected` or `reconnecting` |
+| `GET status` | `{"application","head","projections":[{"name","checkpoint","lag_events","lag_seconds","status","failure_code"}],"reactors":[{"name","status","lag_events"}],"instance":{"id","background_runs"},"listener"}`, where `listener` is `connected`, `reconnecting` or `off` (no `LISTEN` session, as with manual catch-up) |
 
 `GET status` serves `Application::status()` and `GET queues`/`GET outbox` serve
-`JobsHandle::queue_status()`; TE's `/v1/admin/status` embeds the same documents (R10). Writes need
-`application.admin.write`.
+`JobsHandle::queue_status()`; TE's `/v1/admin/status` embeds the same documents (R10). Reads need
+`application.admin.read`. `POST projections/{name}/catch-up` needs `application.projections.catch_up`
+and `POST projections/{name}/rebuild` needs `application.projections.rebuild`, K's specific
+permissions (decided in the AP-A3 review); every other write needs `application.admin.write`.
 
 **Jobs** (`/v1/jobs/admin/`; permissions `jobs.admin.read` and `jobs.admin.write`):
 
@@ -1918,6 +1921,32 @@ description (not gated).
    pooled session holds an `MZAP` lock (`pg_locks`). A partitioned batch losing its CAS writes none.
 
 `application.md` gains a PostgreSQL section, exercised as written.
+
+**A3 delivery notes.** As built in AP-A3:
+
+- Partitioned commits, partitioned rebuild generations and the "partitioned batch losing its CAS
+  writes none" check land with C2, which adds migration 0002 and `project.partition`; no partitioned
+  projection exists before it. The live commit and the swap are single CAS-first transactions.
+- Test 3: the killed holder issues every statement on its lock session, so it fails
+  `database_unavailable` and never reaches a CAS. A lost CAS is shown by a run without the lock (test
+  hook, `Application::project_unlocked`) and by a live run racing a rebuild swap.
+- The application opens its own `LISTEN merezha_app_events` session through `Database::listen`,
+  reconnected by the scheduler, and a reconnect wakes every live lane. The jobs relay and the job
+  dispatcher keep theirs, so a host holds three `LISTEN` sessions; a cross-module fan-out listener
+  can replace them later.
+- A lane whose lock attempt is contended waits the holder's 1 s linger before trying again.
+- The concurrency budget is reserved on the guest (`Guest::reserve_concurrency`): the runtime then
+  refuses a reload whose `max_concurrent_invocations` falls below it. `DELETE .../revisions/{revision}`
+  also removes rows of projections no longer configured.
+- No metric is emitted until TE's meter lands (TE-T3); the store exposes their sources
+  (`PostgresStore::held_locks`, `contended_locks`, the status lag). Logs use TE's names, plus
+  `db.pool_undersized` for the A.8 warning.
+- `catch_up = "manual"` stops live catch-up only: new revisions still warm up and requested rebuilds
+  still run in the background. `Application::rebuild` (the synchronous API) requests or resumes the
+  rebuild and runs it to its swap within the call; `{"resume": true}` without a rebuild starts one.
+- A waiting explicit catch-up retries the run lock every second, and the status `listener` is `off`
+  without a `LISTEN` session (manual catch-up). Memory and SQLite fail `min_position` at once.
+- Reactor lanes, the `r:` lock and the reactor admin routes are C3's; the status lists no reactors.
 
 **B1 tests.**
 
