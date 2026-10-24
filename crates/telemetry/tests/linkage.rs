@@ -49,6 +49,8 @@ fn libraries_with_default_features_link_no_sdk_or_exporter() {
         "merezha-application",
         "merezha-postgres",
         "merezha-domain",
+        // Jobs and the outbox use `propagation` for span parents and links.
+        "merezha-jobs",
     ] {
         let tree = tree(&["-p", package]);
         for krate in SDK_AND_EXPORTERS {

@@ -142,8 +142,9 @@ pub(crate) async fn purge(
         }
     }
     if report.dead_jobs > 0 {
-        tracing::info!(
-            event = "job.admin_action",
+        merezha_telemetry::event!(
+            INFO,
+            "job.admin_action",
             action = "retention_purge",
             count = report.dead_jobs
         );

@@ -68,9 +68,25 @@ pub const TARGET: &str = "merezha";
 /// ```
 /// merezha_telemetry::event!(INFO, "listener.ready", address = "127.0.0.1:8080");
 /// merezha_telemetry::event!(INFO, "listener.draining");
+/// merezha_telemetry::event!(parent: None, ERROR, "startup.failed", code = "invalid_config");
 /// ```
+///
+/// `event!(parent: None, LEVEL, …)` emits outside the current span: an
+/// `ERROR` event inside a span marks that span `Error` (the span bridge),
+/// so an error log about a domain outcome (a dead letter) is emitted
+/// without a parent to keep the span's status for host failures only.
 #[macro_export]
 macro_rules! event {
+    (parent: $parent:expr, $level:ident, $name:literal, $($fields:tt)+) => {
+        $crate::__private::tracing::event!(
+            name: $name,
+            target: $crate::TARGET,
+            parent: $parent,
+            $crate::__private::tracing::Level::$level,
+            $($fields)+,
+            $name
+        )
+    };
     ($level:ident, $name:literal $(,)?) => {
         $crate::__private::tracing::event!(
             name: $name,

@@ -3,7 +3,10 @@
 //! LOCKED` only while it has free slots; every write after the lease is
 //! fenced on the per-claim `lease_token`, so a handler whose lease was lost
 //! (reaped, released by a drain) can never settle the job.
-use crate::retry::{self, Outcome, Settlement};
+use crate::{
+    retry::{self, Outcome, Settlement},
+    telemetry::{self, Attempt, Metrics, spawn},
+};
 use merezha_domain::{Failure, Identity};
 use merezha_platform::{
     AppContext, Database,
@@ -11,6 +14,10 @@ use merezha_platform::{
     ports::{JobContext, JobHandler},
 };
 use merezha_postgres::{Listener, classify};
+use merezha_telemetry::{
+    event,
+    names::jobs::{Classification, Outcome as JobOutcome},
+};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
@@ -20,6 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{Notify, Semaphore, watch};
+use tracing::Instrument;
 
 /// `'MZJB'`, the advisory lock class of the jobs runtime.
 pub(crate) const MZJB: i32 = 1_297_762_882;
@@ -88,13 +96,16 @@ WITH cap AS (
            updated_at = now()
       FROM candidate c WHERE j.id = c.id
     RETURNING j.id, j.kind, j.payload::text AS payload, j.attempts, j.max_attempts,
-              j.lease_token, j.idempotency_key, j.correlation_id, j.causation_id, j.tenant
+              j.lease_token, j.idempotency_key, j.correlation_id, j.causation_id, j.tenant,
+              j.trace_parent, j.trace_state, j.replay_trace_parent, j.replay_trace_state,
+              extract(epoch FROM now() - j.run_at)::float8 AS waited
 ), started AS (
     INSERT INTO merezha_jobs.attempts (lease_token, job_id, attempt, lease_owner, started_at)
     SELECT lease_token, id, attempts, $4, now() FROM leased
 )
 SELECT id, kind, payload, attempts, max_attempts, lease_token::text, idempotency_key,
-       correlation_id, causation_id, tenant
+       correlation_id, causation_id, tenant, trace_parent, trace_state, replay_trace_parent,
+       replay_trace_state, waited
   FROM leased ORDER BY id";
 
 /// One statement settles the job (nulling a flagged payload at a terminal
@@ -204,10 +215,19 @@ struct Leased {
     correlation_id: String,
     causation_id: Option<String>,
     tenant: Option<String>,
+    /// The stored producer context: the parent of the attempt span.
+    trace: Option<merezha_telemetry::propagation::StoredContext>,
+    /// The trace a replayed job died in: the attempt span's link.
+    replayed_from: Option<merezha_telemetry::propagation::StoredContext>,
 }
 
 /// One lease this instance holds.
 struct InFlight {
+    id: i64,
+    queue: String,
+    kind: String,
+    /// When the lease was held, for `merezha.job.duration`.
+    started: Instant,
     lease_secs: f64,
     cancel: watch::Sender<bool>,
     /// The heartbeat found the lease gone: the result is discarded.
@@ -228,6 +248,7 @@ struct Lane {
 pub(crate) struct Worker {
     database: Database,
     ctx: AppContext,
+    metrics: Arc<Metrics>,
     owner: String,
     kinds: Vec<String>,
     handlers: BTreeMap<String, Arc<dyn JobHandler>>,
@@ -257,7 +278,12 @@ fn attempt_number(value: i32) -> u32 {
 }
 
 impl Worker {
-    pub(crate) fn new(database: Database, ctx: AppContext, mut config: WorkerConfig) -> Arc<Self> {
+    pub(crate) fn new(
+        database: Database,
+        ctx: AppContext,
+        metrics: Arc<Metrics>,
+        mut config: WorkerConfig,
+    ) -> Arc<Self> {
         let lanes = std::mem::take(&mut config.plans)
             .into_iter()
             .map(|plan| {
@@ -273,6 +299,7 @@ impl Worker {
             database,
             owner: ctx.instance_id().to_owned(),
             ctx,
+            metrics,
             kinds: handlers.keys().cloned().collect(),
             handlers,
             lanes,
@@ -297,17 +324,17 @@ impl Worker {
         if !self.kinds.is_empty() {
             let mut dispatchers = lock(&self.dispatchers);
             for lane in &self.lanes {
-                dispatchers.push(tokio::spawn(dispatch(self.clone(), lane.clone())));
+                dispatchers.push(spawn(dispatch(self.clone(), lane.clone())));
             }
             if self.config.heartbeat {
-                tasks.push(tokio::spawn(heartbeat(self.clone())));
+                tasks.push(spawn(heartbeat(self.clone())));
             }
             if self.config.listen {
-                tasks.push(tokio::spawn(listen(self.clone())));
+                tasks.push(spawn(listen(self.clone())));
             }
         }
-        tasks.push(tokio::spawn(reaper(self.clone())));
-        tasks.push(tokio::spawn(retain(self.clone())));
+        tasks.push(spawn(reaper(self.clone())));
+        tasks.push(spawn(retain(self.clone())));
     }
 
     /// Whether the drain began: dispatchers lease no more, and a lease
@@ -325,8 +352,9 @@ impl Worker {
     /// Log a background failure once per streak, as `job.worker_failed`.
     fn failed(&self, task: &'static str, failure: &Failure) {
         if lock(&self.failing).insert(task) {
-            tracing::warn!(
-                event = "job.worker_failed",
+            event!(
+                WARN,
+                "job.worker_failed",
                 task,
                 code = failure.code.as_str(),
                 classification = retry::class_name(failure.classification)
@@ -337,7 +365,8 @@ impl Worker {
         lock(&self.failing).remove(task);
     }
 
-    async fn lease(&self, lane: &Lane, free: usize) -> Result<Vec<Leased>, Failure> {
+    /// Lease up to `free` jobs, with how long each waited past `run_at`.
+    async fn lease(&self, lane: &Lane, free: usize) -> Result<Vec<(Leased, f64)>, Failure> {
         let queue = lane.plan.name.clone();
         // Kinds whose handler turned leasing off stay available for other
         // instances (content on an outdated host, CT §2).
@@ -374,17 +403,22 @@ impl Worker {
                         .map_err(|e| classify(&e))?;
                     Ok(rows
                         .iter()
-                        .map(|row| Leased {
-                            id: row.get(0),
-                            kind: row.get(1),
-                            payload: row.get(2),
-                            attempt: attempt_number(row.get(3)),
-                            max_attempts: attempt_number(row.get(4)),
-                            token: row.get(5),
-                            idempotency_key: row.get(6),
-                            correlation_id: row.get(7),
-                            causation_id: row.get(8),
-                            tenant: row.get(9),
+                        .map(|row| {
+                            let leased = Leased {
+                                id: row.get(0),
+                                kind: row.get(1),
+                                payload: row.get(2),
+                                attempt: attempt_number(row.get(3)),
+                                max_attempts: attempt_number(row.get(4)),
+                                token: row.get(5),
+                                idempotency_key: row.get(6),
+                                correlation_id: row.get(7),
+                                causation_id: row.get(8),
+                                tenant: row.get(9),
+                                trace: telemetry::parse(row.get(10), row.get(11)),
+                                replayed_from: telemetry::parse(row.get(12), row.get(13)),
+                            };
+                            (leased, row.get::<_, f64>(14))
                         })
                         .collect())
                 })
@@ -448,6 +482,10 @@ impl Worker {
         self.track(
             &job.token,
             InFlight {
+                id: job.id,
+                queue: lane.plan.name.clone(),
+                kind: job.kind.clone(),
+                started: Instant::now(),
                 lease_secs: lane.plan.settings.lease.as_secs_f64(),
                 cancel,
                 lost: false,
@@ -458,10 +496,62 @@ impl Worker {
         cancelled
     }
 
-    /// Run one held job to its settlement.
+    /// Run one held job to its settlement, inside its `process {queue}`
+    /// span: a CONSUMER child of the stored producer context (TE §2.3).
     async fn run(self: Arc<Self>, lane: Arc<Lane>, job: Leased, cancelled: watch::Receiver<bool>) {
-        tracing::debug!(
-            event = "job.leased",
+        let span = telemetry::process_span(
+            &Attempt {
+                id: job.id,
+                queue: &lane.plan.name,
+                kind: &job.kind,
+                attempt: job.attempt,
+                max_attempts: job.max_attempts,
+            },
+            job.trace.as_ref(),
+            job.replayed_from.as_ref(),
+        );
+        let started = Instant::now();
+        self.attempt(lane, job, cancelled, &span, started)
+            .instrument(span.clone())
+            .await;
+    }
+
+    /// Record one attempt's `merezha.job.duration` point and close its span.
+    fn ended(
+        &self,
+        span: &tracing::Span,
+        queue: &str,
+        job: &Leased,
+        started: Instant,
+        outcome: JobOutcome,
+        failure: Option<(&str, &'static str)>,
+    ) {
+        let classification = failure.and_then(|(_, class)| Classification::from_name(class));
+        self.metrics.attempt(
+            queue,
+            &job.kind,
+            outcome,
+            classification,
+            started.elapsed().as_secs_f64(),
+        );
+        if matches!(outcome, JobOutcome::Succeeded | JobOutcome::DeadLettered) {
+            self.metrics
+                .terminal(queue, &job.kind, outcome, job.attempt);
+        }
+        telemetry::finish(span, outcome, failure.map(|(code, _)| code), classification);
+    }
+
+    async fn attempt(
+        self: Arc<Self>,
+        lane: Arc<Lane>,
+        job: Leased,
+        cancelled: watch::Receiver<bool>,
+        span: &tracing::Span,
+        started: Instant,
+    ) {
+        event!(
+            DEBUG,
+            "job.leased",
             job_id = job.id,
             queue = lane.plan.name.as_str(),
             kind = job.kind.as_str(),
@@ -473,11 +563,22 @@ impl Worker {
         {
             // The handler gave the job back: released now with the attempt
             // refunded, like a drain release, for another instance to run.
-            self.give_back(&lane, &job).await;
+            if self.give_back(&lane, &job).await {
+                self.ended(
+                    span,
+                    &lane.plan.name,
+                    &job,
+                    started,
+                    JobOutcome::Released,
+                    None,
+                );
+            }
             return;
         }
         if self.cut(&job.token) == Some(true) && !matches!(outcome, Outcome::Succeeded) {
-            // Drain cutoff: released with the attempt refunded, not retried.
+            // Drain cutoff: released with the attempt refunded, not
+            // retried. The drain release records the attempt.
+            telemetry::finish(span, JobOutcome::Released, None, None);
             self.park(&job.token);
             return;
         }
@@ -506,18 +607,40 @@ impl Worker {
             Ok(true) => {
                 self.recovered("settle");
                 log_settled(&job, queue, &settlement);
+                let (outcome, failure) = match &settlement {
+                    Settlement::Succeeded => (JobOutcome::Succeeded, None),
+                    Settlement::Retry { code, class, .. } => {
+                        (JobOutcome::Retry, Some((code.as_str(), *class)))
+                    }
+                    Settlement::Dead { code, class } => {
+                        (JobOutcome::DeadLettered, Some((code.as_str(), *class)))
+                    }
+                };
+                self.ended(span, queue, &job, started, outcome, failure);
             }
             // Released by the drain (no entry) or lost: fenced out.
-            Ok(false) if entry.is_some() => tracing::warn!(
-                event = "job.lease_lost",
-                job_id = job.id,
-                queue,
-                kind = job.kind.as_str(),
-                attempt = job.attempt,
-                code = "lease_lost",
-                classification = "transient"
-            ),
-            Ok(false) => {}
+            Ok(false) if entry.is_some() => {
+                event!(
+                    WARN,
+                    "job.lease_lost",
+                    job_id = job.id,
+                    queue,
+                    kind = job.kind.as_str(),
+                    attempt = job.attempt,
+                    code = "lease_lost",
+                    classification = "transient"
+                );
+                self.ended(
+                    span,
+                    queue,
+                    &job,
+                    started,
+                    JobOutcome::LeaseLost,
+                    Some(("lease_lost", "transient")),
+                );
+            }
+            // The drain released it and recorded the attempt.
+            Ok(false) => telemetry::finish(span, JobOutcome::Released, None, None),
             // The lease expires and the reaper decides.
             Err(failure) if entry.is_some() => self.failed("settle", &failure),
             Err(_) => {}
@@ -526,8 +649,8 @@ impl Worker {
 
     /// Release one job its handler gave back ([`JobFailure::release`]).
     /// A failed release leaves the lease to expire and the reaper retries
-    /// it, as for any settle failure.
-    async fn give_back(&self, lane: &Lane, job: &Leased) {
+    /// it, as for any settle failure. Returns whether it was released.
+    async fn give_back(&self, lane: &Lane, job: &Leased) -> bool {
         let mut result = self.release(std::slice::from_ref(&job.token)).await;
         for pause in SETTLE_RETRIES {
             match &result {
@@ -542,17 +665,22 @@ impl Worker {
         }
         let entry = self.untrack(&job.token);
         match result {
-            Ok(ids) if !ids.is_empty() => tracing::info!(
-                event = "job.released",
-                job_id = job.id,
-                queue = lane.plan.name.as_str(),
-                kind = job.kind.as_str(),
-                attempt = job.attempt
-            ),
+            Ok(ids) if !ids.is_empty() => {
+                event!(
+                    INFO,
+                    "job.released",
+                    job_id = job.id,
+                    queue = lane.plan.name.as_str(),
+                    kind = job.kind.as_str(),
+                    attempt = job.attempt
+                );
+                return true;
+            }
             Ok(_) => {}
             Err(failure) if entry.is_some() => self.failed("release", &failure),
             Err(_) => {}
         }
+        false
     }
 
     async fn execute(
@@ -596,8 +724,10 @@ impl Worker {
                 .and_then(|c| Identity::new(c).ok()),
             tenant: job.tenant.as_deref().and_then(|t| Identity::new(t).ok()),
         };
-        // A task of its own, so a panic is caught as `JoinError::is_panic`.
-        let mut task = tokio::spawn(async move { handler.handle(ctx, payload).await });
+        // A task of its own, so a panic is caught as `JoinError::is_panic`;
+        // the handler runs inside the attempt span, so what it issues
+        // (commands, outbox records, outbound calls) joins the job's trace.
+        let mut task = spawn(async move { handler.handle(ctx, payload).await }.in_current_span());
         tokio::select! {
             joined = &mut task => match joined {
                 Ok(Ok(())) => Outcome::Succeeded,
@@ -649,11 +779,23 @@ impl Worker {
             match self.release(&tokens).await {
                 Ok(ids) => {
                     let logged: Vec<i64> = ids.iter().copied().take(MAX_LOGGED_IDS).collect();
-                    tracing::warn!(
-                        event = "job.drain_abandoned",
+                    event!(
+                        WARN,
+                        "job.drain_abandoned",
                         count = ids.len(),
                         job_ids = ?logged
                     );
+                    // One `released` attempt per lease the drain gave back.
+                    let in_flight = lock(&self.in_flight);
+                    for entry in in_flight.values().filter(|entry| ids.contains(&entry.id)) {
+                        self.metrics.attempt(
+                            &entry.queue,
+                            &entry.kind,
+                            JobOutcome::Released,
+                            None,
+                            entry.started.elapsed().as_secs_f64(),
+                        );
+                    }
                 }
                 Err(failure) => self.failed("release", &failure),
             }
@@ -748,9 +890,17 @@ impl Worker {
             for row in &rows {
                 let (id, queue, kind, attempt, state): (i64, String, String, i32, String) =
                     (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+                self.metrics.lease_expired(&queue);
                 if state == "dead" {
-                    tracing::error!(
-                        event = "job.dead_lettered",
+                    self.metrics.terminal(
+                        &queue,
+                        &kind,
+                        JobOutcome::DeadLettered,
+                        attempt_number(attempt),
+                    );
+                    event!(
+                        ERROR,
+                        "job.dead_lettered",
                         job_id = id,
                         queue,
                         kind,
@@ -759,8 +909,9 @@ impl Worker {
                         classification = "transient"
                     );
                 } else {
-                    tracing::warn!(
-                        event = "job.retry_scheduled",
+                    event!(
+                        WARN,
+                        "job.retry_scheduled",
                         job_id = id,
                         queue,
                         kind,
@@ -784,8 +935,9 @@ impl Worker {
                 .map_err(|_| Failure::transient("database_timeout"))?
                 .map_err(|e| classify(&e))?;
         if reverted > 0 {
-            tracing::info!(
-                event = "job.admin_action",
+            event!(
+                INFO,
+                "job.admin_action",
                 action = "reissue_reverted",
                 count = reverted
             );
@@ -810,15 +962,17 @@ impl Worker {
 fn log_settled(job: &Leased, queue: &str, settlement: &Settlement) {
     let kind = job.kind.as_str();
     match settlement {
-        Settlement::Succeeded => tracing::debug!(
-            event = "job.completed",
+        Settlement::Succeeded => event!(
+            DEBUG,
+            "job.completed",
             job_id = job.id,
             queue,
             kind,
             attempt = job.attempt
         ),
-        Settlement::Retry { code, class, .. } => tracing::warn!(
-            event = "job.retry_scheduled",
+        Settlement::Retry { code, class, .. } => event!(
+            WARN,
+            "job.retry_scheduled",
             job_id = job.id,
             queue,
             kind,
@@ -826,8 +980,12 @@ fn log_settled(job: &Leased, queue: &str, settlement: &Settlement) {
             code = code.as_str(),
             classification = *class
         ),
-        Settlement::Dead { code, class } => tracing::error!(
-            event = "job.dead_lettered",
+        // Outside the attempt span: an error event would mark it `Error`,
+        // and a permanent failure is not a host failure (TE §1.1).
+        Settlement::Dead { code, class } => event!(
+            parent: None,
+            ERROR,
+            "job.dead_lettered",
             job_id = job.id,
             queue,
             kind,
@@ -856,7 +1014,8 @@ async fn dispatch(worker: Arc<Worker>, lane: Arc<Lane>) {
                         worker.recovered("lease");
                         full = jobs.len() == free;
                         let stopping = *stop.borrow();
-                        for job in jobs {
+                        for (job, waited) in jobs {
+                            worker.metrics.queue_latency(&lane.plan.name, waited);
                             let cancelled = worker.hold(&lane, &job);
                             if stopping {
                                 // Leased as the drain began: never run,
@@ -872,7 +1031,7 @@ async fn dispatch(worker: Arc<Worker>, lane: Arc<Lane>) {
                             };
                             let worker = worker.clone();
                             let lane = lane.clone();
-                            tokio::spawn(async move {
+                            spawn(async move {
                                 let wake = lane.clone();
                                 worker.run(lane, job, cancelled).await;
                                 drop(permit);
@@ -983,13 +1142,13 @@ async fn listen(worker: Arc<Worker>) {
             Ok(session) => {
                 // Every way out of a session sets `lost` again.
                 if lost {
-                    tracing::info!(event = "db.listener_restored");
+                    event!(INFO, "db.listener_restored");
                 }
                 session
             }
             Err(failure) => {
                 if !lost {
-                    tracing::warn!(event = "db.listener_lost", code = failure.code.as_str());
+                    event!(WARN, "db.listener_lost", code = failure.code.as_str());
                 }
                 lost = true;
                 tokio::select! {
@@ -1014,14 +1173,14 @@ async fn listen(worker: Arc<Worker>) {
                         }
                     }
                     None => {
-                        tracing::warn!(event = "db.listener_lost", code = "database_unavailable");
+                        event!(WARN, "db.listener_lost", code = "database_unavailable");
                         lost = true;
                         break;
                     }
                 },
                 () = tokio::time::sleep(worker.config.listen_check) => {
                     if let Err(failure) = session.check(Instant::now() + LISTEN_DEADLINE).await {
-                        tracing::warn!(event = "db.listener_lost", code = failure.code.as_str());
+                        event!(WARN, "db.listener_lost", code = failure.code.as_str());
                         lost = true;
                         break;
                     }

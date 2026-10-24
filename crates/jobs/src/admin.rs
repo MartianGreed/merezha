@@ -3,13 +3,14 @@
 //! `merezha_jobs.admin_actions` and logs `job.admin_action`. Payloads are
 //! never listed, and a flagged (`contains_secret`) job's payload is never
 //! returned (R3).
-use crate::PgJobs;
+use crate::{PgJobs, telemetry};
 use merezha_domain::{Failure, Identity};
 use merezha_platform::ports::{
     MAX_QUARANTINED_LISTED, MAX_QUEUES_LISTED, OutboxSummary, QuarantinedRecord, QueueStatus,
     QueueSummary, Reissue, ReissueRequest,
 };
 use merezha_postgres::{Tx, classify, tokio_postgres::Row};
+use merezha_telemetry::event;
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -20,6 +21,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tracing::Instrument;
 
 /// Bound on one admin operation.
 const ADMIN_DEADLINE: Duration = Duration::from_secs(10);
@@ -242,6 +244,8 @@ struct Claimed {
     request: ReissueRequest,
     /// `reissue_claimed_at` in microseconds: the fence of every settle.
     at: i64,
+    /// The trace the job died in, linked from the span the hook runs in.
+    died_in: Option<merezha_telemetry::propagation::StoredContext>,
 }
 
 /// How long reissues wait (AP §D.1); [`PgJobs::with_reissue_timing`] in
@@ -290,14 +294,18 @@ enum Target<'a> {
 }
 fn logged(action: &str, count: u64, target: Target<'_>) {
     match target {
-        Target::Job(job_id) => {
-            tracing::info!(event = "job.admin_action", action, count, job_id)
-        }
-        Target::Queue(queue) => {
-            tracing::info!(event = "job.admin_action", action, count, queue)
-        }
+        Target::Job(job_id) => event!(INFO, "job.admin_action", action, count, job_id),
+        Target::Queue(queue) => event!(INFO, "job.admin_action", action, count, queue),
     }
 }
+
+/// The `UPDATE … SET` of a replay back to `available`: the trace the job
+/// died in becomes the replay link of its next attempts, and the
+/// `admin job.replay` span's context (`$2`, `$3`) their parent (TE §2.3).
+const REPLAYED: &str = "state = 'available', attempts = 0, run_at = now(), finished_at = NULL,
+    replays = replays + 1, updated_at = now(),
+    replay_trace_parent = trace_parent, replay_trace_state = trace_state,
+    trace_parent = $2, trace_state = $3";
 
 impl PgJobs {
     fn hook(&self, kind: &str) -> Option<Arc<dyn Reissue>> {
@@ -314,6 +322,7 @@ impl PgJobs {
         Some(Claimed {
             id,
             at: 0,
+            died_in: None,
             hook,
             request: ReissueRequest {
                 job_id: id,
@@ -344,7 +353,7 @@ impl PgJobs {
                     let Some(row) = tx
                         .query_opt(
                             &format!(
-                                "SELECT {CANDIDATE} FROM merezha_jobs.jobs
+                                "SELECT {CANDIDATE}, trace_parent, trace_state FROM merezha_jobs.jobs
                                   WHERE id = $1 AND state = 'dead' AND contains_secret FOR UPDATE"
                             ),
                             &[&id],
@@ -357,6 +366,7 @@ impl PgJobs {
                     let Some(mut claim) = jobs.claimable(&row) else {
                         return Ok(None);
                     };
+                    claim.died_in = telemetry::parse(row.get(8), row.get(9));
                     claim.at = tx
                         .query_one(
                             "UPDATE merezha_jobs.jobs
@@ -413,8 +423,9 @@ impl PgJobs {
             .await
             .map_err(|e| classify(&e))?;
         if settled == 0 {
-            tracing::warn!(
-                event = "job.reissue_claim_lost",
+            event!(
+                WARN,
+                "job.reissue_claim_lost",
                 job_id = claim.id,
                 hook = if outcome.is_ok() {
                     "succeeded"
@@ -508,18 +519,27 @@ impl PgJobs {
     /// hook issues the effect again, else conflict `secret_purged`. Fails
     /// `not_found` or conflict `not_dead`. The work runs in a task of its
     /// own, so a dropped caller cannot cut it between claim and hook.
+    ///
+    /// The replay runs in an `admin job.replay` span, a trace of its own:
+    /// the job's next attempts are its children and link to the trace the
+    /// job died in (TE §2.3).
     pub async fn replay(&self, id: i64, principal: Option<&str>) -> Result<Replay, Failure> {
         let jobs = self.clone();
         let principal = principal.map(str::to_owned);
-        tokio::spawn(async move { jobs.replay_one(id, principal.as_deref()).await })
-            .await
-            .map_err(|_| Failure::transient("internal"))?
+        let span = telemetry::replay_span(Some(id), None);
+        telemetry::spawn(
+            async move { jobs.replay_one(id, principal.as_deref()).await }.instrument(span),
+        )
+        .await
+        .map_err(|_| Failure::transient("internal"))?
     }
 
     async fn replay_one(&self, id: i64, principal: Option<&str>) -> Result<Replay, Failure> {
         let who = principal.map(str::to_owned);
         let jobs = self.clone();
-        let flagged = self
+        let (parent, state) =
+            telemetry::columns(telemetry::stored(&tracing::Span::current()).as_ref());
+        let (flagged, queue) = self
             .database()?
             .transaction(deadline(), move |tx| {
                 Box::pin(async move {
@@ -536,19 +556,16 @@ impl PgJobs {
                     if row.get::<_, String>(8) != "dead" {
                         return Err(Failure::conflict("not_dead"));
                     }
+                    let queue: String = row.get(1);
                     if row.get::<_, bool>(3) {
                         if jobs.claimable(&row).is_none() {
                             return Err(Failure::conflict("secret_purged"));
                         }
-                        return Ok(true);
+                        return Ok((true, queue));
                     }
-                    let queue: String = row.get(1);
                     tx.execute(
-                        "UPDATE merezha_jobs.jobs
-                            SET state = 'available', attempts = 0, run_at = now(), finished_at = NULL,
-                                replays = replays + 1, updated_at = now()
-                          WHERE id = $1",
-                        &[&id],
+                        &format!("UPDATE merezha_jobs.jobs SET {REPLAYED} WHERE id = $1"),
+                        &[&id, &parent, &state],
                     )
                     .await
                     .map_err(|e| classify(&e))?;
@@ -556,11 +573,12 @@ impl PgJobs {
                         .await
                         .map_err(|e| classify(&e))?;
                     audit(tx, who.as_deref(), "replay", &id.to_string(), 1).await?;
-                    Ok(false)
+                    Ok((false, queue))
                 })
             })
             .await?;
         if !flagged {
+            self.inner.metrics.replayed(&queue, 1);
             logged("replay", 1, Target::Job(id));
             return Ok(Replay::Replayed);
         }
@@ -568,7 +586,11 @@ impl PgJobs {
             .claim(id, principal)
             .await?
             .ok_or_else(|| Failure::conflict("not_dead"))?;
+        // The hook runs in this replay's span, which links to the trace
+        // the job died in, as a replayed attempt does (TE §2.3).
+        telemetry::link_replay(&tracing::Span::current(), claim.died_in.as_ref());
         self.reissue(claim).await?;
+        self.inner.metrics.replayed(&queue, 1);
         Ok(Replay::Reissued)
     }
 
@@ -585,13 +607,17 @@ impl PgJobs {
         let progress = Arc::new(ReplayProgress::default());
         let jobs = self.clone();
         let counts = progress.clone();
-        let handle = tokio::spawn(async move {
-            let result = jobs
-                .replay_dead_now(&filter, principal.as_deref(), &counts)
-                .await;
-            counts.done.store(true, Ordering::SeqCst);
-            result
-        });
+        let span = telemetry::replay_span(None, Some(&filter.queue));
+        let handle = telemetry::spawn(
+            async move {
+                let result = jobs
+                    .replay_dead_now(&filter, principal.as_deref(), &counts)
+                    .await;
+                counts.done.store(true, Ordering::SeqCst);
+                result
+            }
+            .instrument(span),
+        );
         (progress, handle)
     }
 
@@ -617,6 +643,8 @@ impl PgJobs {
         let who = principal.map(str::to_owned);
         let filter = filter.clone();
         let queue = filter.queue.clone();
+        let (parent, state) =
+            telemetry::columns(telemetry::stored(&tracing::Span::current()).as_ref());
         let (replayed, refused, flagged) = self
             .database()?
             .transaction(deadline(), move |tx| {
@@ -660,11 +688,8 @@ impl PgJobs {
                     }
                     if !plain.is_empty() {
                         tx.execute(
-                            "UPDATE merezha_jobs.jobs
-                                SET state = 'available', attempts = 0, run_at = now(), finished_at = NULL,
-                                    replays = replays + 1, updated_at = now()
-                              WHERE id = ANY($1)",
-                            &[&plain],
+                            &format!("UPDATE merezha_jobs.jobs SET {REPLAYED} WHERE id = ANY($1)"),
+                            &[&plain, &parent, &state],
                         )
                         .await
                         .map_err(|e| classify(&e))?;
@@ -678,6 +703,7 @@ impl PgJobs {
                 })
             })
             .await?;
+        self.inner.metrics.replayed(&queue, replayed);
         logged("bulk_replay", replayed, Target::Queue(&queue));
         progress.replayed.store(replayed, Ordering::SeqCst);
         progress.refused.store(refused, Ordering::SeqCst);
@@ -689,9 +715,18 @@ impl PgJobs {
                 Ok(None) | Err(_) => None,
             };
             let reissued = match claimed {
-                Some(claim) => self.reissue(claim).await.is_ok(),
+                // One `admin job.replay` span per reissue, a child of the
+                // bulk replay's, so each links to its own dead trace.
+                Some(claim) => {
+                    let span = telemetry::replay_span(Some(claim.id), Some(&queue));
+                    telemetry::link_replay(&span, claim.died_in.as_ref());
+                    self.reissue(claim).instrument(span).await.is_ok()
+                }
                 None => false,
             };
+            if reissued {
+                self.inner.metrics.replayed(&queue, 1);
+            }
             let counter = if reissued {
                 &progress.reissued
             } else {
@@ -756,16 +791,17 @@ impl PgJobs {
             .transaction(deadline(), move |tx| {
                 Box::pin(async move {
                     let cancelled = tx
-                        .execute(
+                        .query_opt(
                             "UPDATE merezha_jobs.jobs
                                 SET state = 'cancelled', finished_at = now(), updated_at = now(),
                                     payload = CASE WHEN contains_secret THEN NULL ELSE payload END
-                              WHERE id = $1 AND state = 'available'",
+                              WHERE id = $1 AND state = 'available'
+                             RETURNING queue",
                             &[&id],
                         )
                         .await
                         .map_err(|e| classify(&e))?;
-                    if cancelled == 0 {
+                    let Some(cancelled) = cancelled else {
                         let exists = tx
                             .query_opt("SELECT 1 FROM merezha_jobs.jobs WHERE id = $1", &[&id])
                             .await
@@ -774,11 +810,13 @@ impl PgJobs {
                             None => Failure::permanent("not_found"),
                             Some(_) => Failure::conflict("not_cancellable"),
                         });
-                    }
-                    audit(tx, who.as_deref(), "cancel", &id.to_string(), 1).await
+                    };
+                    audit(tx, who.as_deref(), "cancel", &id.to_string(), 1).await?;
+                    Ok(cancelled.get::<_, String>(0))
                 })
             })
-            .await?;
+            .await
+            .map(|queue| self.inner.metrics.cancelled(&queue))?;
         logged("cancel", 1, Target::Job(id));
         Ok(())
     }
@@ -791,6 +829,35 @@ impl PgJobs {
         })
     }
 
+    /// The gauges' sample (TE §1.3): the queue counts and the outbox
+    /// backlog of [`PgJobs::queue_status`], the same statements, in one
+    /// transaction under a [`crate::SAMPLE_DEADLINE`] statement timeout.
+    pub(crate) async fn sample(
+        &self,
+        database: &merezha_postgres::Database,
+    ) -> Result<crate::telemetry::Sample, Failure> {
+        let (rows, backlog) = database
+            .transaction(Instant::now() + crate::SAMPLE_DEADLINE, |tx| {
+                Box::pin(async move {
+                    let rows = tx
+                        .query(QUEUE_COUNTS, &[&(MAX_QUEUES_LISTED as i64)])
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    let backlog = tx
+                        .query_one(OUTBOX_BACKLOG, &[])
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    Ok((rows, backlog))
+                })
+            })
+            .await?;
+        Ok(crate::telemetry::Sample {
+            queues: self.summaries(&rows),
+            outbox_pending: count(backlog.get(0)),
+            outbox_lag: backlog.get::<_, f64>(1).max(0.0),
+        })
+    }
+
     /// `GET queues`: per queue counts through the partial indexes
     /// (`jobs_dispatch`, `jobs_running`, `jobs_dead`).
     pub(crate) async fn queue_summaries(&self) -> Result<Vec<QueueSummary>, Failure> {
@@ -799,6 +866,12 @@ impl PgJobs {
             .query(QUEUE_COUNTS, &[&(MAX_QUEUES_LISTED as i64)])
             .await
             .map_err(|e| classify(&e))?;
+        Ok(self.summaries(&rows))
+    }
+
+    /// Configured queues, the queues of registered kinds and the queues
+    /// of `rows` ([`QUEUE_COUNTS`]), by name.
+    fn summaries(&self, rows: &[Row]) -> Vec<QueueSummary> {
         let mut queues: BTreeMap<String, QueueSummary> = BTreeMap::new();
         for plan in self.plans() {
             queues.insert(
@@ -815,7 +888,7 @@ impl PgJobs {
                 },
             );
         }
-        for row in &rows {
+        for row in rows {
             let name: String = row.get(0);
             let plan = self.plan(&name);
             let entry = queues.entry(name.clone()).or_insert(QueueSummary {
@@ -834,7 +907,7 @@ impl PgJobs {
             entry.dead = count(row.get(4));
             entry.oldest_ready_age_s = row.get::<_, f64>(5).max(0.0);
         }
-        Ok(queues.into_values().take(MAX_QUEUES_LISTED).collect())
+        queues.into_values().take(MAX_QUEUES_LISTED).collect()
     }
 
     /// `GET outbox`: the backlog through `outbox_pending` and

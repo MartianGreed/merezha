@@ -1,17 +1,23 @@
 //! The PostgreSQL implementation of the kernel `Outbox` port (AP §B.3).
-use crate::validate;
+use crate::{
+    telemetry::{self, Metrics},
+    validate,
+};
 use merezha_domain::Failure;
 use merezha_platform::{
     BoxFuture, Tx,
     ports::{Appended, OnDuplicate, Outbox, OutboxRecord, OutboxTarget, validate_append},
 };
 use merezha_postgres::classify;
+use merezha_telemetry::names::jobs::RecordKind;
+use std::{collections::HashMap, sync::Arc};
 
 /// The channel append notifies, delivered when the caller commits.
 pub const OUTBOX_CHANNEL: &str = "merezha_jobs_outbox";
 
 /// One multi-row insert of every record, deduplicated on
 /// `(source, dedupe_key)`, then one notification when anything was new.
+/// Returns the ids and keys of the inserted rows.
 const APPEND: &str = "
 WITH rows AS (
     SELECT * FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::int2[],
@@ -26,11 +32,19 @@ WITH rows AS (
            payload::json, contains_secret, correlation_id, causation_id, tenant
       FROM rows ORDER BY ord
     ON CONFLICT (source, dedupe_key) DO NOTHING
-    RETURNING id
+    RETURNING id, dedupe_key
 ), notified AS (
     SELECT pg_notify('merezha_jobs_outbox', '') FROM (SELECT 1 FROM inserted LIMIT 1) AS one
 )
-SELECT (SELECT count(*) FROM inserted), (SELECT count(*) FROM notified)";
+SELECT (SELECT coalesce(array_agg(id ORDER BY id), '{}') FROM inserted),
+       (SELECT coalesce(array_agg(dedupe_key ORDER BY id), '{}') FROM inserted),
+       (SELECT count(*) FROM notified)";
+
+/// The trace context of each inserted record's `send` span (TE §2.3).
+const TRACE: &str = "
+UPDATE merezha_jobs.outbox o SET trace_parent = t.parent, trace_state = t.state
+  FROM unnest($1::bigint[], $2::text[], $3::text[]) AS t (id, parent, state)
+ WHERE o.id = t.id";
 
 /// Appends records inside the caller's transaction. It never commits and
 /// never opens a transaction. Besides the kernel's checks it refuses, before
@@ -40,8 +54,14 @@ SELECT (SELECT count(*) FROM inserted), (SELECT count(*) FROM notified)";
 /// whose payload is not the envelope [`OutboxRecord::event`] builds for
 /// this source (`invalid_event_envelope`).
 ///
-/// The trace columns stay empty until the telemetry block fills them from
-/// the current span (TE-T5).
+/// Each inserted record gets a `send {queue}` or `send {topic}` PRODUCER
+/// span, a child of the caller's span, whose context (sampled or not)
+/// fills the row's `trace_parent`/`trace_state` (TE §2.3, R10) in a
+/// second statement of the same transaction; duplicates get no span. The relay copies it
+/// into every job it fans the record out to.
+///
+/// This form records no metrics; the jobs runtime installs a metered one
+/// behind the `Outbox` port, which also counts `merezha.outbox.appended`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PgOutbox;
 
@@ -53,50 +73,132 @@ impl Outbox for PgOutbox {
         records: &'a [OutboxRecord],
         on_duplicate: OnDuplicate,
     ) -> BoxFuture<'a, Result<Appended, Failure>> {
-        Box::pin(async move {
-            validate_append(records)?;
-            validate::source(source)?;
-            let now = jiff::Timestamp::now();
-            let mut columns = Columns::default();
-            for record in records {
-                validate::record(source, record, now)?;
-                columns.push(record)?;
-            }
-            if records.is_empty() {
-                return Ok(Appended::default());
-            }
-            let row = tx
-                .query_one(
-                    APPEND,
-                    &[
-                        &source,
-                        &columns.dedupe_key,
-                        &columns.record_kind,
-                        &columns.topic,
-                        &columns.queue,
-                        &columns.job_kind,
-                        &columns.priority,
-                        &columns.run_at,
-                        &columns.payload,
-                        &columns.contains_secret,
-                        &columns.correlation_id,
-                        &columns.causation_id,
-                        &columns.tenant,
-                    ],
-                )
-                .await
-                .map_err(|e| classify(&e))?;
-            let inserted = usize::try_from(row.get::<_, i64>(0)).unwrap_or(0);
-            let duplicates = records.len().saturating_sub(inserted);
-            if duplicates > 0 && on_duplicate == OnDuplicate::Fail {
-                return Err(Failure::conflict("outbox_duplicate"));
-            }
-            Ok(Appended {
-                inserted,
-                duplicates,
-            })
-        })
+        Box::pin(append(tx, source, records, on_duplicate, None))
     }
+}
+
+/// [`PgOutbox`] counting `merezha.outbox.appended`: the jobs runtime's
+/// `Outbox` port.
+#[derive(Clone, Debug)]
+pub(crate) struct MeteredOutbox {
+    pub metrics: Arc<Metrics>,
+}
+
+impl Outbox for MeteredOutbox {
+    fn append<'a>(
+        &'a self,
+        tx: &'a mut Tx<'_>,
+        source: &'a str,
+        records: &'a [OutboxRecord],
+        on_duplicate: OnDuplicate,
+    ) -> BoxFuture<'a, Result<Appended, Failure>> {
+        Box::pin(append(
+            tx,
+            source,
+            records,
+            on_duplicate,
+            Some(&self.metrics),
+        ))
+    }
+}
+
+async fn append(
+    tx: &mut Tx<'_>,
+    source: &str,
+    records: &[OutboxRecord],
+    on_duplicate: OnDuplicate,
+    metrics: Option<&Metrics>,
+) -> Result<Appended, Failure> {
+    validate_append(records)?;
+    validate::source(source)?;
+    let now = jiff::Timestamp::now();
+    let mut columns = Columns::default();
+    for record in records {
+        validate::record(source, record, now)?;
+        columns.push(record)?;
+    }
+    if records.is_empty() {
+        return Ok(Appended::default());
+    }
+    let row = tx
+        .query_one(
+            APPEND,
+            &[
+                &source,
+                &columns.dedupe_key,
+                &columns.record_kind,
+                &columns.topic,
+                &columns.queue,
+                &columns.job_kind,
+                &columns.priority,
+                &columns.run_at,
+                &columns.payload,
+                &columns.contains_secret,
+                &columns.correlation_id,
+                &columns.causation_id,
+                &columns.tenant,
+            ],
+        )
+        .await
+        .map_err(|e| classify(&e))?;
+    let ids: Vec<i64> = row.get(0);
+    let keys: Vec<String> = row.get(1);
+    let inserted = ids.len();
+    let duplicates = records.len().saturating_sub(inserted);
+    if duplicates > 0 && on_duplicate == OnDuplicate::Fail {
+        return Err(Failure::conflict("outbox_duplicate"));
+    }
+    // One PRODUCER span per inserted record: a duplicate wrote nothing, so
+    // it has no span (TE §2.3). The first record of a key is the one the
+    // insert took.
+    let mut by_key: HashMap<&str, &OutboxRecord> = HashMap::with_capacity(records.len());
+    for record in records {
+        by_key.entry(record.dedupe_key.as_str()).or_insert(record);
+    }
+    let mut spans = Vec::with_capacity(inserted);
+    let (mut traced, mut parents, mut states) = (Vec::new(), Vec::new(), Vec::new());
+    let mut events = 0u64;
+    for (id, key) in ids.iter().zip(&keys) {
+        let Some(record) = by_key.get(key.as_str()) else {
+            continue;
+        };
+        let span = match &record.target {
+            OutboxTarget::Event { topic } => {
+                events += 1;
+                telemetry::send_span(topic.as_str(), None, None)
+            }
+            OutboxTarget::Job { queue, kind } => {
+                telemetry::send_span(queue.as_str(), Some(queue.as_str()), Some(kind.as_str()))
+            }
+        };
+        if let (Some(parent), state) = telemetry::columns(telemetry::stored(&span).as_ref()) {
+            traced.push(*id);
+            parents.push(parent);
+            states.push(state);
+        }
+        spans.push(span);
+    }
+    // Without a recording layer there is no context and no second statement.
+    if !traced.is_empty() {
+        tx.execute(TRACE, &[&traced, &parents, &states])
+            .await
+            .map_err(|e| classify(&e))?;
+    }
+    drop(spans);
+    if let Some(metrics) = metrics {
+        // Counted at append: a caller rolling back later still counts (the
+        // relay counters count what was committed).
+        metrics.appended(source, RecordKind::Event, events);
+        metrics.appended(
+            source,
+            RecordKind::Job,
+            (inserted as u64).saturating_sub(events),
+        );
+    }
+    Ok(Appended {
+        inserted,
+        duplicates,
+    })
 }
 
 #[derive(Default)]

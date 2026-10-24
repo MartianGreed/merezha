@@ -16,6 +16,7 @@ mod retry;
 mod routes;
 mod scheduler;
 mod schema;
+mod telemetry;
 mod validate;
 mod worker;
 
@@ -30,6 +31,7 @@ pub use scheduler::{
     CONFIG_SOURCE, MAX_SCHEDULES, MAX_SCHEDULES_LISTED, SchedulePage, ScheduleSummary, TickReport,
     Triggered, valid_trigger_key,
 };
+pub use telemetry::INSTRUMENTS;
 
 use merezha_domain::{Failure, Identity};
 use merezha_platform::{
@@ -38,6 +40,7 @@ use merezha_platform::{
     ports::{Enqueued, JobRegistration, Jobs, NewJob, QueueStatus, ScheduleDeclaration, Source},
 };
 use merezha_postgres::{Listener, classify};
+use merezha_telemetry::event;
 use relay::RelaySettings;
 use std::{
     collections::BTreeMap,
@@ -47,6 +50,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use telemetry::{Metrics, spawn};
 use worker::{QueuePlan, Worker, WorkerConfig};
 
 /// Codes this runtime returns, registered at startup (R8).
@@ -80,6 +84,13 @@ pub const MAX_KINDS: usize = 1024;
 const MAX_BATCHES_PER_WAKE: usize = 64;
 /// Bound on enqueue, cancel, requeue and subscription sync.
 const OPERATION_DEADLINE: Duration = Duration::from_secs(10);
+/// Bound on one gauge sample (TE §1.3: a 1 s statement timeout).
+pub const SAMPLE_DEADLINE: Duration = Duration::from_secs(1);
+/// After this many consecutive failed samples the gauges report nothing
+/// rather than stale values, until a sample succeeds.
+pub const STALE_SAMPLES: u32 = 3;
+/// The instrumentation scope of the jobs and outbox instruments.
+pub const SCOPE: &str = "merezha.jobs";
 /// How often an idle `LISTEN` session is probed with `SELECT 1`.
 pub const LISTEN_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// Bound on opening and probing the `LISTEN` session.
@@ -147,6 +158,13 @@ struct Inner {
     /// A `[[jobs.schedules]]` entry that failed to parse, returned by
     /// `start`; config validation makes this unreachable from a file.
     schedule_error: Option<Failure>,
+    /// The `merezha.job.*` and `merezha.outbox.*` instruments (no-op until
+    /// [`PgJobs::with_telemetry`]).
+    metrics: Arc<Metrics>,
+    /// `telemetry.metrics.sample_interval_ms`, when metrics are exported:
+    /// the gauges' sampler runs only then.
+    sample_interval: Option<Duration>,
+    sampler: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// The jobs runtime on PostgreSQL. Cheap to clone; clones share state.
@@ -258,8 +276,32 @@ impl PgJobs {
                 conflicts: Mutex::default(),
                 unschedulable: Mutex::default(),
                 schedule_error,
+                metrics: Arc::new(Metrics::default()),
+                sample_interval: None,
+                sampler: Mutex::new(None),
             }),
         }
+    }
+    /// Record the jobs and outbox instruments on `meters` (scope
+    /// [`SCOPE`], TE §1.3) and, every `sample_interval`
+    /// (`telemetry.metrics.sample_interval_ms`), sample the queue status for
+    /// the `merezha.job.count`, `merezha.job.lag`, `merezha.outbox.pending`
+    /// and `merezha.outbox.lag` gauges. With disabled meters (metrics not
+    /// exported) the instruments stay no-ops and no sampler runs. Call
+    /// before sharing the runtime.
+    pub fn with_telemetry(
+        mut self,
+        meters: &merezha_telemetry::Meters,
+        sample_interval: Duration,
+    ) -> Self {
+        if !meters.enabled() {
+            return self;
+        }
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.metrics = Arc::new(Metrics::new(&meters.meter(SCOPE)));
+            inner.sample_interval = Some(sample_interval.max(Duration::from_millis(1)));
+        }
+        self
     }
     /// The application's `app.version`: a schedule definition declared by a
     /// strictly newer dotted-numeric version replaces another version's
@@ -421,12 +463,13 @@ impl PgJobs {
             .collect::<std::collections::BTreeSet<_>>()
         {
             if !config.queues.contains_key(queue) {
-                tracing::warn!(event = "job.queue_unconfigured", queue = queue.as_str());
+                event!(WARN, "job.queue_unconfigured", queue = queue.as_str());
             }
         }
         let worker = Worker::new(
             database.clone(),
             ctx,
+            self.inner.metrics.clone(),
             WorkerConfig {
                 plans: self.plans(),
                 defaults: config.defaults.clone(),
@@ -459,8 +502,13 @@ impl PgJobs {
     /// Relay pending records now, batch after batch until one comes back
     /// short (at most 64 batches).
     pub async fn relay_now(&self) -> Result<RelayReport, Failure> {
-        let (report, _) =
-            relay::drain(self.database()?, &self.inner.settings, MAX_BATCHES_PER_WAKE).await?;
+        let (report, _) = relay::drain(
+            self.database()?,
+            &self.inner.settings,
+            MAX_BATCHES_PER_WAKE,
+            &self.inner.metrics,
+        )
+        .await?;
         self.inner
             .unrouted
             .fetch_add(report.unrouted, Ordering::Relaxed);
@@ -474,6 +522,7 @@ impl PgJobs {
             self.database()?,
             &self.inner.settings,
             &self.inner.unschedulable,
+            &self.inner.metrics,
         )
         .await
     }
@@ -514,7 +563,15 @@ impl PgJobs {
         key: Option<&str>,
         principal: Option<&str>,
     ) -> Result<Triggered, Failure> {
-        scheduler::trigger(self.database()?, &self.inner.settings, name, key, principal).await
+        scheduler::trigger(
+            self.database()?,
+            &self.inner.settings,
+            name,
+            key,
+            principal,
+            &self.inner.metrics,
+        )
+        .await
     }
     /// Return a quarantined record to pending once its cause is fixed
     /// (D.1 `POST outbox/{id}/requeue`), with an `admin_actions` row for
@@ -567,8 +624,9 @@ impl PgJobs {
                 })
             })
             .await?;
-        tracing::info!(
-            event = "job.admin_action",
+        event!(
+            INFO,
+            "job.admin_action",
             action = "outbox_requeue",
             count = 1
         );
@@ -584,9 +642,9 @@ impl PgJobs {
         if self.inner.started.swap(true, Ordering::SeqCst) {
             return Err(Failure::permanent("jobs_started"));
         }
-        let task = tokio::spawn(background(
+        let task = spawn(background(
             self.clone(),
-            database,
+            database.clone(),
             self.inner.stop.subscribe(),
         ));
         *self
@@ -594,6 +652,19 @@ impl PgJobs {
             .task
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+        if let Some(interval) = self.inner.sample_interval {
+            let sampler = spawn(sample_loop(
+                self.clone(),
+                database,
+                interval,
+                self.inner.stop.subscribe(),
+            ));
+            *self
+                .inner
+                .sampler
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sampler);
+        }
         Ok(())
     }
     /// Declare this instance's subscriptions (`last_declared_at = now()`,
@@ -625,8 +696,9 @@ impl PgJobs {
             .iter()
             .filter(|name| !streak.contains(*name))
         {
-            tracing::warn!(
-                event = "job.schedule_conflict",
+            event!(
+                WARN,
+                "job.schedule_conflict",
                 schedule = name.as_str(),
                 version = self.inner.app_version.as_deref().unwrap_or("")
             );
@@ -696,8 +768,16 @@ struct Failing {
     schedules: bool,
 }
 
-/// Log a declaration failure once per streak as `event`.
-fn streak(result: Result<(), Failure>, failing: &mut bool, event: &'static str) -> bool {
+/// The two declarations a heartbeat makes.
+#[derive(Clone, Copy)]
+enum Declaration {
+    Subscriptions,
+    Schedules,
+}
+
+/// Log a declaration failure once per streak, as
+/// `job.subscription_sync_failed` or `job.schedule_sync_failed`.
+fn streak(result: Result<(), Failure>, failing: &mut bool, declaration: Declaration) -> bool {
     match result {
         Ok(()) => {
             *failing = false;
@@ -705,11 +785,21 @@ fn streak(result: Result<(), Failure>, failing: &mut bool, event: &'static str) 
         }
         Err(failure) => {
             if !*failing {
-                tracing::warn!(
-                    event,
-                    code = failure.code.as_str(),
-                    classification = classification(&failure)
-                );
+                let (code, class) = (failure.code.as_str(), classification(&failure));
+                match declaration {
+                    Declaration::Subscriptions => event!(
+                        WARN,
+                        "job.subscription_sync_failed",
+                        code,
+                        classification = class
+                    ),
+                    Declaration::Schedules => event!(
+                        WARN,
+                        "job.schedule_sync_failed",
+                        code,
+                        classification = class
+                    ),
+                }
             }
             *failing = true;
             false
@@ -724,12 +814,12 @@ async fn declare(jobs: &PgJobs, database: &Database, failing: &mut Failing) -> b
     let subscriptions = streak(
         jobs.sync_subscriptions(database).await,
         &mut failing.subscriptions,
-        "job.subscription_sync_failed",
+        Declaration::Subscriptions,
     );
     let schedules = streak(
         jobs.sync_schedules(database).await,
         &mut failing.schedules,
-        "job.schedule_sync_failed",
+        Declaration::Schedules,
     );
     subscriptions && schedules
 }
@@ -748,18 +838,71 @@ async fn schedule_loop(
         if *stop.borrow() {
             return;
         }
-        match scheduler::tick(&database, &jobs.inner.settings, &jobs.inner.unschedulable).await {
+        match scheduler::tick(
+            &database,
+            &jobs.inner.settings,
+            &jobs.inner.unschedulable,
+            &jobs.inner.metrics,
+        )
+        .await
+        {
             Ok(_) => failing = false,
             Err(failure) => {
                 if !failing {
-                    tracing::warn!(
-                        event = "job.worker_failed",
+                    event!(
+                        WARN,
+                        "job.worker_failed",
                         task = "scheduler",
                         code = failure.code.as_str(),
                         classification = classification(&failure)
                     );
                 }
                 failing = true;
+            }
+        }
+        tokio::select! {
+            _ = stop.changed() => return,
+            () = tokio::time::sleep(interval) => {}
+        }
+    }
+}
+
+/// Sample the queue status for the gauges every `interval`, starting now,
+/// until stop: one read under [`SAMPLE_DEADLINE`], cached for the gauge
+/// callbacks (TE §1.3). A failing read logs `job.worker_failed` (task
+/// `sampler`) once per streak and keeps the last sample; after
+/// [`STALE_SAMPLES`] consecutive failures the gauges report nothing until
+/// a read succeeds.
+async fn sample_loop(
+    jobs: PgJobs,
+    database: Database,
+    interval: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut failed: u32 = 0;
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        match jobs.sample(&database).await {
+            Ok(sample) => {
+                jobs.inner.metrics.sampled(Some(sample));
+                failed = 0;
+            }
+            Err(failure) => {
+                failed = failed.saturating_add(1);
+                if failed == STALE_SAMPLES {
+                    jobs.inner.metrics.sampled(None);
+                }
+                if failed == 1 {
+                    event!(
+                        WARN,
+                        "job.worker_failed",
+                        task = "sampler",
+                        code = failure.code.as_str(),
+                        classification = classification(&failure)
+                    );
+                }
             }
         }
         tokio::select! {
@@ -809,7 +952,7 @@ async fn background(
     }
     // Every instance ticks; row locks and the occurrence key make each
     // occurrence one job.
-    let ticking = tokio::spawn(schedule_loop(
+    let ticking = spawn(schedule_loop(
         jobs.clone(),
         database.clone(),
         jobs.inner.stop.subscribe(),
@@ -850,7 +993,7 @@ async fn background(
             {
                 Ok(session) => {
                     if lost {
-                        tracing::info!(event = "db.listener_restored");
+                        event!(INFO, "db.listener_restored");
                     }
                     lost = false;
                     listener = Some(session);
@@ -858,13 +1001,20 @@ async fn background(
                 }
                 Err(failure) => {
                     if !lost {
-                        tracing::warn!(event = "db.listener_lost", code = failure.code.as_str());
+                        event!(WARN, "db.listener_lost", code = failure.code.as_str());
                     }
                     lost = true;
                 }
             }
         }
-        let drained = match relay::drain(&database, &settings, MAX_BATCHES_PER_WAKE).await {
+        let drained = match relay::drain(
+            &database,
+            &settings,
+            MAX_BATCHES_PER_WAKE,
+            &jobs.inner.metrics,
+        )
+        .await
+        {
             Ok((report, drained)) => {
                 jobs.inner
                     .unrouted
@@ -876,8 +1026,9 @@ async fn background(
                 // Systemic failures abort the batch and retry at the
                 // interval; nothing is quarantined for them.
                 if !relay_failing {
-                    tracing::error!(
-                        event = "outbox.relay_failed",
+                    event!(
+                        ERROR,
+                        "outbox.relay_failed",
                         code = failure.code.as_str(),
                         classification = classification(&failure)
                     );
@@ -909,7 +1060,7 @@ async fn background(
                 };
                 if let Err(failure) = probe {
                     listener = None;
-                    tracing::warn!(event = "db.listener_lost", code = failure.code.as_str());
+                    event!(WARN, "db.listener_lost", code = failure.code.as_str());
                     lost = true;
                 }
             }
@@ -919,7 +1070,7 @@ async fn background(
                     while listener.as_mut().and_then(Listener::try_recv).is_some() {}
                 } else {
                     listener = None;
-                    tracing::warn!(event = "db.listener_lost", code = "database_unavailable");
+                    event!(WARN, "db.listener_lost", code = "database_unavailable");
                     lost = true;
                 }
             }
@@ -979,7 +1130,7 @@ impl Module for PgJobs {
             if let Some(worker) = self.inner.worker.get() {
                 worker.drain(deadline).await;
             }
-            for slot in [&self.inner.task, &self.inner.scheduler] {
+            for slot in [&self.inner.task, &self.inner.scheduler, &self.inner.sampler] {
                 let task = slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -999,7 +1150,9 @@ impl JobsRuntime for PgJobs {
     fn ports(&self, database: &Database) -> JobsPorts {
         let _ = self.inner.database.set(database.clone());
         JobsPorts {
-            outbox: Arc::new(PgOutbox),
+            outbox: Arc::new(outbox::MeteredOutbox {
+                metrics: self.inner.metrics.clone(),
+            }),
             jobs: Arc::new(self.clone()),
         }
     }
@@ -1027,7 +1180,9 @@ impl Jobs for PgJobs {
             let kind = job.kind.as_str().to_owned();
             let secret = job.contains_secret;
             let priority = job.priority;
-            self.database()?
+            let metrics = self.inner.metrics.clone();
+            let enqueued = self
+                .database()?
                 .transaction(Instant::now() + OPERATION_DEADLINE, move |tx| {
                     Box::pin(async move {
                         let inserted = tx
@@ -1056,14 +1211,29 @@ impl Jobs for PgJobs {
                             .await
                             .map_err(|e| classify(&e))?;
                         if let Some(row) = inserted {
+                            let id: i64 = row.get(0);
+                            // The PRODUCER span of the new job, a child of
+                            // the caller's span; its context is the parent of
+                            // every attempt (TE §2.3). An existing job gets
+                            // none.
+                            let send = telemetry::send_span(&queue, Some(&queue), Some(&kind));
+                            if let (Some(parent), state) =
+                                telemetry::columns(telemetry::stored(&send).as_ref())
+                            {
+                                tx.execute(
+                                    "UPDATE merezha_jobs.jobs SET trace_parent = $2, trace_state = $3
+                                      WHERE id = $1",
+                                    &[&id, &parent, &state],
+                                )
+                                .await
+                                .map_err(|e| classify(&e))?;
+                            }
+                            drop(send);
                             // Wake the queue's dispatchers (AP-B2), on commit.
                             tx.execute("SELECT pg_notify('merezha_jobs', $1)", &[&queue])
                                 .await
                                 .map_err(|e| classify(&e))?;
-                            return Ok(Enqueued {
-                                id: row.get(0),
-                                existed: false,
-                            });
+                            return Ok(Enqueued { id, existed: false });
                         }
                         // A new statement sees a conflicting row another
                         // transaction committed meanwhile.
@@ -1085,7 +1255,11 @@ impl Jobs for PgJobs {
                         }
                     })
                 })
-                .await
+                .await?;
+            if !enqueued.existed {
+                metrics.enqueued(job.queue.as_str(), job.kind.as_str(), 1);
+            }
+            Ok(enqueued)
         })
     }
     fn cancel<'a>(&'a self, source: &'a Source, id: i64) -> BoxFuture<'a, Result<bool, Failure>> {
@@ -1104,17 +1278,21 @@ impl Jobs for PgJobs {
                 .acquire(Instant::now() + OPERATION_DEADLINE)
                 .await?;
             let cancelled = client
-                .execute(
+                .query_opt(
                     "UPDATE merezha_jobs.jobs
                         SET state = 'cancelled', finished_at = now(), updated_at = now(),
                             payload = CASE WHEN contains_secret THEN NULL ELSE payload END
                       WHERE id = $1 AND state = 'available'
-                        AND (starts_with(idempotency_key, $2::text || ':') OR kind = ANY($3::text[]))",
+                        AND (starts_with(idempotency_key, $2::text || ':') OR kind = ANY($3::text[]))
+                     RETURNING queue",
                     &[&id, &source.as_str(), &kinds],
                 )
                 .await
                 .map_err(|e| classify(&e))?;
-            Ok(cancelled == 1)
+            if let Some(row) = &cancelled {
+                self.inner.metrics.cancelled(row.get(0));
+            }
+            Ok(cancelled.is_some())
         })
     }
     fn register(&self, source: &Source, registration: JobRegistration) -> Result<(), Failure> {

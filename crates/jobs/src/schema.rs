@@ -168,8 +168,21 @@ CREATE INDEX schedules_due ON merezha_jobs.schedules (next_run_at)
     WHERE enabled AND retired_at IS NULL;
 ";
 
-pub(crate) const MIGRATIONS: [Migration; 3] = [
+/// TE-T5. A dead-letter replay is an operator action with a trace of its
+/// own: it moves the job's stored context (the trace the job died in) to
+/// `replay_trace_parent`/`replay_trace_state`, which every later attempt
+/// span links to (`merezha.link.reason = replay`), and stores the
+/// `admin job.replay` span's context as the parent of those attempts
+/// (TE §2.3). Same formats as the R10 columns.
+const REPLAY_LINK: &str = "
+ALTER TABLE merezha_jobs.jobs
+    ADD COLUMN replay_trace_parent text NULL CHECK (octet_length(replay_trace_parent) = 55),
+    ADD COLUMN replay_trace_state text NULL CHECK (octet_length(replay_trace_state) <= 512);
+";
+
+pub(crate) const MIGRATIONS: [Migration; 4] = [
     Migration::new(1, "initial", INITIAL),
     Migration::new(2, "workers", WORKERS),
     Migration::new(3, "cron", CRON),
+    Migration::new(4, "replay_link", REPLAY_LINK),
 ];
