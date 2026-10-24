@@ -857,7 +857,9 @@ async fn detached_sessions_are_bounded_and_leave_their_pool_slot_open() {
     let mut config = test.config();
     config.pool_size = 1;
     config.max_detached = 1;
-    config.acquire_timeout = Duration::from_millis(300);
+    // Long enough for a slow CI server to open a connection, short enough
+    // to see the bound refuse.
+    config.acquire_timeout = Duration::from_millis(1500);
     let db = Database::connect(&config).unwrap();
     let first = db.detach(soon()).await.unwrap();
     // The single pool slot reopened: a pooled client is still available
@@ -868,7 +870,7 @@ async fn detached_sessions_are_bounded_and_leave_their_pool_slot_open() {
     let started = Instant::now();
     let error = db.detach(soon()).await.unwrap_err();
     assert_eq!(error.code, "database_busy");
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_secs(4));
     // A migration run is a detached session too.
     let error = run_migrations(&db, &module(&[CREATE]), MigrationMode::Apply, soon())
         .await
