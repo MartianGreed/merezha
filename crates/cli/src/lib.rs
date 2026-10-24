@@ -54,7 +54,7 @@ pub fn app_with_application(
 ) -> Router {
     app(runtime).merge(application_http::router(application, None))
 }
-mod application_http;
+pub mod application_http;
 pub mod run;
 
 /// Read, validate and open an application configuration with the runtime as

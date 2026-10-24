@@ -3,6 +3,7 @@ use crate::{
     BoxFuture,
     config::{ConfigIssue, ModuleSection},
     context::AppContext,
+    errors::ErrorCode,
 };
 use axum::Router;
 use merezha_domain::Failure;
@@ -45,6 +46,13 @@ pub trait Module: Send + Sync + 'static {
     }
     /// Ordered forward-only migrations for this module's own schema.
     fn migrations(&self) -> &[Migration] {
+        &[]
+    }
+    /// Error codes this module returns with their HTTP statuses, registered
+    /// at startup (R8). A code another module or the kernel registered with
+    /// a different status stops startup with `error_code_conflict`.
+    /// Canonical kernel codes need not be listed.
+    fn errors(&self) -> &[ErrorCode] {
         &[]
     }
     /// Integration events, for the catalog and later wiring checks.

@@ -8,7 +8,10 @@ use axum::{
 };
 use merezha_application::Application;
 use merezha_domain::{Classification, Failure, Identity};
-use merezha_platform::ports::{Authorizer, ResourceScope};
+use merezha_platform::{
+    edge::Authenticated,
+    ports::{Authorizer, ResourceScope},
+};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 
@@ -19,8 +22,11 @@ struct Routes {
 }
 /// Application routes. Projection catch-up and rebuild are administrative:
 /// with a `policy`, each needs `application.projections.catch_up` or
-/// `application.projections.rebuild` at global scope. `serve` passes no
-/// policy and keeps them open on its loopback listener.
+/// `application.projections.rebuild` at application scope, checked for the
+/// principal the edge authenticated. With a policy (the platform host)
+/// errors also take their status from the platform error registry. `serve`
+/// passes no policy, keeps them open on its loopback listener and keeps its
+/// own error statuses.
 pub fn router(application: Application, policy: Option<Arc<dyn Authorizer>>) -> Router {
     Router::new()
         .route("/v1/application/commands", post(command))
@@ -77,15 +83,31 @@ async fn rebuild(
     .await
 }
 async fn dispatch(state: Routes, request: Request, action: Action) -> Response {
+    let platform = state.policy.is_some();
+    let failure_response = |failure: Failure| {
+        if platform {
+            merezha_platform::error_response(&failure)
+        } else {
+            failure_response(failure)
+        }
+    };
     if let (Action::Project { rebuild, .. }, Some(policy)) = (&action, &state.policy) {
         let permission = if *rebuild {
             "application.projections.rebuild"
         } else {
             "application.projections.catch_up"
         };
+        let principal = request
+            .extensions()
+            .get::<Authenticated>()
+            .and_then(|authenticated| authenticated.0.clone());
         let checked = Identity::new(permission).and_then(|permission| {
             policy
-                .check(None, &permission, &ResourceScope::Application)
+                .check(
+                    principal.as_deref(),
+                    &permission,
+                    &ResourceScope::Application,
+                )
                 .map_err(Failure::from)
         });
         if let Err(failure) = checked {

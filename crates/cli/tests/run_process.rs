@@ -306,10 +306,10 @@ fn run_serves_health_runtime_and_application_behind_the_edge_and_stops_gracefull
         .filter_map(|e| e["event"].as_str().map(str::to_owned))
         .collect();
     for expected in [
-        "database.connected",
-        "migrations.checked",
+        "db.connected",
+        "migration.checked",
         "listener.ready",
-        "http.request",
+        "http.request.completed",
         "listener.draining",
         "listener.stopped",
     ] {
