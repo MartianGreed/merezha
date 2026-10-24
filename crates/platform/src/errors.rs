@@ -121,6 +121,7 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("invalid_config", 422),
     ErrorCode::new("invalid_limits", 422),
     ErrorCode::new("invalid_routes", 422),
+    ErrorCode::new("unsupported_in_this_build", 422),
     ErrorCode::new("invalid_manifest", 422),
     ErrorCode::new("invalid_application_config", 422),
     ErrorCode::new("invalid_arguments", 422),

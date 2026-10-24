@@ -1370,6 +1370,7 @@ dependencies = [
 name = "merezha-application"
 version = "0.1.0"
 dependencies = [
+ "merezha-application",
  "merezha-domain",
  "merezha-runtime",
  "rusqlite",

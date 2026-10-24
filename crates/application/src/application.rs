@@ -1,6 +1,7 @@
 use crate::{
     Authorizer, Guest, GuestSession,
     config::Config,
+    durable::{CommitCommand, DurableStore, ProjectionRef},
     store::{EventStore, MemoryEventStore},
 };
 use merezha_domain::{
@@ -26,10 +27,16 @@ pub struct QueryResult {
     pub value: Value,
     pub checkpoint: u64,
 }
+/// An idempotency key: `(tag, tenant, actor, key)`. Its JSON encoding is
+/// the SQLite receipt key; without a tenant it is byte-identical to the
+/// encoding before tenants existed.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Key {
     pub(crate) tag: Identity,
+    /// The principal's tenant on tenant-scoped routes (AP-C2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tenant: Option<Identity>,
     pub(crate) actor: Option<Identity>,
     pub(crate) key: Identity,
 }
@@ -46,9 +53,11 @@ struct Inner {
     projections: BTreeMap<Identity, Mutex<ProjectionState>>,
     active: AtomicUsize,
 }
+/// A process-local `EventStore` port, or a durable store that also keeps
+/// receipts and projection pairs (SQLite; PostgreSQL from AP-A2).
 enum Storage {
     Volatile(Arc<dyn EventStore>),
-    Sqlite(Arc<crate::sqlite::SqliteStore>),
+    Durable(Arc<dyn DurableStore>),
 }
 impl Storage {
     fn load(
@@ -58,13 +67,13 @@ impl Storage {
     ) -> Result<Vec<merezha_domain::StoredEvent>, Failure> {
         match self {
             Self::Volatile(s) => s.load(stream),
-            Self::Sqlite(s) => s.load(stream, deadline),
+            Self::Durable(s) => s.load(stream, deadline),
         }
     }
     fn head(&self, deadline: std::time::Instant) -> Result<u64, Failure> {
         match self {
             Self::Volatile(s) => s.head(),
-            Self::Sqlite(s) => s.head(deadline),
+            Self::Durable(s) => s.head(deadline),
         }
     }
     fn read_all(
@@ -75,7 +84,7 @@ impl Storage {
     ) -> Result<Vec<merezha_domain::StoredEvent>, Failure> {
         match self {
             Self::Volatile(s) => s.read_all(after, limit),
-            Self::Sqlite(s) => s.read_all(after, limit, deadline),
+            Self::Durable(s) => s.read_all(after, limit, deadline),
         }
     }
 }
@@ -145,7 +154,7 @@ impl Application {
                 config,
                 guest,
                 authorizer,
-                Storage::Sqlite(Arc::new(store)),
+                Storage::Durable(Arc::new(store)),
                 records,
                 recovered,
             )
@@ -240,6 +249,27 @@ impl Application {
         self.admit()?.project(name, true)
     }
 }
+#[cfg(feature = "test-support")]
+impl Application {
+    /// Test support for the store contract: a second application over the
+    /// same durable data with its own connections, pending-claim registry
+    /// and projection cache, as another host has. Memory storage has none.
+    #[doc(hidden)]
+    pub fn independent_instance(&self) -> Result<Self, Failure> {
+        let Storage::Durable(store) = &self.0.store else {
+            return Err(Failure::permanent("storage_configuration"));
+        };
+        let (store, (records, recovered)) = store.independent(&self.0.config)?;
+        Self::construct(
+            self.0.config.clone(),
+            self.0.guest.clone(),
+            self.0.authorizer.clone(),
+            Storage::Durable(store),
+            records,
+            recovered,
+        )
+    }
+}
 impl Admission {
     pub fn deadline(&self) -> std::time::Instant {
         self.deadline
@@ -313,6 +343,7 @@ impl Admission {
         if let Some(key) = command.idempotency_key {
             let key = Key {
                 tag: command.tag.clone(),
+                tenant: None,
                 actor: command.metadata.actor.clone(),
                 key,
             };
@@ -352,8 +383,19 @@ impl Admission {
                 completed: false,
             });
         }
+        if let (Some(pending), Storage::Durable(store)) = (&claim, &self.inner.store)
+            && let Some(receipt) =
+                store.receipt(&pending.key, &pending.fingerprint, self.deadline)?
+        {
+            // Another instance committed this key: replay without deciding.
+            if let Some(claim) = claim {
+                claim.complete(&receipt);
+            }
+            return Ok(receipt);
+        }
         let history = self.inner.store.load(&stream, self.deadline)?;
-        if history.len() > self.inner.config.limits.max_events {
+        let limits = &self.inner.config.limits;
+        if history.len() > limits.max_events.min(limits.max_stream_events) {
             return Err(Failure::permanent("history_limit"));
         }
         let expected = history.last().map_or(0, |event| event.version);
@@ -382,12 +424,15 @@ impl Admission {
             return Err(Failure::permanent("event_batch_limit"));
         }
         let receipt = match &self.inner.store {
-            Storage::Sqlite(store) => store.commit_command(
-                &stream,
-                expected,
-                events,
-                &command.metadata,
-                claim.as_ref().map(|c| (&c.key, c.fingerprint.as_str())),
+            Storage::Durable(store) => store.commit_command(
+                CommitCommand {
+                    stream: &stream,
+                    tenant: None,
+                    expected,
+                    events,
+                    metadata: &command.metadata,
+                    claim: claim.as_ref().map(|c| (&c.key, c.fingerprint.as_str())),
+                },
                 self.deadline,
             )?,
             Storage::Volatile(store) => {
@@ -423,7 +468,18 @@ impl Admission {
             &query.metadata,
         )?;
         let snapshot = match &self.inner.store {
-            Storage::Sqlite(store) => store.projection(&route.projection, self.deadline)?.0,
+            Storage::Durable(store) => {
+                let projection = self
+                    .inner
+                    .config
+                    .projections
+                    .iter()
+                    .find(|p| p.name == route.projection)
+                    .ok_or_else(|| Failure::permanent("projection_not_found"))?;
+                store
+                    .projection(&projection_ref(projection), self.deadline)?
+                    .0
+            }
             Storage::Volatile(_) => self.inner.projections[&route.projection]
                 .try_lock()
                 .map_err(|_| Failure::conflict("projection_in_flight"))?
@@ -462,8 +518,9 @@ impl Admission {
             .try_lock()
             .map_err(|_| Failure::conflict("projection_in_flight"))?;
         let mut revision = 0;
-        if let Storage::Sqlite(store) = &self.inner.store {
-            let (snapshot, stored_revision) = store.projection(&projection.name, self.deadline)?;
+        let target = projection_ref(projection);
+        if let Storage::Durable(store) = &self.inner.store {
+            let (snapshot, stored_revision) = store.projection(&target, self.deadline)?;
             *current = snapshot;
             revision = stored_revision;
         }
@@ -512,23 +569,25 @@ impl Admission {
             self.check_value(&state, self.inner.config.limits.max_state_bytes)?;
             pending = ProjectionState { state, checkpoint };
             if !rebuild {
-                if let Storage::Sqlite(store) = &self.inner.store {
-                    revision = store.commit_projection(
-                        &projection.name,
-                        revision,
-                        &pending,
-                        self.deadline,
-                    )?;
+                if let Storage::Durable(store) = &self.inner.store {
+                    revision =
+                        store.commit_projection(&target, revision, &pending, self.deadline)?;
                 }
                 *current = pending.clone();
             }
         }
         // Rebuild swaps its entire candidate only after every batch succeeds.
-        if rebuild && let Storage::Sqlite(store) = &self.inner.store {
-            store.commit_projection(&projection.name, revision, &pending, self.deadline)?;
+        if rebuild && let Storage::Durable(store) = &self.inner.store {
+            store.commit_projection(&target, revision, &pending, self.deadline)?;
         }
         *current = pending;
         Ok(current.clone())
+    }
+}
+fn projection_ref(projection: &crate::config::Projection) -> ProjectionRef<'_> {
+    ProjectionRef {
+        name: &projection.name,
+        revision: projection.revision,
     }
 }
 fn validate_services(config: &Config, guest: &dyn Guest) -> Result<(), Failure> {
