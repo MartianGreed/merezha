@@ -46,7 +46,8 @@ pub struct ValidateOptions {
 
 /// Where generated `_key`s come from.
 pub trait KeySource {
-    /// A fresh key matching `^[A-Za-z0-9_-]{1,32}$`.
+    /// A fresh key accepted by [`valid_key`]; one that is not (an all-digit
+    /// key, say) is discarded and another requested.
     fn next_key(&mut self) -> Result<String, Failure>;
 }
 /// 12 random characters of `[A-Za-z0-9]` from the platform CSPRNG.
@@ -70,12 +71,15 @@ impl KeySource for RandomKeys<'_> {
     }
 }
 
-/// `^[A-Za-z0-9_-]{1,32}$`, the `_key` syntax.
+/// The `_key` syntax: `^[A-Za-z0-9_-]{1,32}$` with at least one character
+/// that is not a digit, so a key can never be mistaken for the array index
+/// that addresses items without a client key.
 pub fn valid_key(key: &str) -> bool {
     (1..=32).contains(&key.len())
         && key
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && !key.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Fields that passed, in their stored form.

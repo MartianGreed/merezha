@@ -195,7 +195,7 @@ content type. Fields inside components cannot be filtered in v1.
 | `string` | string | `min_length`, `max_length` (default 255, max 4096), `pattern` | Single line: no CR or LF. Length counts Unicode scalar values. |
 | `text` | string | `min_length`, `max_length` (default 10000, max 100000) | Multi-line plain text. |
 | `rich_text` | Portable Text array | `styles`, `marks`, `annotations`, `lists`, `embeds`, `max_blocks` (default 500, max 5000), `max_text_length` (default 100000) | See below. |
-| `integer` | JSON integer | `min`, `max` | Must decode as an integer, so `1.0` is rejected. Range is ±9,007,199,254,740,991, the same safe range as application values. |
+| `integer` | JSON integer | `min`, `max` | Must decode as an integer, so `1.0` is rejected. JSON `-0` is the integer 0; `-0.0` and `-0e0` are accepted as 0 too, because the JSON parser cannot tell them apart from `-0`. Range is ±9,007,199,254,740,991, the same safe range as application values. |
 | `float` | JSON number | `min`, `max` | Finite binary64. Decimal lexical precision is not preserved, as in the application JSON policy. |
 | `decimal` | string | `precision` (default 18, max 28), `scale` (default 2, at most `precision`), `min`, `max` as decimal strings | Matches `^-?(0|[1-9][0-9]*)(\.[0-9]+)?$`. Stored normalized to exactly `scale` fractional digits: `"10"` becomes `"10.00"`, more digits than `scale` is an error, not rounding. Use it for money. |
 | `boolean` | `true` or `false` | none | |
@@ -215,7 +215,8 @@ anchored as `^(?:...)$` and compiled at startup with a 1 MiB size limit on
 the program and on the lazy DFA, so ordinary patterns such as `.{1,255}` or
 `\w{5}` fit. Any string containing U+0000 is
 rejected, `json` fields included, because `jsonb` cannot store it. `_key`
-values match `^[A-Za-z0-9_-]{1,32}$`, are unique within their array, and are
+values match `^[A-Za-z0-9_-]{1,32}$` with at least one non-digit character
+(an all-digit key would read as an array index in error paths), are unique within their array, and are
 assigned randomly (12 characters) when a write omits them. They identify list
 items across revisions and appear in reference paths.
 

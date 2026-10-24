@@ -85,9 +85,10 @@ fn integer(rules: &IntegerRules, value: &Value) -> Result<Value, &'static str> {
     } else if number.is_u64() {
         return Err("max");
     } else {
-        // A binary64 value: JSON `-0` (which parses as -0.0) is 0, integral
-        // values beyond the safe range are out of range, and anything else,
-        // `1.0` included, is not an integer.
+        // A binary64 value. serde_json parses JSON `-0` as -0.0 and cannot
+        // tell it from `-0.0` or `-0e0`, so all three are accepted as the
+        // integer 0. Integral values beyond the safe range are out of range,
+        // and anything else, `1.0` included, is not an integer.
         let f = number.as_f64().unwrap_or(f64::NAN);
         if f == 0.0 && f.is_sign_negative() {
             0

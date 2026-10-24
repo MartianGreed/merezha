@@ -819,3 +819,46 @@ fn numbers_of_the_right_kind_beyond_range_are_min_or_max() {
     );
     same(&float, json!(1.5e300_f64.recip()));
 }
+
+#[test]
+fn all_digit_keys_are_refused_so_index_paths_stay_unambiguous() {
+    let m = model(
+        "{ name = \"a\", type = \"list\", of = { type = \"component\", component = \"quote\" } }",
+    );
+    assert_eq!(
+        validate(
+            &m,
+            &json!({ "a": [{ "text": 1 }, { "_key": "0", "text": 2 }] }),
+            &DRAFT
+        )
+        .unwrap_err(),
+        pairs(&[
+            ("/fields/a/0/text", "type_mismatch"),
+            ("/fields/a/1/_key", "pattern"),
+            ("/fields/a/1/text", "type_mismatch"),
+        ])
+    );
+    assert!(valid_key("0a") && valid_key("_1") && !valid_key("0") && !valid_key("123"));
+    // A key source that offers an all-digit key is asked again.
+    struct Digits(usize);
+    impl merezha_content::KeySource for Digits {
+        fn next_key(&mut self) -> Result<String, merezha_domain::Failure> {
+            self.0 += 1;
+            Ok(if self.0 == 1 {
+                "123".into()
+            } else {
+                "k2".into()
+            })
+        }
+    }
+    let fields = m
+        .validate_fields(
+            "t",
+            &json!({ "a": [{ "text": "x" }] }),
+            &DRAFT,
+            &mut Digits(0),
+        )
+        .unwrap()
+        .fields;
+    assert_eq!(fields["a"][0]["_key"], "k2");
+}
