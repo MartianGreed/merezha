@@ -229,7 +229,10 @@ async fn capture_notifications_accept_inside_a_transaction_without_writing() {
                         WebhookEvent {
                             tenant: None,
                             event_type: id("tasks.task_completed"),
-                            source_event_id: DedupeKey::new("tasks:t1:completed").unwrap(),
+                            source_event_id: merezha_platform::ports::EventId::new(
+                                "tasks:t1:completed",
+                            )
+                            .unwrap(),
                             occurred_at: jiff::Timestamp::UNIX_EPOCH,
                             data: json!({}),
                         },

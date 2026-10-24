@@ -131,7 +131,7 @@ mod tests {
         }
         let captured = factory.captured();
         assert_eq!(captured.len(), CaptureNotifications::CAPACITY);
-        assert_eq!(captured[0].dedupe_key.as_str(), "identity.magic_link:k6");
+        assert_eq!(captured[0].dedupe_key, "identity.magic_link:k6");
         assert_eq!(captured[0].recipient_kinds, vec!["email_address"]);
         assert!(captured[0].had_secret_data);
         assert!(!format!("{captured:?}").contains("t0k3n-s3cr3t"));
@@ -281,5 +281,23 @@ mod tests {
         assert!(Source::new("identity").is_ok());
         assert!(Source::new("api").is_ok());
         assert_eq!(Source::new("Api").unwrap_err().code, "invalid_source");
+    }
+
+    #[test]
+    fn webhook_event_ids_fit_a_source_and_a_full_dedupe_key() {
+        let longest = format!("{}:{}", "s".repeat(64), "k".repeat(MAX_DEDUPE_KEY_BYTES));
+        assert_eq!(longest.len(), MAX_EVENT_ID_BYTES);
+        assert_eq!(EventId::new(longest.clone()).unwrap().as_str(), longest);
+        assert!(
+            DedupeKey::new(longest.clone()).is_err(),
+            "too long for a dedupe key"
+        );
+        assert_eq!(
+            EventId::new(format!("{longest}x")).unwrap_err().code,
+            "invalid_event_id"
+        );
+        for bad in ["", "has space", "é"] {
+            assert!(EventId::new(bad).is_err(), "{bad}");
+        }
     }
 }

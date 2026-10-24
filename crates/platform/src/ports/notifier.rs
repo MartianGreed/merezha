@@ -246,6 +246,32 @@ pub struct NotificationHandle {
     pub duplicate: bool,
 }
 
+/// Longest event id: a source (at most 64 bytes), `:` and an outbox dedupe
+/// key, as integration events are named `{source}:{dedupe_key}`.
+pub const MAX_EVENT_ID_BYTES: usize = 64 + 1 + super::MAX_DEDUPE_KEY_BYTES;
+
+/// The id of the event a webhook announces, such as
+/// `identity:usr_01JB2X6Q9F3W:registered`: 1 to [`MAX_EVENT_ID_BYTES`] bytes
+/// of `[A-Za-z0-9._:/-]`. It deduplicates webhook events.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventId(String);
+impl EventId {
+    /// Fails permanent `invalid_event_id`.
+    pub fn new(value: impl Into<String>) -> Result<Self, Failure> {
+        let value = value.into();
+        let valid = (1..=MAX_EVENT_ID_BYTES).contains(&value.len())
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:/-".contains(&b));
+        valid
+            .then_some(Self(value))
+            .ok_or_else(|| Failure::permanent("invalid_event_id"))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// An event for registered webhook endpoints. `Debug` hides `data`.
 #[derive(Clone, PartialEq)]
 pub struct WebhookEvent {
@@ -253,7 +279,7 @@ pub struct WebhookEvent {
     pub tenant: Option<TenantId>,
     pub event_type: EventType,
     /// The caller's event id; the dedupe key.
-    pub source_event_id: DedupeKey,
+    pub source_event_id: EventId,
     pub occurred_at: Timestamp,
     pub data: Value,
 }
@@ -392,7 +418,8 @@ pub struct CapturedNotification {
     /// The topic or the webhook event type.
     pub name: Identity,
     pub recipient_kinds: Vec<&'static str>,
-    pub dedupe_key: DedupeKey,
+    /// The request's dedupe key or the webhook's source event id.
+    pub dedupe_key: String,
     pub had_secret_data: bool,
 }
 
@@ -446,7 +473,7 @@ impl CaptureNotifier {
             kind: "notification",
             name: request.topic,
             recipient_kinds: request.recipients.iter().map(Recipient::kind).collect(),
-            dedupe_key: request.dedupe_key,
+            dedupe_key: request.dedupe_key.as_str().to_owned(),
             had_secret_data: !request.secret_data.is_empty(),
         });
         Ok(NotificationHandle {
@@ -529,7 +556,7 @@ impl Notifier for CaptureNotifier {
             kind: "webhook",
             name: event.event_type,
             recipient_kinds: Vec::new(),
-            dedupe_key: event.source_event_id,
+            dedupe_key: event.source_event_id.as_str().to_owned(),
             had_secret_data: false,
         });
         Box::pin(async {
