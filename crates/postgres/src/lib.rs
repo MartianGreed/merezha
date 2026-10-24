@@ -8,9 +8,15 @@ mod tls;
 
 pub use deadpool_postgres::Transaction;
 pub use migrate::{
-    MIGRATIONS_LOCK, Migration, MigrationError, MigrationMode, MigrationReport, ModuleMigrations,
-    PendingMigration, checksum, run_migrations,
+    MIGRATIONS_LOCK, Migration, MigrationError, MigrationKind, MigrationMode, MigrationReport,
+    ModuleMigrations, PendingMigration, checksum, run_migrations,
 };
+
+/// The open transaction every port that writes "inside the caller's
+/// transaction" takes, such as `Outbox::append` and `Notifier::request`, so
+/// one transaction carries the caller's rows, its outbox records and its
+/// notification requests. [`Database::transaction`] hands it out.
+pub type Tx<'a> = Transaction<'a>;
 pub use testing::{REQUIRE_DATABASE_ENV, TEST_DATABASE_ENV, TestDatabase};
 pub use tokio_postgres;
 
@@ -277,12 +283,12 @@ impl Database {
     pub async fn transaction<T, F>(&self, deadline: Instant, work: F) -> Result<T, Failure>
     where
         T: Send,
-        F: for<'t> FnOnce(&'t Transaction<'t>) -> BoxFuture<'t, Result<T, Failure>> + Send,
+        F: for<'t> FnOnce(&'t mut Tx<'_>) -> BoxFuture<'t, Result<T, Failure>> + Send,
     {
         let mut client = self.acquire(deadline).await?;
         let budget = statement_budget(deadline, self.statement_timeout)?;
         let at = tokio::time::Instant::from_std(deadline);
-        let transaction = match tokio::time::timeout_at(at, client.transaction()).await {
+        let mut transaction = match tokio::time::timeout_at(at, client.transaction()).await {
             Ok(Ok(transaction)) => transaction,
             Ok(Err(error)) => return Err(classify(&error)),
             Err(_) => return Err(Failure::transient("database_timeout")),
@@ -294,7 +300,7 @@ impl Database {
             Err(_) => return Err(Failure::transient("database_timeout")),
         }
         // Dropping the transaction on any early return rolls it back.
-        let value = match tokio::time::timeout_at(at, work(&transaction)).await {
+        let value = match tokio::time::timeout_at(at, work(&mut transaction)).await {
             Ok(Ok(value)) => value,
             Ok(Err(failure)) => return Err(failure),
             Err(_) => return Err(Failure::transient("database_timeout")),

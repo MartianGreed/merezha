@@ -6,16 +6,16 @@ use merezha_postgres::{
 };
 use std::time::{Duration, Instant};
 
-const CREATE: Migration = Migration {
-    version: 1,
-    name: "create_notes",
-    sql: "CREATE TABLE notes (id bigint PRIMARY KEY, body text NOT NULL);",
-};
-const INDEX: Migration = Migration {
-    version: 2,
-    name: "index_notes",
-    sql: "CREATE INDEX notes_body ON notes (body); INSERT INTO notes VALUES (1, 'seed');",
-};
+const CREATE: Migration = Migration::new(
+    1,
+    "create_notes",
+    "CREATE TABLE notes (id bigint PRIMARY KEY, body text NOT NULL);",
+);
+const INDEX: Migration = Migration::new(
+    2,
+    "index_notes",
+    "CREATE INDEX notes_body ON notes (body); INSERT INTO notes VALUES (1, 'seed');",
+);
 
 fn soon() -> Instant {
     Instant::now() + Duration::from_secs(20)
@@ -172,11 +172,11 @@ async fn concurrent_runners_are_serialized_by_the_advisory_lock() {
     };
     // Not idempotent SQL: two unserialized runners would fail with
     // duplicate_table or a ledger primary key violation.
-    const SLOW: Migration = Migration {
-        version: 1,
-        name: "slow_create",
-        sql: "SELECT pg_sleep(0.3); CREATE TABLE once (id int);",
-    };
+    const SLOW: Migration = Migration::new(
+        1,
+        "slow_create",
+        "SELECT pg_sleep(0.3); CREATE TABLE once (id int);",
+    );
     let mut runners = Vec::new();
     for _ in 0..4 {
         let db = Database::connect(&test.config()).unwrap();
@@ -245,11 +245,11 @@ async fn failing_migration_rolls_back_alone() {
         return;
     };
     let db = Database::connect(&test.config()).unwrap();
-    let broken = Migration {
-        version: 2,
-        name: "broken",
-        sql: "CREATE TABLE half (id int); SELECT * FROM missing_table;",
-    };
+    let broken = Migration::new(
+        2,
+        "broken",
+        "CREATE TABLE half (id int); SELECT * FROM missing_table;",
+    );
     let error = run_migrations(
         &db,
         &module(&[CREATE, broken]),
@@ -455,4 +455,205 @@ async fn url_options_are_kept_beside_the_statement_timeout() {
         .unwrap()
         .get(0);
     assert_eq!(timeout, "5s");
+}
+
+const BODY_INDEX: Migration = Migration::non_transactional(
+    3,
+    "notes_body_concurrently",
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS notes_body_cc ON notes (body);",
+);
+const UNIQUE_BODY: Migration = Migration::non_transactional(
+    3,
+    "notes_body_unique",
+    "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS notes_body_unique ON notes (body)",
+);
+const DUPLICATES: Migration = Migration::new(
+    2,
+    "duplicate_bodies",
+    "INSERT INTO notes VALUES (1, 'same'), (2, 'same');",
+);
+/// `Some(valid)` for an existing index, `None` when there is none.
+async fn index_valid(db: &Database, name: &str) -> Option<bool> {
+    let client = db.acquire(soon()).await.unwrap();
+    client
+        .query_opt(
+            "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = $1",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .map(|row| row.get(0))
+}
+
+#[tokio::test]
+async fn non_transactional_step_runs_outside_a_transaction_and_is_recorded_after_success() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = Database::connect(&test.config()).unwrap();
+    let declared = [CREATE, INDEX, BODY_INDEX];
+    // CREATE INDEX CONCURRENTLY fails inside a transaction block, so a
+    // success proves the step ran outside one.
+    let report = run_migrations(&db, &module(&declared), MigrationMode::Apply, soon())
+        .await
+        .unwrap();
+    assert_eq!(report.applied.len(), 3);
+    assert_eq!(index_valid(&db, "notes_body_cc").await, Some(true));
+    let rows = ledger(&db).await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2].1, 3);
+    assert_eq!(
+        rows[2].3,
+        checksum(BODY_INDEX.sql),
+        "checksummed like the others"
+    );
+    let rerun = run_migrations(&db, &module(&declared), MigrationMode::Apply, soon())
+        .await
+        .unwrap();
+    assert!(rerun.applied.is_empty());
+    let verify = run_migrations(&db, &module(&declared), MigrationMode::Verify, soon())
+        .await
+        .unwrap();
+    assert!(verify.is_current());
+    // A changed step is drift like any other migration.
+    let edited = Migration::non_transactional(
+        3,
+        "notes_body_concurrently",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS notes_body_cc ON notes (id)",
+    );
+    let error = run_migrations(
+        &db,
+        &module(&[CREATE, INDEX, edited]),
+        MigrationMode::Verify,
+        soon(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.failure.code, "migration_checksum_mismatch");
+}
+
+#[tokio::test]
+async fn a_step_interrupted_before_its_ledger_row_is_retried_safely() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = Database::connect(&test.config()).unwrap();
+    run_migrations(&db, &module(&[CREATE, INDEX]), MigrationMode::Apply, soon())
+        .await
+        .unwrap();
+    // A crash after the statement but before the ledger insert: the index
+    // exists, the ledger does not know it.
+    let client = db.acquire(soon()).await.unwrap();
+    client
+        .batch_execute("CREATE INDEX CONCURRENTLY notes_body_cc ON notes (body)")
+        .await
+        .unwrap();
+    drop(client);
+    let report = run_migrations(
+        &db,
+        &module(&[CREATE, INDEX, BODY_INDEX]),
+        MigrationMode::Apply,
+        soon(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.applied.len(), 1);
+    assert_eq!(ledger(&db).await.len(), 3);
+    assert_eq!(index_valid(&db, "notes_body_cc").await, Some(true));
+}
+
+#[tokio::test]
+async fn a_failed_concurrent_build_is_not_recorded_and_its_invalid_index_is_rebuilt() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = Database::connect(&test.config()).unwrap();
+    let declared = [CREATE, DUPLICATES, UNIQUE_BODY];
+    let error = run_migrations(&db, &module(&declared), MigrationMode::Apply, soon())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (error.failure.code.as_str(), error.version),
+        ("migration_failed", Some(3))
+    );
+    assert_eq!(ledger(&db).await.len(), 2, "a failed step is not recorded");
+    assert_eq!(
+        index_valid(&db, "notes_body_unique").await,
+        Some(false),
+        "the failed concurrent build left an invalid index"
+    );
+    // Still failing: the invalid index is dropped, rebuilt and fails again.
+    let error = run_migrations(&db, &module(&declared), MigrationMode::Apply, soon())
+        .await
+        .unwrap_err();
+    assert_eq!(error.version, Some(3));
+    assert_eq!(ledger(&db).await.len(), 2);
+    let verify = run_migrations(&db, &module(&declared), MigrationMode::Verify, soon())
+        .await
+        .unwrap();
+    assert_eq!(verify.pending.len(), 1);
+    // Fix the data: the retry drops the invalid index and builds a valid one
+    // instead of letting IF NOT EXISTS keep the broken one.
+    let client = db.acquire(soon()).await.unwrap();
+    client
+        .batch_execute("DELETE FROM notes WHERE id = 2")
+        .await
+        .unwrap();
+    drop(client);
+    let report = run_migrations(&db, &module(&declared), MigrationMode::Apply, soon())
+        .await
+        .unwrap();
+    assert_eq!(report.applied.len(), 1);
+    assert_eq!(index_valid(&db, "notes_body_unique").await, Some(true));
+    assert_eq!(ledger(&db).await.len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_runners_serialize_non_transactional_steps() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    const SLOW: Migration = Migration::new(
+        1,
+        "slow_create",
+        "SELECT pg_sleep(0.2); CREATE TABLE notes (id bigint PRIMARY KEY, body text NOT NULL);",
+    );
+    let declared = [SLOW, BODY_INDEX];
+    let mut runners = Vec::new();
+    for _ in 0..4 {
+        let db = Database::connect(&test.config()).unwrap();
+        runners.push(tokio::spawn(async move {
+            run_migrations(&db, &module(&declared), MigrationMode::Apply, soon())
+                .await
+                .map(|report| report.applied.len())
+        }));
+    }
+    let mut applied = 0;
+    for runner in runners {
+        applied += runner.await.unwrap().unwrap();
+    }
+    assert_eq!(applied, 2, "each migration is applied exactly once");
+    let db = Database::connect(&test.config()).unwrap();
+    assert_eq!(ledger(&db).await.len(), 2);
+    assert_eq!(index_valid(&db, "notes_body_cc").await, Some(true));
+}
+
+#[tokio::test]
+async fn transactions_hand_out_a_mutable_tx_for_ports() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = Database::connect(&test.config()).unwrap();
+    async fn port(tx: &mut merezha_postgres::Tx<'_>) -> Result<i32, merezha_domain::Failure> {
+        let row = tx
+            .query_one("SELECT 7", &[])
+            .await
+            .map_err(|e| classify(&e))?;
+        Ok(row.get(0))
+    }
+    let value = db
+        .transaction(soon(), |tx| Box::pin(async move { port(tx).await }))
+        .await
+        .unwrap();
+    assert_eq!(value, 7);
 }

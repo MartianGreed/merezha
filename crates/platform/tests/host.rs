@@ -26,16 +26,12 @@ use std::{
 use tower::ServiceExt;
 
 const NOTES: [Migration; 2] = [
-    Migration {
-        version: 1,
-        name: "create_schema",
-        sql: "CREATE SCHEMA notes; CREATE TABLE notes.items (id bigint PRIMARY KEY);",
-    },
-    Migration {
-        version: 2,
-        name: "seed",
-        sql: "INSERT INTO notes.items VALUES (1), (2);",
-    },
+    Migration::new(
+        1,
+        "create_schema",
+        "CREATE SCHEMA notes; CREATE TABLE notes.items (id bigint PRIMARY KEY);",
+    ),
+    Migration::new(2, "seed", "INSERT INTO notes.items VALUES (1), (2);"),
 ];
 
 /// A minimal block: one schema, a few routes and observable lifecycle hooks.
@@ -424,11 +420,7 @@ async fn verify_mode_refuses_readiness_until_migrations_are_current() {
     .unwrap();
     assert_eq!(ready(&router).await, StatusCode::OK);
     // A changed migration stops the next startup in either mode.
-    const EDITED: [Migration; 1] = [Migration {
-        version: 1,
-        name: "create_schema",
-        sql: "CREATE SCHEMA notes;",
-    }];
+    const EDITED: [Migration; 1] = [Migration::new(1, "create_schema", "CREATE SCHEMA notes;")];
     for migrate in [false, true] {
         let edited = Notes {
             migrations: Some(&EDITED),

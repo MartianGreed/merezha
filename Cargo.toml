@@ -38,7 +38,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std", "at
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "json", "registry"] }
 tower-http = { version = "0.7.1", default-features = false, features = ["cors"] }
 http-body-util = "0.1.5"
-sha2 = { version = "0.10.9", default-features = false }
+sha2 = { version = "0.11.1", default-features = false }
 getrandom = { version = "0.4.3", default-features = false }
 
 [profile.dev]
