@@ -998,6 +998,12 @@ async fn the_early_listener_answers_health_and_refuses_routes_during_a_slow_migr
         503,
         "starting until the listener switches"
     );
+    assert_eq!(
+        http_get(address, "/health/ready").await.0,
+        503,
+        "not ready until the listener switches, though every check passed"
+    );
+    assert!(host.lifecycle().evaluation().unwrap().passed());
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(early.serve(host, async move {
         let _ = stopped.await;
@@ -1062,4 +1068,190 @@ async fn shutdown_flips_readiness_before_the_listener_closes() {
         tokio::net::TcpStream::connect(address).await.is_err(),
         "the listener closed after the delay"
     );
+}
+
+/// `Flaky::mode` values.
+const HEALTHY: u8 = 0;
+const PANICS: u8 = 1;
+const BLOCKS: u8 = 2;
+/// A module whose `ready()` answers, panics, or blocks its thread for 3 s
+/// before it returns a future.
+#[derive(Clone, Default)]
+struct Flaky {
+    mode: Arc<std::sync::atomic::AtomicU8>,
+}
+impl Module for Flaky {
+    fn name(&self) -> &'static str {
+        "flaky"
+    }
+    fn ready(&self) -> BoxFuture<'_, Result<(), Failure>> {
+        match self.mode.load(Ordering::SeqCst) {
+            PANICS => panic!("readiness check bug"),
+            BLOCKS => std::thread::sleep(Duration::from_secs(3)),
+            _ => {}
+        }
+        Box::pin(async { Ok(()) })
+    }
+}
+/// Poll `/health/ready` through `router` until it answers `status`.
+async fn ready_within(router: &Router, status: StatusCode, within: Duration) -> Duration {
+    let started = Instant::now();
+    loop {
+        if call(router, get_request("/health/ready")).await.0 == status {
+            return started.elapsed();
+        }
+        assert!(
+            started.elapsed() < within,
+            "/health/ready never answered {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Review finding 1: a readiness check that panics after a first success
+/// turns readiness off at the next refresh (the refresh survives the
+/// panic) and on again once it recovers.
+#[tokio::test]
+async fn a_panicking_readiness_check_turns_readiness_off() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let flaky = Flaky::default();
+    let host = Host::start(
+        config(&test, true, ""),
+        vec![Box::new(Notes::default()), Box::new(flaky.clone())],
+        parts(),
+    )
+    .await
+    .unwrap();
+    let router = host.router();
+    assert_eq!(
+        call(&router, get_request("/health/ready")).await.0,
+        StatusCode::OK
+    );
+    flaky.mode.store(PANICS, Ordering::SeqCst);
+    ready_within(
+        &router,
+        StatusCode::SERVICE_UNAVAILABLE,
+        Duration::from_secs(2),
+    )
+    .await;
+    let evaluation = host.lifecycle().evaluation().unwrap();
+    let codes: Vec<(&str, &str)> = evaluation
+        .modules
+        .iter()
+        .map(|m| (m.name, m.code.as_str()))
+        .collect();
+    assert_eq!(codes, [("notes", "ok"), ("flaky", "internal")]);
+    flaky.mode.store(HEALTHY, Ordering::SeqCst);
+    ready_within(&router, StatusCode::OK, Duration::from_secs(2)).await;
+}
+
+/// Review finding 1: a `ready()` that blocks its thread is bounded by the
+/// check timeout and stalls neither the other checks nor the runtime,
+/// even on a single-threaded runtime.
+#[tokio::test(flavor = "current_thread")]
+async fn a_blocking_readiness_check_stalls_nothing_else() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let flaky = Flaky::default();
+    let notes = Notes::default();
+    let host = Host::start(
+        config(&test, true, ""),
+        vec![Box::new(notes.clone()), Box::new(flaky.clone())],
+        parts(),
+    )
+    .await
+    .unwrap();
+    let router = host.router();
+    flaky.mode.store(BLOCKS, Ordering::SeqCst);
+    let took = ready_within(
+        &router,
+        StatusCode::SERVICE_UNAVAILABLE,
+        Duration::from_secs(3),
+    )
+    .await;
+    assert!(took < Duration::from_millis(2_500), "{took:?}");
+    // The runtime still answers at once while the check blocks.
+    let started = Instant::now();
+    assert_eq!(
+        call(&router, get_request("/health/live")).await.0,
+        StatusCode::OK
+    );
+    assert!(started.elapsed() < Duration::from_millis(200));
+    // The other module's state still reaches readiness.
+    notes.unready.store(true, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let evaluation = host.lifecycle().evaluation().unwrap();
+        let codes: Vec<(&str, &str)> = evaluation
+            .modules
+            .iter()
+            .map(|m| (m.name, m.code.as_str()))
+            .collect();
+        if codes == [("notes", "warming_up"), ("flaky", "timeout")] {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{codes:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    notes.unready.store(false, Ordering::SeqCst);
+    flaky.mode.store(HEALTHY, Ordering::SeqCst);
+    ready_within(&router, StatusCode::OK, Duration::from_secs(6)).await;
+}
+
+/// A module whose start takes long, to interrupt it.
+struct SlowStart;
+impl Module for SlowStart {
+    fn name(&self) -> &'static str {
+        "slow_start"
+    }
+    fn start(&self, _ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            Ok(())
+        })
+    }
+}
+
+/// Review finding 5: a shutdown signal during startup interrupts the
+/// module start in progress and shuts the modules already started down.
+#[tokio::test]
+async fn an_interrupted_startup_stops_the_modules_it_started() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let notes = Notes::default();
+    let (signal, interrupt) = tokio::sync::watch::channel(false);
+    let options = merezha_platform::HostOptions {
+        interrupt: Some(interrupt),
+        ..merezha_platform::HostOptions::default()
+    };
+    let starting = tokio::spawn(Host::start_with(
+        config(&test, true, ""),
+        vec![Box::new(notes.clone()), Box::new(SlowStart)],
+        parts(),
+        options.clone(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while notes.started.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "notes never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let signalled = Instant::now();
+    signal.send(true).unwrap();
+    let error = starting.await.unwrap().unwrap_err();
+    assert_eq!(error.failure.code, "startup_interrupted");
+    assert!(signalled.elapsed() < Duration::from_secs(2));
+    assert_eq!(
+        notes.stopped.load(Ordering::SeqCst),
+        1,
+        "started modules stop"
+    );
+    // Already signalled: the next start refuses before touching anything.
+    let error = Host::start_with(config(&test, true, ""), vec![], parts(), options)
+        .await
+        .unwrap_err();
+    assert_eq!(error.failure.code, "startup_interrupted");
 }

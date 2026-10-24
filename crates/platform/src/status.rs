@@ -198,6 +198,7 @@ fn readiness(lifecycle: &Lifecycle) -> Value {
     json!({
         "ready": lifecycle.ready(),
         "draining": lifecycle.draining(),
+        "stale": lifecycle.stale(),
         "checks": checks,
     })
 }

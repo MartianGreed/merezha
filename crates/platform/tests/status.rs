@@ -90,6 +90,13 @@ impl Jobs for FakeJobs {
     fn subscribe(&self, _: &Source, _: &Identity, _: &Identity) -> Result<(), Failure> {
         Err(Failure::permanent("jobs_unavailable"))
     }
+    fn schedule(
+        &self,
+        _: &Source,
+        _: merezha_platform::ports::ScheduleDeclaration,
+    ) -> Result<(), Failure> {
+        Err(Failure::permanent("jobs_unavailable"))
+    }
     fn queue_status(&self) -> BoxFuture<'_, Result<QueueStatus, Failure>> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Ok(queue_status()) })
@@ -417,4 +424,29 @@ async fn with_identity_status_needs_the_permission_at_application_scope() {
             None => assert_eq!(body["startup"]["state"], "started"),
         }
     }
+}
+
+/// Review finding 3: identity's authenticator beside the allow-all policy
+/// would switch every permission check off; startup refuses the pairing.
+#[tokio::test]
+async fn an_authenticator_with_the_allow_all_policy_is_refused() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let jobs = Arc::new(FakeJobs::default());
+    let options = HostOptions {
+        authenticator: Some(Arc::new(HeaderAuthenticator)),
+        ..HostOptions::default()
+    };
+    let error = Host::start_with(
+        config(&test, ""),
+        vec![Box::new(Ledger)],
+        parts(&jobs, loopback()),
+        options,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.failure.code, "allow_all_with_authenticator");
+    assert!(loopback().allows_all());
+    assert!(!GrantPolicy.allows_all());
 }

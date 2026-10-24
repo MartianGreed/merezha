@@ -143,6 +143,8 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("migration_out_of_order", 422),
     ErrorCode::new("migration_failed", 422),
     ErrorCode::new("allow_all_requires_loopback", 422),
+    ErrorCode::new("allow_all_with_authenticator", 422),
+    ErrorCode::new("startup_interrupted", 422),
     ErrorCode::new("error_code_conflict", 422),
     ErrorCode::new("http_client_config", 422),
     ErrorCode::new("module_start_failed", 422),

@@ -102,8 +102,11 @@ and one `startup.failed` event carrying a stable `code`:
    `/health/startup` answers 200 from then on.
 
 A failed step logs `startup.failed`, closes the early listener
-(`listener.stopped`) and exits 2. SIGINT or SIGTERM during startup stops it
-and exits 0.
+(`listener.stopped`) and exits 2. SIGINT or SIGTERM during startup
+interrupts it before the next step, or during a migration (rolled back with
+its session) or a module start (that module is abandoned); the modules
+already started shut down within the module shutdown budget, the early
+listener closes and the process exits 0.
 
 SIGINT or SIGTERM after startup runs the drain sequence: `shutdown.started`
 and `listener.draining` are logged and readiness answers 503 at once while
@@ -372,7 +375,7 @@ status remain.
 | `[telemetry.traces]` | `sampler` (`parent_based_ratio`, `always_off`), `ratio` (0.0 to 1.0, default 1.0, root decisions only), `trust_inbound` (`trusted_proxies`, `always`, `never`), `endpoint` (used verbatim), `max_queue` (2048 spans queued plus in flight; more are dropped and counted), `max_batch` (512, at most `max_queue`), `schedule_delay_ms` (5000) |
 | `[telemetry.metrics]` | `interval_ms` (30000, at least 1 s), `temporality` (`cumulative`, `delta`), `sample_interval_ms` (15000), `endpoint` |
 | `[telemetry.logs]` | `level` (`info`), `endpoint`, `max_queue`, `max_batch`, `schedule_delay_ms` (1000) |
-| `[telemetry.privacy]` | `record_tenant_id` (`true`), `record_subject_id` (`false`), `record_client_address` (`false`) |
+| `[telemetry.privacy]` | `record_tenant_id` (`true`), `record_subject_id` (`false`), `record_client_address` (`false`; no signal carries `client.address` yet, so `true` has no effect) |
 | `[telemetry.propagation]` | `outbound_hosts`: at most 64 exact lowercase host names |
 
 ### `[modules.<name>]`
@@ -441,9 +444,13 @@ directory relative paths resolve against (the canonical directory of
 - records `http.server.request.duration` (method, route, status,
   `error.type`, scheme), `http.server.active_requests` (method, scheme),
   `http.server.request.body.size` (declared `Content-Length`; method,
-  route) and `merezha.http.server.rejected` (`merezha.reason`: `starting`,
-  `overloaded`, `body_limit`, `timeout`), through the meter the binary
-  passes in `HostOptions::meter`.
+  route) and `merezha.http.server.rejected` for what the edge itself
+  refused (`merezha.reason`: `starting` from the early listener, `body_limit`
+  for a declared or read body over `http.body_limit`; a module's
+  `overloaded` or `timeout` reply is not an edge rejection), through the
+  meter the binary passes in `HostOptions::meter`. `client.address` is not
+  recorded on server spans yet, so `telemetry.privacy.record_client_address
+  = true` has no effect.
 - refuses bodies over `http.body_limit`: a larger `Content-Length` fails at
   once and an undeclared body fails while it is read. The same limit replaces
   the 2 MiB default of axum's `Bytes` and `Json` extractors.
@@ -528,7 +535,16 @@ with K2.
 
 Readiness checks run in a background task every 2 s, each bounded by 1 s:
 the pool answers `SELECT 1`, migrations are current, and every module's
-`ready()`. Probes read the cached result and never touch the database. If
+`ready()`. Probes read the cached result and never touch the database.
+Module checks run concurrently, each on a blocking thread of its own: one
+that panics reports `internal`, one that blocks or runs past 1 s reports
+`timeout` (and no second check of that module starts while it is still
+stuck), and neither delays the other checks. One evaluation takes at most
+3 s (database, migration re-verification, then the concurrent module
+checks). An evaluation older than the refresh interval plus 3 s plus a 1 s
+margin, 6 s by default, counts as not ready, so readiness can be at most
+that stale and a refresh that stops turns it 503 instead of keeping the
+last answer. If
 migrations were pending at startup, readiness verifies them again until
 another host has applied them. A module may hold readiness for a bounded
 warm-up (R10): the jobs runtime until its first subscription sync, and,
@@ -543,7 +559,10 @@ the first `code` on each transition (`health.ready` on recovery), and
 ## Status
 
 `GET /v1/admin/status` (`crates/platform/src/status.rs`, TE §5) is the
-protected diagnostics document. With the identity block (an authenticator
+protected diagnostics document. An authenticator beside the allow-all
+policy (`Authorizer::allows_all`) stops startup with
+`allow_all_with_authenticator`, so identity never runs with permission
+checks off. With the identity block (an authenticator
 in `HostOptions::authenticator`) it requires `system.status.read` at
 `ResourceScope::Application`; a tenant-scoped grant is not enough,
 `platform_admin` passes, and failures are `401 unauthenticated` and
@@ -560,7 +579,8 @@ Every field is a code, a count, a configured name or a timestamp:
   `host_version`, `instance_id`, `started_at`, `uptime_s`.
 - `startup`: `state` (`starting`, `started`), `completed_at`,
   `duration_ms`.
-- `readiness`: `ready`, `draining`, `checks` (`name`, `ok`, `code`,
+- `readiness`: `ready`, `draining`, `stale` (the last evaluation is past
+  the staleness bound), `checks` (`name`, `ok`, `code`,
   `duration_ms`, `checked_at`) from the last evaluation.
 - `database`: `pool` (`max`, `size`, `idle`, `waiting`, from the pool
   without I/O) and `migrations` per module (`applied`, `pending`).

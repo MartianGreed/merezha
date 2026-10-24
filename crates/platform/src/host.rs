@@ -188,6 +188,22 @@ pub struct HostOptions {
     pub meter: Option<Meter>,
     /// Sections of `/v1/admin/status` other subsystems own.
     pub status: Vec<Arc<dyn StatusSection>>,
+    /// Turns `true` on a shutdown signal during startup: the host stops
+    /// before its next step, interrupts a running migration or module
+    /// start, shuts down the modules already started within
+    /// `Timeouts::module_shutdown`, and fails `startup_interrupted`.
+    pub interrupt: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+/// Resolve once `interrupt` turns `true`; never without one, or once its
+/// sender is gone without having signalled.
+async fn interrupted(interrupt: Option<tokio::sync::watch::Receiver<bool>>) {
+    if let Some(mut interrupt) = interrupt
+        && interrupt.wait_for(|stop| *stop).await.is_ok()
+    {
+        return;
+    }
+    std::future::pending::<()>().await;
 }
 impl std::fmt::Debug for HostOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -267,6 +283,17 @@ impl Host {
         parts: HostParts,
         options: HostOptions,
     ) -> Result<Self, StartupError> {
+        if options
+            .interrupt
+            .as_ref()
+            .is_some_and(|stop| *stop.borrow())
+        {
+            return Err(StartupError::new("startup_interrupted"));
+        }
+        // An authenticator means identity: permission checks must be real.
+        if options.authenticator.is_some() && parts.authorizer.allows_all() {
+            return Err(StartupError::new("allow_all_with_authenticator"));
+        }
         let jobs = parts.jobs.clone();
         let errors = Arc::new(error_registry(
             &modules
@@ -329,33 +356,38 @@ impl Host {
                 MigrationMode::Apply => parts.timeouts.migrate,
                 MigrationMode::Verify => Duration::from_secs(30),
             };
-        let migrations = run_migrations(&database, &declared, mode, deadline)
-            .await
-            .map_err(|error| {
-                let (code, module) = (error.failure.code.as_str(), error.module.as_deref());
-                if code == "migration_checksum_mismatch" {
-                    merezha_telemetry::event!(
-                        ERROR,
-                        "migration.checksum_mismatch",
-                        code,
-                        module,
-                        version = error.version
-                    );
-                } else {
-                    merezha_telemetry::event!(
-                        ERROR,
-                        "migration.refused",
-                        code,
-                        module,
-                        version = error.version
-                    );
-                }
-                StartupError {
-                    failure: error.failure.clone(),
-                    migration: Some(error),
-                    module: None,
-                }
-            })?;
+        let run = tokio::select! {
+            run = run_migrations(&database, &declared, mode, deadline) => run,
+            // A migration interrupted mid-way rolls back with its session.
+            () = interrupted(options.interrupt.clone()) => {
+                return Err(StartupError::new("startup_interrupted"));
+            }
+        };
+        let migrations = run.map_err(|error| {
+            let (code, module) = (error.failure.code.as_str(), error.module.as_deref());
+            if code == "migration_checksum_mismatch" {
+                merezha_telemetry::event!(
+                    ERROR,
+                    "migration.checksum_mismatch",
+                    code,
+                    module,
+                    version = error.version
+                );
+            } else {
+                merezha_telemetry::event!(
+                    ERROR,
+                    "migration.refused",
+                    code,
+                    module,
+                    version = error.version
+                );
+            }
+            StartupError {
+                failure: error.failure.clone(),
+                migration: Some(error),
+                module: None,
+            }
+        })?;
         drop(declared);
         merezha_telemetry::event!(
             INFO,
@@ -409,7 +441,15 @@ impl Host {
                     migration: None,
                     module: Some(module.name()),
                 })?;
-            let result = tokio::time::timeout_at(at, module.start(own)).await;
+            let result = tokio::select! {
+                result = tokio::time::timeout_at(at, module.start(own)) => result,
+                () = interrupted(options.interrupt.clone()) => {
+                    // The modules already started shut down within their
+                    // budget; the one interrupted mid-start is abandoned.
+                    stop_modules(&started, parts.timeouts.module_shutdown).await;
+                    return Err(StartupError::new("startup_interrupted"));
+                }
+            };
             if !matches!(result, Ok(Ok(()))) {
                 let code = match &result {
                     Ok(Err(failure)) => failure.code.as_str(),
@@ -440,6 +480,7 @@ impl Host {
         }
         let external = options.lifecycle.is_some();
         let lifecycle = options.lifecycle.clone().unwrap_or_else(Lifecycle::new);
+        lifecycle.set_max_age(health::staleness_bound(parts.timeouts.readiness_interval));
         let readiness = Arc::new(Readiness::new(
             database.clone(),
             modules.clone(),

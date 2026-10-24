@@ -236,8 +236,8 @@ impl StatusSection for ApplicationSection {
 }
 
 /// Bind the early listener, run startup inside the `startup` span, then
-/// serve until `shutdown` and drain. A shutdown signal during startup stops
-/// it and exits 0.
+/// serve until `shutdown` and drain. A shutdown signal during startup
+/// interrupts it (modules already started shut down) and exits 0.
 async fn serve(
     config: merezha_platform::ProjectConfig,
     modules: Vec<Box<dyn Module>>,
@@ -249,10 +249,13 @@ async fn serve(
         shutdown.await;
         let _ = signal.send(true);
     });
-    let stop = move || {
-        let mut stopped = stopped.clone();
-        async move {
-            let _ = stopped.wait_for(|stopped| *stopped).await;
+    let stop = {
+        let stopped = stopped.clone();
+        move || {
+            let mut stopped = stopped.clone();
+            async move {
+                let _ = stopped.wait_for(|stopped| *stopped).await;
+            }
         }
     };
     let early = match EarlyListener::bind(&config, None, &options).await {
@@ -263,18 +266,19 @@ async fn serve(
         }
     };
     options.lifecycle = Some(early.lifecycle().clone());
-    let startup =
-        start(config, modules, options).instrument(tracing::info_span!(names::span::STARTUP));
-    let started = tokio::select! {
-        started = startup => started,
-        () = stop() => {
+    // A shutdown signal during startup interrupts it: the host shuts the
+    // modules it already started down and fails `startup_interrupted`.
+    options.interrupt = Some(stopped);
+    let started = start(config, modules, options)
+        .instrument(tracing::info_span!(names::span::STARTUP))
+        .await;
+    let host = match started {
+        Ok(host) => host,
+        Err(code) if code == "startup_interrupted" => {
             merezha_telemetry::event!(INFO, "listener.draining");
             early.close(CLOSE_WITHIN).await;
             return ExitCode::SUCCESS;
         }
-    };
-    let host = match started {
-        Ok(host) => host,
         Err(code) => {
             merezha_telemetry::event!(ERROR, "startup.failed", code = code.as_str());
             early.close(CLOSE_WITHIN).await;

@@ -392,7 +392,7 @@ A key not in the table is dropped at export.
 | `merezha.principal.kind` (`user`, `api_key`, `system`, `anonymous`) | yes | no | yes | edge |
 | `merezha.tenant.id` | yes when `record_tenant_id` (default true) | never | same | opaque id; identity's organization id is this key |
 | `user.id` (opaque subject) | yes when `record_subject_id` (default false) | never | same | pseudonymous personal data, so off by default (TE1); identity's user id is this key |
-| `client.address` | yes when `record_client_address` (default false) | never | same | personal data |
+| `client.address` | yes when `record_client_address` (default false); not recorded by the T2 edge yet, so the switch has no effect | never | same | personal data |
 | `merezha.guest.*`, `merezha.catalog.generation` | yes | listed instruments only | yes | runtime |
 | `merezha.projection.*`, `merezha.reactor.*` | yes | listed | yes | application |
 | `db.*`, `merezha.db.*` (no `db.query.text`, no parameters) | yes | listed | no | statement registry |
@@ -807,7 +807,11 @@ Refinements:
 - **Readiness checks** run in a 2-second background task and probes read the
   cached result, so probes never hit the database: pool acquire plus
   `SELECT 1` within 1 s, migrations current, an active catalog generation,
-  every module's `ready()`. A module may hold readiness for a bounded
+  every module's `ready()`. Module checks run concurrently, each isolated on
+  a blocking thread and bounded by 1 s (a panic is `internal`, a stuck check
+  `timeout`). An evaluation older than interval + 3 × 1 s + 1 s (6 s by
+  default) counts as not ready: that is the worst-case staleness of a probe
+  answer, and a refresh that stops can never leave readiness at 200. A module may hold readiness for a bounded
   warm-up (R10): AP while projection revisions warm
   (`application.projections.warm_readiness`), content while its concurrent
   index builds run (R15).

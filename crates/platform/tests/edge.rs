@@ -65,6 +65,18 @@ fn routes() -> Router {
             }),
         )
         .route(
+            "/v1/busy",
+            get(|| async {
+                merezha_platform::error_response(&merezha_domain::Failure::transient("overloaded"))
+            }),
+        )
+        .route(
+            "/v1/late",
+            get(|| async {
+                merezha_platform::error_response(&merezha_domain::Failure::transient("timeout"))
+            }),
+        )
+        .route(
             "/v1/crash",
             get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
         )
@@ -410,4 +422,46 @@ async fn the_starting_listener_refuses_routes_with_a_registered_code() {
         ErrorRegistry::kernel().status_of("starting"),
         Some(StatusCode::SERVICE_UNAVAILABLE)
     );
+}
+
+/// Review finding 4: `merezha.http.server.rejected` counts what the edge
+/// itself refused (an oversized body here), never a module's `overloaded`
+/// or `timeout` reply.
+#[tokio::test]
+async fn only_the_edges_own_refusals_count_as_rejected() {
+    let harness = harness(1.0);
+    let router = edge_for(&harness, TrustInbound::TrustedProxies, routes());
+    for path in ["/v1/busy", "/v1/late"] {
+        let response = send(&router, request("GET", path, PUBLIC_PEER, None)).await;
+        assert!(response.status().is_server_error(), "{path}");
+    }
+    assert!(
+        harness
+            .metric("merezha.http.server.rejected")
+            .points()
+            .is_empty(),
+        "module replies are not edge rejections"
+    );
+    // A declared body over `http.body_limit` (1 MiB) and an undeclared one
+    // refused while it is read.
+    let mut declared = request("POST", "/v1/notes", PUBLIC_PEER, None);
+    declared
+        .headers_mut()
+        .insert("content-length", "2097152".parse().unwrap());
+    assert_eq!(
+        send(&router, declared).await.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let mut streamed = request("POST", "/v1/notes", PUBLIC_PEER, None);
+    *streamed.body_mut() = Body::from(vec![b'x'; 2 << 20]);
+    assert_eq!(
+        send(&router, streamed).await.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let rejected = harness.metric("merezha.http.server.rejected");
+    assert_eq!(
+        rejected.value(&[("merezha.reason", "body_limit")]),
+        Some(2.0)
+    );
+    assert_eq!(rejected.points().len(), 1);
 }

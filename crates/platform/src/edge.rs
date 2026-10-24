@@ -391,9 +391,11 @@ pub fn apply(router: Router, settings: EdgeSettings) -> Router {
     };
     let router = if settings.starting {
         router.fallback(|| async {
-            ErrorReply::new(Failure::transient("starting"))
+            let mut response = ErrorReply::new(Failure::transient("starting"))
                 .retry_after(Duration::from_secs(1))
-                .into_response()
+                .into_response();
+            response.extensions_mut().insert(Rejected(Reason::Starting));
+            response
         })
     } else {
         router.fallback(|| async { error_response(&Failure::permanent("not_found")) })
@@ -737,19 +739,12 @@ async fn context(State(state): State<EdgeState>, mut request: Request, next: Nex
     response
 }
 
-/// A refused request, counted in `merezha.http.server.rejected`.
+/// A request the edge itself refused, counted in
+/// `merezha.http.server.rejected`. Only the edge's own responses carry it:
+/// the starting fallback and the body limit. Codes a module or the runtime
+/// returns (`overloaded`, `timeout`) are not edge rejections.
 #[derive(Clone, Copy, Debug)]
 struct Rejected(Reason);
-/// The rejection reason of an error code, if it is one.
-fn rejection(code: &str) -> Option<Reason> {
-    match code {
-        "starting" => Some(Reason::Starting),
-        "overloaded" => Some(Reason::Overloaded),
-        "body_limit" => Some(Reason::BodyLimit),
-        "timeout" => Some(Reason::Timeout),
-        _ => None,
-    }
-}
 
 /// Largest error body inspected by [`normalize_errors`].
 const MAX_ERROR_BODY: usize = 65_536;
@@ -816,9 +811,6 @@ async fn normalize_errors(
     if let Some(registered) = response.extensions_mut().remove::<Registered>() {
         *response.status_mut() = state.errors.status(&registered.failure);
         set_retry_after(&mut response, registered.retry_after);
-        if let Some(reason) = rejection(&registered.failure.code) {
-            response.extensions_mut().insert(Rejected(reason));
-        }
         return response;
     }
     let status = response.status();
@@ -850,13 +842,6 @@ async fn normalize_errors(
         if error.is_some() {
             set_retry_after(&mut response, None);
         }
-        if let Some(reason) = error
-            .and_then(|e| e.get("code"))
-            .and_then(|c| c.as_str())
-            .and_then(rejection)
-        {
-            response.extensions_mut().insert(Rejected(reason));
-        }
         return response;
     }
     let code = error
@@ -873,8 +858,12 @@ async fn normalize_errors(
     let body = serde_json::to_vec(&json!({ "error": failure })).unwrap_or_default();
     let mut response = Response::from_parts(parts, Body::from(body));
     set_retry_after(&mut response, None);
-    if let Some(reason) = rejection(&failure.code) {
-        response.extensions_mut().insert(Rejected(reason));
+    // An extractor's plain 413: `http.body_limit` refused the body while
+    // it was read.
+    if status == StatusCode::PAYLOAD_TOO_LARGE && error.is_none() {
+        response
+            .extensions_mut()
+            .insert(Rejected(Reason::BodyLimit));
     }
     response
 }
@@ -886,7 +875,11 @@ async fn limit_body(State(state): State<EdgeState>, request: Request, next: Next
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|length| length > state.body_limit as u64) {
-        return error_response(&Failure::permanent("body_limit"));
+        let mut response = error_response(&Failure::permanent("body_limit"));
+        response
+            .extensions_mut()
+            .insert(Rejected(Reason::BodyLimit));
+        return response;
     }
     // Chunked or undeclared bodies fail while being read past the limit.
     let request =

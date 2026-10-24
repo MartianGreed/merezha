@@ -5,8 +5,13 @@
 //! pool answers `SELECT 1`, migrations are current, every module's
 //! `ready()`), each within one second, in a background task every
 //! [`READINESS_INTERVAL`]; probes read the cached result and never touch
-//! the database. Responses carry only a status word; failing checks are
-//! logged as `health.not_ready` and shown by `/v1/admin/status`.
+//! the database. Module checks run concurrently, each on a blocking thread
+//! of its own, so a check that panics reports `internal` and one that
+//! blocks its thread reports `timeout` without stalling the others. An
+//! evaluation older than [`staleness_bound`] counts as not ready, so a
+//! refresh that stops can never leave readiness at 200. Responses carry
+//! only a status word; failing checks are logged as `health.not_ready` and
+//! shown by `/v1/admin/status`.
 use crate::module::Module;
 use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use merezha_postgres::{Database, MigrationMode, ModuleMigrations, run_migrations};
@@ -26,6 +31,17 @@ pub const CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 pub const READINESS_INTERVAL: Duration = Duration::from_secs(2);
 /// The code of a passing check.
 const OK: &str = "ok";
+/// Slack on top of the longest evaluation in [`staleness_bound`].
+const STALENESS_MARGIN: Duration = Duration::from_secs(1);
+/// The age past which an evaluation no longer counts and readiness is 503:
+/// the refresh `interval` plus the longest evaluation (the database check,
+/// the migration re-verification and the concurrent module checks, each
+/// bounded by [`CHECK_TIMEOUT`]) plus a margin. With the defaults, 6 s.
+pub const fn staleness_bound(interval: Duration) -> Duration {
+    interval
+        .saturating_add(Duration::from_secs(3 * CHECK_TIMEOUT.as_secs()))
+        .saturating_add(STALENESS_MARGIN)
+}
 /// [`Readiness::check`] calls within this window share one evaluation.
 const CACHE_FOR: Duration = Duration::from_millis(250);
 
@@ -92,7 +108,10 @@ pub struct Lifecycle {
     completed: Mutex<Option<Completed>>,
     started: AtomicBool,
     draining: AtomicBool,
-    evaluation: Mutex<Option<Evaluation>>,
+    /// The last evaluation and when it finished.
+    evaluation: Mutex<Option<(Instant, Evaluation)>>,
+    /// Older evaluations count as not ready ([`staleness_bound`]).
+    max_age: Mutex<Duration>,
     /// Whether the last logged evaluation passed; starts `true`, so the
     /// first failure logs `health.not_ready` and a first success logs
     /// nothing.
@@ -108,6 +127,7 @@ impl Lifecycle {
             started: AtomicBool::new(false),
             draining: AtomicBool::new(false),
             evaluation: Mutex::new(None),
+            max_age: Mutex::new(staleness_bound(READINESS_INTERVAL)),
             reported: AtomicBool::new(true),
         })
     }
@@ -157,8 +177,10 @@ impl Lifecycle {
     pub fn drain(&self) {
         self.draining.store(true, Ordering::SeqCst);
     }
-    /// Started, not draining and the last evaluation passed.
+    /// Started, not draining, and the last evaluation passed and is
+    /// younger than [`Lifecycle::max_age`].
     pub fn ready(&self) -> bool {
+        let max_age = self.max_age();
         self.started()
             && !self.draining()
             && self
@@ -166,24 +188,45 @@ impl Lifecycle {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_ref()
-                .is_some_and(Evaluation::passed)
+                .is_some_and(|(at, evaluation)| at.elapsed() <= max_age && evaluation.passed())
+    }
+    /// The age past which an evaluation no longer counts.
+    pub fn max_age(&self) -> Duration {
+        *self.max_age.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    pub(crate) fn set_max_age(&self, max_age: Duration) {
+        *self.max_age.lock().unwrap_or_else(PoisonError::into_inner) = max_age;
+    }
+    /// Whether the last evaluation is older than [`Lifecycle::max_age`]
+    /// (or none ran): the refresh has stopped or stalls.
+    pub fn stale(&self) -> bool {
+        let max_age = self.max_age();
+        self.evaluation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() > max_age)
     }
     /// The last readiness evaluation, if any ran.
     pub fn evaluation(&self) -> Option<Evaluation> {
         self.evaluation
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+            .as_ref()
+            .map(|(_, evaluation)| evaluation.clone())
     }
     /// Keep `evaluation` and log a transition: `health.not_ready` with the
     /// failing check names and the first code, or `health.ready`.
     fn record(&self, evaluation: Evaluation) {
+        self.record_at(Instant::now(), evaluation);
+    }
+    fn record_at(&self, at: Instant, evaluation: Evaluation) {
         let passed = evaluation.passed();
         let failures = evaluation.failures();
         *self
             .evaluation
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(evaluation);
+            .unwrap_or_else(PoisonError::into_inner) = Some((at, evaluation));
         if self.reported.swap(passed, Ordering::SeqCst) == passed {
             return;
         }
@@ -215,6 +258,8 @@ impl Lifecycle {
 pub struct Readiness {
     database: Database,
     modules: Vec<Arc<dyn Module>>,
+    /// Per module: a check still running on its blocking thread.
+    in_flight: Vec<Arc<AtomicBool>>,
     migrations_current: AtomicBool,
     lifecycle: Arc<Lifecycle>,
     last: tokio::sync::Mutex<Option<Instant>>,
@@ -228,6 +273,10 @@ impl Readiness {
     ) -> Self {
         Self {
             database,
+            in_flight: modules
+                .iter()
+                .map(|_| Arc::new(AtomicBool::new(false)))
+                .collect(),
             modules,
             migrations_current: AtomicBool::new(migrations_current),
             lifecycle,
@@ -259,7 +308,22 @@ impl Readiness {
     async fn evaluate(&self) -> Evaluation {
         let mut checks = Vec::new();
         let started = Instant::now();
-        let database = self.database.ping(started + CHECK_TIMEOUT).await;
+        // Module checks start first and run while the database is checked.
+        let pending: Vec<_> = self
+            .modules
+            .iter()
+            .zip(&self.in_flight)
+            .map(|(module, in_flight)| {
+                (
+                    module.name(),
+                    tokio::spawn(module_check(module.clone(), in_flight.clone())),
+                )
+            })
+            .collect();
+        let database =
+            tokio::time::timeout(CHECK_TIMEOUT, self.database.ping(started + CHECK_TIMEOUT))
+                .await
+                .unwrap_or_else(|_| Err(merezha_domain::Failure::transient("timeout")));
         checks.push(result("database", database.as_ref().err(), started));
         if database.is_ok() && !self.migrations_current() {
             // Another host may have applied them since startup: re-verify.
@@ -272,20 +336,24 @@ impl Readiness {
                     migrations: m.migrations(),
                 })
                 .collect();
-            let verified = run_migrations(
-                &self.database,
-                &declared,
-                MigrationMode::Verify,
-                started + CHECK_TIMEOUT,
+            let verified = tokio::time::timeout(
+                CHECK_TIMEOUT,
+                run_migrations(
+                    &self.database,
+                    &declared,
+                    MigrationMode::Verify,
+                    started + CHECK_TIMEOUT,
+                ),
             )
             .await;
             let failure = match verified {
-                Ok(report) if report.is_current() => {
+                Ok(Ok(report)) if report.is_current() => {
                     self.migrations_current.store(true, Ordering::SeqCst);
                     None
                 }
-                Ok(_) => Some(merezha_domain::Failure::transient("migrations_pending")),
-                Err(error) => Some(error.failure),
+                Ok(Ok(_)) => Some(merezha_domain::Failure::transient("migrations_pending")),
+                Ok(Err(error)) => Some(error.failure),
+                Err(_) => Some(merezha_domain::Failure::transient("timeout")),
             };
             checks.push(result("migrations", failure.as_ref(), started));
         } else if !self.migrations_current() {
@@ -298,20 +366,50 @@ impl Readiness {
             });
         }
         let mut modules = Vec::new();
-        for module in &self.modules {
-            let at = tokio::time::Instant::now() + CHECK_TIMEOUT;
-            let code = match tokio::time::timeout_at(at, module.ready()).await {
-                Ok(Ok(())) => OK.to_owned(),
-                Ok(Err(failure)) => failure.code,
-                Err(_) => "timeout".to_owned(),
-            };
+        for (name, check) in pending {
+            let code = check.await.unwrap_or_else(|_| INTERNAL.to_owned());
             modules.push(ModuleReadiness {
-                name: module.name(),
+                name,
                 ready: code == OK,
                 code,
             });
         }
         Evaluation { checks, modules }
+    }
+}
+
+/// The code of a check that panicked.
+const INTERNAL: &str = "internal";
+/// The code of a check that did not answer within [`CHECK_TIMEOUT`].
+const TIMEOUT: &str = "timeout";
+/// Clears a module's in-flight flag when its check ends, unwinding
+/// included.
+struct InFlight(Arc<AtomicBool>);
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+/// One module's `ready()` on a blocking thread of its own, bounded by
+/// [`CHECK_TIMEOUT`]: a panic reports `internal`, a check that blocks or
+/// takes longer reports `timeout`. While a previous check of the module
+/// is still running, no other starts and the result is `timeout`, so a
+/// stuck check holds at most one thread.
+async fn module_check(module: Arc<dyn Module>, in_flight: Arc<AtomicBool>) -> String {
+    if in_flight.swap(true, Ordering::SeqCst) {
+        return TIMEOUT.to_owned();
+    }
+    let guard = InFlight(in_flight);
+    let runtime = tokio::runtime::Handle::current();
+    let task = merezha_telemetry::spawn_blocking_in_span(move || {
+        let _guard = guard;
+        runtime.block_on(module.ready())
+    });
+    match tokio::time::timeout(CHECK_TIMEOUT, task).await {
+        Ok(Ok(Ok(()))) => OK.to_owned(),
+        Ok(Ok(Err(failure))) => failure.code,
+        Ok(Err(_)) => INTERNAL.to_owned(),
+        Err(_) => TIMEOUT.to_owned(),
     }
 }
 fn result(
@@ -341,7 +439,9 @@ pub(crate) fn spawn_refresh(readiness: &Arc<Readiness>, interval: Duration) {
             if readiness.lifecycle.draining() {
                 return;
             }
-            readiness.check().await;
+            // Each refresh runs as a task of its own, so a panic ends that
+            // refresh only, never the loop.
+            let _ = tokio::spawn(async move { readiness.check().await }).await;
         }
     });
 }
@@ -376,5 +476,44 @@ async fn ready(State(lifecycle): State<Arc<Lifecycle>>) -> impl IntoResponse {
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status":"not_ready"})),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn passing() -> Evaluation {
+        Evaluation {
+            checks: vec![CheckResult {
+                name: "database",
+                ok: true,
+                code: OK.to_owned(),
+                duration_ms: 1,
+                checked_at: jiff::Timestamp::now().to_string(),
+            }],
+            modules: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_evaluation_past_the_staleness_bound_is_not_ready() {
+        assert_eq!(staleness_bound(READINESS_INTERVAL), Duration::from_secs(6));
+        let lifecycle = Lifecycle::new();
+        lifecycle.record(passing());
+        assert!(!lifecycle.ready(), "not started yet");
+        lifecycle.complete();
+        assert!(lifecycle.ready() && !lifecycle.stale());
+        // The refresh stopped: the last passing evaluation ages out.
+        let max_age = lifecycle.max_age();
+        lifecycle.record_at(
+            Instant::now() - max_age - Duration::from_millis(1),
+            passing(),
+        );
+        assert!(!lifecycle.ready() && lifecycle.stale());
+        lifecycle.set_max_age(max_age * 2);
+        assert!(lifecycle.ready());
+        lifecycle.drain();
+        assert!(!lifecycle.ready());
     }
 }
