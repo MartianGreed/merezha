@@ -741,3 +741,59 @@ async fn detached_and_listener_sessions_are_reported_as_their_own_pools() {
     assert_eq!(gauge(count, "merezha.detached", Some("used")), Some(0.0));
     assert_eq!(gauge(count, "merezha.listen", Some("used")), Some(0.0));
 }
+
+const SELECT_TEXT: Statement = Statement::new(
+    "canary.items.select_text",
+    "SELECT canary.items",
+    "SELECT body FROM canary.items WHERE body = $1 <and conditions built per call>",
+);
+
+#[tokio::test]
+async fn text_built_at_run_time_runs_with_parameters_under_its_registered_name() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let harness = Harness::new();
+    let db = database(&test, &harness).for_module("canary");
+    migrate(&db).await;
+    let client = db.acquire(soon()).await.unwrap();
+    db.execute(&client, &INSERT, &[&CANARY]).await.unwrap();
+    // The text varies per call; the value stays a parameter.
+    let text = "SELECT body FROM canary.items WHERE body = $1 AND id > $2";
+    let rows = db
+        .query_text(&client, &SELECT_TEXT, text, &[&CANARY, &0i64])
+        .instrument(caller())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), CANARY);
+    let refused = db
+        .query_text(&client, &SELECT_TEXT, "SELECT * FROM canary.missing", &[])
+        .instrument(caller())
+        .await;
+    assert_eq!(classify(&refused.unwrap_err()).code, "database_error");
+    drop(client);
+    let spans: Vec<SpanData> = client_spans(&harness)
+        .into_iter()
+        .filter(|s| s.name == "SELECT canary.items")
+        .collect();
+    assert_eq!(spans.len(), 2);
+    for span in &spans {
+        assert_eq!(
+            attribute(span, "merezha.db.statement").as_deref(),
+            Some("canary.items.select_text")
+        );
+        let text = format!("{span:?}");
+        assert!(!text.contains("id > $2") && !text.contains("canary.missing"));
+        assert!(!text.contains(CANARY));
+    }
+    let duration = harness.metric("db.client.operation.duration");
+    assert_eq!(
+        duration.value(&[
+            ("db.collection.name", "canary.items"),
+            ("db.operation.name", "SELECT"),
+            ("merezha.module", "canary"),
+        ]),
+        Some(1.0)
+    );
+}

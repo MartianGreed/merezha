@@ -618,6 +618,22 @@ impl Database {
     ) -> Result<(), tokio_postgres::Error> {
         self.telemetry.batch_text(session, statement, sql).await
     }
+    /// [`Database::query`] for text built at run time under a registered
+    /// name, with parameters: a list whose filters, sort keys and cursor
+    /// condition vary per request, its shape documented in
+    /// `statement.sql`. Every value travels as a parameter; the text holds
+    /// only identifiers and placeholders the caller built from validated
+    /// input. The text is never recorded.
+    pub async fn query_text(
+        &self,
+        session: &impl Session,
+        statement: &Statement,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<Row>, tokio_postgres::Error> {
+        let fut = on_driver!(session, |c| c.query(sql, params));
+        self.telemetry.observe(statement, fut).await
+    }
 }
 
 impl Telemetry {

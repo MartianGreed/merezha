@@ -238,7 +238,8 @@ span name and `db.query.summary`; operation and collection derive from it.
 `Statement::new` checks both at compile time, and `adhoc` is a reserved
 name. Statements run through `Database::query`, `execute` and their
 siblings, which take any session (pooled client, `Tx`, detached client);
-text built at run time runs through `batch_text` under a registered name.
+text built at run time runs through `batch_text` (no rows) or `query_text`
+(parameters and rows) under a registered name.
 SQL sent through the driver directly is invisible to telemetry rather than
 reported as `adhoc` (T4: `Tx` stays the driver's transaction type so blocks
 keep compiling), so it fails review instead; a source scan in

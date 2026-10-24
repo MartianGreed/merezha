@@ -29,10 +29,18 @@
 //! the variant delete, soft delete, undelete, immediate purge, the trash
 //! and the `content.trash_purge` job ([`Store::delete_entry`]), each with
 //! its outbox events in the change's transaction, and the background
-//! fallback rebuild after a locale or fallback change ([`REBUILD_JOB`]). Delivery is
-//! C5 and assets C7.
+//! fallback rebuild after a locale or fallback change ([`REBUILD_JOB`]).
+//!
+//! CT-C5, delivery: published entries under `/v1/content/{type}` (and
+//! `/v1/content/o/{organization}/{type}`) by each type's `access`,
+//! preview of drafts with `content.preview`, `fields`, `populate`
+//! (also on management draft reads), by-slug lookups, weak ETags from
+//! the scope generations with 304 answered from `generations` alone,
+//! cache headers, and the model endpoints. Its statements are registered
+//! ([`STATEMENTS`]). Assets are C7.
 mod activation;
 mod canonical;
+mod delivery;
 mod diff;
 mod http;
 mod indexes;
@@ -42,6 +50,7 @@ mod manage;
 mod model;
 mod module;
 mod parse;
+mod populate;
 mod publish;
 mod query;
 mod rebuild;
@@ -51,6 +60,7 @@ mod scalar;
 mod schema;
 mod settings;
 mod slug;
+mod statements;
 mod store;
 mod trash;
 mod value;
@@ -61,6 +71,7 @@ pub use activation::{
     TIGHTENING_SCAN_LIMIT, TightenedCount, Verified, activate, existing_indexes, missing_indexes,
     read_active, unneeded_indexes, verify,
 };
+pub use delivery::{MODEL_READ, PREVIEW, PREVIEW_CACHE_CONTROL, VARY};
 pub use diff::{Change, ChangeClass, change_classes, diff, diff_models};
 pub use http::{
     ENTRIES_DELETE, ENTRIES_PUBLISH, ENTRIES_PURGE, ENTRIES_READ, ENTRIES_WRITE, NO_STORE,
@@ -80,13 +91,18 @@ pub use parse::{
     CONTENT_PERMISSIONS, MAX_DESCRIPTION, MAX_MODEL_BYTES, MAX_PATTERN_BYTES, ModelOptions,
     PATTERN_SIZE_LIMIT, PermissionCatalog,
 };
+pub use populate::{IDS_PER_STATEMENT, POPULATE_LIMIT};
 pub use publish::{Expect, Item, PUBLISHED, UNPUBLISHED};
 pub use query::{MAX_CURSOR_BYTES, MAX_FILTER_VALUES, MAX_QUERY_BYTES};
 pub use rebuild::{PendingRebuild, REBUILD_BATCH, REBUILD_JOB, pending_rebuild};
 pub use rich_text::{MAX_HREF_BYTES, MAX_MARK_DEFS, MAX_SPAN_MARKS, MAX_SPANS};
 pub use schema::{MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATIONS};
-pub use settings::{ContentSettings, DEFAULT_PURGE_CRON, DEFAULT_TRASH_RETENTION, Limits, Trash};
+pub use settings::{
+    ContentSettings, DEFAULT_CACHE_CONTROL_PRIVATE, DEFAULT_CACHE_CONTROL_PUBLIC,
+    DEFAULT_PURGE_CRON, DEFAULT_TRASH_RETENTION, Delivery, Limits, MAX_CACHE_CONTROL, Trash,
+};
 pub use slug::slugify;
+pub use statements::STATEMENTS;
 pub use store::{
     Actor, BATCH_ITEMS_PER_TIMEOUT, Content, DRAFT_SAVED, EntrySummary, Page, Referrer, Rejection,
     RevisionItem, RevisionView, Saved, Store, Target, VariantView, WriteKind,
@@ -137,6 +153,7 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("singleton_exists", 409),
     ErrorCode::new("entry_referenced", 409),
     ErrorCode::new("default_variant_required", 409),
+    ErrorCode::new("populate_limit", 400),
 ];
 
 /// Every detail code field validation reports (section 2).

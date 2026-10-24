@@ -12,7 +12,7 @@ use merezha_content::{ActivationOptions, ContentHandle, ContentModule};
 use merezha_domain::{Failure, Identity, MessageKind, Metadata};
 use merezha_jobs::PgJobs;
 use merezha_platform::{
-    ConfigInput, Database, Host, HostParts, Timeouts,
+    ConfigInput, Database, Host, HostOptions, HostParts, Timeouts,
     edge::Authenticated,
     host::configure,
     ports::{
@@ -195,6 +195,32 @@ pub fn principal(name: &str) -> Principal {
             id("author"),
             set(&EDITOR),
         ),
+        // Delivery (C5): drafts through `stage=draft`.
+        "previewer" => GrantSnapshot::empty().with_application(Grants::new(
+            vec![id("previewer")],
+            set(&["content.preview"]),
+        )),
+        // `content.delivery.read` at application scope.
+        "delivery_reader" => GrantSnapshot::empty().with_application(Grants::new(
+            vec![id("delivery_reader")],
+            set(&["content.delivery.read"]),
+        )),
+        // `content.delivery.read` on the `brief` type only.
+        "brief_reader" => GrantSnapshot::empty().with_application_resource(
+            id("content_type"),
+            id("brief"),
+            set(&["content.delivery.read"]),
+        ),
+        // `content.delivery.read` on the `article` type only.
+        "article_delivery" => GrantSnapshot::empty().with_application_resource(
+            id("content_type"),
+            id("article"),
+            set(&["content.delivery.read"]),
+        ),
+        "model_reader" => GrantSnapshot::empty().with_application(Grants::new(
+            vec![id("model_reader")],
+            set(&["content.model.read"]),
+        )),
         // Tenant grants never satisfy application-scoped types.
         "tenant_editor" => {
             GrantSnapshot::empty().with_tenant(Grants::new(vec![id("editor")], set(&EDITOR)))
@@ -280,6 +306,32 @@ pub async fn start_in(
     test: &TestDatabase,
     policy: Arc<dyn Authorizer>,
 ) -> Fixture {
+    start_with_options(dir, test, policy, HostOptions::default()).await
+}
+
+/// A migrating host on `model` whose pool records its statements in
+/// `harness`'s metrics (`db.client.operation.duration`).
+pub async fn start_metered(
+    test: &TestDatabase,
+    settings: &str,
+    model: &str,
+    harness: &merezha_telemetry::testing::Harness,
+) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    project(dir.path(), true, settings, model);
+    let options = HostOptions {
+        meters: harness.telemetry().meters(),
+        ..HostOptions::default()
+    };
+    start_with_options(dir, test, Arc::new(FixturePolicy), options).await
+}
+
+async fn start_with_options(
+    dir: tempfile::TempDir,
+    test: &TestDatabase,
+    policy: Arc<dyn Authorizer>,
+    options: HostOptions,
+) -> Fixture {
     let module = ContentModule::with_options(fast());
     let handle = module.handle();
     let input = ConfigInput {
@@ -303,7 +355,7 @@ pub async fn start_in(
         ..parts
     };
     let db = Database::connect(&config.database).unwrap();
-    let host = Host::start(config, modules, parts)
+    let host = Host::start_with(config, modules, parts, options)
         .await
         .expect("host starts");
     let router = host.router().layer(axum::middleware::from_fn(authenticate));

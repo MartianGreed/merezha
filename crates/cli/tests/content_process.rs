@@ -1,7 +1,8 @@
 //! `merezha run` mounts the content management routes (CT-C3, and C4's
 //! publishing, deletion and trash routes): a private
 //! listener allows them through the loopback policy, a public one without
-//! identity denies them. A real process against real PostgreSQL; skips
+//! identity denies them. Delivery (C5) serves `public` types to anonymous
+//! readers on both. A real process against real PostgreSQL; skips
 //! with a message when `MEREZHA_TEST_DATABASE_URL` is unset.
 mod support;
 use merezha_postgres::TestDatabase;
@@ -74,6 +75,30 @@ fn the_host_serves_content_management_routes_behind_its_policy() {
     );
     assert_eq!(published.status, 200, "{:?}", published.body);
     assert_eq!(published.body["items"][0]["sys"]["status"], "published");
+    // C5: the published page through delivery, and one that stays.
+    let delivered = support::request(address, "GET", &format!("/v1/content/page/{id}"), "");
+    assert_eq!(delivered.status, 200, "{:?}", delivered.body);
+    assert_eq!(delivered.body["fields"]["title"], "Home");
+    assert!(
+        delivered.headers.contains("etag: w/\""),
+        "{}",
+        delivered.headers
+    );
+    let about = support::request(
+        address,
+        "POST",
+        "/v1/content/manage/entries/page",
+        &json!({"fields": {"title": "About"}}).to_string(),
+    );
+    let about_id = about.body["sys"]["id"].as_str().unwrap().to_owned();
+    let published = support::request(
+        address,
+        "POST",
+        "/v1/content/manage/batch/publish",
+        &json!({"items": [{"type": "page", "id": about_id, "locale": "en", "revision": 1}]})
+            .to_string(),
+    );
+    assert_eq!(published.status, 200, "{:?}", published.body);
     let deleted = support::request(
         address,
         "DELETE",
@@ -92,5 +117,15 @@ fn the_host_serves_content_management_routes_behind_its_policy() {
     let denied = support::request(address, "GET", "/v1/content/manage/entries/page", "");
     assert_eq!(denied.status, 401, "{:?}", denied.body);
     assert_eq!(denied.body["error"]["code"], "unauthenticated");
+    let model = support::request(address, "GET", "/v1/content/manage/model", "");
+    assert_eq!(model.status, 401, "{:?}", model.body);
+    // Delivery of a public type needs no principal, whatever the policy.
+    let delivered = support::request(address, "GET", "/v1/content/page", "");
+    assert_eq!(delivered.status, 200, "{:?}", delivered.body);
+    assert_eq!(delivered.body["items"][0]["fields"]["title"], "About");
+    assert_eq!(delivered.body["items"].as_array().unwrap().len(), 1);
+    let model = support::request(address, "GET", "/v1/content/model", "");
+    assert_eq!(model.status, 200, "{:?}", model.body);
+    assert!(model.body["types"]["page"].is_object());
     host.stop();
 }
