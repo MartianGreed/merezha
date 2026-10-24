@@ -489,7 +489,10 @@ kind = "tasks.send_reminders"
 payload = { only = ["late"], limit = 50 }
 "#,
         &[("MEREZHA_JOBS__QUEUES__DEFAULT__CONCURRENCY", "4")],
-        &[("jobs.relay.batch", "250")],
+        &[
+            ("jobs.relay.batch", "250"),
+            (r#"jobs.queues."notify.webhook".concurrency"#, "12"),
+        ],
     )
     .unwrap();
     let jobs = &config.jobs;
@@ -499,6 +502,10 @@ payload = { only = ["late"], limit = 50 }
     assert_eq!(default.concurrency, 4, "env beats the file");
     assert_eq!(default.settings.max_attempts, 5, "inherits [jobs.defaults]");
     let webhook = &jobs.queues["notify.webhook"];
+    assert_eq!(
+        webhook.concurrency, 12,
+        "a quoted flag segment names a dotted queue"
+    );
     assert_eq!(webhook.settings.backoff_max, Duration::from_secs(86_400));
     assert_eq!(webhook.settings.max_attempts, 5);
     assert_eq!(jobs.readiness_max_lag, Some(Duration::from_secs(120)));
@@ -508,6 +515,30 @@ payload = { only = ["late"], limit = 50 }
         serde_json::json!({"only": ["late"], "limit": 50})
     );
     assert_eq!(jobs.schedules[0].timezone, "Europe/Paris");
+}
+
+#[test]
+fn flags_address_dotted_queue_names_with_a_quoted_segment() {
+    let config = load(
+        "",
+        &[],
+        &[(r#"jobs.queues."notify.email".concurrency"#, "5")],
+    )
+    .unwrap();
+    assert_eq!(config.jobs.queues["notify.email"].concurrency, 5);
+    let errors = load(
+        "",
+        &[],
+        &[(r#"jobs.queues."notify.email.concurrency"#, "5")],
+    )
+    .unwrap_err();
+    assert_eq!(
+        codes(&errors),
+        vec![(
+            r#"jobs.queues."notify.email.concurrency"#.into(),
+            "unknown_key"
+        )]
+    );
 }
 
 #[test]

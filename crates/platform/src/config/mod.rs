@@ -642,6 +642,38 @@ fn valid_origin(origin: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"-.:[]".contains(&b))
 }
 
+/// Split a flag key on `.`, keeping a double-quoted segment whole, as TOML
+/// does: `jobs.queues."notify.email".concurrency`. `None` for an unclosed
+/// quote or a quote inside a segment.
+fn flag_path(key: &str) -> Option<Vec<String>> {
+    let mut path = Vec::new();
+    let mut rest = key;
+    loop {
+        let (segment, after) = match rest.strip_prefix('"') {
+            Some(quoted) => {
+                let end = quoted.find('"')?;
+                let after = &quoted[end + 1..];
+                if !(after.is_empty() || after.starts_with('.')) {
+                    return None;
+                }
+                (&quoted[..end], after)
+            }
+            None => match rest.find('.') {
+                Some(dot) => (&rest[..dot], &rest[dot..]),
+                None => (rest, ""),
+            },
+        };
+        if segment.contains('"') {
+            return None;
+        }
+        path.push(segment.to_owned());
+        match after.strip_prefix('.') {
+            Some(next) => rest = next,
+            None => return Some(path),
+        }
+    }
+}
+
 /// TOML literal for module overrides, falling back to a plain string.
 fn module_value(raw: &str) -> toml::Value {
     toml::from_str::<toml::Table>(&format!("v = {raw}"))
@@ -871,8 +903,10 @@ fn parse_parts(
             layers.set(&path, value, origin, &mut issues);
         }
         for (key, value) in overrides {
-            let path: Vec<String> = key.split('.').map(str::to_owned).collect();
-            layers.set(&path, value.clone(), Origin::Flag, &mut issues);
+            match flag_path(key) {
+                Some(path) => layers.set(&path, value.clone(), Origin::Flag, &mut issues),
+                None => issues.push(ConfigIssue::new(key.clone(), "unknown_key", Origin::Flag)),
+            }
         }
         let resolver = Arc::new(SecretResolver {
             base_dir: base_dir.clone(),
@@ -1146,4 +1180,27 @@ fn build(
         })
     })();
     (config, modules)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flag_keys_keep_quoted_segments_whole() {
+        let path = |key| flag_path(key).map(|p| p.join("|"));
+        assert_eq!(path("http.listen").as_deref(), Some("http|listen"));
+        assert_eq!(
+            path(r#"jobs.queues."notify.email".concurrency"#).as_deref(),
+            Some("jobs|queues|notify.email|concurrency")
+        );
+        assert_eq!(path(r#""a"."b""#).as_deref(), Some("a|b"));
+        for bad in [
+            r#"jobs.queues."notify.email"#,
+            r#"jobs."q"x.k"#,
+            r#"jo"bs.k"#,
+        ] {
+            assert_eq!(flag_path(bad), None, "{bad}");
+        }
+    }
 }
