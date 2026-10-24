@@ -111,8 +111,15 @@ pub async fn main(args: impl IntoIterator<Item = String>, ignored: Vec<String>) 
             .collect(),
         overrides: arguments.overrides,
     };
-    let modules = crate::modules(&input);
-    run(input, modules, host::shutdown_signal(), ignored).await
+    let (modules, identity) = crate::host_blocks(&input);
+    run_with(
+        input,
+        modules,
+        Some(identity),
+        host::shutdown_signal(),
+        ignored,
+    )
+    .await
 }
 
 /// Run the host with `modules` until `shutdown` resolves, then flush
@@ -122,6 +129,21 @@ pub async fn main(args: impl IntoIterator<Item = String>, ignored: Vec<String>) 
 pub async fn run(
     input: ConfigInput,
     modules: Vec<Box<dyn Module>>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    otel_ignored: Vec<String>,
+) -> ExitCode {
+    run_with(input, modules, None, shutdown, otel_ignored).await
+}
+
+/// [`run`] with the identity block's handle: when `[modules.identity]` is
+/// present the host installs its session authenticator and its metrics,
+/// and the permission policy denies by default (identity PR 1 has no RBAC
+/// `Authorizer` yet, and the host refuses allow-all beside an
+/// authenticator).
+pub async fn run_with(
+    input: ConfigInput,
+    modules: Vec<Box<dyn Module>>,
+    identity: Option<merezha_identity::IdentityHandle>,
     shutdown: impl Future<Output = ()> + Send + 'static,
     otel_ignored: Vec<String>,
 ) -> ExitCode {
@@ -169,11 +191,16 @@ pub async fn run(
     let jobs = merezha_jobs::PgJobs::new(&config.jobs)
         .with_app_version(config.app.version.clone())
         .with_telemetry(&meters, config.telemetry.metrics.sample_interval);
-    let options = HostOptions {
+    let mut options = HostOptions {
         meters,
         status: vec![Arc::new(TelemetrySection(telemetry.status_reader()))],
         ..HostOptions::default()
     };
+    if let Some(identity) = identity
+        && modules.iter().any(|m| m.name() == merezha_identity::NAME)
+    {
+        options.authenticator = Some(identity.authenticator());
+    }
     let code = serve(config, modules, shutdown, options, jobs).await;
     // Flush traces, logs and metrics within `shutdown_timeout_ms`, then the
     // stderr writer.
@@ -329,8 +356,11 @@ async fn start(
     // A trusted proxy means requests arrive from elsewhere even on a
     // loopback listener, so it counts as public too.
     let private = host::private_listener(&config);
+    // With the identity block (an authenticator) the policy denies every
+    // permission check until ID PR 2 brings the RBAC `Authorizer`:
+    // `401 unauthenticated` without a principal, `403 unauthorized` with one.
     let authorizer: Arc<dyn Authorizer> = match LoopbackAllowAll::new(config.http.listen) {
-        Ok(allow) if private => Arc::new(allow),
+        Ok(allow) if private && options.authenticator.is_none() => Arc::new(allow),
         _ => Arc::new(DenyAll),
     };
     let mut modules = modules;
@@ -406,7 +436,10 @@ async fn start(
         None => None,
     };
     // A PostgreSQL application's routes come from its module instead.
-    let routes = match (private, application) {
+    // The raw runtime endpoints have no authentication of their own: with
+    // the identity block (an authenticator) they are never mounted.
+    let raw_runtime = private && options.authenticator.is_none();
+    let routes = match (raw_runtime, application) {
         (true, Some(application)) => crate::app(runtime).merge(crate::application_http::router(
             application,
             Some(authorizer.clone()),
@@ -420,7 +453,7 @@ async fn start(
     merezha_telemetry::event!(
         INFO,
         "runtime.loaded",
-        raw_runtime = private,
+        raw_runtime,
         application = config.application.is_some()
     );
     // The jobs runtime stops first; the module shutdown budget adds its drain

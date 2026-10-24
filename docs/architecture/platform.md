@@ -31,7 +31,8 @@ below it follow the process umask.
 
 `merezha run --config merezha.toml` (`crates/cli/src/run.rs`) puts them
 together with the existing runtime and application layer, and registers the
-content block ([Content](#content)) and the notifications block
+identity block ([Identity block](#identity-block)), the content block
+([Content](#content)) and the notifications block
 ([Notifications block](#notifications-block)), each off until its
 `[modules.<name>]` section is present. `merezha serve` is unchanged.
 
@@ -126,7 +127,7 @@ process exits 0. A serving failure exits 1.
 | `GET /health/startup` | kernel | always, from the early listener on |
 | `GET /health/ready` | kernel | always, from the early listener on |
 | `GET /v1/admin/status` | kernel (TE §5) | always; see [Status](#status) |
-| `/v1/<module>/...` | each enabled module | its `[modules.<module>]` section exists |
+| `/v1/<module>/...` | each enabled module (`/v1/identity/...` for identity) | its `[modules.<module>]` section exists |
 | `/v1/application/...` | application layer (the `application` module on PostgreSQL) | `[application]` is set |
 | `/v1/jobs/admin/...` | jobs runtime (AP §D.1) | always; each route is a permission check |
 | `/health`, `/v1/services/...`, `/v1/pipelines/...`, `/v1/reload` | raw runtime | the listener is private |
@@ -147,6 +148,17 @@ application's admin routes ([application storage](#application-storage)) need
 `application.admin.read` to read and `application.admin.write` to abandon a
 rebuild or delete a revision, checked the same way. A deployment exposes
 nothing unauthenticated by accident.
+
+With the identity block the edge authenticates every request through its
+session `Authenticator` (`HostOptions::authenticator`), and the host refuses
+the allow-all policy beside it (`allow_all_with_authenticator`). Identity
+PR 1 has no RBAC `Authorizer` yet and principals carry an empty grant
+snapshot, so `merezha run` installs the deny-all policy on every listener,
+loopback included: application commands and queries, the application and
+jobs admin routes and `/v1/admin/status` answer `401 unauthenticated`
+without a session and `403 unauthorized` with one, until ID PR 2. The raw
+runtime endpoints, which have no authentication of their own, are never
+mounted beside the authenticator, even on a private listener.
 
 ## Configuration reference
 
@@ -220,8 +232,9 @@ CORS is off while `allowed_origins` is empty.
 | `max_age_seconds` | integer | `600` | no | 0 to 86400 |
 
 Allowed methods are GET, POST, PUT, PATCH and DELETE. Allowed request
-headers are `content-type`, `authorization`, `x-request-id`, `traceparent`
-and `tracestate`. `x-request-id` is exposed to scripts.
+headers are `content-type`, `authorization`, `x-request-id`, `traceparent`,
+`tracestate` and `x-csrf-token` (identity's CSRF header, so a cross-origin
+front end can send it). `x-request-id` is exposed to scripts.
 
 ### `[database]`
 
@@ -825,7 +838,7 @@ pass what they learned in (`NotificationRequest::members`).
 
 | Port | Contract | Fallback without its block |
 | --- | --- | --- |
-| `Authenticator` | `RequestHead` (request parts) to `Option<Arc<Principal>>`; `Ok(None)` without credentials, permanent `unauthenticated` for bad ones, transient when its store is down; loads every grant into the snapshot | none: no principal |
+| `Authenticator` | `RequestHead` (request parts) to `Option<Arc<Principal>>`; `Ok(None)` without credentials, permanent `unauthenticated` for bad ones, transient when its store is down; loads every grant into the snapshot. `rejection_headers(request, failure)` (default none) adds headers to the edge's error response when it refused a request, such as identity's `Set-Cookie` clearing a dead session cookie | none: no principal |
 | `Principal` | `subject` (`usr_..`, `key_..`, or `sys_<name>` for system principals, `Principal::system`), `kind` (`User`, `ApiKey`, `System`), `user`, `service_account`, `tenant`, `grants: Arc<GrantSnapshot>`, `session: Option<SessionFacts>` | |
 | `GrantSnapshot` | break-glass, application grants, application-level resource grants, tenant grants, resource grants in the tenant and an API key limit; `evaluate` and `Principal::check` decide synchronously in identity's order (ID §5) and return `Allowed::{Grant, BreakGlass}` or `AccessDenied { reason }` | |
 | `ResourceScope` | `Application`, `Tenant(id)`, `Resource { tenant: Option<id>, kind, id }`; a resource without a tenant is application-level (R5). A tenant grant never satisfies an application check | |
@@ -835,6 +848,121 @@ pass what they learned in (`NotificationRequest::members`).
 | `Notifier` | `validate(&request)` (pure), `request(tx, NotificationRequest)` and `emit_webhook(tx, WebhookEvent)` (NT §3.1); a webhook's `source_event_id` is an `EventId` of up to 225 bytes, room for `{source}:{dedupe_key}`. Requests carry topic, 1 to 100 recipients (`User`, `Tenant`, `Application { roles }`, `Address`), channels, template, `data`, `secret_data`, locale, dedupe key, tenant, `members`, `not_before`, `expires_at`, collapse key and correlation. For sources `application` and `api` with a tenant every user recipient must be in `members` (`recipient_not_in_tenant`). `Debug` never shows data, secret data or addresses. `NotifierFactory::bind(source)` hands out bound notifiers | `CaptureNotifications`: validates structurally, logs a redacted `notification.captured` warning, keeps the last 64 redacted records (never `data`, `secret_data` or addresses) and delivers nothing |
 | `Directory` | `users(ids)` (at most 100) to verified `Contact`s, `tenant_members(tenant, roles?, PageRequest)` and `application_members(roles?, PageRequest)` (pages of at most 500, keyset by user id), `is_member(user, tenant)` (R7) | `EmptyDirectory`: resolves nothing; nobody is a member |
 | `BlobStore` | `put(key, BlobBody, attrs) -> BlobStat` streaming, `get(key, range?) -> BlobRead` streaming, `head`, idempotent `delete`, `signed_get_url(key, ttl) -> Option<String>` (CT §6); `BlobKey` is 1 to 1024 bytes of `[A-Za-z0-9._-]` segments; `BlobError` maps to classified failures | `UnavailableBlobStore`: fails permanent `blob_store_unavailable`. `merezha_blob::ObjectBlobStore` is the local and S3 implementation |
+
+## Identity block
+
+`merezha-identity` (`crates/identity`, [design](../design/identity.md)) is
+the identity block, a `Module` named `identity` with schema
+`merezha_identity` (ledger key `identity`). Slice ID PR 1 ships accounts with
+email and password, email verification, password sign-in, sessions (cookie
+and bearer), the Origin and CSRF checks, reauthentication, magic links,
+password reset and change, email change, account deletion, PostgreSQL rate
+limits, audit events, the cleanup job and the session `Authenticator`.
+Organizations, RBAC, the `Authorizer`, API keys and the `Directory` come with
+ID PR 2, OAuth, OIDC and passkeys with PR 3; their tables stay `unknown_key`.
+
+```toml
+[modules.identity]
+app_origin = "https://app.example.com"
+secret_key = { env = "MEREZHA_IDENTITY_SECRET_KEY" }   # at least 32 bytes
+
+[modules.identity.password]                 # enables password sign-in
+
+[modules.identity.magic_links]              # enables magic links
+```
+
+| Key | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `app_origin` | required | `https://host[:port]`, or `http://localhost`, `127.0.0.1`, `[::1]` on a private loopback listener | The front end: links, `return_to`, the Origin check |
+| `api_base_url` | `app_origin` | as `app_origin` | Externally visible base of this host (OAuth callbacks, PR 3) |
+| `allowed_origins` | `[app_origin]` | 1 to 32 origins | Accepted `Origin` values |
+| `secret_key`, `secret_key_previous` | required, none | secrets of at least 32 bytes (`secret_too_short`) | HKDF derives the CSRF, rate-limit and audit-subject keys; CSRF tokens of the previous key stay valid during a rotation |
+| `registration` | `open` | `open`, `invite_only`, `closed` | `invite_only` refuses sign-up until invitations (PR 2) |
+| `require_verified_email` | `true` | | Unverified accounts cannot sign in |
+| `unverified_account_ttl` | `7d` | 1 h to 365 d | Cleanup deletes never-used unverified accounts after it, only while verification is required |
+| `dev_print_links` | `false` | private loopback listener only (`refused_when_public`) | Log every emailed link as `identity.dev_link` on stderr |
+| `notify_new_sign_in` | `false` | | `identity.new_sign_in` on each password sign-in |
+| `links.verify_email`, `links.magic_link`, `links.password_reset`, `links.email_change` | `/auth/verify-email`, `/auth/magic-link`, `/auth/reset-password`, `/auth/confirm-email` | relative paths or absolute URLs on `app_origin` (`invalid_url`) | Pages the token is appended to as `#token=...` |
+| `password.min_length`, `password.max_length` | `12`, `256` | 8 to 256 | Unicode scalar values after NFKC; the blocklist and context words apply, no composition rules |
+| `password.blocklist_file` | none | a `{ file }` or `{ env }` secret, at most 64 KiB | One extra refused password per line |
+| `password.argon2_memory_kib`, `argon2_iterations`, `argon2_parallelism` | `65536`, `2`, `1` | at least 19456 and 2 (`out_of_range`) | Argon2id cost; tune with `merezha identity password-benchmark` |
+| `password.hash_concurrency`, `password.hash_queue_timeout` | `0` (available parallelism), `2s` | 0 to 1024, 10 ms to 30 s | Concurrent hashes; a longer wait answers `503 overloaded` |
+| `sessions.idle_timeout`, `absolute_timeout`, `reauthentication_window`, `touch_interval` | `7d`, `30d`, `10m`, `60s` | idle at most absolute (`idle_exceeds_absolute`) | Session lifetime; a request writes `last_seen_at` at most once per touch interval |
+| `sessions.max_per_user`, `sessions.bearer` | `50`, `true` | 1 to 1000 | The least recently seen session is evicted past the cap; `bearer` allows `"transport": "bearer"` |
+| `tokens.email_verification_ttl`, `magic_link_ttl`, `password_reset_ttl`, `email_change_ttl` | `24h`, `15m`, `30m`, `1h` | | One-time token lifetimes |
+| `magic_links.sign_up` | `true` | | Unknown addresses get a sign-up link while registration is open |
+| `rate_limits.<policy>.limit`, `.period` | identity §7 | 1 to 1000000, 1 s to 30 d | Policies `sign_in_ip`, `sign_in_account_ip`, `sign_in_account`, `registration_ip`, `email_address_ip`, `email_address`, `email_ip`, `token_ip`, `reauth_session` |
+| `audit.retention` | `400d` | 1 d to 3650 d | Audit rows older than this are deleted by the cleanup job |
+| `cleanup.interval`, `cleanup.batch_size` | `10m`, `1000` | minutes dividing an hour, hours dividing a day, or `1d`; 1 to 10000 | The `identity.cleanup` cron schedule and its delete batches |
+
+At least one sign-in method table is required (`no_sign_in_method`).
+
+Registration and verification resends set a binding cookie,
+`__Host-merezha_verify` (`merezha_verify` with the development cookie,
+`HttpOnly`, `SameSite=Lax`, for `tokens.email_verification_ttl`). A
+verification confirmed without it from the browser that registered claims an
+unverified account: its password, credentials and sessions go, and the new
+session answers `"password_unset": true`. Email change tokens are bound to
+the requesting session; any other confirmation answers
+`401 sign_in_required` and changes nothing. Password reset, verification
+resend and magic-link requests only queue an `identity.link_request` job
+(queue `identity`); the job looks the account up and requests the mail, so
+the request path is the same for every address. Every statement identity
+runs is a registered `Statement` (`merezha_identity::sql::STATEMENTS`).
+
+At start the block refuses to run without a notification delivery path
+(`notifications_required`, logged as `module.start_failed`): verification
+and reset mail would be dropped by the capture fallback. Until the
+notifications block delivers (NT-N2), only `dev_print_links = true` on a
+private loopback listener starts it, and every link then appears on stderr
+as `identity.dev_link` (stderr only, never exported). It also registers the
+`identity.cleanup` and `identity.link_request` kinds on queue `identity` and
+the cleanup schedule (UTC), which
+deletes expired sessions and tokens, drained rate-limit buckets, audit rows
+past retention and, while `require_verified_email = true`, unverified
+accounts past their TTL that never signed in.
+
+Routes, all under `/v1/identity/`, JSON bodies of at most 16 KiB
+(`415 unsupported_media_type`, `413 body_limit`), every answer
+`Cache-Control: no-store`: `POST registrations`, `POST email-verifications`,
+`POST email-verifications/confirm`, `POST sessions`, `GET`/`DELETE session`,
+`POST session/reauthenticate`, `GET sessions`, `DELETE sessions/{id}`,
+`POST sessions/revoke-all`, `POST magic-links`, `POST magic-links/consume`,
+`POST password-resets`, `POST password-resets/complete`, `GET`/`PATCH`/`DELETE me`,
+`PUT me/password`, `POST me/email-changes`, `POST me/email-changes/confirm`,
+`GET me/security-events` (identity §4 has the bodies and errors).
+
+Sessions travel in the cookie `__Host-merezha_session` (`Secure`, `HttpOnly`,
+`SameSite=Lax`, `Max-Age` to the absolute expiry), or `merezha_session`
+without `Secure` when `app_origin` is a loopback origin on a private
+listener, or as `Authorization: Bearer mzs_...`. A cookie and an
+`Authorization` header together answer `400 ambiguous_credentials`; a bad,
+expired or revoked credential `401 unauthenticated` (a dead cookie is
+cleared in the same answer); a database failure `503 unavailable`. Unsafe
+cookie requests on every route need an allowed `Origin` (or none with
+`Sec-Fetch-Site: same-origin`, else `403 origin_rejected`) and the
+`X-CSRF-Token` the session answers return (`403 csrf_failed`). Anonymous
+unsafe identity requests need the Origin check only, so non-browser clients
+send `Origin: <app_origin>`; bearer requests need neither.
+
+Error codes it registers: `ambiguous_credentials` (400),
+`invalid_credentials`, `invalid_token`, `reauthentication_required`,
+`sign_in_required` (401),
+`origin_rejected`, `csrf_failed`, `email_unverified`, `account_disabled`,
+`registration_closed` (403), `email_taken`, `sole_owner` (409),
+`password_too_short`, `password_too_long`, `password_blocklisted`,
+`password_contextual`, `notifications_required`, `blocklist_unavailable`
+(422).
+
+`merezha identity password-benchmark [--config PATH] [--set SECTION.KEY=VALUE]...
+[--memory-kib N] [--iterations N] [--parallelism N] [--samples N]` hashes
+`--samples` times (default 5, at most 100) with the project's
+`[modules.identity.password]` cost, the flags overriding it, and prints
+`{"status":"ok","algorithm":"argon2id","argon2_memory_kib",
+"argon2_iterations","argon2_parallelism","samples","min_ms","median_ms",
+"max_ms"}` with exit code 0; invalid arguments, configuration or cost below
+the floors print `{"status":"invalid","error":{"code"}}` with exit code 2.
+Aim for about 60 to 120 ms per hash on production cores.
 
 ## Notifications block
 
@@ -1866,8 +1994,9 @@ itself.
   `jobs.drain_timeout_ms` plus 3 s to the module shutdown budget.
 - There is no request deadline at the edge yet; handlers bound their own
   work.
-- `Host::start` installs no `Authenticator` yet, so the edge never
-  authenticates until identity's block registers one.
+- Identity PR 1 installs the session `Authenticator` but no `Authorizer`:
+  every permission check is denied while identity is on (see
+  [Routes](#routes)) until ID PR 2.
 - The events, outbox and jobs `trace_parent`/`trace_state` columns are
   filled (TE-T3, TE-T5).
 - Reactor lag, lock and batch instruments arrive with the reactors (AP-C3);

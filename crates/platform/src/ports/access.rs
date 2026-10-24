@@ -409,6 +409,15 @@ pub trait Authenticator: Send + Sync {
         &'a self,
         request: &'a RequestHead,
     ) -> BoxFuture<'a, Result<Option<Arc<Principal>>, Failure>>;
+    /// Headers the edge adds to the error response when
+    /// [`Authenticator::authenticate`] refused `request` with `failure`,
+    /// such as a `Set-Cookie` that clears a dead session cookie so the
+    /// browser's next request is anonymous instead of refused again. No
+    /// header by default.
+    fn rejection_headers(&self, request: &RequestHead, failure: &Failure) -> axum::http::HeaderMap {
+        let _ = (request, failure);
+        axum::http::HeaderMap::new()
+    }
 }
 
 /// Permission policy over principals, extending the application's
