@@ -2,8 +2,8 @@
 //! indexes): one host at a time, under a session advisory lock held on a
 //! connection detached from the pool, builds the indexes a pending model
 //! adds, activates it in one transaction with its outbox event, then drops
-//! the indexes it no longer needs and rebuilds the `published` fallback
-//! rows a new locale or a changed fallback affects (C4).
+//! the indexes it no longer needs. A new locale or a changed fallback
+//! enqueues the `published` rebuild job in the same transaction (C4).
 use crate::{
     diff::{Change, ChangeClass, change_classes, diff},
     indexes::{DerivedIndex, derived_indexes, drop_statement, is_derived_name},
@@ -267,13 +267,9 @@ pub struct ActivationReport {
     /// `content.index_failed` and retried by the next start.
     pub undropped: Vec<String>,
     pub tightened: Vec<TightenedCount>,
-    /// Entries whose `published` rows this run rebuilt after a locale or
-    /// fallback change.
-    pub rebuilt: u64,
-    /// The rebuild is not finished (the run's bound expired after the
-    /// commit); readiness reports `content_rebuild_pending` until the next
-    /// migrating start completes it.
-    pub rebuild_pending: bool,
+    /// The activation recorded a pending `published` rebuild and enqueued
+    /// its `content.published_rebuild` job.
+    pub rebuild_enqueued: bool,
 }
 
 /// Read the active model.
@@ -373,13 +369,13 @@ pub fn unneeded_indexes(
 /// anything is written. A cancelled or failed run closes its session, which
 /// releases the lock.
 ///
-/// When the activation adds a locale or changes a fallback, the same
-/// transaction records a pending rebuild in `merezha_content.rebuilds`;
-/// after the index drops, still under the lock, the run re-materializes
-/// the `published` rows of every live entry with a published variant in
-/// batches of [`crate::REBUILD_BATCH`] entries, one transaction each with
-/// its resume cursor. A current model resumes a rebuild a crashed run left
-/// pending. Until it completes [`verify`] reports `content_rebuild_pending`.
+/// When the activation adds a locale or changes a fallback, or finds an
+/// older rebuild still pending, the same transaction marks any pending
+/// rebuild `superseded`, records one for this version in
+/// `merezha_content.rebuilds` and appends the `content.published_rebuild`
+/// job ([`crate::REBUILD_JOB`]) to the outbox. The job re-materializes the
+/// `published` rows in the background on any current host; readiness does
+/// not wait for it.
 pub async fn activate(
     db: &Database,
     outbox: &SourceOutbox,
@@ -398,6 +394,7 @@ pub async fn activate(
         attempts: HashMap::new(),
         created: Vec::new(),
         committed: None,
+        rebuild_enqueued: false,
     };
     let at = tokio::time::Instant::from_std(deadline);
     let mut reconnects = 0;
@@ -416,8 +413,7 @@ pub async fn activate(
                     dropped: Vec::new(),
                     undropped: Vec::new(),
                     tightened: Vec::new(),
-                    rebuilt: 0,
-                    rebuild_pending: true,
+                    rebuild_enqueued: run.rebuild_enqueued,
                 };
             }
             Err(_) => {
@@ -495,11 +491,6 @@ pub async fn verify(
                 .map_err(ActivationError::new)?;
             if !missing_indexes(&derived_indexes(model), &existing).is_empty() {
                 Verified::NotReady("index_build_pending")
-            } else if crate::publish::rebuild_pending(client, model.version())
-                .await
-                .map_err(ActivationError::new)?
-            {
-                Verified::NotReady("content_rebuild_pending")
             } else {
                 Verified::Ready
             }
@@ -557,6 +548,8 @@ struct Run<'a> {
     created: Vec<String>,
     /// The plan this run committed, once the activation transaction did.
     committed: Option<Plan>,
+    /// The committed activation enqueued a `published` rebuild.
+    rebuild_enqueued: bool,
 }
 
 impl Run<'_> {
@@ -605,8 +598,7 @@ impl Run<'_> {
                 dropped: Vec::new(),
                 undropped: Vec::new(),
                 tightened: Vec::new(),
-                rebuilt: 0,
-                rebuild_pending: false,
+                rebuild_enqueued: false,
             });
         }
         let expected = derived_indexes(self.model);
@@ -618,14 +610,10 @@ impl Run<'_> {
         }
         let activated = matches!(plan.status, Status::Fresh | Status::Pending);
         if activated {
-            self.commit(&mut session, &plan).await?;
+            self.rebuild_enqueued = self.commit(&mut session, &plan).await?;
             self.committed = Some(plan.clone());
         }
         let (dropped, undropped) = self.drop_unneeded(&session, &expected).await;
-        // Still under the lock, so two hosts never rebuild at once.
-        let rebuilt = crate::publish::rebuild_published(self.db, self.model, self.deadline)
-            .await
-            .map_err(|f| Self::stop(&session, f))?;
         // Dropping the session releases the lock.
         drop(session);
         Ok(ActivationReport {
@@ -635,8 +623,7 @@ impl Run<'_> {
             dropped,
             undropped,
             tightened: Vec::new(),
-            rebuilt,
-            rebuild_pending: false,
+            rebuild_enqueued: self.rebuild_enqueued,
         })
     }
 
@@ -833,7 +820,7 @@ impl Run<'_> {
     }
 
     /// The activation transaction.
-    async fn commit(&self, session: &mut DetachedClient, plan: &Plan) -> Result<(), Stop> {
+    async fn commit(&self, session: &mut DetachedClient, plan: &Plan) -> Result<bool, Stop> {
         let version = i32::try_from(self.model.version())
             .map_err(|_| Stop::failed(ActivationError::new(Failure::permanent("invalid_input"))))?;
         let previous = plan.previous_version.map(|v| v as i32);
@@ -848,6 +835,8 @@ impl Run<'_> {
             .collect();
         let record = self
             .event(plan)
+            .map_err(|f| Stop::failed(ActivationError::new(f)))?;
+        let job = crate::rebuild::rebuild_job(self.model.version(), None)
             .map_err(|f| Stop::failed(ActivationError::new(f)))?;
         let outbox = self.outbox.clone();
         let result = session
@@ -905,9 +894,21 @@ impl Run<'_> {
                             .map_err(|e| classify(&e))?;
                     }
                     // A new locale or fallback changes which variant serves
-                    // which locale: the `published` rows are rebuilt after
-                    // the commit, resumably. A first activation has none.
-                    if changed > 0 && previous.is_some() {
+                    // which locale: the `published` rows are rebuilt by a
+                    // background job. A first activation has no rows.
+                    // A rebuild still pending for an older version is carried
+                    // forward: this one covers every entry.
+                    let carried = tx
+                        .execute(
+                            "UPDATE merezha_content.rebuilds \
+                                SET state = 'superseded', updated_at = now() \
+                              WHERE state = 'pending'",
+                            &[],
+                        )
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    let rebuild = (changed > 0 && previous.is_some()) || carried > 0;
+                    if rebuild {
                         tx.execute(
                             "INSERT INTO merezha_content.rebuilds (version, state, updated_at) \
                              VALUES ($1, 'pending', now())",
@@ -915,6 +916,9 @@ impl Run<'_> {
                         )
                         .await
                         .map_err(|e| classify(&e))?;
+                        outbox
+                            .append(tx, std::slice::from_ref(&job), OnDuplicate::Ignore)
+                            .await?;
                     }
                     // Every scope's ETags change with the model (access rules,
                     // locales, the model endpoint).
@@ -927,19 +931,19 @@ impl Run<'_> {
                     outbox
                         .append(tx, std::slice::from_ref(&record), OnDuplicate::Fail)
                         .await?;
-                    Ok(())
+                    Ok(rebuild)
                 })
             })
             .await;
         match result {
-            Ok(()) => {
+            Ok(rebuild) => {
                 merezha_telemetry::event!(
                 INFO, "content.model_activated", version = self.model.version(),
                                     previous_version = plan.previous_version,
                                     fingerprint = self.model.fingerprint(),
                                     change_classes = ?plan.change_classes()
                                 );
-                Ok(())
+                Ok(rebuild)
             }
             Err(failure) => Err(Self::stop(session, failure)),
         }

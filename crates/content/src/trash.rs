@@ -122,11 +122,20 @@ impl Work {
             bump_generation(tx, &target.scope).await?;
         }
         if options.purge {
-            // Variants, revisions, published rows and refs cascade.
+            // Variants, revisions, published rows and outgoing refs
+            // cascade; incoming refs go too, in every scope, so an id
+            // created again does not inherit stale referrers.
             tx.execute(
                 "DELETE FROM merezha_content.entries \
                   WHERE id = $1::text::uuid AND scope = $2 AND content_type = $3",
                 &[&id, &target.scope, &target.content_type],
+            )
+            .await
+            .map_err(|e| sql(&e))?;
+            tx.execute(
+                "DELETE FROM merezha_content.refs \
+                  WHERE target_kind = 'entry' AND target_id = $1::text::uuid",
+                &[&id],
             )
             .await
             .map_err(|e| sql(&e))?;
@@ -302,6 +311,13 @@ impl Work {
               WHERE e.id = t.id::uuid AND e.scope = t.scope AND e.content_type = t.content_type \
                 AND e.deleted_at IS NOT NULL",
             &[&ids, &scopes, &types],
+        )
+        .await
+        .map_err(|e| sql(&e))?;
+        tx.execute(
+            "DELETE FROM merezha_content.refs \
+              WHERE target_kind = 'entry' AND target_id = ANY($1::text[]::uuid[])",
+            &[&ids],
         )
         .await
         .map_err(|e| sql(&e))?;

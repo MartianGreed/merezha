@@ -248,7 +248,6 @@ fn content_errors_register_with_the_kernel_codes() {
         ("singleton_exists", 409),
         ("entry_referenced", 409),
         ("default_variant_required", 409),
-        ("content_rebuild_pending", 503),
         ("content_model_superseded", 503),
         ("content_model_invalid", 422),
         ("content_model_breaking", 422),

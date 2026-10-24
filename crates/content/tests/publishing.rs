@@ -1093,3 +1093,28 @@ async fn event_counts_per_operation() {
     .await;
     assert_eq!(event_counts(&fx.db).await, counts(5, 4, 3, 1, 2));
 }
+
+#[tokio::test]
+async fn a_locale_without_a_declared_fallback_falls_back_to_the_default() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let model = "version = 1\n\
+                 locales = [{ code = \"en\", default = true }, { code = \"de\" }, { code = \"de-AT\", fallback = \"de\" }]\n\
+                 [types.note]\naccess = \"public\"\n\
+                 fields = [{ name = \"title\", type = \"string\", required = true }]\n";
+    let fx = start(&test, "", model).await;
+    let id = id_of(&fx.create("note", json!({"fields": {"title": "Hi"}})).await);
+    fx.add_variant("note", &id, "de-AT", json!({"title": "Servus"}))
+        .await;
+    fx.publish("note", &id, "en", 1).await;
+    assert_eq!(
+        rows(&fx.db, &id).await,
+        ["de:en:1", "de-AT:en:1", "en:en:1"]
+    );
+    fx.publish("note", &id, "de-AT", 1).await;
+    assert_eq!(
+        rows(&fx.db, &id).await,
+        ["de:en:1", "de-AT:de-AT:1", "en:en:1"]
+    );
+}

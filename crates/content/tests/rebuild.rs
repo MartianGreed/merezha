@@ -1,14 +1,14 @@
 //! CT-C4 and model activation (section 2): a new locale or a changed
-//! fallback rebuilds the `published` fallback rows in batches, readiness
-//! stays false while a rebuild is pending, and the next migrating start
-//! finishes one a crashed run left.
+//! fallback enqueues the background `published` rebuild, the host is ready
+//! while it runs, a host killed mid-rebuild leaves it for another to
+//! finish, and a newer activation carries a pending rebuild forward.
 mod http;
 
 use axum::http::StatusCode;
 use http::*;
+use merezha_platform::Module;
 use merezha_postgres::TestDatabase;
 use serde_json::json;
-use std::sync::Arc;
 
 /// `CHAIN_MODEL` as version 2: `fr-BE` now falls back to `en`, and `de`
 /// (falling back to `en`) is new.
@@ -19,9 +19,16 @@ fn v2() -> String {
     )
 }
 
+/// `v2` as version 3 with a tightened rule and no locale change.
+fn v3() -> String {
+    v2().replace("version = 2", "version = 3").replace(
+        "{ name = \"title\", type = \"string\", required = true }]",
+        "{ name = \"title\", type = \"string\", required = true, max_length = 100 }]",
+    )
+}
+
 /// `count` published `page` entries straight through SQL, each with its
-/// `en` variant, revision and `en` row only (as v1 materialized a
-/// subset), plus one localized article published in `en` and `fr`.
+/// `en` variant, revision and `en` row only (a partial materialization).
 async fn seed_pages(db: &merezha_platform::Database, count: i64) {
     execute(
         db,
@@ -53,12 +60,26 @@ async fn seed_pages(db: &merezha_platform::Database, count: i64) {
     .await;
 }
 
-#[tokio::test]
-async fn a_new_locale_or_a_changed_fallback_rebuilds_the_published_rows_at_activation() {
+async fn page_rows(db: &merezha_platform::Database, locale: &str) -> i64 {
+    scalar(
+        db,
+        &format!(
+            "SELECT count(*) FROM merezha_content.published \
+              WHERE content_type = 'page' AND locale = '{locale}'"
+        ),
+    )
+    .await
+}
+
+const REBUILD_STATES: &str = "SELECT coalesce(string_agg(version || ':' || state, ',' \
+     ORDER BY version), '') FROM merezha_content.rebuilds";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_rebuild_runs_in_the_background_while_the_host_is_ready() {
     let Some(test) = TestDatabase::create() else {
         return;
     };
-    let old = start(&test, "", CHAIN_MODEL).await;
+    let old = start_with(&test, NO_WORKERS, "", CHAIN_MODEL).await;
     let id = id_of(
         &old.create("article", json!({"fields": {"title": "Hello"}}))
             .await,
@@ -67,125 +88,149 @@ async fn a_new_locale_or_a_changed_fallback_rebuilds_the_published_rows_at_activ
         .await;
     old.publish("article", &id, "en", 1).await;
     old.publish("article", &id, "fr", 1).await;
-    assert_eq!(
-        rows(&old.db, &id).await,
-        ["en:en:1", "fr:fr:1", "fr-BE:fr:1"]
-    );
     // More than two batches of entries with published variants.
     seed_pages(&old.db, 1100).await;
     let generation_before = generation(&old.db, "app").await;
-    let new = start(&test, "", &v2()).await;
+    // Activation completes and the host is ready; nothing has run the job.
+    let new = start_with(&test, NO_WORKERS, "", &v2()).await;
+    assert!(eventually_ready(&new.host).await);
+    assert_eq!(strings(&new.db, REBUILD_STATES).await, ["2:pending"]);
+    assert_eq!(page_rows(&new.db, "de").await, 0);
+    assert_eq!(
+        rows(&new.db, &id).await,
+        ["en:en:1", "fr:fr:1", "fr-BE:fr:1"]
+    );
+    // Writes and publishes work meanwhile, on the new model.
+    let reply = new.publish("article", &id, "en", 1).await;
+    assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(
         rows(&new.db, &id).await,
         ["de:en:1", "en:en:1", "fr:fr:1", "fr-BE:en:1"]
     );
-    assert_eq!(
-        scalar(
-            &new.db,
-            "SELECT count(*) FROM merezha_content.published WHERE content_type = 'page'"
-        )
-        .await,
-        1100 * 4
-    );
-    assert_eq!(
-        strings(
-            &new.db,
-            "SELECT version || ':' || state FROM merezha_content.rebuilds"
-        )
-        .await,
-        ["2:done"]
-    );
-    // Activation bumps once, then every rebuild batch (three) once more.
-    assert_eq!(generation(&new.db, "app").await, generation_before + 4);
-    // No event of its own: fallback rows emit none.
-    assert_eq!(events(&new.db, "content.entry_published").await.len(), 2);
-    assert!(eventually_ready(&new.host).await);
-    // A restart with the same model has nothing to rebuild.
-    let again = start(&test, "", &v2()).await;
-    assert_eq!(generation(&again.db, "app").await, generation_before + 4);
-    // A model change without a locale change records no rebuild.
-    let v3 = v2().replace("version = 2", "version = 3").replace(
-        "{ name = \"title\", type = \"string\", required = true }]",
-        "{ name = \"title\", type = \"string\", required = true, max_length = 100 }]",
-    );
-    start(&test, "", &v3).await;
-    assert_eq!(
-        scalar(&new.db, "SELECT count(*) FROM merezha_content.rebuilds").await,
-        1
-    );
+    // A host with workers runs it.
+    let worker = start(&test, "", &v2()).await;
+    wait_for(&worker.db, REBUILD_STATES, "2:done").await;
+    assert_eq!(page_rows(&worker.db, "de").await, 1100);
+    assert_eq!(page_rows(&worker.db, "fr-BE").await, 1100);
+    // Activation bumps once, the publish once, each of the three batches
+    // once more.
+    assert_eq!(generation(&worker.db, "app").await, generation_before + 5);
+    // Fallback rows emit no events of their own.
+    assert_eq!(events(&worker.db, "content.entry_published").await.len(), 3);
+    // A restart with the same model has nothing to rebuild; a model change
+    // without a locale change records no rebuild either.
+    start(&test, "", &v2()).await;
+    start(&test, "", &v3()).await;
+    assert_eq!(strings(&worker.db, REBUILD_STATES).await, ["2:done"]);
 }
 
-#[tokio::test]
-async fn a_pending_rebuild_keeps_readiness_false_and_the_next_migrating_start_finishes_it() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_killed_mid_rebuild_leaves_it_for_another_to_finish() {
     let Some(test) = TestDatabase::create() else {
         return;
     };
-    let old = start(&test, "", CHAIN_MODEL).await;
-    seed_pages(&old.db, 30).await;
-    let new = start(&test, "", &v2()).await;
-    assert_eq!(
-        scalar(&new.db, "SELECT count(*) FROM merezha_content.published").await,
-        120
-    );
-    // As if the run crashed after its first batches: rows for `de` gone,
-    // the rebuild pending with a cursor past some of the entries.
+    let old = start_with(&test, NO_WORKERS, "", CHAIN_MODEL).await;
+    seed_pages(&old.db, 1100).await;
+    // Every committed cursor move, and a gate on the second batch.
     execute(
-        &new.db,
-        "DELETE FROM merezha_content.published WHERE locale = 'de';
-         UPDATE merezha_content.rebuilds SET state = 'pending',
-                after_entry = (SELECT id FROM merezha_content.entries ORDER BY id OFFSET 9 LIMIT 1)",
+        &old.db,
+        "CREATE TABLE public.rebuild_log (n serial, after_entry uuid, state text);
+         CREATE FUNCTION public.log_rebuild() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF OLD.after_entry IS NOT NULL AND NEW.state = 'pending' THEN
+             PERFORM pg_advisory_xact_lock(4242);
+           END IF;
+           INSERT INTO public.rebuild_log (after_entry, state) VALUES (NEW.after_entry, NEW.state);
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER log_rebuild BEFORE UPDATE ON merezha_content.rebuilds
+           FOR EACH ROW EXECUTE FUNCTION public.log_rebuild();",
     )
     .await;
-    // A host that does not migrate stays not ready, and changes nothing.
-    let dir = tempfile::tempdir().unwrap();
-    project(dir.path(), false, "", &v2());
-    let waiting = start_in(dir, &test, Arc::new(FixturePolicy)).await;
+    let gate = old.db.acquire(soon()).await.unwrap();
+    gate.execute("SELECT pg_advisory_lock(4242)", &[])
+        .await
+        .unwrap();
+    let gate_pid: i32 = gate
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let jobs = "[jobs.queues.content]\nbackoff_base_ms = 1500\n";
+    let first = start_with(&test, jobs, "", &v2()).await;
+    // The first batch committed; the second waits at its cursor move.
+    let stuck = wait_blocked_by(&first.db, gate_pid).await;
     assert_eq!(
-        waiting
-            .handle
-            .state()
-            .unwrap()
-            .readiness()
-            .await
-            .unwrap_err()
-            .code,
-        "content_rebuild_pending"
+        scalar(&first.db, "SELECT count(*) FROM public.rebuild_log").await,
+        1
     );
-    assert!(!waiting.host.readiness().check().await);
+    // Kill its session and stop its jobs runtime.
+    execute(&first.db, &format!("SELECT pg_terminate_backend({stuck})")).await;
+    first.jobs.shutdown(soon()).await;
+    gate.execute("SELECT pg_advisory_unlock(4242)", &[])
+        .await
+        .unwrap();
+    // Another host resumes after the committed cursor.
+    let second = start_with(&test, jobs, "", &v2()).await;
+    wait_for(&second.db, REBUILD_STATES, "2:done").await;
+    assert_eq!(page_rows(&second.db, "de").await, 1100);
+    let cursors = strings(
+        &second.db,
+        "SELECT coalesce(after_entry::text, '-') FROM public.rebuild_log ORDER BY n",
+    )
+    .await;
+    assert_eq!(cursors.len(), 3, "{cursors:?}");
+    assert!(
+        cursors.windows(2).all(|w| w[0] < w[1]),
+        "the cursor only moves forward: {cursors:?}"
+    );
     assert_eq!(
-        scalar(
-            &new.db,
-            "SELECT count(*) FROM merezha_content.published WHERE locale = 'de'"
+        strings(
+            &second.db,
+            "SELECT string_agg(a.outcome, ',' ORDER BY a.started_at) FROM merezha_jobs.attempts a \
+               JOIN merezha_jobs.jobs j ON j.id = a.job_id \
+              WHERE j.kind = 'content.published_rebuild'"
         )
         .await,
-        0
+        ["failed,succeeded"]
     );
-    // The next migrating start resumes after the cursor.
-    let resumed = start(&test, "", &v2()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_newer_activation_carries_a_pending_rebuild_forward() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let old = start_with(&test, NO_WORKERS, "", CHAIN_MODEL).await;
+    seed_pages(&old.db, 30).await;
+    start_with(&test, NO_WORKERS, "", &v2()).await;
+    assert_eq!(strings(&old.db, REBUILD_STATES).await, ["2:pending"]);
+    // Version 3 changes no locale, yet takes the pending rebuild over.
+    start_with(&test, NO_WORKERS, "", &v3()).await;
     assert_eq!(
-        scalar(
-            &resumed.db,
-            "SELECT count(*) FROM merezha_content.published WHERE locale = 'de'"
+        strings(&old.db, REBUILD_STATES).await,
+        ["2:superseded,3:pending"]
+    );
+    assert_eq!(
+        strings(
+            &old.db,
+            "SELECT string_agg(dedupe_key, ',' ORDER BY id) FROM merezha_jobs.outbox \
+              WHERE record_kind = 'job'"
         )
         .await,
-        20
+        ["rebuild:2,rebuild:3"]
     );
-    assert_eq!(
-        strings(&resumed.db, "SELECT state FROM merezha_content.rebuilds").await,
-        ["done"]
-    );
-    assert!(eventually_ready(&resumed.host).await);
-    assert!(waiting.handle.state().unwrap().readiness().await.is_ok());
-    // Writes work on the rebuilt model.
-    let page = id_of(
-        &resumed
-            .create("page", json!({"fields": {"title": "New"}}))
-            .await,
-    );
-    let reply = resumed.publish("page", &page, "en", 1).await;
-    assert_eq!(reply.status, StatusCode::OK);
-    assert_eq!(
-        rows(&resumed.db, &page).await,
-        ["de:en:1", "en:en:1", "fr:en:1", "fr-BE:en:1"]
-    );
+    // A current host runs both jobs: version 2's finds nothing of its own
+    // to do, version 3's rebuilds every entry with `v2`'s locales.
+    let worker = start(&test, "", &v3()).await;
+    wait_for(&worker.db, REBUILD_STATES, "2:superseded,3:done").await;
+    wait_for(
+        &worker.db,
+        "SELECT string_agg(state, ',' ORDER BY id) FROM merezha_jobs.jobs \
+          WHERE kind = 'content.published_rebuild'",
+        "succeeded,succeeded",
+    )
+    .await;
+    assert_eq!(page_rows(&worker.db, "de").await, 30);
+    assert_eq!(page_rows(&worker.db, "fr-BE").await, 30);
 }

@@ -103,6 +103,33 @@ async fn the_diff_classifies_against_the_database_and_fails_on_refused_changes()
         .unwrap();
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("status current\n"), "{text}");
+    assert!(!text.contains("content_rebuild_pending"), "{text}");
+    // A pending `published` rebuild is reported, without failing the diff.
+    let db = Database::connect(&test.config()).unwrap();
+    db.acquire(Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap()
+        .batch_execute(
+            "INSERT INTO merezha_content.rebuilds (version, state, updated_at) \
+             VALUES (1, 'pending', now())",
+        )
+        .await
+        .unwrap();
+    let (text, code) = merezha_cli::content::diff(&input(dir.path(), test.url()))
+        .await
+        .unwrap();
+    assert_eq!(code, 0, "{text}");
+    assert!(
+        text.contains("content_rebuild_pending version 1 after start\n"),
+        "{text}"
+    );
+    db.acquire(Instant::now() + Duration::from_secs(10))
+        .await
+        .unwrap()
+        .batch_execute("UPDATE merezha_content.rebuilds SET state = 'done'")
+        .await
+        .unwrap();
+    db.close();
     // An additive change with an index to build.
     let additive = V1.replace("version = 1", "version = 2").replace(
         "{ name = \"body\", type = \"text\" },",

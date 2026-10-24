@@ -31,6 +31,9 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Batch items per `limits.query_timeout` of a batch's transaction.
+pub const BATCH_ITEMS_PER_TIMEOUT: usize = 50;
+
 /// The event every draft save appends (section 7).
 pub const DRAFT_SAVED: &str = "content.entry_draft_saved";
 
@@ -422,6 +425,14 @@ impl Store {
     }
     pub(crate) fn deadline(&self) -> Instant {
         Instant::now() + self.state.settings().limits.query_timeout
+    }
+    /// The transaction deadline of a batch of `items`: one
+    /// `limits.query_timeout` per [`BATCH_ITEMS_PER_TIMEOUT`] items started,
+    /// so a full batch is not held to one request's bound. Each statement
+    /// stays bounded by `database.statement_timeout_ms`.
+    pub(crate) fn batch_deadline(&self, items: usize) -> Instant {
+        let periods = u32::try_from(items.div_ceil(BATCH_ITEMS_PER_TIMEOUT).max(1)).unwrap_or(1);
+        Instant::now() + self.state.settings().limits.query_timeout * periods
     }
     pub(crate) fn database(&self) -> &Database {
         self.ctx.database()

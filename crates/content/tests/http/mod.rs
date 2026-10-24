@@ -239,17 +239,33 @@ pub struct Fixture {
 /// Write the project into `dir`: `merezha.toml` with `[modules.content]`
 /// plus `settings` (keys of that section), and `content.toml`.
 pub fn project(dir: &Path, migrate: bool, settings: &str, model: &str) {
+    project_with(dir, migrate, "", settings, model);
+}
+
+/// [`project`] with `top`, other top-level sections such as `[jobs]`,
+/// before `[modules.content]`.
+pub fn project_with(dir: &Path, migrate: bool, top: &str, settings: &str, model: &str) {
     std::fs::write(dir.join("content.toml"), model).unwrap();
     std::fs::write(
         dir.join("merezha.toml"),
         format!(
             "[app]\nid = \"site\"\n[database]\nurl = {{ env = \"CONTENT_DATABASE_URL\" }}\n\
              migrate = {migrate}\npool_size = 16\nstatement_timeout_ms = 30000\n\
-             [runtime]\nmanifest = \"runtime.toml\"\n[modules.content]\n{settings}\n"
+             [runtime]\nmanifest = \"runtime.toml\"\n{top}\n[modules.content]\n{settings}\n"
         ),
     )
     .unwrap();
 }
+
+/// A migrating host on `model` with the top-level sections `top`.
+pub async fn start_with(test: &TestDatabase, top: &str, settings: &str, model: &str) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    project_with(dir.path(), true, top, settings, model);
+    start_in(dir, test, Arc::new(FixturePolicy)).await
+}
+
+/// `[jobs]` for a host that runs no job workers.
+pub const NO_WORKERS: &str = "[jobs]\nworkers = false\n";
 
 fn fast() -> ActivationOptions {
     ActivationOptions {
@@ -661,4 +677,50 @@ pub async fn eventually_ready(host: &Host) -> bool {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     false
+}
+
+/// Wait up to ten seconds for `sql`'s single text value to be `expected`.
+pub async fn wait_for(db: &Database, sql: &str, expected: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let found = strings(db, sql).await;
+        if found == [expected] {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{sql}: {found:?}, not {expected}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Backends of `db`'s database blocked by backend `pid`.
+pub async fn blocked_by(db: &Database, pid: i32) -> Vec<i32> {
+    let client = db.acquire(soon()).await.unwrap();
+    client
+        .query(
+            "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+            &[&pid],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+/// Wait up to ten seconds for a backend blocked by `pid`; returns it.
+pub async fn wait_blocked_by(db: &Database, pid: i32) -> i32 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(found) = blocked_by(db, pid).await.first() {
+            return *found;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing blocked by backend {pid}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

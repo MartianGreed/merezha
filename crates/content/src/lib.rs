@@ -28,8 +28,8 @@
 //! `published` rows materialized per locale with fallback, generations,
 //! the variant delete, soft delete, undelete, immediate purge, the trash
 //! and the `content.trash_purge` job ([`Store::delete_entry`]), each with
-//! its outbox events in the change's transaction, and the fallback
-//! rebuild after a locale or fallback change ([`activate`]). Delivery is
+//! its outbox events in the change's transaction, and the background
+//! fallback rebuild after a locale or fallback change ([`REBUILD_JOB`]). Delivery is
 //! C5 and assets C7.
 mod activation;
 mod canonical;
@@ -44,6 +44,7 @@ mod module;
 mod parse;
 mod publish;
 mod query;
+mod rebuild;
 mod refs;
 mod rich_text;
 mod scalar;
@@ -79,15 +80,16 @@ pub use parse::{
     CONTENT_PERMISSIONS, MAX_DESCRIPTION, MAX_MODEL_BYTES, MAX_PATTERN_BYTES, ModelOptions,
     PATTERN_SIZE_LIMIT, PermissionCatalog,
 };
-pub use publish::{Expect, Item, PUBLISHED, REBUILD_BATCH, UNPUBLISHED};
+pub use publish::{Expect, Item, PUBLISHED, UNPUBLISHED};
 pub use query::{MAX_CURSOR_BYTES, MAX_FILTER_VALUES, MAX_QUERY_BYTES};
+pub use rebuild::{PendingRebuild, REBUILD_BATCH, REBUILD_JOB, pending_rebuild};
 pub use rich_text::{MAX_HREF_BYTES, MAX_MARK_DEFS, MAX_SPAN_MARKS, MAX_SPANS};
 pub use schema::{MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATIONS};
 pub use settings::{ContentSettings, DEFAULT_PURGE_CRON, DEFAULT_TRASH_RETENTION, Limits, Trash};
 pub use slug::slugify;
 pub use store::{
-    Actor, Content, DRAFT_SAVED, EntrySummary, Page, Referrer, Rejection, RevisionItem,
-    RevisionView, Saved, Store, Target, VariantView, WriteKind,
+    Actor, BATCH_ITEMS_PER_TIMEOUT, Content, DRAFT_SAVED, EntrySummary, Page, Referrer, Rejection,
+    RevisionItem, RevisionView, Saved, Store, Target, VariantView, WriteKind,
 };
 pub use trash::{
     DELETED, DeleteOptions, PURGE_BATCH, PURGE_SUBJECT, PURGED, QUEUE, TRASH_PURGE, TrashItem,
@@ -135,7 +137,6 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("singleton_exists", 409),
     ErrorCode::new("entry_referenced", 409),
     ErrorCode::new("default_variant_required", 409),
-    ErrorCode::new("content_rebuild_pending", 503),
 ];
 
 /// Every detail code field validation reports (section 2).

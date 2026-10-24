@@ -651,3 +651,92 @@ async fn the_trash_purge_runs_on_its_declared_cron_schedule() {
     );
     assert_eq!(events(&fx.db, "content.entry_purged").await.len(), 1);
 }
+
+#[tokio::test]
+async fn a_purge_removes_incoming_refs_so_a_recreated_id_has_no_stale_referrers() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let fx = start(&test, "", CHAIN_MODEL).await;
+    for (n, immediate) in [(0, true), (1, false)] {
+        let target = id_of(
+            &fx.create("author", json!({"fields": {"name": format!("Ada {n}")}}))
+                .await,
+        );
+        fx.create(
+            "article",
+            json!({"fields": {"title": format!("Refers {n}"), "author": {"id": target}}}),
+        )
+        .await;
+        if immediate {
+            delete(
+                &fx,
+                &format!("{}?purge=true", entry("author", &target)),
+                "admin",
+            )
+            .await;
+        } else {
+            // Through the retention job.
+            delete(&fx, &entry("author", &target), "admin").await;
+            execute(
+                &fx.db,
+                &format!(
+                    "UPDATE merezha_content.entries SET deleted_at = now() - interval '40 days' \
+                      WHERE id = '{target}'"
+                ),
+            )
+            .await;
+            run_purge_job(&fx, "content:test-refs").await;
+        }
+        assert_eq!(
+            scalar(
+                &fx.db,
+                &format!(
+                    "SELECT count(*) FROM merezha_content.refs \
+                      WHERE target_kind = 'entry' AND target_id = '{target}'"
+                )
+            )
+            .await,
+            0,
+            "purged {immediate}"
+        );
+        // The id comes back with a client id, and nothing lists it.
+        let again = fx
+            .post("/v1/content/manage/entries/author")
+            .json(&json!({"id": target, "fields": {"name": "Again"}}))
+            .send()
+            .await;
+        assert_eq!(again.status, StatusCode::CREATED, "{:?}", again.body);
+        let referrers = fx
+            .get(&format!("{}/referrers", entry("author", &target)))
+            .send()
+            .await;
+        assert_eq!(referrers.body["items"], json!([]), "purged {immediate}");
+    }
+}
+
+#[tokio::test]
+async fn a_self_reference_does_not_block_if_unreferenced() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let fx = start(&test, "", CHAIN_MODEL).await;
+    let id = id_of(
+        &fx.create("article", json!({"fields": {"title": "Me"}}))
+            .await,
+    );
+    let saved = fx
+        .put(&variant("article", &id, "en"))
+        .if_match(1)
+        .json(&json!({"fields": {"title": "Me", "related": [{"id": id}]}}))
+        .send()
+        .await;
+    assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+    let reply = delete(
+        &fx,
+        &format!("{}?if_unreferenced=true", entry("article", &id)),
+        "admin",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT, "{:?}", reply.body);
+}

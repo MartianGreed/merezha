@@ -1744,16 +1744,23 @@ one or none (the loaded model is still pending, as on a new host before a
 migrating one activated it) fails `content_model_pending`, and the host
 stays as it is. Both are 503 with `Retry-After: 1`.
 
-When an activation adds a locale or changes a fallback, its transaction
-records a pending rebuild in `merezha_content.rebuilds` (migration 3).
-After the index drops, still under the lock, the host re-materializes
+When an activation adds a locale or changes a fallback, or finds an older
+rebuild still pending, its transaction marks any pending rebuild
+`superseded`, records one for its version in `merezha_content.rebuilds`
+(migration 3) and appends the job `content.published_rebuild` (queue
+`content`, key `rebuild:<version>`). Readiness does not wait for it: any
+current host's jobs runtime runs it in the background, re-materializing
 the `published` rows of every live entry with a published variant, 500
 entries per transaction in id order, each with the model version check,
-a generation bump for the scopes it touched and the resume cursor. A
-crashed run leaves the row `pending`: readiness then reports
-`content_rebuild_pending` (503) on every host of that model, and the next
-migrating start resumes after the cursor. A first activation has nothing
-to rebuild. Fallback rows emit no events.
+the entries locked, a generation bump for the scopes it touched and the
+resume cursor (`content.rebuild_batch`, then `content.rebuild_completed`).
+A run that nears its job deadline or is cancelled appends a continuation
+job; a host that dies mid-batch leaves the cursor at the last commit and
+the retried job resumes there. Until it is done, delivery may serve the
+previous materialization for the affected locales, as in a rolling
+deploy. `merezha content diff` prints `content_rebuild_pending version <n>
+after <entry id or start>` while one is pending. A first activation has
+nothing to rebuild. Fallback rows emit no events.
 
 After the activation commits, the index drop pass (each drop bounded by
 30 s) and the tightening count (30 s, on a pooled session after the lock is
@@ -1791,8 +1798,7 @@ Error codes it registers: `content_model_invalid`,
 `invalid_json` (400), `content_type_not_found` (404), and
 `content_model_superseded`, `content_model_outdated`,
 `content_model_pending`, `content_model_conflict`,
-`content_activation_timeout`, `index_build_pending`,
-`content_rebuild_pending` (503).
+`content_activation_timeout`, `index_build_pending` (503).
 
 Once a host is outdated its content job kinds stop leasing: content
 registers its handlers through `ContentState::guard_jobs`, whose
@@ -1803,7 +1809,8 @@ handler meets `content_model_superseded` mid-run, is given back with
 `JobFailure::release()`: available again at once with its attempt
 refunded, for a current host to run.
 
-Content's job kinds (C4): `content.trash_purge` on the `content` queue
+Content's job kinds (C4): `content.published_rebuild` (above, enqueued by
+activation) and `content.trash_purge`, both on the `content` queue
 (`[jobs.queues.content]` tunes it), declared at start as the cron
 schedule `content.trash_purge` through `JobsHandle::schedule` with
 `trash.purge_cron` in `UTC`. Each run hard-deletes entries trashed longer
@@ -1880,8 +1887,21 @@ non-default variant with its revisions and refs (`default_variant_required`,
 409, for the default one); a published one falls back and appends
 `content.entry_unpublished` with reason `delete`.
 
-Codes added by C4: `entry_referenced`, `default_variant_required` (409),
-`content_rebuild_pending` (503).
+Codes added by C4: `entry_referenced`, `default_variant_required` (409).
+
+Concurrency: a save, publish or restore locks the entries its references
+resolve to `FOR KEY SHARE` until it commits, and `require_published`
+share-locks the target too. A delete, purge, publish or unpublish of a
+target (`FOR UPDATE`) therefore waits for such a save and then counts its
+refs (`if_unreferenced`) or removes them with the entry (`purge`); a save
+meeting a delete in flight waits and then reports `reference_not_found`;
+a referrer's publish meeting its target's unpublish in flight waits and
+then reports `reference_unpublished`. Two publishes that each require the
+other can deadlock; PostgreSQL aborts one, answered `database_conflict`
+(409, conflict, retryable). A purge also deletes the refs pointing at the
+entry, in every scope. A batch's transaction gets one
+`limits.query_timeout` per 50 items started (a full 500-item batch, ten);
+each statement stays bounded by `database.statement_timeout_ms`.
 
 Codes added by C3: `entry_not_found`, `revision_not_found` (404),
 `locale_unknown`, `invalid_query`, `invalid_filter`, `invalid_sort`,

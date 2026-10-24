@@ -311,9 +311,10 @@ impl ContentModule {
             .ok_or_else(|| Failure::permanent("content_not_configured"))
     }
     /// Register the content job kinds, each through
-    /// [`ContentState::guard_jobs`], and their schedules:
+    /// [`ContentState::guard_jobs`], and their schedules (C4):
     /// `content.trash_purge` on the `content` queue, declared as the cron
-    /// schedule of the same name with `trash.purge_cron` in UTC (C4).
+    /// schedule of the same name with `trash.purge_cron` in UTC, and
+    /// `content.published_rebuild`, which activation enqueues.
     fn register_jobs(&self, ctx: &AppContext, state: &Arc<ContentState>) -> Result<(), Failure> {
         let jobs = ctx.jobs(NAME)?;
         let store = Store::new(state.clone(), ctx.clone(), ctx.outbox(NAME)?);
@@ -321,6 +322,14 @@ impl ContentModule {
             crate::trash::TRASH_PURGE,
             crate::trash::QUEUE,
             state.guard_jobs(Arc::new(crate::trash::TrashPurge { store })),
+            KindOptions::default(),
+        )?;
+        jobs.register(
+            crate::rebuild::REBUILD_JOB,
+            crate::trash::QUEUE,
+            state.guard_jobs(Arc::new(crate::rebuild::RebuildPublished {
+                store: Store::new(state.clone(), ctx.clone(), ctx.outbox(NAME)?),
+            })),
             KindOptions::default(),
         )?;
         jobs.schedule(ScheduleDeclaration {
@@ -500,7 +509,7 @@ impl Module for ContentModule {
                     Ok(report) => {
                         if report.plan.status == crate::Status::Outdated {
                             state.mark_outdated();
-                        } else if !report.rebuild_pending {
+                        } else {
                             state.current.store(true, Ordering::SeqCst);
                         }
                     }

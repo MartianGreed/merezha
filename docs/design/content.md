@@ -337,18 +337,30 @@ session and releases the lock. It builds the indexes the new model adds (section
 one transaction marks the active `models` row `superseded`, inserts the new
 one as `active`, syncs `locales`, bumps the affected generations and appends
 `content.model_activated`. After that it drops the indexes the new model no
-longer needs and rebuilds the `published` fallback rows that a new locale or
-a changed fallback affects, in batches of 500 entries. Readiness
-stays false until all of it completes. As built in C4: the activation
-transaction records a pending row in `merezha_content.rebuilds`
-(migration 3) when it inserts a locale or changes a fallback; each batch
-re-materializes every live entry with a published variant, in id order,
-and advances the row's cursor, so the next migrating start resumes a
-crashed rebuild, and every host of the model reports
-`content_rebuild_pending` until it is done. A lost session loses its lock too,
-so the run reopens one (twice at most), retakes the lock and plans again,
-keeping each index's attempt count. With `database.migrate = false`, a pending model
-change fails readiness with `content_model_pending`.
+longer needs; the `published` fallback rows that a new locale or a changed
+fallback affects are rebuilt in the background. Readiness stays false
+until the indexes and the activation are done, not the rebuild. A lost
+session loses its lock too, so the run reopens one (twice at most),
+retakes the lock and plans again, keeping each index's attempt count.
+With `database.migrate = false`, a pending model change fails readiness
+with `content_model_pending`.
+
+Decision (C4 review, 2026-10-24): readiness is not gated on the fallback
+rebuild. The activation transaction records a pending row in
+`merezha_content.rebuilds` (migration 3) when it inserts a locale or
+changes a fallback, or when an older rebuild is still pending (that one
+turns `superseded`: the new one covers every entry), and appends the
+content job `content.published_rebuild`, registered through
+`guard_jobs`. Any current host runs it: batches of 500 live entries with
+a published variant, in id order, each re-materializing its entries,
+bumping the generations it touched and persisting the cursor, logged as
+`content.rebuild_batch` and `content.rebuild_completed`. A run stopped by
+its deadline or a cancel appends a continuation job; a host dying
+mid-batch leaves the committed cursor for the retried job. Until it is
+done, delivery may serve the previous materialization for the affected
+locales, eventually consistent like the mixed state of a rolling deploy.
+`merezha content diff` reports a pending rebuild as
+`content_rebuild_pending`; readiness does not.
 
 ### Mixed model versions
 
@@ -946,6 +958,19 @@ undelete and the trash. As built:
 - The trash purge is the cron schedule `content.trash_purge`, in UTC.
 - The tightening count reads only own `published` rows
   (`source_locale = locale`); fallback rows repeat their source.
+- Reference resolution locks the target entries `FOR KEY SHARE` until the
+  saving transaction commits, and `require_published` share-locks its
+  target before reading `published`. So a delete, purge, publish or
+  unpublish of a target waits for a save that references it and then
+  sees its refs, a save waits for a delete in flight and then gets
+  `reference_not_found`, and a referrer's publish waits for its target's
+  unpublish and then gets `reference_unpublished`. Two publishes requiring
+  each other may deadlock; PostgreSQL aborts one (`database_conflict`,
+  409, retryable).
+- A purge deletes the refs pointing at the entry too, in every scope, so
+  an id created again inherits no stale referrers.
+- A batch's transaction gets one `limits.query_timeout` per 50 items
+  started; the request bound would be too short for 500 items.
 
 Until identity lands, C3 relies on the host's policy: a private listener
 allows every route, a public one denies every route (`unauthenticated`

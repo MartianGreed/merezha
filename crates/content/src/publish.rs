@@ -60,6 +60,8 @@ struct Required {
     target: Uuid,
     locale: String,
     scope: String,
+    /// The reference's allowed types; empty allows every type.
+    types: Vec<String>,
 }
 
 /// The locales `locale` falls back through, itself first and the default
@@ -362,12 +364,25 @@ impl Work {
         let mut problems: Vec<(usize, FieldError)> = Vec::new();
         for need in &required {
             let target = need.target.hyphenated().to_string();
+            // Share-lock the target first: an unpublish or delete of it
+            // (`FOR UPDATE`) in flight is waited for and then seen, and
+            // one arriving later waits for this commit. Two publishes that
+            // each require the other may deadlock; PostgreSQL aborts one
+            // with `database_conflict` (409, conflict, retryable).
+            tx.query_opt(
+                "SELECT 1 FROM merezha_content.entries \
+                  WHERE id = $1::text::uuid AND (scope = $2 OR scope = 'app') FOR SHARE",
+                &[&target, &need.scope],
+            )
+            .await
+            .map_err(|e| sql(&e))?;
             let found = tx
                 .query_opt(
                     "SELECT 1 FROM merezha_content.published \
                       WHERE entry_id = $1::text::uuid AND locale = $2 \
-                        AND (scope = $3 OR scope = 'app')",
-                    &[&target, &need.locale, &need.scope],
+                        AND (scope = $3 OR scope = 'app') \
+                        AND (cardinality($4::text[]) = 0 OR content_type = ANY($4::text[]))",
+                    &[&target, &need.locale, &need.scope, &need.types],
                 )
                 .await
                 .map_err(|e| sql(&e))?;
@@ -455,6 +470,7 @@ impl Work {
             if let ReferenceTarget::Entry {
                 id: to,
                 require_published: true,
+                allowed,
                 ..
             } = &reference.target
             {
@@ -464,6 +480,7 @@ impl Work {
                     target: *to,
                     locale: locale.to_owned(),
                     scope: target.scope.clone(),
+                    types: allowed.clone(),
                 });
             }
         }
@@ -722,7 +739,8 @@ impl Store {
     ) -> Result<Vec<VariantView>, Rejection> {
         let work = self.work();
         let actor = actor.clone();
-        crate::store::transaction(self.database(), self.deadline(), move |tx| {
+        let deadline = self.batch_deadline(items.len());
+        crate::store::transaction(self.database(), deadline, move |tx| {
             Box::pin(async move { work.publish(tx, &items, &actor, batch).await })
         })
         .await
@@ -741,7 +759,8 @@ impl Store {
     ) -> Result<Vec<VariantView>, Rejection> {
         let work = self.work();
         let actor = actor.clone();
-        crate::store::transaction(self.database(), self.deadline(), move |tx| {
+        let deadline = self.batch_deadline(items.len());
+        crate::store::transaction(self.database(), deadline, move |tx| {
             Box::pin(async move { work.unpublish(tx, &items, &actor, batch).await })
         })
         .await
@@ -771,121 +790,5 @@ impl Store {
             })
         })
         .await
-    }
-}
-
-/// Entries one fallback rebuild transaction re-materializes (section 2).
-pub const REBUILD_BATCH: i64 = 500;
-
-/// Whether `version` has a fallback rebuild still pending.
-pub(crate) async fn rebuild_pending(
-    client: &impl merezha_postgres::tokio_postgres::GenericClient,
-    version: u32,
-) -> Result<bool, Failure> {
-    let version = i32::try_from(version).map_err(|_| Failure::permanent("invalid_input"))?;
-    let row = client
-        .query_one(
-            "SELECT to_regclass('merezha_content.rebuilds') IS NOT NULL",
-            &[],
-        )
-        .await
-        .map_err(|e| merezha_postgres::classify(&e))?;
-    if !row.get::<_, bool>(0) {
-        return Ok(false);
-    }
-    Ok(client
-        .query_opt(
-            "SELECT 1 FROM merezha_content.rebuilds WHERE version = $1 AND state = 'pending'",
-            &[&version],
-        )
-        .await
-        .map_err(|e| merezha_postgres::classify(&e))?
-        .is_some())
-}
-
-/// Finish `model`'s pending fallback rebuild, if any: re-materialize the
-/// `published` rows of every live entry with a published variant, in id
-/// order, [`REBUILD_BATCH`] entries per transaction. Each transaction runs
-/// the model version check, locks its entries, bumps the generation of
-/// every scope it touched and advances the resume cursor, so a crashed or
-/// interrupted run continues where it stopped. Returns the entries
-/// rebuilt.
-pub(crate) async fn rebuild_published(
-    db: &merezha_platform::Database,
-    model: &ContentModel,
-    deadline: std::time::Instant,
-) -> Result<u64, Failure> {
-    let version =
-        i32::try_from(model.version()).map_err(|_| Failure::permanent("invalid_input"))?;
-    let indexes = std::sync::Arc::new(crate::indexes::derived_indexes(model));
-    let model = std::sync::Arc::new(model.clone());
-    let mut total = 0u64;
-    loop {
-        let model = model.clone();
-        let indexes = indexes.clone();
-        let batch = crate::store::transaction(db, deadline, move |tx| {
-            Box::pin(async move {
-                crate::module::lock_model_version(tx, model.version()).await?;
-                let Some(cursor) = tx
-                    .query_opt(
-                        "SELECT after_entry::text FROM merezha_content.rebuilds \
-                          WHERE version = $1 AND state = 'pending' FOR UPDATE",
-                        &[&version],
-                    )
-                    .await
-                    .map_err(|e| sql(&e))?
-                else {
-                    return Ok(None);
-                };
-                let after: Option<String> = cursor.get(0);
-                let rows = tx
-                    .query(
-                        "SELECT e.id::text, e.scope, e.content_type FROM merezha_content.entries e \
-                          WHERE e.deleted_at IS NULL \
-                            AND ($1::text IS NULL OR e.id > $1::text::uuid) \
-                            AND EXISTS (SELECT 1 FROM merezha_content.variants v \
-                                         WHERE v.entry_id = e.id AND v.scope = e.scope \
-                                           AND v.content_type = e.content_type \
-                                           AND NOT v.deleted AND v.published_revision IS NOT NULL) \
-                          ORDER BY e.id LIMIT $2 FOR UPDATE OF e",
-                        &[&after, &REBUILD_BATCH],
-                    )
-                    .await
-                    .map_err(|e| sql(&e))?;
-                let mut scopes = BTreeSet::new();
-                for row in &rows {
-                    let (id, scope, content_type): (String, String, String) =
-                        (row.get(0), row.get(1), row.get(2));
-                    materialize(tx, &model, &indexes, &scope, &content_type, &id).await?;
-                    scopes.insert(scope);
-                }
-                for scope in &scopes {
-                    bump_generation(tx, scope).await?;
-                }
-                let last: Option<String> = rows.last().map(|r| r.get(0));
-                let done = (rows.len() as i64) < REBUILD_BATCH;
-                tx.execute(
-                    "UPDATE merezha_content.rebuilds \
-                        SET after_entry = $2::text::uuid, updated_at = now(), \
-                            state = CASE WHEN $3 THEN 'done' ELSE 'pending' END \
-                      WHERE version = $1",
-                    &[&version, &last.or(after), &done],
-                )
-                .await
-                .map_err(|e| sql(&e))?;
-                Ok(Some((rows.len() as u64, done)))
-            })
-        })
-        .await
-        .map_err(|r| r.failure)?;
-        match batch {
-            None => return Ok(total),
-            Some((count, done)) => {
-                total += count;
-                if done {
-                    return Ok(total);
-                }
-            }
-        }
     }
 }

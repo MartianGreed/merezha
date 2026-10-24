@@ -265,26 +265,42 @@ async fn additive_tightening_access_and_index_changes_activate() {
         .await,
         ["en:-", "fr:en", "fr-BE:fr"]
     );
-    // The activation bumps it, and so does the rebuild of the published
-    // rows the new `fr-BE` locale needs (C4): the published `en` entry now
-    // serves `fr` and `fr-BE` too.
     assert_eq!(
         scalar_i64(
             &db,
             "SELECT generation FROM merezha_content.generations WHERE scope = 'app'"
         )
         .await,
-        9
+        8
     );
-    assert_eq!(report.rebuilt, 1);
-    assert!(!report.rebuild_pending);
+    // The new `fr-BE` locale needs the `published` rows rebuilt (C4): the
+    // same transaction records the rebuild and enqueues its job, which a
+    // host's jobs runtime runs in the background.
+    assert!(report.rebuild_enqueued);
+    assert_eq!(
+        strings(
+            &db,
+            "SELECT version || ':' || state FROM merezha_content.rebuilds"
+        )
+        .await,
+        ["2:pending"]
+    );
+    assert_eq!(
+        strings(
+            &db,
+            "SELECT dedupe_key || ':' || queue || ':' || job_kind FROM merezha_jobs.outbox \
+              WHERE record_kind = 'job'"
+        )
+        .await,
+        ["rebuild:2:content:content.published_rebuild"]
+    );
     assert_eq!(
         strings(
             &db,
             "SELECT locale || ':' || source_locale FROM merezha_content.published ORDER BY locale"
         )
         .await,
-        ["en:en", "fr:en", "fr-BE:en"]
+        ["en:en"]
     );
     // New indexes built (category sort, isbn unique), the dropped ones gone
     // (reading_minutes sort, legacy_code unique), the slug's kept.
