@@ -237,7 +237,7 @@ metrics! {
         [key::DB_SYSTEM_NAME, key::DB_OPERATION_NAME, key::DB_COLLECTION_NAME, key::DB_RESPONSE_STATUS_CODE, key::ERROR_TYPE, key::MODULE],
         "registered statements x SQLSTATEs seen x modules x buckets";
     DB_CLIENT_CONNECTION_COUNT = "db.client.connection.count", Gauge, "{connection}", NONE,
-        [key::DB_CLIENT_CONNECTION_POOL_NAME, key::DB_CLIENT_CONNECTION_STATE], "pools x 2 states";
+        [key::DB_CLIENT_CONNECTION_POOL_NAME, key::DB_CLIENT_CONNECTION_STATE], "3 pools (merezha, merezha.detached, merezha.listen) x 2 states";
     DB_CLIENT_CONNECTION_MAX = "db.client.connection.max", Gauge, "{connection}", NONE,
         [key::DB_CLIENT_CONNECTION_POOL_NAME], "pools";
     DB_CLIENT_CONNECTION_PENDING_REQUESTS = "db.client.connection.pending_requests", Gauge, "{request}", NONE,
@@ -1611,6 +1611,11 @@ pub mod db {
     /// `db.client.connection.pool.name` of the kernel pool, the one pool a
     /// host opens (`application_name` of its sessions is the same).
     pub const POOL: &str = "merezha";
+    /// The sessions `Database::detach` took out of the pool, bounded by
+    /// `database.max_detached`.
+    pub const DETACHED_POOL: &str = "merezha.detached";
+    /// The open `LISTEN` sessions, outside the pool and the detached budget.
+    pub const LISTEN_POOL: &str = "merezha.listen";
     /// `merezha.module` of statements run through a `Database` no module
     /// was scoped to: the host's own probes, the migration ledger.
     pub const KERNEL_MODULE: &str = "kernel";
@@ -1675,7 +1680,11 @@ pub mod db {
         KeyValue::new(key::MODULE, opentelemetry::Value::String(module.into()))
     }
     pub fn pool() -> KeyValue {
-        KeyValue::new(key::DB_CLIENT_CONNECTION_POOL_NAME, POOL)
+        pool_named(POOL)
+    }
+    /// One of [`POOL`], [`DETACHED_POOL`] and [`LISTEN_POOL`].
+    pub fn pool_named(name: &'static str) -> KeyValue {
+        KeyValue::new(key::DB_CLIENT_CONNECTION_POOL_NAME, name)
     }
     pub fn connection_state(state: ConnectionState) -> KeyValue {
         KeyValue::new(key::DB_CLIENT_CONNECTION_STATE, state.as_str())

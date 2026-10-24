@@ -164,7 +164,6 @@ pub async fn run(
         );
     }
     let options = HostOptions {
-        meter: Some(telemetry.meter(EDGE_METER)),
         meters: telemetry.meters(),
         status: vec![Arc::new(TelemetrySection(telemetry.status_reader()))],
         ..HostOptions::default()
@@ -176,8 +175,6 @@ pub async fn run(
     code
 }
 
-/// The instrumentation scope of the edge's HTTP instruments.
-const EDGE_METER: &str = "merezha.edge";
 /// How long requests already admitted by the early listener may finish
 /// when startup fails or is interrupted.
 const CLOSE_WITHIN: Duration = Duration::from_secs(5);

@@ -386,3 +386,31 @@ fn the_log_bridge_honours_telemetry_logs_level() {
     // stderr follows log_level, independently.
     assert_eq!(harness.stderr_lines().len(), 4);
 }
+
+/// `Telemetry::meters()` is enabled exactly when metrics are exported, and
+/// its meters reach the exporter.
+#[test]
+fn telemetry_meters_are_enabled_only_when_metrics_are_exported() {
+    let harness = Harness::new();
+    let meters = harness.telemetry().meters();
+    assert!(meters.enabled());
+    meters
+        .meter("merezha-test")
+        .u64_counter("merezha.db.listener.reconnects")
+        .build()
+        .add(1, &[]);
+    assert_eq!(
+        harness
+            .metric("merezha.db.listener.reconnects")
+            .points()
+            .len(),
+        1
+    );
+    drop(harness);
+    let traces_only = TelemetryConfig {
+        signals: vec![Signal::Traces],
+        ..TelemetryConfig::default()
+    };
+    let harness = Harness::with(traces_only, Service::raw());
+    assert!(!harness.telemetry().meters().enabled());
+}

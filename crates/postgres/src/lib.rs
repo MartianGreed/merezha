@@ -289,13 +289,19 @@ impl Database {
             .runtime(Runtime::Tokio1)
             .build()
             .map_err(|_| Failure::permanent("invalid_database_config"))?;
-        let telemetry = Telemetry::new(Instruments::new(meter, &pool));
+        let detached = Arc::new(tokio::sync::Semaphore::new(config.max_detached));
+        let telemetry = Telemetry::new(Instruments::new(
+            meter,
+            &pool,
+            &detached,
+            config.max_detached,
+        ));
         Ok(Self {
             pool,
             session,
             acquire_timeout: config.acquire_timeout,
             statement_timeout: config.statement_timeout,
-            detached: Arc::new(tokio::sync::Semaphore::new(config.max_detached)),
+            detached,
             telemetry,
         })
     }
@@ -421,7 +427,9 @@ impl Database {
     /// waits for one to drop, within `acquire_timeout` and the deadline, and
     /// then fails transient `database_busy`.
     pub async fn detach(&self, deadline: Instant) -> Result<DetachedClient, Failure> {
-        let bound = deadline.min(Instant::now() + self.acquire_timeout);
+        let started = Instant::now();
+        let bound = deadline.min(started + self.acquire_timeout);
+        let waiting = self.telemetry.detached_waiting();
         let permit = match tokio::time::timeout_at(
             bound.into(),
             self.detached.clone().acquire_owned(),
@@ -430,8 +438,14 @@ impl Database {
         {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => return Err(Failure::transient("database_closed")),
-            Err(_) => return Err(Failure::transient("database_busy")),
+            Err(_) => {
+                drop(waiting);
+                self.telemetry.detached_timeout();
+                return Err(Failure::transient("database_busy"));
+            }
         };
+        drop(waiting);
+        self.telemetry.detached_acquired(started.elapsed());
         let pooled = self.acquire(deadline).await?;
         let client = deadpool_postgres::Object::take(pooled);
         // A dropped client only closes its socket. Without this setting a

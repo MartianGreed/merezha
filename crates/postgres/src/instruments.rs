@@ -18,7 +18,10 @@ use std::{
     borrow::Cow,
     collections::BTreeMap,
     future::Future,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tracing::{Instrument, Span, field::Empty};
@@ -33,6 +36,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Whether the current span is one the span bridge records: it has a valid
+/// OpenTelemetry span context. A caller span the bridge filtered out (a
+/// non-`merezha` target, or below `INFO`) or a subscriber without the
+/// bridge leaves none, so DB spans are never orphaned into roots.
+pub(crate) fn traced_caller() -> bool {
+    let current = Span::current();
+    !current.is_none() && merezha_telemetry::propagation::span_context(&current).is_some()
 }
 
 /// Whether a failure breaks the host's own contract and sets span status
@@ -57,11 +69,25 @@ pub(crate) struct Instruments {
     pending: Arc<Mutex<BTreeMap<String, u64>>>,
     listeners: Mutex<BTreeMap<String, ListenState>>,
     last_timeout_log: Mutex<Option<Instant>>,
+    /// Callers waiting for a detached session slot.
+    detached_waiting: Arc<AtomicUsize>,
+    /// Listener sessions open now.
+    listeners_open: Arc<AtomicUsize>,
     _gauges: Vec<ObservableGauge<u64>>,
 }
 
 impl Instruments {
-    pub(crate) fn new(meter: &Meter, pool: &deadpool_postgres::Pool) -> Self {
+    /// The pool's instruments, plus two more connection pools on the same
+    /// gauges: `merezha.detached`, the sessions [`crate::Database::detach`]
+    /// took out of the pool (at most `max_detached`), and `merezha.listen`,
+    /// the open listener sessions (unbounded, so no `max`). Neither has
+    /// idle connections.
+    pub(crate) fn new(
+        meter: &Meter,
+        pool: &deadpool_postgres::Pool,
+        detached: &Arc<tokio::sync::Semaphore>,
+        max_detached: usize,
+    ) -> Self {
         use names::metric as m;
         let histogram = |row: names::Metric| {
             meter
@@ -71,6 +97,10 @@ impl Instruments {
                 .build()
         };
         let counter = |row: names::Metric| meter.u64_counter(row.name).with_unit(row.unit).build();
+        let detached_waiting = Arc::new(AtomicUsize::new(0));
+        let listeners_open = Arc::new(AtomicUsize::new(0));
+        let slots = Arc::downgrade(detached);
+        let listening = Arc::downgrade(&listeners_open);
         let weak = pool.weak();
         let count = meter
             .u64_observable_gauge(m::DB_CLIENT_CONNECTION_COUNT.name)
@@ -87,6 +117,25 @@ impl Instruments {
                         observer.observe(value, &[db::pool(), db::connection_state(state)]);
                     }
                 }
+                if let Some(slots) = slots.upgrade() {
+                    let used = max_detached.saturating_sub(slots.available_permits());
+                    observer.observe(
+                        used as u64,
+                        &[
+                            db::pool_named(db::DETACHED_POOL),
+                            db::connection_state(db::ConnectionState::Used),
+                        ],
+                    );
+                }
+                if let Some(open) = listening.upgrade() {
+                    observer.observe(
+                        open.load(Ordering::Relaxed) as u64,
+                        &[
+                            db::pool_named(db::LISTEN_POOL),
+                            db::connection_state(db::ConnectionState::Used),
+                        ],
+                    );
+                }
             })
             .build();
         let weak = pool.weak();
@@ -96,16 +145,24 @@ impl Instruments {
             .with_callback(move |observer| {
                 if let Some(pool) = weak.upgrade() {
                     observer.observe(pool.status().max_size as u64, &[db::pool()]);
+                    observer.observe(max_detached as u64, &[db::pool_named(db::DETACHED_POOL)]);
                 }
             })
             .build();
         let weak = pool.weak();
+        let queued = Arc::downgrade(&detached_waiting);
         let waiting = meter
             .u64_observable_gauge(m::DB_CLIENT_CONNECTION_PENDING_REQUESTS.name)
             .with_unit(m::DB_CLIENT_CONNECTION_PENDING_REQUESTS.unit)
             .with_callback(move |observer| {
                 if let Some(pool) = weak.upgrade() {
                     observer.observe(pool.status().waiting as u64, &[db::pool()]);
+                }
+                if let Some(queued) = queued.upgrade() {
+                    observer.observe(
+                        queued.load(Ordering::Relaxed) as u64,
+                        &[db::pool_named(db::DETACHED_POOL)],
+                    );
                 }
             })
             .build();
@@ -130,6 +187,8 @@ impl Instruments {
             pending,
             listeners: Mutex::new(BTreeMap::new()),
             last_timeout_log: Mutex::new(None),
+            detached_waiting,
+            listeners_open,
             _gauges: vec![count, max, waiting, migrations],
         }
     }
@@ -183,7 +242,7 @@ impl Telemetry {
     }
 
     fn statement_span(&self, statement: &Statement) -> Span {
-        if Span::current().is_none() {
+        if !traced_caller() {
             return Span::none();
         }
         let span = tracing::info_span!(
@@ -208,7 +267,7 @@ impl Telemetry {
 
     /// The `transaction {module}` span, inside a caller's span only.
     pub(crate) fn transaction_span(&self) -> Span {
-        if Span::current().is_none() {
+        if !traced_caller() {
             return Span::none();
         }
         let name = format!("transaction {}", self.module());
@@ -250,6 +309,32 @@ impl Telemetry {
         }
     }
 
+    /// A caller waiting for a detached slot until the guard drops.
+    pub(crate) fn detached_waiting(&self) -> Waiting {
+        self.instruments
+            .detached_waiting
+            .fetch_add(1, Ordering::Relaxed);
+        Waiting(self.instruments.detached_waiting.clone())
+    }
+    /// A detached slot granted after `waited`.
+    pub(crate) fn detached_acquired(&self, waited: Duration) {
+        self.instruments
+            .wait_time
+            .record(waited.as_secs_f64(), &[db::pool_named(db::DETACHED_POOL)]);
+    }
+    /// A wait for a detached slot that gave up.
+    pub(crate) fn detached_timeout(&self) {
+        self.instruments
+            .timeouts
+            .add(1, &[db::pool_named(db::DETACHED_POOL)]);
+    }
+    /// One open listener session until the guard drops.
+    pub(crate) fn listener_open(&self) -> Waiting {
+        self.instruments
+            .listeners_open
+            .fetch_add(1, Ordering::Relaxed);
+        Waiting(self.instruments.listeners_open.clone())
+    }
     /// A listener session on `channels` opened. After one on the same
     /// channels was lost, this is a reconnect.
     pub(crate) fn listener_connected(&self, channels: &str) {
@@ -285,6 +370,15 @@ impl Telemetry {
 pub(crate) fn record_failure(span: &Span, failure: &Failure) {
     if host_failure(failure.classification, &failure.code) {
         span.record("otel.status_code", "error");
+    }
+}
+
+/// Decrements its counter when dropped: a waiter that gave up or was
+/// cancelled, or a listener session that closed.
+pub(crate) struct Waiting(Arc<AtomicUsize>);
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

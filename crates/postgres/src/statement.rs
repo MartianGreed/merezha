@@ -216,6 +216,241 @@ pub fn check_registry(sets: &[&[Statement]]) -> Result<(), Vec<&'static str>> {
     }
 }
 
+/// Driver methods that take SQL text, a driver statement or a portal
+/// first: a call to one of them is unregistered unless its second argument
+/// is a registered [`Statement`] (the registry's own methods take the
+/// session first and the statement second).
+pub const DRIVER_METHODS: &[&str] = &[
+    "query",
+    "query_one",
+    "query_opt",
+    "query_raw",
+    "query_typed",
+    "query_typed_raw",
+    "query_portal",
+    "execute",
+    "execute_raw",
+    "batch_execute",
+    "simple_query",
+    "prepare",
+    "prepare_typed",
+    "prepare_cached",
+    "prepare_typed_cached",
+    "bind",
+    "copy_in",
+    "copy_out",
+];
+
+/// `source` with comments blanked and string and character literal
+/// contents replaced by `_`, newlines kept, so calls are found in code only
+/// and arguments split on code commas only.
+fn code_only(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let blank = |b: u8| if b == b'\n' { b'\n' } else { b' ' };
+    while i < bytes.len() {
+        let b = bytes[i];
+        if bytes[i..].starts_with(b"//") {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(b' ');
+                i += 1;
+            }
+        } else if bytes[i..].starts_with(b"/*") {
+            let mut depth = 0usize;
+            while i < bytes.len() {
+                if bytes[i..].starts_with(b"/*") {
+                    depth += 1;
+                    out.extend_from_slice(b"  ");
+                    i += 2;
+                } else if bytes[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    out.extend_from_slice(b"  ");
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    out.push(blank(bytes[i]));
+                    i += 1;
+                }
+            }
+        } else if b == b'r'
+            && matches!(bytes.get(i + 1), Some(b'"' | b'#'))
+            && !bytes
+                .get(i.wrapping_sub(1))
+                .is_some_and(|p| p.is_ascii_alphanumeric() || *p == b'_')
+        {
+            // Raw string: r"…", r#"…"#.
+            let hashes = bytes[i + 1..].iter().take_while(|c| **c == b'#').count();
+            if bytes.get(i + 1 + hashes) != Some(&b'"') {
+                out.push(b);
+                i += 1;
+                continue;
+            }
+            out.push(b'"');
+            i += 2 + hashes;
+            let mut close = vec![b'"'];
+            close.extend(std::iter::repeat_n(b'#', hashes));
+            while i < bytes.len() && !bytes[i..].starts_with(&close) {
+                out.push(if bytes[i] == b'\n' { b'\n' } else { b'_' });
+                i += 1;
+            }
+            out.push(b'"');
+            i += close.len();
+        } else if b == b'"' {
+            out.push(b'"');
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' {
+                    out.push(b'_');
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    out.push(if bytes[i] == b'\n' { b'\n' } else { b'_' });
+                    i += 1;
+                }
+            }
+            out.push(b'"');
+            i += 1;
+        } else if b == b'\'' {
+            // A character literal ('x', '\n', '"'); otherwise a lifetime.
+            let end = if bytes.get(i + 1) == Some(&b'\\') {
+                bytes[i + 2..]
+                    .iter()
+                    .position(|c| *c == b'\'')
+                    .map(|p| i + 2 + p)
+            } else {
+                let width = source[i + 1..].chars().next().map_or(1, char::len_utf8);
+                (bytes.get(i + 1 + width) == Some(&b'\'')).then_some(i + 1 + width)
+            };
+            match end {
+                Some(end) => {
+                    out.push(b'\'');
+                    out.extend(std::iter::repeat_n(b'_', end - i - 1));
+                    out.push(b'\'');
+                    i = end + 1;
+                }
+                None => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The top-level arguments of the call whose `(` ends at `start`.
+fn arguments(code: &str, start: usize) -> Vec<&str> {
+    let bytes = code.as_bytes();
+    let mut depth = 0usize;
+    let mut args = Vec::new();
+    let mut from = start;
+    for (offset, b) in bytes[start..].iter().enumerate() {
+        let at = start + offset;
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth > 0 => depth -= 1,
+            b')' => {
+                let last = code[from..at].trim();
+                if !last.is_empty() {
+                    args.push(last);
+                }
+                return args;
+            }
+            b',' if depth == 0 => {
+                args.push(code[from..at].trim());
+                from = at + 1;
+            }
+            _ => {}
+        }
+    }
+    args
+}
+
+/// `&path::TO::A_CONSTANT`: a registered statement constant by convention.
+fn statement_argument(argument: &str) -> bool {
+    let Some(path) = argument.strip_prefix('&') else {
+        return false;
+    };
+    let segments: Vec<&str> = path.trim().split("::").collect();
+    segments.iter().all(|s| {
+        !s.is_empty()
+            && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && !s.as_bytes()[0].is_ascii_digit()
+    }) && segments.last().is_some_and(|last| {
+        last.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    })
+}
+
+/// Calls in `source` that hand SQL to the driver instead of a registered
+/// [`Statement`], as `(line, method)`: a [`DRIVER_METHODS`] call with
+/// arguments whose second argument is not `&A_STATEMENT`. Comments and
+/// string contents are ignored. A block lists its own violations in a test
+/// with [`scan_sources`].
+pub fn unregistered_calls(source: &str) -> Vec<(usize, &'static str)> {
+    let code = code_only(source);
+    let mut found = Vec::new();
+    for method in DRIVER_METHODS {
+        let needle = format!(".{method}(");
+        for (at, _) in code.match_indices(&needle) {
+            let args = arguments(&code, at + needle.len());
+            if args.is_empty() {
+                continue;
+            }
+            if args.get(1).is_some_and(|a| statement_argument(a)) {
+                continue;
+            }
+            let line = code[..at].bytes().filter(|b| *b == b'\n').count() + 1;
+            found.push((line, *method));
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+/// [`unregistered_calls`] over every `.rs` file under `dir`, recursively,
+/// except the file names in `skip`, as `path:line: method`. A file that
+/// cannot be read is an error.
+pub fn scan_sources(dir: &std::path::Path, skip: &[&str]) -> std::io::Result<Vec<String>> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    let mut files = 0usize;
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if !name.ends_with(".rs") || skip.contains(&name) {
+            continue;
+        }
+        files += 1;
+        let source = std::fs::read_to_string(&path)?;
+        for (line, method) in unregistered_calls(&source) {
+            found.push(format!("{}:{line}: {method}", path.display()));
+        }
+    }
+    if files == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no Rust source to scan",
+        ));
+    }
+    found.sort();
+    Ok(found)
+}
+
 /// A connection or transaction statements can run on: the driver's
 /// `Client` and `Transaction`, the pool's [`crate::PooledClient`],
 /// [`crate::Tx`] and [`crate::DetachedClient`].
@@ -327,6 +562,17 @@ impl Database {
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Option<Row>, tokio_postgres::Error> {
         self.telemetry.maybe_row(session, statement, params).await
+    }
+    /// `statement.sql` prepared on `client` through the pool's per-session
+    /// statement cache, for [`Database::query_one_prepared`]. Not timed: it
+    /// is a cache lookup after the session's first use.
+    pub async fn prepare_cached(
+        &self,
+        client: &crate::PooledClient,
+        statement: &Statement,
+    ) -> Result<tokio_postgres::Statement, tokio_postgres::Error> {
+        // The registry's own dispatch; the scan skips this file.
+        client.prepare_cached(statement.sql).await
     }
     /// [`Database::query_one`] with `prepared`, the driver statement
     /// prepared from `statement.sql` (for example with the pool's
@@ -649,44 +895,52 @@ mod tests {
         );
     }
     /// Every SQL call of the kernel's runtime goes through the registry:
-    /// no source file but this one calls a driver method directly. The test
-    /// harness (`testing.rs`) runs administrative SQL on its own connection,
-    /// outside any pool, and is excluded.
+    /// no source file of the crate hands SQL to the driver. `statement.rs`
+    /// is the registry's own dispatch, and the test harness (`testing.rs`)
+    /// runs administrative SQL on its own connection outside any pool.
     #[test]
     fn kernel_sources_call_no_driver_method_directly() {
-        let sources = [
-            ("lib.rs", include_str!("lib.rs")),
-            ("migrate.rs", include_str!("migrate.rs")),
-            ("listen.rs", include_str!("listen.rs")),
-            ("instruments.rs", include_str!("instruments.rs")),
-            ("tls.rs", include_str!("tls.rs")),
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let found = scan_sources(&dir, &["statement.rs", "testing.rs"]).unwrap();
+        assert!(found.is_empty(), "unregistered SQL: {found:?}");
+    }
+    #[test]
+    fn the_scan_flags_every_bypass_form() {
+        let bypasses = [
+            "let sql = \"SELECT 1\";\nclient.query(sql, &[]).await",
+            "client.query_one(\"SELECT 1\", &[])",
+            "client\n    .execute(\n        \"INSERT INTO t VALUES ($1)\",\n        &[&a],\n    )",
+            "tx.batch_execute(&set)",
+            "client.simple_query(\"SELECT 1\")",
+            "client.query_typed(SQL, &[])",
+            "client.prepare_typed(SQL, &[])",
+            "client.prepare_cached(sql::APPEND.sql)",
+            "client.query_raw(&statement, params)",
+            "client.query_one(&prepared, &params)",
+            "client.query(kernel::PING.sql, &[])",
+            "client.copy_in(\"COPY t FROM STDIN\")",
         ];
-        let calls = [
-            ".query(",
-            ".query_one(",
-            ".query_opt(",
-            ".query_raw(",
-            ".execute(",
-            ".execute_raw(",
-            ".batch_execute(",
-            ".simple_query(",
-            ".prepare(",
-            ".copy_in(",
-            ".copy_out(",
-        ];
-        for (file, text) in sources {
-            for (number, line) in text.lines().enumerate() {
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
-                for call in calls {
-                    assert!(
-                        !line.contains(call),
-                        "{file}:{}: `{call}` bypasses the statement registry",
-                        number + 1
-                    );
-                }
-            }
+        for source in bypasses {
+            assert_eq!(unregistered_calls(source).len(), 1, "{source}");
         }
+        let fine = [
+            "db.query(&client, &sql::HEAD, &[])",
+            "db.execute(tx, &INSERT, &[&a, &b])",
+            "self.db\n    .query_opt(\n        &self.client,\n        &sql::PROJECTION,\n        &[&name, &revision],\n    )",
+            "db.prepare_cached(&client, &sql::APPEND)",
+            "url.query()",
+            "// client.query(\"SELECT 1\", &[])",
+            "/* tx.batch_execute(\"x\") */",
+            "let doc = \"call .query(\\\"x\\\", &[]) here\";",
+            "let quote = b'\"'; let other = 'a';",
+            "let raw = r#\"client.execute(\"x\", &[])\"#;",
+        ];
+        for source in fine {
+            assert_eq!(unregistered_calls(source), vec![], "{source}");
+        }
+        assert_eq!(
+            unregistered_calls("fn a<'t>(x: &'t str) {}\nclient.execute(sql, &[])"),
+            vec![(2, "execute")]
+        );
     }
 }

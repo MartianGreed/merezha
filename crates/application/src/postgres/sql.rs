@@ -327,45 +327,12 @@ mod tests {
             Ok(())
         );
     }
-    /// No store source hands SQL text to a driver method: every call takes
-    /// a session and a registered statement. (`prepare_cached` of the
-    /// append is the one driver call, and `tests.rs` is excluded.)
+    /// No source of the PostgreSQL store hands SQL to the driver: every
+    /// file of `src/postgres/` is scanned except the crash-cut tests.
     #[test]
     fn store_sources_hand_no_sql_to_the_driver() {
-        let sources = [
-            ("mod.rs", include_str!("mod.rs")),
-            ("runner.rs", include_str!("runner.rs")),
-            ("scheduler.rs", include_str!("scheduler.rs")),
-            ("admin.rs", include_str!("admin.rs")),
-            ("verify.rs", include_str!("verify.rs")),
-        ];
-        for (file, text) in sources {
-            for method in [
-                ".query(",
-                ".query_one(",
-                ".query_opt(",
-                ".query_raw(",
-                ".execute(",
-                ".simple_query(",
-                ".batch_execute(",
-                ".prepare(",
-            ] {
-                for (at, _) in text.match_indices(method) {
-                    let argument = text[at + method.len()..].trim_start();
-                    let raw = method == ".batch_execute("
-                        || method == ".simple_query("
-                        || method == ".prepare("
-                        || [
-                            "\"", "sql::", "&sql::", "format!", "&format!", "r\"", "r#\"",
-                        ]
-                        .iter()
-                        .any(|start| argument.starts_with(start));
-                    assert!(
-                        !raw,
-                        "{file}: `{method}` at byte {at} bypasses the statement registry"
-                    );
-                }
-            }
-        }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/postgres");
+        let found = merezha_postgres::statement::scan_sources(&dir, &["tests.rs"]).unwrap();
+        assert!(found.is_empty(), "unregistered SQL: {found:?}");
     }
 }

@@ -691,17 +691,19 @@ impl PostgresStore {
     /// the statement runs leaves its outcome unknown.
     async fn append(&self, a: &Append, deadline: Instant) -> Result<Row, Failure> {
         let client = self.db.acquire(deadline).await?;
-        let statement =
-            match tokio::time::timeout_at(deadline.into(), client.prepare_cached(sql::APPEND.sql))
-                .await
-            {
-                Ok(Ok(statement)) => statement,
-                Ok(Err(error)) => return Err(read_error(&error)),
-                Err(_) => {
-                    drop(PooledClient::take(client));
-                    return Err(timeout());
-                }
-            };
+        let statement = match tokio::time::timeout_at(
+            deadline.into(),
+            self.db.prepare_cached(&client, &sql::APPEND),
+        )
+        .await
+        {
+            Ok(Ok(statement)) => statement,
+            Ok(Err(error)) => return Err(read_error(&error)),
+            Err(_) => {
+                drop(PooledClient::take(client));
+                return Err(timeout());
+            }
+        };
         let Some((lock_timeout_ms, statement_ms)) = self.append_bounds(deadline) else {
             return Err(timeout());
         };

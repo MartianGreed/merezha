@@ -18,7 +18,7 @@ pub mod status;
 
 pub use config::{ConfigErrors, ConfigInput, ConfigIssue, ModuleSection, ProjectConfig};
 pub use context::{AppContext, Clock, OsRandom, OutboundHttp, Random, SystemClock};
-pub use edge::{ErrorReply, error_response};
+pub use edge::{EDGE_SCOPE, ErrorReply, error_response};
 pub use errors::{ErrorCode, ErrorRegistry, FieldError};
 pub use host::{EarlyListener, Host, HostOptions, HostParts, StartupError, Timeouts};
 pub use merezha_postgres::{BoxFuture, Database, Migration, MigrationKind, Secret, Tx};

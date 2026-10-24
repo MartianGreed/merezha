@@ -273,6 +273,9 @@ pub struct HttpMetrics {
     body_size: Histogram<u64>,
     rejected: Counter<u64>,
 }
+/// Instrumentation scope of the edge's HTTP instruments.
+pub const EDGE_SCOPE: &str = "merezha.edge";
+
 impl HttpMetrics {
     pub fn new(meter: &Meter) -> Self {
         use names::metric::{
@@ -303,7 +306,7 @@ impl HttpMetrics {
     /// Instruments on a no-op meter.
     pub fn noop() -> Self {
         use opentelemetry::metrics::MeterProvider;
-        Self::new(&opentelemetry::metrics::noop::NoopMeterProvider::new().meter("merezha.edge"))
+        Self::new(&opentelemetry::metrics::noop::NoopMeterProvider::new().meter(EDGE_SCOPE))
     }
 }
 impl Default for HttpMetrics {

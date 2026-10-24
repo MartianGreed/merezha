@@ -594,7 +594,7 @@ async fn run(
         rest = tail;
         let module = modules[index].module;
         let own = telemetry.for_module(module.to_owned());
-        let span = if tracing::Span::current().is_none() {
+        let span = if !crate::instruments::traced_caller() {
             tracing::Span::none()
         } else {
             Telemetry::migration_span(module)

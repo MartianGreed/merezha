@@ -448,7 +448,7 @@ directory relative paths resolve against (the canonical directory of
   refused (`merezha.reason`: `starting` from the early listener, `body_limit`
   for a declared or read body over `http.body_limit`; a module's
   `overloaded` or `timeout` reply is not an edge rejection), through the
-  meter the binary passes in `HostOptions::meter`. `client.address` is not
+  meter of scope `merezha.edge` (`EDGE_SCOPE`) from the meters the binary passes in `HostOptions::meters`. `client.address` is not
   recorded on server spans yet, so `telemetry.privacy.record_client_address
   = true` has no effect.
 - refuses bodies over `http.body_limit`: a larger `Content-Length` fails at
@@ -971,15 +971,24 @@ application store's are `merezha_application::postgres::STATEMENTS`
 (`app.*`; the append is `app.events.append`, summary
 `INSERT merezha_app.events`, run prepared through `query_one_prepared`), the
 capture driver's `merezha_notifications::drivers::STATEMENTS`. SQL
-sent through the driver directly is not observed at all; the kernel's
-sources are scanned by a test so none of its SQL bypasses the registry.
+sent through the driver directly is not observed at all, so each crate
+scans its own sources in a test: `statement::scan_sources(dir, skip)`
+walks every `.rs` file and reports each call of a driver method
+(`query`, `query_typed`, `execute`, `batch_execute`, `simple_query`,
+`prepare`, `prepare_cached`, `copy_in` and the rest of
+`statement::DRIVER_METHODS`) whose second argument is not a registered
+`&STATEMENT`, comments and string contents ignored. The kernel, the
+application store and the notifications block run it; jobs, content and
+`merezha content diff` adopt the registry next (issue #41). The append
+prepares through `Database::prepare_cached(&client, &STATEMENT)`.
 
 - **`db.client.operation.duration`** (seconds) times every registered
   statement with `db.system.name = postgresql`, `db.operation.name` and
   `db.collection.name` from the summary, `merezha.module`, and on failure
   `db.response.status_code` (the SQLSTATE) and `error.type` (the `classify`
   code, or `cancelled` when the caller dropped the statement first).
-- **Spans.** Inside a caller's span, a statement is a CLIENT span named
+- **Spans.** Inside a caller's span the span bridge records (a
+  `merezha*` span at `info` or above, with a valid OpenTelemetry context), a statement is a CLIENT span named
   after its summary with the same attributes plus `db.query.summary` and
   `merezha.db.statement`; `Database::transaction` and
   `DetachedClient::transaction` open `transaction {module}` with
@@ -999,7 +1008,11 @@ sources are scanned by a test so none of its SQL bypasses the registry.
   `db.client.connection.wait_time` records each successful acquisition;
   `db.client.connection.timeouts` counts acquisitions that gave up
   (`database_busy`), which also log `db.pool_timeout` at most every 10 s.
-  The pool name is `merezha`.
+  The pool name is `merezha`. Detached sessions are the pool
+  `merezha.detached` (`count{used}`, `max` = `max_detached`,
+  `pending_requests`, `wait_time` and `timeouts` of slot waits), and open
+  listener sessions the pool `merezha.listen` (`count{used}` only: they are
+  not bounded).
 - **Listeners.** A listener session that ended (`recv` returned `None`) or
   failed `check` is lost; the next successful `listen` on the same channels
   counts one `merezha.db.listener.reconnects`. The `db.listener_lost` and
@@ -1013,10 +1026,14 @@ sources are scanned by a test so none of its SQL bypasses the registry.
 
 The instruments come from the meter the pool was built with:
 `Database::connect_with_meter(&config, &meter)`; `Database::connect` uses
-no-op instruments. `HostOptions::meters` (a `merezha_telemetry::Meters`,
-the one meter source libraries take) builds the kernel pool from
-`meters.meter("merezha-postgres")`; `merezha run` passes the OTLP
-pipeline's `Telemetry::meters()`, and `Host::start` keeps no-op meters.
+no-op instruments. `merezha_telemetry::Meters` is the one meter source
+of the workspace: `Meters::new(provider)` (enabled), `Meters::noop()` or
+`Meters::default()` (records nothing), `enabled()`, and `meter(scope)`.
+`Telemetry::meters()` returns the SDK provider's when metrics are
+exported and no-op meters otherwise. `HostOptions::meters` builds the edge
+instruments from `meter("merezha.edge")` and the kernel pool from
+`meter("merezha-postgres")`; `merezha run` passes `Telemetry::meters()`,
+and `Host::start` keeps no-op meters.
 
 ### Application storage
 

@@ -7,7 +7,8 @@ license.workspace = true
 
 [dependencies]
 merezha-domain = { path = "../domain" }
-merezha-telemetry = { path = "../telemetry" }
+# `propagation` (no SDK): DB spans parent only on a span the bridge records.
+merezha-telemetry = { path = "../telemetry", features = ["propagation"] }
 opentelemetry.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true

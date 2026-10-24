@@ -45,6 +45,8 @@ pub struct Listener {
     telemetry: Telemetry,
     /// The channel set, comma-joined: the reconnect counter's key.
     channels: String,
+    /// Counts this session in `db.client.connection.count{merezha.listen}`.
+    _open: crate::instruments::Waiting,
 }
 impl std::fmt::Debug for Listener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -159,6 +161,7 @@ async fn connect(
         driver,
         telemetry: telemetry.clone(),
         channels: key,
+        _open: telemetry.listener_open(),
     };
     // Channel names are validated identifiers, never values.
     let statements: String = channels

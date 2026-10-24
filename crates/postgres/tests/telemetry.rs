@@ -577,3 +577,167 @@ async fn every_kernel_statement_is_registered_and_exercised() {
         assert!(summaries.contains(&*span.name), "{}", span.name);
     }
 }
+
+#[tokio::test]
+async fn detached_transactions_are_traced_and_failures_set_the_transaction_status() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let harness = Harness::new();
+    let db = database(&test, &harness).for_module("probe");
+    async {
+        let mut detached = db.detach(soon()).await.unwrap();
+        let session = db.clone();
+        detached
+            .transaction(soon(), move |tx| {
+                Box::pin(async move {
+                    session
+                        .query_one(tx, &PROBE, &[])
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        // A host failure inside the work marks the transaction span.
+        let failed = detached
+            .transaction(soon(), |_| {
+                Box::pin(async { Err::<(), _>(merezha_domain::Failure::transient("probe_lost")) })
+            })
+            .await;
+        assert_eq!(failed.unwrap_err().code, "probe_lost");
+        // A domain rejection leaves it unset.
+        let rejected = db
+            .transaction(soon(), |_| {
+                Box::pin(async { Err::<(), _>(merezha_domain::Failure::permanent("rejected")) })
+            })
+            .await;
+        assert_eq!(rejected.unwrap_err().code, "rejected");
+    }
+    .instrument(caller())
+    .await;
+    let transactions: Vec<SpanData> = harness
+        .spans()
+        .into_iter()
+        .filter(|s| s.name == "transaction probe")
+        .collect();
+    assert_eq!(transactions.len(), 3);
+    let caller_id = harness.span("caller").span_context.span_id();
+    assert!(transactions.iter().all(|t| t.parent_span_id == caller_id));
+    let succeeded = &transactions[0];
+    assert_eq!(succeeded.status, Status::Unset);
+    let children: Vec<String> = client_spans(&harness)
+        .into_iter()
+        .filter(|s| s.parent_span_id == succeeded.span_context.span_id())
+        .map(|s| s.name.to_string())
+        .collect();
+    assert_eq!(children, ["BEGIN", "SET", "SELECT", "COMMIT"]);
+    assert!(matches!(transactions[1].status, Status::Error { .. }));
+    assert_eq!(transactions[2].status, Status::Unset);
+    // Every statement finished: none is recorded as cancelled.
+    let duration = harness.metric("db.client.operation.duration");
+    assert_eq!(duration.value(&[("error.type", "cancelled")]), None);
+    assert!(
+        client_spans(&harness)
+            .iter()
+            .all(|s| attribute(s, "error.type").is_none())
+    );
+}
+
+const PROBE: Statement = Statement::new("canary.probe", "SELECT", "SELECT 1");
+
+#[tokio::test]
+async fn a_caller_span_the_bridge_does_not_record_opens_no_db_span() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let harness = Harness::new();
+    let db = database(&test, &harness);
+    let foreign = tracing::info_span!(target: "elsewhere", "foreign");
+    let quiet = tracing::debug_span!(target: "merezha_test", "quiet");
+    for span in [foreign, quiet] {
+        async {
+            db.ping(soon()).await.unwrap();
+            db.transaction(soon(), |_| Box::pin(async { Ok(()) }))
+                .await
+                .unwrap();
+        }
+        .instrument(span)
+        .await;
+    }
+    assert!(harness.spans().is_empty(), "{:?}", harness.spans());
+    assert_eq!(
+        harness
+            .metric("db.client.operation.duration")
+            .value(&[("db.operation.name", "SELECT")]),
+        Some(2.0)
+    );
+}
+
+#[tokio::test]
+async fn detached_and_listener_sessions_are_reported_as_their_own_pools() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let harness = Harness::new();
+    let mut config = test.config();
+    config.max_detached = 2;
+    config.acquire_timeout = Duration::from_millis(300);
+    let db =
+        Database::connect_with_meter(&config, &harness.telemetry().meters().meter(METER_SCOPE))
+            .unwrap();
+    let gauge = |name: &str, pool: &str, state: Option<&str>| {
+        let mut attributes = vec![("db.client.connection.pool.name", pool)];
+        if let Some(state) = state {
+            attributes.push(("db.client.connection.state", state));
+        }
+        harness.metric(name).value(&attributes)
+    };
+    let count = "db.client.connection.count";
+    assert_eq!(
+        gauge("db.client.connection.max", "merezha.detached", None),
+        Some(2.0)
+    );
+    assert_eq!(gauge(count, "merezha.detached", Some("used")), Some(0.0));
+    assert_eq!(gauge(count, "merezha.listen", Some("used")), Some(0.0));
+    let first = db.detach(soon()).await.unwrap();
+    let second = db.detach(soon()).await.unwrap();
+    let listener = db.listen(&["probe_events"], soon()).await.unwrap();
+    assert_eq!(gauge(count, "merezha.detached", Some("used")), Some(2.0));
+    assert_eq!(gauge(count, "merezha.listen", Some("used")), Some(1.0));
+    // A third detach waits for a slot, then gives up.
+    let waiter = {
+        let db = db.clone();
+        tokio::spawn(async move { db.detach(soon()).await.map(drop) })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        gauge(
+            "db.client.connection.pending_requests",
+            "merezha.detached",
+            None
+        ),
+        Some(1.0)
+    );
+    assert_eq!(waiter.await.unwrap().unwrap_err().code, "database_busy");
+    assert_eq!(
+        gauge(
+            "db.client.connection.pending_requests",
+            "merezha.detached",
+            None
+        ),
+        Some(0.0)
+    );
+    assert_eq!(
+        gauge("db.client.connection.timeouts", "merezha.detached", None),
+        Some(1.0)
+    );
+    assert_eq!(
+        gauge("db.client.connection.wait_time", "merezha.detached", None),
+        Some(2.0)
+    );
+    drop((first, second, listener));
+    assert_eq!(gauge(count, "merezha.detached", Some("used")), Some(0.0));
+    assert_eq!(gauge(count, "merezha.listen", Some("used")), Some(0.0));
+}
