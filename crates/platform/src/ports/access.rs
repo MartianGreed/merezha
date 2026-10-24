@@ -464,7 +464,8 @@ impl Authorizer for LoopbackAllowAll {
     }
 }
 /// Fallback policy for a public listener without the identity block: every
-/// check fails `unauthorized`.
+/// check fails, `unauthenticated` without a principal and `unauthorized`
+/// with one, as the [`Authorizer`] contract says.
 #[derive(Debug, Default)]
 pub struct DenyAll;
 impl ApplicationAuthorizer for DenyAll {
@@ -482,11 +483,14 @@ impl ApplicationAuthorizer for DenyAll {
 impl Authorizer for DenyAll {
     fn check(
         &self,
-        _: Option<&Principal>,
+        principal: Option<&Principal>,
         _: &Permission,
         _: &ResourceScope,
     ) -> Result<Allowed, AccessDenied> {
-        Err(AccessDenied::new(DenyReason::NoGrant))
+        Err(AccessDenied::new(match principal {
+            None => DenyReason::Unauthenticated,
+            Some(_) => DenyReason::NoGrant,
+        }))
     }
 }
 
@@ -543,6 +547,15 @@ mod tests {
         );
         let denied = DenyAll
             .check(None, &id("tasks.create"), &ResourceScope::Application)
+            .unwrap_err();
+        assert_eq!(denied.failure().code, "unauthenticated");
+        let someone = user(None, GrantSnapshot::empty().with_break_glass());
+        let denied = DenyAll
+            .check(
+                Some(&someone),
+                &id("tasks.create"),
+                &ResourceScope::Application,
+            )
             .unwrap_err();
         assert_eq!(denied.failure().code, "unauthorized");
         assert_eq!(
