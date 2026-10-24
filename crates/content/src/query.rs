@@ -1,0 +1,912 @@
+//! Management list queries (section 5, filters, sorting and pagination):
+//! the query string, typed filter values, sort keys with nulls last, and
+//! keyset cursors bound to a fingerprint of the query.
+use crate::{
+    model::{Cardinality, ContentModel, ContentType, Field, FieldKind},
+    scalar,
+    settings::Limits,
+    store::{Rejection, VARIANT_FROM, variant_columns},
+};
+use base64::Engine as _;
+use merezha_domain::Failure;
+use merezha_platform::{FieldError, errors::MAX_DETAILS};
+use merezha_postgres::tokio_postgres::types::ToSql;
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
+
+/// Most values one `in` or `has` clause takes.
+pub const MAX_FILTER_VALUES: usize = 50;
+/// Longest accepted query string.
+pub const MAX_QUERY_BYTES: usize = 16_384;
+/// Longest accepted cursor.
+pub const MAX_CURSOR_BYTES: usize = 4096;
+
+/// One `key=value` pair of a query string, percent-decoded (`+` is a
+/// space). Fails `invalid_query` on malformed escapes or non-UTF-8.
+pub(crate) fn pairs(query: Option<&str>) -> Result<Vec<(String, String)>, Rejection> {
+    let query = query.unwrap_or("");
+    if query.len() > MAX_QUERY_BYTES {
+        return Err(problem("invalid_query", "", "too_long"));
+    }
+    let mut out = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match (decode(key), decode(value)) {
+            (Some(key), Some(value)) => out.push((key, value)),
+            _ => return Err(problem("invalid_query", "", "invalid_encoding")),
+        }
+    }
+    Ok(out)
+}
+
+fn decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let hex = bytes.get(index + 1..index + 3)?;
+                let hex = std::str::from_utf8(hex).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                index += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+pub(crate) fn detail(path: &str, code: &str) -> FieldError {
+    FieldError::new(path, code).unwrap_or_else(|_| FieldError {
+        path: String::new(),
+        code: code.to_owned(),
+    })
+}
+fn problem(code: &str, path: &str, reason: &str) -> Rejection {
+    Rejection {
+        failure: Failure::permanent(code),
+        details: vec![detail(path, reason)],
+    }
+}
+fn rejection(code: &str, mut details: Vec<FieldError>) -> Rejection {
+    details.truncate(MAX_DETAILS);
+    Rejection {
+        failure: Failure::permanent(code),
+        details,
+    }
+}
+
+/// `status=` of the management list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusFilter {
+    Draft,
+    Published,
+    Changed,
+    Any,
+}
+impl StatusFilter {
+    fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "draft" => Self::Draft,
+            "published" => Self::Published,
+            "changed" => Self::Changed,
+            "any" => Self::Any,
+            _ => return None,
+        })
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Published => "published",
+            Self::Changed => "changed",
+            Self::Any => "any",
+        }
+    }
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Draft => " AND v.published_revision IS NULL",
+            Self::Published => " AND v.published_revision = v.draft_revision",
+            Self::Changed => {
+                " AND v.published_revision IS NOT NULL AND v.published_revision <> v.draft_revision"
+            }
+            Self::Any => "",
+        }
+    }
+}
+
+/// Filter operators (section 5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Op {
+    Eq,
+    In,
+    Has,
+    Ne,
+    Exists,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+impl Op {
+    fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "eq" => Self::Eq,
+            "in" => Self::In,
+            "has" => Self::Has,
+            "ne" => Self::Ne,
+            "exists" => Self::Exists,
+            "lt" => Self::Lt,
+            "lte" => Self::Lte,
+            "gt" => Self::Gt,
+            "gte" => Self::Gte,
+            _ => return None,
+        })
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::In => "in",
+            Self::Has => "has",
+            Self::Ne => "ne",
+            Self::Exists => "exists",
+            Self::Lt => "lt",
+            Self::Lte => "lte",
+            Self::Gt => "gt",
+            Self::Gte => "gte",
+        }
+    }
+    fn repeatable(self) -> bool {
+        matches!(self, Self::In | Self::Has)
+    }
+    fn comparison(self) -> Option<&'static str> {
+        match self {
+            Self::Lt => Some("<"),
+            Self::Lte => Some("<="),
+            Self::Gt => Some(">"),
+            Self::Gte => Some(">="),
+            _ => None,
+        }
+    }
+}
+
+/// The cast a sortable field's text takes in SQL, as in its derived index.
+fn cast(kind: &FieldKind) -> &'static str {
+    match kind {
+        FieldKind::Integer(_) => "bigint",
+        FieldKind::Float(_) => "float8",
+        FieldKind::Decimal(_) => "numeric",
+        _ => "text",
+    }
+}
+/// The typed SQL expression of a top-level field, matching the derived
+/// sort index.
+fn field_expression(name: &str, kind: &FieldKind) -> String {
+    match cast(kind) {
+        "text" => format!("(v.draft_data->>'{name}')"),
+        cast => format!("((v.draft_data->>'{name}'))::{cast}"),
+    }
+}
+fn null_expression(name: &str) -> String {
+    format!("((v.draft_data->'{name}') IS NULL)")
+}
+
+/// A filter value parsed with the field's type: the stored JSON form, as
+/// containment matches it, plus the text a typed comparison casts.
+fn scalar_value(kind: &FieldKind, text: &str) -> Result<(Value, String), &'static str> {
+    if text.contains('\0') {
+        return Err("invalid_value");
+    }
+    let value = match kind {
+        FieldKind::Integer(_) => {
+            let n: i64 = text.parse().map_err(|_| "invalid_value")?;
+            if n.abs() > crate::model::MAX_SAFE_INTEGER {
+                return Err("invalid_value");
+            }
+            Value::from(n)
+        }
+        FieldKind::Float(_) => {
+            let n: f64 = text.parse().map_err(|_| "invalid_value")?;
+            if !n.is_finite() {
+                return Err("invalid_value");
+            }
+            serde_json::Number::from_f64(n)
+                .map(Value::Number)
+                .ok_or("invalid_value")?
+        }
+        FieldKind::Decimal(rules) => Value::String(
+            scalar::decimal(text, rules.precision, rules.scale).map_err(|_| "invalid_value")?,
+        ),
+        FieldKind::Boolean => match text {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => return Err("invalid_value"),
+        },
+        FieldKind::Datetime(_) => {
+            Value::String(scalar::datetime(text).map_err(|_| "invalid_value")?)
+        }
+        FieldKind::Date(_) => Value::String(scalar::date(text).map_err(|_| "invalid_value")?),
+        FieldKind::Enum(rules) if !rules.values.iter().any(|v| v == text) => {
+            return Err("invalid_value");
+        }
+        FieldKind::String(_) | FieldKind::Text(_) | FieldKind::Slug(_) | FieldKind::Enum(_) => {
+            Value::String(text.to_owned())
+        }
+        _ => return Err("not_filterable"),
+    };
+    let text = match &value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    Ok((value, text))
+}
+
+fn uuid_value(text: &str) -> Result<String, &'static str> {
+    if text.len() != 36 {
+        return Err("invalid_value");
+    }
+    uuid::Uuid::try_parse(text)
+        .map(|id| id.hyphenated().to_string())
+        .map_err(|_| "invalid_value")
+}
+
+/// One sort key with its SQL.
+#[derive(Clone, Debug)]
+struct SortKey {
+    /// `-name`, `name`, `sys.updated_at`, ...
+    spelled: String,
+    desc: bool,
+    /// `IS NULL` expression for fields; system timestamps are never null.
+    null: Option<String>,
+    value: String,
+    /// The value as text, what the cursor carries.
+    text: String,
+    /// The cast a cursor value takes back.
+    cast: &'static str,
+}
+
+fn sort_key(content_type: &ContentType, spelled: &str) -> Result<SortKey, &'static str> {
+    let (desc, name) = match spelled.strip_prefix('-') {
+        Some(name) => (true, name),
+        None => (false, spelled),
+    };
+    let system = |column: &str| SortKey {
+        spelled: spelled.to_owned(),
+        desc,
+        null: None,
+        value: column.to_owned(),
+        text: format!("to_char({column} AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"),
+        cast: "timestamptz",
+    };
+    match name {
+        "sys.updated_at" => Ok(system("v.draft_updated_at")),
+        "sys.created_at" => Ok(system("e.created_at")),
+        _ => {
+            let field = content_type.field(name).ok_or("unknown_field")?;
+            if !field.sortable {
+                return Err("not_sortable");
+            }
+            let value = field_expression(&field.name, &field.kind);
+            Ok(SortKey {
+                spelled: spelled.to_owned(),
+                desc,
+                null: Some(null_expression(&field.name)),
+                text: format!("({value})::text"),
+                value,
+                cast: cast(&field.kind),
+            })
+        }
+    }
+}
+
+/// A parsed management list request, ready to run.
+#[derive(Debug)]
+pub(crate) struct ListQuery {
+    pub limit: u32,
+    pub fields: Option<Vec<String>>,
+    pub statement: String,
+    pub params: Vec<Box<dyn ToSql + Sync + Send>>,
+    pub keys: usize,
+    /// The 16 hex characters cursors of this query carry.
+    pub fingerprint: String,
+}
+
+/// Collects SQL parameters, numbering them.
+struct Params(Vec<Box<dyn ToSql + Sync + Send>>);
+impl Params {
+    fn push(&mut self, value: impl ToSql + Sync + Send + 'static) -> String {
+        self.0.push(Box::new(value));
+        format!("${}", self.0.len())
+    }
+}
+
+/// A decoded cursor: the last row's sort values (text, `None` for null)
+/// and its entry id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    pub keys: Vec<Option<String>>,
+    pub id: String,
+}
+
+/// `base64url({"v":1,"q":...,"k":[...],"id":...})`, without padding.
+pub(crate) fn encode_cursor(fingerprint: &str, keys: &[Option<String>], id: &str) -> String {
+    let body = json!({"v": 1, "q": fingerprint, "k": keys, "id": id});
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(body.to_string())
+}
+
+/// Decode a cursor minted for the query with `fingerprint`, holding
+/// `keys` sort values; anything else is `invalid_cursor`.
+pub(crate) fn decode_cursor(
+    text: &str,
+    fingerprint: &str,
+    keys: usize,
+) -> Result<Cursor, Rejection> {
+    let invalid = || problem("invalid_cursor", "/cursor", "invalid_value");
+    if text.len() > MAX_CURSOR_BYTES {
+        return Err(invalid());
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(text)
+        .map_err(|_| invalid())?;
+    let Ok(Value::Object(body)) = serde_json::from_slice::<Value>(&bytes) else {
+        return Err(invalid());
+    };
+    if body.len() != 4 || body.get("v") != Some(&json!(1)) {
+        return Err(invalid());
+    }
+    if body.get("q").and_then(Value::as_str) != Some(fingerprint) {
+        return Err(invalid());
+    }
+    let id = body
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?
+        .to_owned();
+    let values = body
+        .get("k")
+        .and_then(Value::as_array)
+        .ok_or_else(invalid)?;
+    if values.len() != keys {
+        return Err(invalid());
+    }
+    let mut out = Vec::with_capacity(keys);
+    for value in values {
+        match value {
+            Value::Null => out.push(None),
+            Value::String(s) if s.len() <= 1024 => out.push(Some(s.clone())),
+            _ => return Err(invalid()),
+        }
+    }
+    Ok(Cursor { keys: out, id })
+}
+
+/// Whether `text` parses under `cast` exactly as PostgreSQL will cast it,
+/// so a forged cursor never reaches the database as a cast error.
+fn castable(cast: &str, text: &str) -> bool {
+    match cast {
+        "bigint" => text.parse::<i64>().is_ok(),
+        "float8" => text.parse::<f64>().is_ok_and(f64::is_finite),
+        "numeric" => {
+            let digits = text.strip_prefix('-').unwrap_or(text);
+            let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+            !whole.is_empty()
+                && whole.len() <= 40
+                && fraction.len() <= 40
+                && whole.bytes().all(|b| b.is_ascii_digit())
+                && fraction.bytes().all(|b| b.is_ascii_digit())
+                && (!digits.contains('.') || !fraction.is_empty())
+        }
+        "timestamptz" => text.ends_with('Z') && text.parse::<jiff::Timestamp>().is_ok(),
+        _ => !text.contains('\0'),
+    }
+}
+
+fn hex16(text: &str) -> String {
+    let digest = Sha256::digest(text.as_bytes());
+    let mut out = String::with_capacity(16);
+    for byte in &digest[..8] {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Parse a management list query string for `content_type` in `scope`.
+pub(crate) fn parse_list(
+    model: &ContentModel,
+    content_type: &ContentType,
+    scope: &str,
+    query: Option<&str>,
+    limits: &Limits,
+) -> Result<ListQuery, Rejection> {
+    let pairs = pairs(query)?;
+    let mut locale = None;
+    let mut status = None;
+    let mut sort = None;
+    let mut limit = None;
+    let mut cursor = None;
+    let mut fields = None;
+    // (field, op) -> raw values, in first-seen order.
+    let mut clauses: Vec<((String, Op), Vec<String>)> = Vec::new();
+    let mut unknown = Vec::new();
+    let mut filter_problems = Vec::new();
+    for (key, value) in pairs {
+        if let Some(rest) = key.strip_prefix("filter[") {
+            let parsed = rest
+                .strip_suffix(']')
+                .and_then(|r| r.split_once("]["))
+                .filter(|(f, o)| {
+                    !f.is_empty() && !o.contains(['[', ']']) && !f.contains(['[', ']'])
+                });
+            let Some((field, op)) = parsed else {
+                filter_problems.push(detail("/filter", "invalid_key"));
+                continue;
+            };
+            let Some(op) = Op::parse(op) else {
+                filter_problems.push(detail("/filter", "unknown_operator"));
+                continue;
+            };
+            let key = (field.to_owned(), op);
+            match clauses.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, values)) if op.repeatable() => values.push(value),
+                Some(_) => filter_problems.push(detail("/filter", "duplicate_key")),
+                None => clauses.push((key, vec![value])),
+            }
+            continue;
+        }
+        let slot = match key.as_str() {
+            "locale" => &mut locale,
+            "status" => &mut status,
+            "sort" => &mut sort,
+            "limit" => &mut limit,
+            "cursor" => &mut cursor,
+            "fields" => &mut fields,
+            _ => {
+                unknown.push(detail("", "unknown_parameter"));
+                continue;
+            }
+        };
+        if slot.is_some() {
+            unknown.push(detail(&format!("/{key}"), "duplicate_parameter"));
+        } else {
+            *slot = Some(value);
+        }
+    }
+    let status = match status.as_deref() {
+        None => StatusFilter::Any,
+        Some(text) => match StatusFilter::parse(text) {
+            Some(status) => status,
+            None => {
+                unknown.push(detail("/status", "invalid_value"));
+                StatusFilter::Any
+            }
+        },
+    };
+    let limit = match limit.as_deref() {
+        None => limits.default_page_size,
+        Some(text) => match text.parse::<u32>() {
+            Ok(n) if (1..=limits.max_page_size).contains(&n) => n,
+            _ => {
+                unknown.push(detail("/limit", "invalid_value"));
+                limits.default_page_size
+            }
+        },
+    };
+    let fields = match fields.as_deref() {
+        None => None,
+        Some(text) => {
+            let names: Vec<String> = text.split(',').map(str::to_owned).collect();
+            if names.iter().any(|n| content_type.field(n).is_none()) {
+                unknown.push(detail("/fields", "unknown_field"));
+            }
+            Some(names)
+        }
+    };
+    if !unknown.is_empty() {
+        return Err(rejection("invalid_query", unknown));
+    }
+    let locale = match locale {
+        None => model.default_locale().code.clone(),
+        Some(code) => code,
+    };
+    if !locale_allowed(model, content_type, &locale) {
+        return Err(Failure::permanent("locale_unknown").into());
+    }
+
+    let mut params = Params(Vec::new());
+    let scope_param = params.push(scope.to_owned());
+    let type_param = params.push(content_type.name.clone());
+    let locale_param = params.push(locale.clone());
+    let mut conditions = String::new();
+    let mut canonical: Vec<String> = Vec::new();
+    if clauses.len() > limits.max_filters as usize {
+        filter_problems.push(detail("/filter", "too_many_filters"));
+    }
+    for ((name, op), values) in &clauses {
+        match filter(content_type, name, *op, values, &mut params) {
+            Ok((sql, normalized)) => {
+                conditions.push_str(" AND ");
+                conditions.push_str(&sql);
+                canonical.push(format!(
+                    "{name}\u{1f}{}\u{1f}{}",
+                    op.as_str(),
+                    normalized.join("\u{1e}")
+                ));
+            }
+            Err((path, code)) => filter_problems.push(detail(&path, code)),
+        }
+    }
+    if !filter_problems.is_empty() {
+        return Err(rejection("invalid_filter", filter_problems));
+    }
+    canonical.sort();
+
+    let spelled: Vec<String> = match sort.as_deref() {
+        None => vec!["-sys.updated_at".to_owned()],
+        Some(text) => text.split(',').map(str::to_owned).collect(),
+    };
+    let mut sort_problems = Vec::new();
+    if spelled.len() > limits.max_sort_keys as usize {
+        sort_problems.push(detail("/sort", "too_many_keys"));
+    }
+    let mut keys = Vec::new();
+    for spelled in &spelled {
+        let bare = spelled.trim_start_matches('-');
+        if keys
+            .iter()
+            .any(|k: &SortKey| k.spelled.trim_start_matches('-') == bare)
+        {
+            sort_problems.push(detail("/sort", "duplicate_key"));
+            continue;
+        }
+        match sort_key(content_type, spelled) {
+            Ok(key) => keys.push(key),
+            Err(code) => sort_problems.push(detail("/sort", code)),
+        }
+    }
+    if !sort_problems.is_empty() {
+        return Err(rejection("invalid_sort", sort_problems));
+    }
+    let fingerprint = hex16(&format!(
+        "{}\n{scope}\ndraft\n{locale}\n{}\n{}\n{}",
+        content_type.name,
+        status.as_str(),
+        canonical.join("\n"),
+        spelled.join(",")
+    ));
+
+    let mut after = String::new();
+    if let Some(text) = cursor {
+        let cursor = decode_cursor(&text, &fingerprint, keys.len())?;
+        let valid = uuid_value(&cursor.id).is_ok()
+            && keys
+                .iter()
+                .zip(&cursor.keys)
+                .all(|(key, value)| match value {
+                    None => key.null.is_some(),
+                    Some(text) => castable(key.cast, text),
+                });
+        if !valid {
+            return Err(problem("invalid_cursor", "/cursor", "invalid_value"));
+        }
+        after = after_condition(&keys, &cursor, &mut params);
+    }
+
+    let mut order = String::new();
+    let mut texts = String::new();
+    for key in &keys {
+        if let Some(null) = &key.null {
+            let _ = write!(order, "{null} ASC, ");
+        }
+        let _ = write!(
+            order,
+            "{} {}, ",
+            key.value,
+            if key.desc { "DESC" } else { "ASC" }
+        );
+        let _ = write!(texts, ", {}", key.text);
+    }
+    order.push_str("v.entry_id ASC");
+    let fetch = params.push(i64::from(limit) + 1);
+    let statement = format!(
+        "SELECT {}{texts} FROM {VARIANT_FROM} \
+          WHERE v.scope = {scope_param} AND v.content_type = {type_param} \
+            AND v.locale = {locale_param} AND NOT v.deleted AND e.deleted_at IS NULL\
+            {}{conditions}{after} \
+          ORDER BY {order} LIMIT {fetch}",
+        variant_columns(),
+        status.sql(),
+    );
+    Ok(ListQuery {
+        limit,
+        fields,
+        statement,
+        params: params.0,
+        keys: keys.len(),
+        fingerprint,
+    })
+}
+
+/// Whether `locale` addresses a variant of `content_type`: a configured
+/// locale, and the default one for a non-localized type.
+pub(crate) fn locale_allowed(
+    model: &ContentModel,
+    content_type: &ContentType,
+    locale: &str,
+) -> bool {
+    if content_type.localized {
+        model.locales().iter().any(|l| l.code == locale)
+    } else {
+        model.default_locale().code == locale
+    }
+}
+
+/// The keyset condition "after `cursor`" for `keys` then `entry_id`:
+/// lexicographic over `(is null, value)` per key, nulls last.
+fn after_condition(keys: &[SortKey], cursor: &Cursor, params: &mut Params) -> String {
+    let mut terms: Vec<String> = Vec::new();
+    let mut prefix: Vec<String> = Vec::new();
+    let joined = |prefix: &[String], last: String| {
+        if prefix.is_empty() {
+            last
+        } else {
+            format!("{} AND {last}", prefix.join(" AND "))
+        }
+    };
+    for (key, value) in keys.iter().zip(&cursor.keys) {
+        if let Some(null) = &key.null {
+            let last_null = value.is_none();
+            if !last_null {
+                // Every null row comes after every non-null one.
+                terms.push(joined(&prefix, null.clone()));
+                prefix.push(format!("NOT {null}"));
+            } else {
+                prefix.push(null.clone());
+            }
+        }
+        if let Some(text) = value {
+            let param = params.push(text.clone());
+            let typed = format!("{param}::text::{}", key.cast);
+            let op = if key.desc { "<" } else { ">" };
+            terms.push(joined(&prefix, format!("{} {op} {typed}", key.value)));
+            prefix.push(format!("{} = {typed}", key.value));
+        }
+    }
+    let id = params.push(cursor.id.clone());
+    terms.push(joined(&prefix, format!("v.entry_id > {id}::text::uuid")));
+    format!(
+        " AND ({})",
+        terms
+            .iter()
+            .map(|t| format!("({t})"))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    )
+}
+
+type FilterError = (String, &'static str);
+
+/// One filter clause as SQL plus its normalized values.
+fn filter(
+    content_type: &ContentType,
+    name: &str,
+    op: Op,
+    values: &[String],
+    params: &mut Params,
+) -> Result<(String, Vec<String>), FilterError> {
+    if values.len() > MAX_FILTER_VALUES {
+        return Err(("/filter".into(), "too_many_values"));
+    }
+    if let Some(system) = name.strip_prefix("sys.") {
+        return system_filter(system, op, values, params);
+    }
+    let Some(field) = content_type.field(name) else {
+        return Err(("/filter".into(), "unknown_field"));
+    };
+    let path = format!("/filter/{name}/{}", op.as_str());
+    if !field.filterable {
+        return Err((path, "not_filterable"));
+    }
+    let single = || values.first().cloned().unwrap_or_default();
+    match op {
+        Op::Exists => {
+            let present = match single().as_str() {
+                "true" => true,
+                "false" => false,
+                _ => return Err((path, "invalid_value")),
+            };
+            let param = params.push(field.name.clone());
+            let sql = format!("v.draft_data ? {param}");
+            Ok((
+                if present { sql } else { format!("NOT ({sql})") },
+                vec![present.to_string()],
+            ))
+        }
+        Op::Eq | Op::In | Op::Ne => {
+            if op != Op::In && values.len() != 1 {
+                return Err((path, "invalid_value"));
+            }
+            let mut terms = Vec::new();
+            let mut normalized = Vec::new();
+            for text in values {
+                let stored = match &field.kind {
+                    FieldKind::Reference(rules) if rules.cardinality == Cardinality::One => {
+                        json!({ "id": uuid_value(text).map_err(|c| (path.clone(), c))? })
+                    }
+                    kind if kind.is_scalar() => {
+                        scalar_value(kind, text).map_err(|c| (path.clone(), c))?.0
+                    }
+                    _ => return Err((path, "not_supported")),
+                };
+                normalized.push(stored.to_string());
+                terms.push(containment(field, stored, params));
+            }
+            normalized.sort();
+            normalized.dedup();
+            let sql = format!("({})", terms.join(" OR "));
+            Ok((
+                if op == Op::Ne {
+                    format!("NOT {sql}")
+                } else {
+                    sql
+                },
+                normalized,
+            ))
+        }
+        Op::Has => {
+            let mut items = Vec::new();
+            for text in values {
+                let item = match &field.kind {
+                    FieldKind::Reference(rules) if rules.cardinality == Cardinality::Many => {
+                        json!({ "id": uuid_value(text).map_err(|c| (path.clone(), c))? })
+                    }
+                    FieldKind::List(list) if list.of.kind.is_scalar() => {
+                        scalar_value(&list.of.kind, text)
+                            .map_err(|c| (path.clone(), c))?
+                            .0
+                    }
+                    _ => return Err((path, "not_supported")),
+                };
+                items.push(item);
+            }
+            let mut normalized: Vec<String> = items.iter().map(Value::to_string).collect();
+            normalized.sort();
+            normalized.dedup();
+            Ok((containment(field, Value::Array(items), params), normalized))
+        }
+        Op::Lt | Op::Lte | Op::Gt | Op::Gte => {
+            if !field.sortable {
+                return Err((path, "not_sortable"));
+            }
+            if values.len() != 1 {
+                return Err((path, "invalid_value"));
+            }
+            let (_, text) = scalar_value(&field.kind, &single()).map_err(|c| (path.clone(), c))?;
+            let param = params.push(text.clone());
+            let comparison = op.comparison().unwrap_or("=");
+            Ok((
+                format!(
+                    "{} {comparison} {param}::text::{}",
+                    field_expression(&field.name, &field.kind),
+                    cast(&field.kind)
+                ),
+                vec![text],
+            ))
+        }
+    }
+}
+
+fn containment(field: &Field, value: Value, params: &mut Params) -> String {
+    let mut object = Map::new();
+    object.insert(field.name.clone(), value);
+    let param = params.push(Value::Object(object).to_string());
+    format!("v.draft_data @> {param}::text::jsonb")
+}
+
+fn system_filter(
+    name: &str,
+    op: Op,
+    values: &[String],
+    params: &mut Params,
+) -> Result<(String, Vec<String>), FilterError> {
+    let path = || format!("/filter/sys.{name}/{}", op.as_str());
+    match name {
+        "id" => {
+            let ids = values
+                .iter()
+                .map(|v| uuid_value(v))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|c| (path(), c))?;
+            match op {
+                Op::Eq | Op::Ne if ids.len() == 1 => {
+                    let param = params.push(ids[0].clone());
+                    let cmp = if op == Op::Eq { "=" } else { "<>" };
+                    Ok((format!("v.entry_id {cmp} {param}::text::uuid"), ids))
+                }
+                Op::In => {
+                    let mut sorted = ids.clone();
+                    sorted.sort();
+                    sorted.dedup();
+                    let param = params.push(ids);
+                    Ok((format!("v.entry_id = ANY({param}::text[]::uuid[])"), sorted))
+                }
+                Op::Eq | Op::Ne => Err((path(), "invalid_value")),
+                _ => Err((path(), "unknown_operator")),
+            }
+        }
+        "created_at" | "updated_at" => {
+            let column = if name == "created_at" {
+                "e.created_at"
+            } else {
+                "v.draft_updated_at"
+            };
+            let comparison = match op {
+                Op::Eq => "=",
+                other => other.comparison().ok_or((path(), "unknown_operator"))?,
+            };
+            let [value] = values else {
+                return Err((path(), "invalid_value"));
+            };
+            let value = scalar::datetime(value).map_err(|_| (path(), "invalid_value"))?;
+            let param = params.push(value.clone());
+            Ok((
+                format!("{column} {comparison} {param}::text::timestamptz"),
+                vec![value],
+            ))
+        }
+        _ => Err(("/filter".into(), "unknown_field")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_strings_decode_percent_escapes_and_plus() {
+        let pairs = pairs(Some("filter%5Btitle%5D%5Beq%5D=a+b%2Bc&limit=5")).unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                ("filter[title][eq]".into(), "a b+c".into()),
+                ("limit".into(), "5".into())
+            ]
+        );
+        assert!(super::pairs(Some("a=%zz")).is_err());
+        assert!(super::pairs(Some("a=%ff")).is_err());
+    }
+    #[test]
+    fn cursors_round_trip_and_refuse_other_queries() {
+        let text = encode_cursor("0123456789abcdef", &[Some("4".into()), None], "id");
+        let cursor = decode_cursor(&text, "0123456789abcdef", 2).unwrap();
+        assert_eq!(cursor.keys, vec![Some("4".into()), None]);
+        for (fingerprint, keys) in [("fedcba9876543210", 2), ("0123456789abcdef", 1)] {
+            assert_eq!(
+                decode_cursor(&text, fingerprint, keys)
+                    .unwrap_err()
+                    .failure
+                    .code,
+                "invalid_cursor"
+            );
+        }
+        assert!(decode_cursor("!!", "0123456789abcdef", 2).is_err());
+    }
+    #[test]
+    fn forged_cursor_values_never_reach_a_cast() {
+        assert!(castable("bigint", "-12"));
+        assert!(!castable("bigint", "1.5"));
+        assert!(castable("numeric", "-10.25"));
+        assert!(!castable("numeric", "1e5"));
+        assert!(!castable("numeric", "1."));
+        assert!(castable("timestamptz", "2026-10-24T09:00:00.123456Z"));
+        assert!(!castable("timestamptz", "yesterday"));
+        assert!(!castable("float8", "NaN"));
+    }
+}

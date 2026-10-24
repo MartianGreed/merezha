@@ -13,22 +13,34 @@
 //! write starts with ([`ContentState::check_writable`]) and the platform
 //! [`ContentModule`].
 //!
-//! Entry routes and writes are C3 onward. They take the loaded model and
-//! the write check from [`ContentHandle::state`], map unique violations
-//! back to fields through [`DerivedIndex::field`], and resolve
-//! [`Validated::references`] against the database.
+//! CT-C3, drafts and revisions: the management routes under
+//! `/v1/content/manage` ([`ContentModule`]'s router): entry creation,
+//! variant reads, `PUT`, `PATCH`, revision history, restore with
+//! retention, singletons, shared-field copies, the filtered and sorted
+//! list with keyset cursors, unique violations mapped to their field
+//! through [`DerivedIndex::field`], reference resolution and referrers
+//! ([`Store`]). Every write transaction starts with
+//! [`ContentState::check_writable`] and every statement carries the
+//! route's scope and content type. Publishing and deletion are C4,
+//! delivery C5 and assets C7.
 mod activation;
 mod canonical;
 mod diff;
+mod http;
 mod indexes;
 mod issues;
+mod json;
 mod model;
 mod module;
 mod parse;
+mod query;
+mod refs;
 mod rich_text;
 mod scalar;
 mod schema;
+mod settings;
 mod slug;
+mod store;
 mod value;
 
 pub use activation::{
@@ -38,6 +50,7 @@ pub use activation::{
     read_active, unneeded_indexes, verify,
 };
 pub use diff::{Change, ChangeClass, change_classes, diff, diff_models};
+pub use http::{ENTRIES_READ, ENTRIES_WRITE, NO_STORE, RESOURCE_KIND};
 pub use indexes::{
     DerivedIndex, INDEX_PREFIX, IndexPurpose, IndexTable, SCHEMA, derived_indexes, drop_statement,
     is_derived_name,
@@ -52,9 +65,15 @@ pub use parse::{
     CONTENT_PERMISSIONS, MAX_DESCRIPTION, MAX_MODEL_BYTES, MAX_PATTERN_BYTES, ModelOptions,
     PATTERN_SIZE_LIMIT, PermissionCatalog,
 };
+pub use query::{MAX_CURSOR_BYTES, MAX_FILTER_VALUES, MAX_QUERY_BYTES};
 pub use rich_text::{MAX_HREF_BYTES, MAX_MARK_DEFS, MAX_SPAN_MARKS, MAX_SPANS};
 pub use schema::{MIGRATION_1, MIGRATIONS};
+pub use settings::{ContentSettings, Limits};
 pub use slug::slugify;
+pub use store::{
+    Actor, Content, DRAFT_SAVED, EntrySummary, Page, Referrer, Rejection, RevisionItem,
+    RevisionView, Saved, Store, Target, VariantView, WriteKind,
+};
 pub use value::{
     GENERATED_KEY_LENGTH, KeySource, MAX_ALT_LENGTH, MAX_DETAIL_PATH, RandomKeys, ReferenceTarget,
     Stage, ValidateOptions, Validated, ValueError, ValueReference, valid_key,
@@ -63,10 +82,12 @@ pub use value::{
 use merezha_platform::ErrorCode;
 
 /// The codes this crate returns, registered in the kernel error registry
-/// by [`ContentModule`] (R8). `content_model_superseded` reaches HTTP from
-/// every write of C3 onward, as do `validation_failed`, `invalid_json` and
-/// `content_type_not_found`. The model, index and activation codes are
-/// startup and readiness codes (section 5).
+/// by [`ContentModule`] (R8). `content_model_superseded` and
+/// `content_model_pending` reach HTTP from every write, as do the entry
+/// codes of section 5. The model, index and activation codes are startup
+/// and readiness codes. `revision_conflict`, `body_limit`,
+/// `unsupported_media_type`, `unauthenticated`, `unauthorized`,
+/// `tenant_required` and `timeout` are the kernel's.
 pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new(MODEL_INVALID, 422),
     ErrorCode::new("validation_failed", 422),
@@ -82,6 +103,17 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("content_activation_timeout", 503),
     ErrorCode::new("index_build_pending", 503),
     ErrorCode::new("index_build_failed", 422),
+    ErrorCode::new("entry_not_found", 404),
+    ErrorCode::new("revision_not_found", 404),
+    ErrorCode::new("locale_unknown", 400),
+    ErrorCode::new("invalid_query", 400),
+    ErrorCode::new("invalid_filter", 400),
+    ErrorCode::new("invalid_sort", 400),
+    ErrorCode::new("invalid_cursor", 400),
+    ErrorCode::new("variant_exists", 412),
+    ErrorCode::new("precondition_required", 428),
+    ErrorCode::new("entry_exists", 409),
+    ErrorCode::new("singleton_exists", 409),
 ];
 
 /// Every detail code field validation reports (section 2).

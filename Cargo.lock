@@ -1659,19 +1659,23 @@ name = "merezha-content"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "deunicode",
  "jiff",
+ "merezha-application",
  "merezha-domain",
  "merezha-jobs",
  "merezha-platform",
  "merezha-postgres",
  "regex",
  "rust_decimal",
+ "serde",
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "uuid",
 ]

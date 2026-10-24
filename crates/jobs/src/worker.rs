@@ -329,7 +329,17 @@ impl Worker {
 
     async fn lease(&self, lane: &Lane, free: usize) -> Result<Vec<Leased>, Failure> {
         let queue = lane.plan.name.clone();
-        let kinds = self.kinds.clone();
+        // Kinds whose handler turned leasing off stay available for other
+        // instances (content on an outdated host, CT §2).
+        let kinds: Vec<String> = self
+            .kinds
+            .iter()
+            .filter(|kind| self.handlers.get(*kind).is_some_and(|h| h.accepts_leases()))
+            .cloned()
+            .collect();
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
         let wanted = i64::try_from(free).unwrap_or(i64::MAX);
         let owner = self.owner.clone();
         let lease_secs = lane.plan.settings.lease.as_secs_f64();

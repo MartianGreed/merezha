@@ -609,6 +609,60 @@ async fn an_instance_without_the_handler_never_leases_the_job() {
     new.shutdown(soon()).await;
 }
 
+/// A handler whose leasing can be turned off, like content's on a host
+/// whose model was superseded.
+struct Gated {
+    open: Arc<std::sync::atomic::AtomicBool>,
+    runs: Arc<AtomicUsize>,
+}
+impl merezha_platform::ports::JobHandler for Gated {
+    fn handle<'a>(
+        &'a self,
+        _: merezha_platform::ports::JobContext,
+        _: serde_json::Value,
+    ) -> BoxFuture<'a, Result<(), JobFailure>> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        ok()
+    }
+    fn accepts_leases(&self) -> bool {
+        self.open.load(Ordering::SeqCst)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kind_whose_handler_refuses_leases_stays_available() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let config = jobs_config(&test, "[jobs]\npoll_interval_ms = 100");
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let gated: Arc<dyn merezha_platform::ports::JobHandler> = Arc::new(Gated {
+        open: open.clone(),
+        runs: runs.clone(),
+    });
+    let jobs = workers(
+        &db,
+        &config,
+        "gated",
+        vec![("tasks.gated", gated), ("tasks.other", func(|_, _| ok()))],
+    )
+    .await;
+    let gated_id = insert_job(&db, "tasks.gated", "tasks:gated", "{}", false).await;
+    let other_id = insert_job(&db, "tasks.other", "tasks:other", "{}", false).await;
+    // The other kind still runs; the refused one is never leased.
+    wait_state(&db, other_id, "succeeded", Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(state(&db, gated_id).await, "available");
+    assert!(attempts(&db, gated_id).await.is_empty());
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    open.store(true, Ordering::SeqCst);
+    wait_state(&db, gated_id, "succeeded", Duration::from_secs(2)).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    jobs.shutdown(soon()).await;
+}
+
 /// Records what the reissue hook was asked.
 #[derive(Default)]
 struct Reissued(Mutex<Vec<ReissueRequest>>);

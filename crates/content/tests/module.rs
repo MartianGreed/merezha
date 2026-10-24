@@ -151,10 +151,78 @@ fn every_model_problem_is_reported_with_its_toml_path_and_unknown_keys_fail() {
 }
 
 #[test]
+fn limits_and_revision_retention_are_validated_with_every_problem_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    project(
+        dir.path(),
+        false,
+        "[modules.content]\n\
+         limits = { max_page_size = 50, default_page_size = 60, max_filters = 0, \
+                    query_timeout = \"1h\", max_entry_bytes = \"big\", max_batch = 5 }\n\
+         revisions = { retain = 1 }\n",
+        &[("content.toml", V1)],
+    );
+    let issues = configure_issues(dir.path()).unwrap_err();
+    let mut issues: Vec<(&str, &str)> = issues
+        .iter()
+        .map(|(k, c)| (k.as_str(), c.as_str()))
+        .collect();
+    issues.sort();
+    assert_eq!(
+        issues,
+        [
+            ("modules.content.limits.default_page_size", "out_of_range"),
+            ("modules.content.limits.max_batch", "unknown_key"),
+            ("modules.content.limits.max_entry_bytes", "expected_integer"),
+            ("modules.content.limits.max_filters", "out_of_range"),
+            ("modules.content.limits.query_timeout", "out_of_range"),
+            ("modules.content.revisions.retain", "out_of_range"),
+        ]
+    );
+    project(
+        dir.path(),
+        false,
+        "[modules.content]\nlimits = { max_page_size = 10, query_timeout = \"250ms\" }\n\
+         revisions = { retain = 7 }\n",
+        &[("content.toml", V1)],
+    );
+    let handle = configure_issues(dir.path()).unwrap();
+    let settings = *handle.state().unwrap().settings();
+    assert_eq!(settings.revisions_retain, 7);
+    assert_eq!(settings.limits.max_page_size, 10);
+    // The default page size follows a lower maximum.
+    assert_eq!(settings.limits.default_page_size, 10);
+    assert_eq!(settings.limits.query_timeout, Duration::from_millis(250));
+    assert_eq!(settings.limits.max_entry_bytes, 262_144);
+    project(
+        dir.path(),
+        false,
+        "[modules.content]\nlimits = 3\n",
+        &[("content.toml", V1)],
+    );
+    assert_eq!(
+        configure_issues(dir.path()).unwrap_err(),
+        [(
+            "modules.content.limits".to_owned(),
+            "expected_table".to_owned()
+        )]
+    );
+}
+
+#[test]
 fn content_errors_register_with_the_kernel_codes() {
     let mut registry = ErrorRegistry::kernel();
     registry.register("content", ERRORS).unwrap();
     for (code, status) in [
+        ("entry_not_found", 404),
+        ("revision_not_found", 404),
+        ("locale_unknown", 400),
+        ("invalid_filter", 400),
+        ("variant_exists", 412),
+        ("revision_conflict", 412),
+        ("precondition_required", 428),
+        ("entry_exists", 409),
+        ("singleton_exists", 409),
         ("content_model_superseded", 503),
         ("content_model_invalid", 422),
         ("content_model_breaking", 422),

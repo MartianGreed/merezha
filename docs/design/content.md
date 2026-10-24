@@ -833,6 +833,48 @@ All paths are under `/v1/content/manage`. `{type}` is a content type,
 
 Batch publish items carry `revision` in place of `If-Match`.
 
+C3 ships the draft and revision routes of this table (list, create, entry
+summary, variant read, `PUT`, `PATCH`, revisions, restore, referrers and
+their singleton forms); the rest arrive with C4, C5 and C7. As built:
+
+- `If-Match` names one strong `"r<n>"`. Any other value (`*`, a weak or
+  listed tag) never matches the draft and is `revision_conflict`.
+  `If-None-Match: *` sent with `If-Match` fails as RFC 9110 orders them:
+  `variant_exists` when the variant exists.
+- A `PUT` that leaves out a slug the variant has keeps it (the host never
+  changes an existing slug); `PATCH` removes one only when it sends `null`.
+- A non-localized type has only the default locale: any other locale on
+  its routes or in `POST` is `locale_unknown`.
+- Field rules and reference problems are reported together: the
+  references of the fields that pass on their own are resolved even when
+  others fail. A restore keeps them all as `warnings` (only a `unique`
+  conflict fails it) and records the refs of the fields that resolve.
+- A reference whose target lives in a scope the entry cannot reference is
+  `reference_scope`; the lookup that tells it from `reference_not_found`
+  reads only whether a live entry of that id exists.
+- Repeated `filter[f][in]` keys are one clause (any value); repeated
+  `filter[f][has]` keys must all be present. Other operators take one
+  value per field. `sys.id` takes `eq`, `in` and `ne`; `sys.created_at`
+  and `sys.updated_at` take `eq` and the range operators.
+- Revisions, referrers and lists page with the cursor shape of section 5;
+  each cursor is bound to its listing (the variant, or the entry and
+  stage).
+- Referrers list the refs recorded in the target's scope; `title` comes
+  from the referring variant's draft, or its `published` row for
+  `stage=published`.
+- Every route answers `private, no-store`; single-variant responses carry
+  the strong revision ETag and `fields` in model order. `populate` on a
+  draft read comes with C5's population; until then it is an unknown
+  parameter (`invalid_query`).
+- A save of a non-default variant share-locks the default variant while it
+  reads the shared values, so a concurrent default save cannot be undone
+  by a stale copy.
+
+Until identity lands, C3 relies on the host's policy: a private listener
+allows every route, a public one denies every route (`unauthenticated`
+without a principal). The `identity_required` startup refusal waits for
+identity's `Authenticator`, so a public listener still starts.
+
 ### Delivery routes
 
 | Method and path | Access | Query | Success |
