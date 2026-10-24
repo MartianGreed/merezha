@@ -98,7 +98,12 @@ fn post(address: SocketAddr, path: &str, body: &str) -> (u16, Value) {
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    write!(stream,"POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",body.len()).unwrap();
+    // One write, as in `support::request`: head and body arrive together.
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     let (headers, body) = response.split_once("\r\n\r\n").unwrap();

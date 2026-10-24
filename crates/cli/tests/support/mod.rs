@@ -151,18 +151,22 @@ pub struct Reply {
     /// The JSON body, or the raw text as a JSON string.
     pub body: Value,
 }
-/// One request on its own `Connection: close` connection.
+/// One request on its own `Connection: close` connection, head and body
+/// sent in one write. The host may answer before reading a body (an unknown
+/// service, a denied message) and then close; a body byte still unread at
+/// that close makes the kernel reset the connection, which can discard the
+/// reply. One write lands the body with the head, so the server has buffered
+/// it by the time it parses the head.
 pub fn request(address: SocketAddr, method: &str, path: &str, body: &str) -> Reply {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    write!(
-        stream,
+    let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
-    )
-    .unwrap();
+    );
+    stream.write_all(request.as_bytes()).unwrap();
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     let (headers, body) = response.split_once("\r\n\r\n").unwrap();

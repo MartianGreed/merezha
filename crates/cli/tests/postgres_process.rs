@@ -7,34 +7,17 @@ use merezha_postgres::TestDatabase;
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::{Read, Write},
-    net::{SocketAddr, TcpStream},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
 };
 use support::Host;
 
 const DATABASE_ENV: &str = "RUN_TEST_DATABASE_URL";
 
 fn request(address: SocketAddr, path: &str, body: &str) -> (u16, Value) {
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    write!(
-        stream,
-        "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
-    (
-        headers.split_whitespace().nth(1).unwrap().parse().unwrap(),
-        serde_json::from_str(body).unwrap_or_else(|_| json!(body)),
-    )
+    let reply = support::request(address, "POST", path, body);
+    (reply.status, reply.body)
 }
 fn command(stream: &str, key: Option<&str>) -> String {
     json!({"tag":"Add","stream":stream,"payload":{"amount":1},"idempotency_key":key,
