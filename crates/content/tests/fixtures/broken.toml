@@ -1,0 +1,57 @@
+# A model with one or more problems in every section, for the golden
+# output in broken.expected.
+version = 0
+locales = [
+  { code = "en", default = true },
+  { code = "fr", fallback = "de" },
+  { code = "en_GB" },
+]
+
+[[migrations]]
+to = 2
+
+[components.seo]
+fields = [
+  { name = "title", type = "string", max_length = 5000 },
+  { name = "title", type = "text" },
+  { name = "image", type = "asset" },
+  { name = "rank", type = "integer", sortable = true },
+]
+
+[components.block]
+fields = [{ name = "x", type = "string" }]
+
+[types.article]
+kind = "page"
+title_field = "summary"
+fields = [
+  { name = "title", type = "string", max_length = 0, unique = true },
+  { name = "slug", type = "slug", from = "missing" },
+  { name = "category", type = "enum", values = ["News"] },
+  { name = "author", type = "reference", to = ["person"], min_items = 1 },
+  { name = "body", type = "rich_text", styles = ["normal", "h7"], embeds = ["quote"] },
+  { name = "reading_minutes", type = "integer", min = 10, max = 1, sortable = true },
+  { name = "price", type = "decimal", precision = 4, scale = 6 },
+  { name = "data", type = "json", filterable = true },
+  { name = "sys", type = "string" },
+  { name = "pattern", type = "string", pattern = "(" },
+  { name = "colour", type = "colour" },
+  { name = "count", type = "integer", default = 1.5 },
+  { name = "extra", type = "string", maxlength = 3 },
+  { name = "tags", type = "list", of = { type = "rich_text" } },
+]
+
+[types.partner_brief]
+access = "private"
+fields = [{ name = "title", type = "string" }]
+
+[types.secret]
+access = { permission = "billing.read" }
+fields = []
+
+[types.manage]
+access = "public"
+fields = [{ name = "title", type = "string" }]
+
+[settings]
+colour = "red"
