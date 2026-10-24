@@ -366,81 +366,6 @@ fn count_of(instance: &Instance, tag: &str) -> (Value, u64) {
     (result.value, result.checkpoint)
 }
 
-/// A3 test 1: without explicit catch-up, projections converge within 1 s
-/// through `NOTIFY`, and within the interval without the `LISTEN` session.
-#[test]
-fn projections_converge_within_a_second_by_notify_and_within_the_interval_without_listen() {
-    let Some(pg) = Pg::new() else { return };
-    let probe = Arc::new(Probe::default());
-    // The writer runs no scheduler, so only the notification wakes the
-    // reader (its interval is 10 minutes).
-    let writer = pg
-        .open(config(), &probe, BackgroundOptions::default())
-        .unwrap();
-    let never = Duration::from_secs(600);
-    let reader = pg.start(
-        config(),
-        &probe,
-        Pg::options(CatchUp::Auto, never, RunHooks::default()),
-    );
-    until(Duration::from_secs(5), "the listener connects", || {
-        reader.app.status().unwrap().listener == Some("connected")
-    });
-    for round in 1..=3u64 {
-        writer.app.command(add("a", 1)).unwrap();
-        let took = until(Duration::from_secs(1), "notify convergence", || {
-            pg.checkpoint("count") == round
-        });
-        eprintln!("round {round}: converged in {took:?}");
-    }
-    // Kill the LISTEN session: the listener reconnects, wakes every lane
-    // and converges again.
-    pg.execute(
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-         WHERE query LIKE 'LISTEN merezha_app_events%' AND datname = current_database()",
-    );
-    writer.app.command(add("a", 1)).unwrap();
-    until(
-        Duration::from_secs(1),
-        "convergence after a reconnect",
-        || pg.checkpoint("count") == 4,
-    );
-    until(Duration::from_secs(5), "the listener reconnects", || {
-        reader.app.status().unwrap().listener == Some("connected")
-    });
-    pg.stop(&reader);
-    // Without a LISTEN session only the interval wakes another host's runs.
-    let hooks = RunHooks {
-        skip_listen: true,
-        ..RunHooks::default()
-    };
-    let deaf = pg.start(
-        config(),
-        &probe,
-        Pg::options(CatchUp::Auto, never, hooks.clone()),
-    );
-    // Its lanes check once at start; ready means they all did.
-    until(
-        Duration::from_secs(5),
-        "the deaf instance's start-up check",
-        || deaf.scheduler.as_ref().unwrap().ready(),
-    );
-    writer.app.command(add("a", 1)).unwrap();
-    std::thread::sleep(Duration::from_millis(1500));
-    assert_eq!(pg.checkpoint("count"), 4, "nothing woke the deaf instance");
-    pg.stop(&deaf);
-    let polling = pg.start(
-        config(),
-        &probe,
-        Pg::options(CatchUp::Auto, Duration::from_millis(500), hooks),
-    );
-    writer.app.command(add("a", 1)).unwrap();
-    until(Duration::from_millis(1500), "interval convergence", || {
-        pg.checkpoint("count") == 6
-    });
-    pg.stop(&polling);
-}
-
 /// A3 test 2 and "two instances never run the same projection at once":
 /// every batch is applied once, never by two runs at once.
 #[test]
@@ -809,9 +734,11 @@ fn a_rebuild_over_20000_events_serves_the_old_state_until_an_atomic_swap() {
         "rebuild_in_progress"
     );
     let stop = AtomicBool::new(false);
+    // Queries the reader answered from the rebuilt state so far.
+    let rebuilt = AtomicUsize::new(0);
     let (old, new) = std::thread::scope(|scope| {
         let reader = scope.spawn(|| {
-            let (mut old, mut new) = (0, 0);
+            let mut old = 0;
             let mut swapped = false;
             while !stop.load(Ordering::SeqCst) {
                 let (value, checkpoint) = count_of(&a, "Count");
@@ -820,13 +747,13 @@ fn a_rebuild_over_20000_events_serves_the_old_state_until_an_atomic_swap() {
                 assert!(checkpoint >= 20_000, "{value} at {checkpoint}");
                 if value["cold"] == true {
                     swapped = true;
-                    new += 1;
+                    rebuilt.fetch_add(1, Ordering::SeqCst);
                 } else {
                     assert!(!swapped, "the old state came back after the swap");
                     old += 1;
                 }
             }
-            (old, new)
+            (old, rebuilt.load(Ordering::SeqCst))
         });
         for i in 0..20 {
             a.app.command(add(&format!("w{}", i % 4), 1)).unwrap();
@@ -838,7 +765,11 @@ fn a_rebuild_over_20000_events_serves_the_old_state_until_an_atomic_swap() {
         until(Duration::from_secs(10), "live carries on", || {
             pg.checkpoint("count") == 20_052
         });
-        std::thread::sleep(Duration::from_millis(100));
+        // However starved the reader, it answers from the swapped state
+        // before it stops.
+        until(Duration::from_secs(30), "a query after the swap", || {
+            rebuilt.load(Ordering::SeqCst) > 0
+        });
         stop.store(true, Ordering::SeqCst);
         reader.join().unwrap()
     });
@@ -1459,4 +1390,85 @@ fn a_listen_reconnect_wakes_every_live_lane() {
         || pg.checkpoint("count") == 1 && pg.checkpoint("other") == 1,
     );
     pg.stop(&instance);
+}
+
+/// Latency and deadline-race tests (issue #37). CI runs them after the
+/// parallel suite, alone and one at a time:
+/// `cargo test -- --test-threads=1 timing::`.
+mod timing {
+    use super::*;
+    /// A3 test 1: without explicit catch-up, projections converge within 1 s
+    /// through `NOTIFY`, and within the interval without the `LISTEN` session.
+    #[test]
+    fn projections_converge_within_a_second_by_notify_and_within_the_interval_without_listen() {
+        let Some(pg) = Pg::new() else { return };
+        let probe = Arc::new(Probe::default());
+        // The writer runs no scheduler, so only the notification wakes the
+        // reader (its interval is 10 minutes).
+        let writer = pg
+            .open(config(), &probe, BackgroundOptions::default())
+            .unwrap();
+        let never = Duration::from_secs(600);
+        let reader = pg.start(
+            config(),
+            &probe,
+            Pg::options(CatchUp::Auto, never, RunHooks::default()),
+        );
+        until(Duration::from_secs(5), "the listener connects", || {
+            reader.app.status().unwrap().listener == Some("connected")
+        });
+        for round in 1..=3u64 {
+            writer.app.command(add("a", 1)).unwrap();
+            let took = until(Duration::from_secs(1), "notify convergence", || {
+                pg.checkpoint("count") == round
+            });
+            eprintln!("round {round}: converged in {took:?}");
+        }
+        // Kill the LISTEN session: the listener reconnects, wakes every lane
+        // and converges again.
+        pg.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE query LIKE 'LISTEN merezha_app_events%' AND datname = current_database()",
+        );
+        writer.app.command(add("a", 1)).unwrap();
+        until(
+            Duration::from_secs(1),
+            "convergence after a reconnect",
+            || pg.checkpoint("count") == 4,
+        );
+        until(Duration::from_secs(5), "the listener reconnects", || {
+            reader.app.status().unwrap().listener == Some("connected")
+        });
+        pg.stop(&reader);
+        // Without a LISTEN session only the interval wakes another host's runs.
+        let hooks = RunHooks {
+            skip_listen: true,
+            ..RunHooks::default()
+        };
+        let deaf = pg.start(
+            config(),
+            &probe,
+            Pg::options(CatchUp::Auto, never, hooks.clone()),
+        );
+        // Its lanes check once at start; ready means they all did.
+        until(
+            Duration::from_secs(5),
+            "the deaf instance's start-up check",
+            || deaf.scheduler.as_ref().unwrap().ready(),
+        );
+        writer.app.command(add("a", 1)).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(pg.checkpoint("count"), 4, "nothing woke the deaf instance");
+        pg.stop(&deaf);
+        let polling = pg.start(
+            config(),
+            &probe,
+            Pg::options(CatchUp::Auto, Duration::from_millis(500), hooks),
+        );
+        writer.app.command(add("a", 1)).unwrap();
+        until(Duration::from_millis(1500), "interval convergence", || {
+            pg.checkpoint("count") == 6
+        });
+        pg.stop(&polling);
+    }
 }

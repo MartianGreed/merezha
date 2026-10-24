@@ -74,7 +74,7 @@ pub async fn started(db: &Database, config: &JobsConfig, mode: RelayMode) -> PgJ
     jobs
 }
 pub async fn wait_ready(jobs: &PgJobs) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PATIENCE;
     while jobs.ready().await.is_err() {
         assert!(Instant::now() < deadline, "jobs runtime never became ready");
         tokio::time::sleep(Duration::from_millis(10)).await;

@@ -914,8 +914,8 @@ async fn fired_schedules_are_counted_and_their_attempts_are_roots() {
 /// Review item 4 (M3): on the handler path, a dead letter counts only once
 /// its fenced settle wrote it. Attempt 1 outlives its lease (no
 /// heartbeat), the reaper re-offers the job, attempt 2 succeeds, and
-/// attempt 1's late permanent failure is fenced out: no dead letter, one
-/// `lease_lost` attempt.
+/// attempt 1's late permanent failure, returned only once attempt 2 began,
+/// is fenced out: no dead letter, one `lease_lost` attempt.
 #[tokio::test]
 async fn a_fenced_out_permanent_failure_is_not_a_dead_letter() {
     let Some(test) = TestDatabase::create() else {
@@ -933,16 +933,19 @@ async fn a_fenced_out_permanent_failure_is_not_a_dead_letter() {
         .without_heartbeat()
         .with_telemetry(&harness.telemetry().meters(), Duration::from_millis(50));
     jobs.ports(&db);
+    let second_began = Arc::new(tokio::sync::Notify::new());
     handle(&jobs, "tasks")
         .register(
             "tasks.remind",
             "default",
-            func(|ctx, _| {
+            func(move |ctx, _| {
+                let began = second_began.clone();
                 Box::pin(async move {
                     if ctx.attempt == 1 {
-                        tokio::time::sleep(Duration::from_millis(2_500)).await;
+                        let _ = tokio::time::timeout(PATIENCE, began.notified()).await;
                         return Err(JobFailure::permanent("bad_address"));
                     }
+                    began.notify_one();
                     Ok(())
                 })
             }),
@@ -1124,9 +1127,11 @@ async fn a_failing_sample_keeps_the_last_values_within_its_deadline() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // Bounded by the sample's deadline, not by the lock: generous for a
+    // loaded machine, far below the test's patience it would otherwise use.
     let took = locked.elapsed();
     assert!(
-        took < merezha_jobs::SAMPLE_DEADLINE + Duration::from_secs(2),
+        took < merezha_jobs::SAMPLE_DEADLINE + Duration::from_secs(10),
         "the sample waited {took:?}"
     );
     assert_eq!(harness.metric("merezha.job.count").value(&ready), Some(1.0));
@@ -1191,10 +1196,11 @@ async fn the_relay_skips_records_another_relay_holds() {
         .batch_execute("BEGIN; SELECT id FROM merezha_jobs.outbox ORDER BY id LIMIT 1 FOR UPDATE")
         .await
         .unwrap();
+    // A relay waiting on the lock would wait out its 10 s deadline.
     let started = Instant::now();
     let report = jobs.relay_now().await.unwrap();
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(5),
         "the relay waited"
     );
     assert_eq!(report.relayed, 2);

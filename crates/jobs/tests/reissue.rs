@@ -327,8 +327,11 @@ async fn a_late_settle_of_a_reverted_claim_is_fenced_out() {
     let id = flagged_dead(&db, "tasks:fenced").await;
     let first = jobs.clone();
     let slow = tokio::spawn(async move { first.replay(id, Some("usr_a")).await });
+    // A's hook runs only once its claim committed: wait for the hook, not
+    // for the claimed row, which the reaper may revert before a starved
+    // poll sees it.
     let deadline = Instant::now() + PATIENCE;
-    while claim_of(&db, id).await != ("cancelled".into(), 1, true) {
+    while hook.0.load(Ordering::SeqCst) == 0 {
         assert!(Instant::now() < deadline, "A never claimed");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

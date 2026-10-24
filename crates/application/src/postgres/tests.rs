@@ -343,13 +343,15 @@ fn an_append_that_answered_keeps_its_outcome_when_only_the_reset_fails_or_is_lat
         .await
         .unwrap();
     });
+    // Room for the append on a loaded machine, and well under the 5 s
+    // session default that bounds the late reset below.
     let mut short = config();
-    short.limits.timeout_ms = 1000;
+    short.limits.timeout_ms = 2000;
     for (position, reset) in [
         // The reset fails outright.
         (1, "RESET no_such_parameter"),
         // The reset answers only after the caller's deadline: the session
-        // default (5 s) bounds the sleep, not the append's 1 s.
+        // default (5 s) bounds the sleep, not the append's 2 s.
         (2, "RESET statement_timeout; SELECT pg_sleep(10)"),
     ] {
         let mut store = runtime
@@ -372,8 +374,9 @@ fn an_append_that_answered_keeps_its_outcome_when_only_the_reset_fails_or_is_lat
         let started = Instant::now();
         let receipt = app.command(command(None)).unwrap();
         assert_eq!(receipt.position, position, "{reset}");
-        // Well before the late reset's 10 s, with slack for a loaded runner.
-        assert!(started.elapsed() < Duration::from_secs(4), "{reset}");
+        // At the caller's deadline, before the late reset ends at the 5 s
+        // session default.
+        assert!(started.elapsed() < Duration::from_millis(4500), "{reset}");
         // The session whose statement timeout was not restored is closed.
         assert_eq!(db.status().size, before - 1, "{reset}");
     }

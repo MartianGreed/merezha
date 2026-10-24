@@ -373,7 +373,8 @@ async fn enqueue_notifies_the_queue_on_commit() {
         (woken.channel.as_str(), woken.payload.as_str()),
         (JOBS_CHANNEL, "default")
     );
-    // An existing job is not new work.
+    // An existing job is not new work. Notifications arrive in commit
+    // order, so a later sentinel arriving first proves none was sent.
     assert!(
         tasks
             .enqueue(new_job("remind:t1", json!({})))
@@ -381,8 +382,17 @@ async fn enqueue_notifies_the_queue_on_commit() {
             .unwrap()
             .existed
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(listener.try_recv().is_none());
+    execute(
+        &db,
+        &format!("SELECT pg_notify('{JOBS_CHANNEL}', 'sentinel')"),
+    )
+    .await
+    .unwrap();
+    let next = tokio::time::timeout(PATIENCE, listener.recv())
+        .await
+        .expect("the sentinel")
+        .unwrap();
+    assert_eq!(next.payload, "sentinel");
 }
 
 /// A runtime of one "version": it declares `kinds` on `topic` for source
@@ -423,6 +433,9 @@ async fn registered(db: &Database, key: &str) {
 
 /// Re-review F2: during a rolling deploy, v1 and v2 instances restart in
 /// turns; v2's new subscription is never deactivated and gets every event.
+/// `retire_after` is long enough that no restart outlives it on a loaded
+/// machine: only an instance retiring what its own registry lacks could
+/// deactivate it.
 #[tokio::test]
 async fn alternating_v1_and_v2_restarts_never_retire_the_new_subscription() {
     let Some(test) = TestDatabase::create() else {
@@ -431,7 +444,7 @@ async fn alternating_v1_and_v2_restarts_never_retire_the_new_subscription() {
     let db = database(&test).await;
     let config = jobs_config(
         &test,
-        "[jobs.subscriptions]\nheartbeat = \"200ms\"\nretire_after = \"6s\"",
+        "[jobs.subscriptions]\nheartbeat = \"200ms\"\nretire_after = \"1h\"",
     );
     let v1 = &["audit.record"][..];
     let v2 = &["audit.record", "audit.trail"][..];
@@ -470,9 +483,45 @@ async fn an_instance_with_an_empty_registry_retires_nothing() {
     declaring.shutdown(soon()).await;
 }
 
+/// Wait for a subscription heartbeat of `audit.record`'s declarer that
+/// began after now: its retire step, run in the same transaction after the
+/// declaration, saw every change committed before this call.
+async fn a_later_heartbeat(db: &Database) {
+    let since = scalar(
+        db,
+        "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint",
+    )
+    .await;
+    wait_for(
+        db,
+        &format!(
+            "SELECT count(*) FROM merezha_jobs.subscriptions
+              WHERE job_kind = 'audit.record' AND last_declared_at > to_timestamp({since} / 1e6)"
+        ),
+        1,
+        PATIENCE,
+    )
+    .await;
+}
+/// Date `audit.legacy`'s last declaration `ago` back, as if nobody had
+/// declared it since, then wait for a heartbeat to judge it.
+async fn age_legacy(db: &Database, ago: &str) {
+    execute(
+        db,
+        &format!(
+            "UPDATE merezha_jobs.subscriptions SET last_declared_at = now() - interval '{ago}'
+              WHERE job_kind = 'audit.legacy'"
+        ),
+    )
+    .await
+    .unwrap();
+    a_later_heartbeat(db).await;
+}
+
 /// Re-review F2: a subscription nobody declared for `retire_after` is
 /// retired, kept as history and no longer routed; declaring it again
-/// reactivates it.
+/// reactivates it. The window is an hour and the undeclared row is dated
+/// back explicitly, so no stall of a loaded machine can age a row.
 #[tokio::test]
 async fn a_subscription_nobody_declares_is_retired_after_the_grace_window() {
     let Some(test) = TestDatabase::create() else {
@@ -481,7 +530,7 @@ async fn a_subscription_nobody_declares_is_retired_after_the_grace_window() {
     let db = database(&test).await;
     let config = jobs_config(
         &test,
-        "[jobs.subscriptions]\nheartbeat = \"200ms\"\nretire_after = \"3s\"\n[jobs.relay]\ninterval_ms = 600000",
+        "[jobs.subscriptions]\nheartbeat = \"200ms\"\nretire_after = \"1h\"\n[jobs.relay]\ninterval_ms = 600000",
     );
     let all = ["audit.record", "audit.legacy", "audit.extra"];
     let old = version(&db, &config, &all).await;
@@ -494,7 +543,14 @@ async fn a_subscription_nobody_declares_is_retired_after_the_grace_window() {
         3,
         "still inside the grace window"
     );
-    wait_for(&db, ACTIVE, 2, PATIENCE).await;
+    age_legacy(&db, "59 minutes").await;
+    assert_eq!(
+        scalar(&db, ACTIVE).await,
+        3,
+        "a minute inside the grace window"
+    );
+    age_legacy(&db, "61 minutes").await;
+    assert_eq!(scalar(&db, ACTIVE).await, 2, "past the grace window");
     assert_eq!(
         scalar(
             &db,
@@ -506,7 +562,8 @@ async fn a_subscription_nobody_declares_is_retired_after_the_grace_window() {
         "retired, not deleted"
     );
     // The declared ones stay active across heartbeats.
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    a_later_heartbeat(&db).await;
+    a_later_heartbeat(&db).await;
     assert_eq!(scalar(&db, ACTIVE).await, 2);
     registered(&db, "usr_1:registered").await;
     new.relay_now().await.unwrap();

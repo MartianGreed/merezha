@@ -349,7 +349,9 @@ async fn pool_gauges_follow_pool_status_and_timeouts_are_counted_and_logged() {
     let harness = Harness::new();
     let mut config = test.config();
     config.pool_size = 2;
-    config.acquire_timeout = Duration::from_millis(300);
+    // Long enough for a loaded machine to see the waiter before it gives
+    // up; the waits below poll for it rather than sleep.
+    config.acquire_timeout = Duration::from_secs(3);
     let db =
         Database::connect_with_meter(&config, &harness.telemetry().meters().meter(METER_SCOPE))
             .unwrap();
@@ -378,7 +380,11 @@ async fn pool_gauges_follow_pool_status_and_timeouts_are_counted_and_logged() {
         let db = db.clone();
         tokio::spawn(async move { db.acquire(soon()).await.map(drop) })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let spawned = Instant::now();
+    while db.status().waiting == 0 {
+        assert!(spawned.elapsed() < Duration::from_secs(3), "no waiter");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(db.status().waiting, 1);
     assert_eq!(
         gauge("db.client.connection.pending_requests", None),
@@ -445,8 +451,15 @@ async fn a_listener_reconnect_after_a_lost_session_is_counted_once() {
          WHERE datname = '{}'",
         test.name()
     ));
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(listener.check(soon()).await.is_err());
+    // Termination is asynchronous: the probe fails once the backend is gone.
+    let terminated = Instant::now();
+    while listener.check(soon()).await.is_ok() {
+        assert!(
+            terminated.elapsed() < Duration::from_secs(20),
+            "a dead session passed the check"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     drop(db.listen(&["probe_events"], soon()).await.unwrap());
     assert_eq!(reconnects(), 2.0);
 }
@@ -683,7 +696,7 @@ async fn detached_and_listener_sessions_are_reported_as_their_own_pools() {
     let harness = Harness::new();
     let mut config = test.config();
     config.max_detached = 2;
-    config.acquire_timeout = Duration::from_millis(300);
+    config.acquire_timeout = Duration::from_secs(3);
     let db =
         Database::connect_with_meter(&config, &harness.telemetry().meters().meter(METER_SCOPE))
             .unwrap();
@@ -711,15 +724,18 @@ async fn detached_and_listener_sessions_are_reported_as_their_own_pools() {
         let db = db.clone();
         tokio::spawn(async move { db.detach(soon()).await.map(drop) })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
+    let spawned = Instant::now();
+    let pending = || {
         gauge(
             "db.client.connection.pending_requests",
             "merezha.detached",
-            None
-        ),
-        Some(1.0)
-    );
+            None,
+        )
+    };
+    while pending() != Some(1.0) {
+        assert!(spawned.elapsed() < Duration::from_secs(3), "no waiter");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(waiter.await.unwrap().unwrap_err().code, "database_busy");
     assert_eq!(
         gauge(

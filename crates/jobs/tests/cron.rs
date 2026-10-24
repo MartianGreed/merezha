@@ -26,12 +26,46 @@ fn entry(name: &str, cron: &str, timezone: &str) -> String {
 /// No workers (jobs stay `available`), a fast heartbeat, and the given
 /// scheduler interval.
 fn config(test: &TestDatabase, interval_ms: u64, extra: &str) -> JobsConfig {
+    retiring_after(test, interval_ms, "6s", extra)
+}
+/// [`config`] with `retire_after = retire`.
+fn retiring_after(test: &TestDatabase, interval_ms: u64, retire: &str, extra: &str) -> JobsConfig {
     jobs_config(
         test,
         &format!(
-            "[jobs]\nworkers = false\n[jobs.scheduler]\ninterval_ms = {interval_ms}\n[jobs.subscriptions]\nheartbeat = \"200ms\"\nretire_after = \"6s\"\n{extra}"
+            "[jobs]\nworkers = false\n[jobs.scheduler]\ninterval_ms = {interval_ms}\n[jobs.subscriptions]\nheartbeat = \"200ms\"\nretire_after = \"{retire}\"\n{extra}"
         ),
     )
+}
+/// Date schedule `name`'s last declaration `ago` back, as if nobody had
+/// declared it since, then wait for a scheduler heartbeat of `tasks.daily`'s
+/// declarer that began after it: its retire step, run in the same
+/// transaction after the declaration, saw the change.
+async fn age_schedule(db: &Database, name: &str, ago: &str) {
+    execute(
+        db,
+        &format!(
+            "UPDATE merezha_jobs.schedules SET last_declared_at = now() - interval '{ago}'
+              WHERE name = '{name}'"
+        ),
+    )
+    .await
+    .unwrap();
+    let since = scalar(
+        db,
+        "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint",
+    )
+    .await;
+    wait_for(
+        db,
+        &format!(
+            "SELECT count(*) FROM merezha_jobs.schedules
+              WHERE name = 'tasks.daily' AND last_declared_at > to_timestamp({since} / 1e6)"
+        ),
+        1,
+        PATIENCE,
+    )
+    .await;
 }
 async fn instance(db: &Database, config: &JobsConfig) -> PgJobs {
     started(db, config, RelayMode::Off).await
@@ -242,10 +276,19 @@ async fn a_schedule_declared_by_v2_survives_v1_restarts_during_a_rolling_deploy(
         return;
     };
     let db = database(&test).await;
-    let v1 = config(&test, 3_600_000, &entry("tasks.daily", "0 9 * * *", "UTC"));
-    let v2 = config(
+    // An hour: no restart of a loaded machine outlives it, so only an
+    // instance retiring what it does not declare could retire the digest;
+    // the rollback below dates its last declaration back explicitly.
+    let v1 = retiring_after(
         &test,
         3_600_000,
+        "1h",
+        &entry("tasks.daily", "0 9 * * *", "UTC"),
+    );
+    let v2 = retiring_after(
+        &test,
+        3_600_000,
+        "1h",
         &[
             entry("tasks.daily", "0 9 * * *", "UTC"),
             entry("tasks.digest", "0 18 * * fri", "Europe/Paris"),
@@ -271,7 +314,10 @@ async fn a_schedule_declared_by_v2_survives_v1_restarts_during_a_rolling_deploy(
     new.shutdown(soon()).await;
     let only_v1 = instance(&db, &v1).await;
     assert_eq!(scalar(&db, LIVE).await, 1, "still inside the grace window");
-    wait_for(&db, LIVE, 0, PATIENCE).await;
+    age_schedule(&db, "tasks.digest", "59 minutes").await;
+    assert_eq!(scalar(&db, LIVE).await, 1, "a minute inside the window");
+    age_schedule(&db, "tasks.digest", "61 minutes").await;
+    assert_eq!(scalar(&db, LIVE).await, 0, "past the window");
     assert_eq!(
         scalar(
             &db,
@@ -571,7 +617,7 @@ async fn modules_declare_schedules_whose_jobs_run_through_their_handler() {
     tick_until(&db, &jobs, JOBS, 1).await;
     let started = std::time::Instant::now();
     while seen.lock().unwrap().is_empty() {
-        assert!(started.elapsed() < Duration::from_secs(5), "never ran");
+        assert!(started.elapsed() < PATIENCE, "never ran");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(
@@ -934,8 +980,22 @@ async fn firing_notifies_the_queue_and_an_existing_occurrence_is_a_duplicate() {
         existing
     );
     assert!(next_run(&db, "tasks.dup").await > db_now(&db).await);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(listener.try_recv().is_none(), "a duplicate wakes nobody");
+    // Notifications arrive in commit order: a later sentinel arriving
+    // first proves the duplicate sent none.
+    execute(
+        &db,
+        &format!(
+            "SELECT pg_notify('{}', 'sentinel')",
+            merezha_jobs::JOBS_CHANNEL
+        ),
+    )
+    .await
+    .unwrap();
+    let next = tokio::time::timeout(PATIENCE, listener.recv())
+        .await
+        .expect("the sentinel")
+        .unwrap();
+    assert_eq!(next.payload, "sentinel", "a duplicate wakes nobody");
 }
 
 /// Review item 6: a trigger with a caller key is idempotent, a bad key is

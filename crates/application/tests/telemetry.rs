@@ -490,12 +490,17 @@ fn projection_lag_gauges_read_appends_without_catch_up_and_zero_after_it() {
     // A catch-up with nothing new leaves no span.
     app.catch_up("count").unwrap();
     assert_eq!(harness.spans_named("projection count").len(), 1);
-    // The next append after a catch-up starts a fresh age.
+    // The next append after a catch-up starts a fresh age: no older than
+    // the time since the append began (plus the millisecond rounding of
+    // its timestamp), however slow the machine, while an age kept from
+    // before the catch-up would be 300 ms older.
     std::thread::sleep(Duration::from_millis(300));
+    let appending = Instant::now();
     app.command(command("Add", json!({"events": 1}))).unwrap();
     assert_eq!(lag(metric::PROJECTION_LAG_EVENTS.name), Some(1.0));
     let age = lag(metric::PROJECTION_LAG_AGE.name).unwrap();
-    assert!((0.0..0.25).contains(&age), "{age}");
+    let since = appending.elapsed().as_secs_f64();
+    assert!(age >= 0.0 && age <= since + 0.01, "{age} after {since}");
     harness.assert_catalogued();
 }
 

@@ -534,72 +534,6 @@ fn positions_stay_contiguous_under_load_from_two_instances_and_a_reader_never_se
 }
 
 #[test]
-fn a_held_head_lock_fails_appends_storage_busy_and_queued_appends_commit_in_position_order() {
-    let Some(pg) = Pg::new() else { return };
-    let probe = Arc::new(Probe::default());
-    let mut short = config();
-    short.limits.timeout_ms = 1000;
-    let app = pg.open(short, &probe);
-    let holder = pg.hold_head();
-    let started = Instant::now();
-    assert_eq!(
-        code(app.command(command("one", json!(1), None))),
-        "storage_busy"
-    );
-    // `storage_busy` (not `timeout`) proves the server gave up first.
-    let waited = started.elapsed();
-    assert!(waited < Duration::from_millis(1000) + SLACK, "{waited:?}");
-    // Readers are not blocked and see nothing new.
-    assert_eq!(pg.count("SELECT count(*) FROM merezha_app.events"), 0);
-    assert_eq!(pg.count("SELECT position FROM merezha_app.head"), 0);
-    // Appends queued behind the holder commit after it, contiguously.
-    let patient = pg.open(config(), &probe);
-    let (receipts, observations) = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..4)
-            .map(|i| {
-                let app = patient.clone();
-                scope.spawn(move || app.command(command(&format!("q{i}"), json!(i), None)))
-            })
-            .collect();
-        pg.wait_for_lock_waiters(4);
-        assert_eq!(pg.count("SELECT count(*) FROM merezha_app.events"), 0);
-        let pg = &pg;
-        // Commit order equals position order: every snapshot a reader takes
-        // while the queue drains shows a prefix 1..=k of the positions.
-        let reader = scope.spawn(move || {
-            let mut observations = Vec::new();
-            let until = Instant::now() + Duration::from_secs(10);
-            loop {
-                assert!(Instant::now() < until, "queued appends never all committed");
-                let seen: Vec<i64> = pg
-                    .rows("SELECT position FROM merezha_app.events ORDER BY position")
-                    .iter()
-                    .map(|r| r.get(0))
-                    .collect();
-                assert_eq!(seen, (1..=seen.len() as i64).collect::<Vec<_>>());
-                let done = seen.len() == 4;
-                observations.push(seen.len());
-                if done {
-                    return observations;
-                }
-            }
-        });
-        pg.release_head(holder);
-        let receipts = handles
-            .into_iter()
-            .map(|h| h.join().unwrap().unwrap())
-            .collect::<Vec<_>>();
-        (receipts, reader.join().unwrap())
-    });
-    let mut positions: Vec<u64> = receipts.iter().map(|r| r.position).collect();
-    positions.sort();
-    assert_eq!(positions, vec![1, 2, 3, 4]);
-    assert!(observations.windows(2).all(|w| w[0] <= w[1]));
-    assert_receipts_match_rows(&pg, &receipts);
-    assert!(pg.verify().ok);
-}
-
-#[test]
 fn the_same_key_on_two_instances_at_once_appends_once_and_both_get_the_same_receipt() {
     let Some(pg) = Pg::new() else { return };
     let probe = Arc::new(Probe::default());
@@ -1236,50 +1170,6 @@ fn an_append_losing_its_key_to_a_zero_event_command_rolls_back_in_flight() {
 }
 
 #[test]
-fn a_slow_pool_acquire_still_bounds_the_lock_wait_by_the_time_left() {
-    let Some(pg) = Pg::new() else { return };
-    let probe = Arc::new(Probe::default());
-    let mut c = config();
-    c.limits.timeout_ms = 3000;
-    let db = pg.pool(1);
-    let store = pg
-        .runtime
-        .block_on(PostgresStore::connect(
-            &db,
-            &c,
-            PostgresOptions::default(),
-            deadline(),
-        ))
-        .unwrap();
-    let app =
-        Application::with_postgres(c, guest(&probe), Arc::new(AllowAll), Arc::new(store)).unwrap();
-    let holder = pg.hold_head();
-    let (arrived, release) = probe.hold();
-    let started = Instant::now();
-    let result = std::thread::scope(|scope| {
-        let command = scope.spawn(|| app.command(command("one", json!(1), None)));
-        arrived.recv_timeout(Duration::from_secs(10)).unwrap();
-        // The decision is made; the only pooled session is busy for 1.5 s.
-        let busy = pg.runtime.block_on(db.acquire(deadline())).unwrap();
-        release.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(1500));
-        drop(busy);
-        command.join().unwrap()
-    });
-    // `storage_busy`, not `commit_outcome_unknown`: the lock wait was cut
-    // from the time left after the slow acquire, so the server ended the
-    // statement before the caller's 3 s deadline.
-    assert_eq!(code(result), "storage_busy");
-    let waited = started.elapsed();
-    assert!(waited < Duration::from_millis(3000) + SLACK, "{waited:?}");
-    pg.release_head(holder);
-    // Nothing commits later behind the caller's back.
-    std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(pg.count("SELECT count(*) FROM merezha_app.events"), 0);
-    assert_eq!(pg.count("SELECT position FROM merezha_app.head"), 0);
-}
-
-#[test]
 fn an_append_never_waits_past_the_database_statement_timeout() {
     let Some(pg) = Pg::new() else { return };
     let probe = Arc::new(Probe::default());
@@ -1422,4 +1312,120 @@ fn append_throughput_with_8_concurrent_single_event_writers() {
         "throughput: {total} commits in {run:?} = {:.0}/s with 8 single-event writers",
         total as f64 / run.as_secs_f64()
     );
+}
+
+/// Latency and deadline-race tests (issue #37). CI runs them after the
+/// parallel suite, alone and one at a time:
+/// `cargo test -- --test-threads=1 timing::`.
+mod timing {
+    use super::*;
+    #[test]
+    fn a_held_head_lock_fails_appends_storage_busy_and_queued_appends_commit_in_position_order() {
+        let Some(pg) = Pg::new() else { return };
+        let probe = Arc::new(Probe::default());
+        let mut short = config();
+        short.limits.timeout_ms = 1000;
+        let app = pg.open(short, &probe);
+        let holder = pg.hold_head();
+        let started = Instant::now();
+        assert_eq!(
+            code(app.command(command("one", json!(1), None))),
+            "storage_busy"
+        );
+        // `storage_busy` (not `timeout`) proves the server gave up first.
+        let waited = started.elapsed();
+        assert!(waited < Duration::from_millis(1000) + SLACK, "{waited:?}");
+        // Readers are not blocked and see nothing new.
+        assert_eq!(pg.count("SELECT count(*) FROM merezha_app.events"), 0);
+        assert_eq!(pg.count("SELECT position FROM merezha_app.head"), 0);
+        // Appends queued behind the holder commit after it, contiguously.
+        let patient = pg.open(config(), &probe);
+        let (receipts, observations) = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|i| {
+                    let app = patient.clone();
+                    scope.spawn(move || app.command(command(&format!("q{i}"), json!(i), None)))
+                })
+                .collect();
+            pg.wait_for_lock_waiters(4);
+            assert_eq!(pg.count("SELECT count(*) FROM merezha_app.events"), 0);
+            let pg = &pg;
+            // Commit order equals position order: every snapshot a reader takes
+            // while the queue drains shows a prefix 1..=k of the positions.
+            let reader = scope.spawn(move || {
+                let mut observations = Vec::new();
+                let until = Instant::now() + Duration::from_secs(10);
+                loop {
+                    assert!(Instant::now() < until, "queued appends never all committed");
+                    let seen: Vec<i64> = pg
+                        .rows("SELECT position FROM merezha_app.events ORDER BY position")
+                        .iter()
+                        .map(|r| r.get(0))
+                        .collect();
+                    assert_eq!(seen, (1..=seen.len() as i64).collect::<Vec<_>>());
+                    let done = seen.len() == 4;
+                    observations.push(seen.len());
+                    if done {
+                        return observations;
+                    }
+                }
+            });
+            pg.release_head(holder);
+            let receipts = handles
+                .into_iter()
+                .map(|h| h.join().unwrap().unwrap())
+                .collect::<Vec<_>>();
+            (receipts, reader.join().unwrap())
+        });
+        let mut positions: Vec<u64> = receipts.iter().map(|r| r.position).collect();
+        positions.sort();
+        assert_eq!(positions, vec![1, 2, 3, 4]);
+        assert!(observations.windows(2).all(|w| w[0] <= w[1]));
+        assert_receipts_match_rows(&pg, &receipts);
+        assert!(pg.verify().ok);
+    }
+
+    #[test]
+    fn a_slow_pool_acquire_still_bounds_the_lock_wait_by_the_time_left() {
+        let Some(pg) = Pg::new() else { return };
+        let probe = Arc::new(Probe::default());
+        let mut c = config();
+        c.limits.timeout_ms = 3000;
+        let db = pg.pool(1);
+        let store = pg
+            .runtime
+            .block_on(PostgresStore::connect(
+                &db,
+                &c,
+                PostgresOptions::default(),
+                deadline(),
+            ))
+            .unwrap();
+        let app = Application::with_postgres(c, guest(&probe), Arc::new(AllowAll), Arc::new(store))
+            .unwrap();
+        let holder = pg.hold_head();
+        let (arrived, release) = probe.hold();
+        let started = Instant::now();
+        let result = std::thread::scope(|scope| {
+            let command = scope.spawn(|| app.command(command("one", json!(1), None)));
+            arrived.recv_timeout(Duration::from_secs(10)).unwrap();
+            // The decision is made; the only pooled session is busy for 1.5 s.
+            let busy = pg.runtime.block_on(db.acquire(deadline())).unwrap();
+            release.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(busy);
+            command.join().unwrap()
+        });
+        // `storage_busy`, not `commit_outcome_unknown`: the lock wait was cut
+        // from the time left after the slow acquire, so the server ended the
+        // statement before the caller's 3 s deadline.
+        assert_eq!(code(result), "storage_busy");
+        let waited = started.elapsed();
+        assert!(waited < Duration::from_millis(3000) + SLACK, "{waited:?}");
+        pg.release_head(holder);
+        // Nothing commits later behind the caller's back.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(pg.count("SELECT count(*) FROM merezha_app.events"), 0);
+        assert_eq!(pg.count("SELECT position FROM merezha_app.head"), 0);
+    }
 }

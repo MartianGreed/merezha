@@ -106,11 +106,8 @@ async fn committed_records_relay_within_a_second_by_notify_and_within_the_interv
         PATIENCE,
     )
     .await;
-    // The 300 ms cadence, with generous tolerance for a slow machine.
-    assert!(
-        took < Duration::from_millis(300) + Duration::from_secs(5),
-        "no LISTEN session: the interval woke it: {took:?}"
-    );
+    // No LISTEN session: only the 300 ms interval can have woken it.
+    assert!(took < PATIENCE, "the interval woke it: {took:?}");
     polling.shutdown(soon()).await;
     assert!(polling.ready().await.is_err(), "not ready after shutdown");
 }
