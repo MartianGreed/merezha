@@ -1286,9 +1286,11 @@ Process tests hold the relay with `MEREZHA_JOBS_TEST_RELAY=off` (or
 `interval`, no `LISTEN`), and `MEREZHA_JOBS_TEST_HANDLER=<ms>` registers a
 `test.sleep` kind on queue `default` whose handler sleeps that long,
 ignoring `cancel`. Only builds with the `test-hooks` feature read
-them; the feature also adds `PgJobs::without_heartbeat` and
+them; the feature also adds `PgJobs::without_heartbeat`,
 `PgJobs::with_reissue_timing` (shorter hook deadline, claim timeout and
-`202` wait), and
+`202` wait), `PgJobs::with_lease_deadline` (a lease transaction that may
+wait longer than 5 s on the queue lock) and `PgJobs::workers_stopping`
+(whether the drain began), and
 `merezha-jobs`' own tests enable it through a self dev-dependency. `merezha-cli`'s dev-dependency enables it, and Cargo unifies that into
 every build that compiles the dev-dependencies: the `merezha` binary built
 by `cargo test` or `--all-targets` reads the variable. Builds without them,

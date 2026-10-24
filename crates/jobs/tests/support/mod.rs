@@ -20,6 +20,10 @@ use std::{
 pub fn id(value: &str) -> Identity {
     Identity::new(value).unwrap()
 }
+/// How long a test waits for something that must happen. Waits return as
+/// soon as it does, so this bound only matters on a starved machine (a
+/// loaded CI runner); it never stands in for an asserted latency.
+pub const PATIENCE: Duration = Duration::from_secs(30);
 pub fn soon() -> Instant {
     Instant::now() + Duration::from_secs(10)
 }

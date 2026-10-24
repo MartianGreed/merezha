@@ -122,6 +122,7 @@ struct Inner {
     subscriptions: SubscriptionsConfig,
     listen_check: Duration,
     heartbeat: bool,
+    lease_deadline: Duration,
     reissue: admin::ReissueTiming,
     mode: RelayMode,
     database: OnceLock<Database>,
@@ -231,6 +232,7 @@ impl PgJobs {
                 subscriptions: config.subscriptions.clone(),
                 listen_check: LISTEN_CHECK_INTERVAL,
                 heartbeat: true,
+                lease_deadline: worker::STATEMENT_DEADLINE,
                 reissue: admin::ReissueTiming::default(),
                 mode,
                 database: OnceLock::new(),
@@ -263,6 +265,26 @@ impl PgJobs {
             inner.heartbeat = false;
         }
         self
+    }
+    /// Let one lease transaction wait up to `deadline` instead of 5 s
+    /// (feature `test-hooks`), for tests that hold a lease back on the
+    /// queue lock; the pool's statement timeout must allow it too. Call
+    /// before sharing the runtime.
+    #[cfg(feature = "test-hooks")]
+    pub fn with_lease_deadline(mut self, deadline: Duration) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.lease_deadline = deadline;
+        }
+        self
+    }
+    /// Whether the workers' drain began (feature `test-hooks`), so a test
+    /// can release a held lease only once the dispatchers saw the stop.
+    #[cfg(feature = "test-hooks")]
+    pub fn workers_stopping(&self) -> bool {
+        self.inner
+            .worker
+            .get()
+            .is_some_and(|worker| worker.stopping())
     }
     /// Shorter reissue bounds for tests (feature `test-hooks`): the hook
     /// deadline, the age after which the reaper reverts a claim, and how
@@ -400,6 +422,7 @@ impl PgJobs {
                 listen: self.inner.mode == RelayMode::Listen,
                 listen_check: self.inner.listen_check,
                 max_lag: config.readiness_max_lag,
+                lease_deadline: self.inner.lease_deadline,
             },
         );
         if self.inner.worker.set(worker.clone()).is_ok() {

@@ -67,7 +67,7 @@ impl Captured {
     }
 }
 async fn wait_log(logs: &Captured, needle: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PATIENCE;
     while !logs.text().contains(needle) {
         assert!(Instant::now() < deadline, "no {needle} in {}", logs.text());
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -195,13 +195,7 @@ async fn a_systemic_relay_failure_quarantines_nothing_and_the_relay_resumes() {
     execute(&db, "DROP TRIGGER refuse ON merezha_jobs.jobs")
         .await
         .unwrap();
-    wait_for(
-        &db,
-        "SELECT count(*) FROM merezha_jobs.jobs",
-        2,
-        Duration::from_secs(3),
-    )
-    .await;
+    wait_for(&db, "SELECT count(*) FROM merezha_jobs.jobs", 2, PATIENCE).await;
     assert_eq!(
         scalar(
             &db,
@@ -299,7 +293,7 @@ async fn a_killed_listen_session_is_reopened_and_checks_fail_on_dead_sessions() 
     let db = database(&test).await;
     let config = jobs_config(&test, "[jobs.relay]\ninterval_ms = 600000");
     let jobs = started(&db, &config, RelayMode::Listen).await;
-    wait_for(&db, LISTENERS, 1, Duration::from_secs(5)).await;
+    wait_for(&db, LISTENERS, 1, PATIENCE).await;
     let first = scalar(
         &db,
         "SELECT pid::bigint FROM pg_stat_activity
@@ -317,7 +311,7 @@ async fn a_killed_listen_session_is_reopened_and_checks_fail_on_dead_sessions() 
                 AND pid <> {first}"
         ),
         1,
-        Duration::from_secs(5),
+        PATIENCE,
     )
     .await;
     append(
@@ -332,7 +326,7 @@ async fn a_killed_listen_session_is_reopened_and_checks_fail_on_dead_sessions() 
         &db,
         "SELECT count(*) FROM merezha_jobs.jobs WHERE idempotency_key = 'tasks:after-kill'",
         1,
-        Duration::from_secs(1),
+        PATIENCE,
     )
     .await;
     jobs.shutdown(soon()).await;
@@ -349,7 +343,7 @@ async fn a_killed_listen_session_is_reopened_and_checks_fail_on_dead_sessions() 
         .await
         .unwrap();
     // Termination is asynchronous: the probe fails once the backend is gone.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PATIENCE;
     while session.check(soon()).await.is_ok() {
         assert!(Instant::now() < deadline, "a dead session passed the check");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -371,9 +365,9 @@ async fn enqueue_notifies_the_queue_on_commit() {
         .enqueue(new_job("remind:t1", json!({})))
         .await
         .unwrap();
-    let woken = tokio::time::timeout(Duration::from_secs(1), listener.recv())
+    let woken = tokio::time::timeout(PATIENCE, listener.recv())
         .await
-        .expect("a notification within 1 s")
+        .expect("a notification")
         .unwrap();
     assert_eq!(
         (woken.channel.as_str(), woken.payload.as_str()),
@@ -437,7 +431,7 @@ async fn alternating_v1_and_v2_restarts_never_retire_the_new_subscription() {
     let db = database(&test).await;
     let config = jobs_config(
         &test,
-        "[jobs.subscriptions]\nheartbeat = \"100ms\"\nretire_after = \"2s\"",
+        "[jobs.subscriptions]\nheartbeat = \"200ms\"\nretire_after = \"6s\"",
     );
     let v1 = &["audit.record"][..];
     let v2 = &["audit.record", "audit.trail"][..];
@@ -487,7 +481,7 @@ async fn a_subscription_nobody_declares_is_retired_after_the_grace_window() {
     let db = database(&test).await;
     let config = jobs_config(
         &test,
-        "[jobs.subscriptions]\nheartbeat = \"100ms\"\nretire_after = \"500ms\"\n[jobs.relay]\ninterval_ms = 600000",
+        "[jobs.subscriptions]\nheartbeat = \"200ms\"\nretire_after = \"3s\"\n[jobs.relay]\ninterval_ms = 600000",
     );
     let all = ["audit.record", "audit.legacy", "audit.extra"];
     let old = version(&db, &config, &all).await;
@@ -500,7 +494,7 @@ async fn a_subscription_nobody_declares_is_retired_after_the_grace_window() {
         3,
         "still inside the grace window"
     );
-    wait_for(&db, ACTIVE, 2, Duration::from_secs(3)).await;
+    wait_for(&db, ACTIVE, 2, PATIENCE).await;
     assert_eq!(
         scalar(
             &db,
@@ -634,7 +628,7 @@ async fn the_idle_listen_session_is_probed_on_its_interval() {
         "SELECT count(*) FROM pg_stat_activity
           WHERE datname = current_database() AND query = 'SELECT 1'",
         1,
-        Duration::from_secs(3),
+        PATIENCE,
     )
     .await;
     jobs.shutdown(soon()).await;

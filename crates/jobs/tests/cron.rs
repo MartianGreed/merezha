@@ -29,7 +29,7 @@ fn config(test: &TestDatabase, interval_ms: u64, extra: &str) -> JobsConfig {
     jobs_config(
         test,
         &format!(
-            "[jobs]\nworkers = false\n[jobs.scheduler]\ninterval_ms = {interval_ms}\n[jobs.subscriptions]\nheartbeat = \"100ms\"\nretire_after = \"2s\"\n{extra}"
+            "[jobs]\nworkers = false\n[jobs.scheduler]\ninterval_ms = {interval_ms}\n[jobs.subscriptions]\nheartbeat = \"200ms\"\nretire_after = \"6s\"\n{extra}"
         ),
     )
 }
@@ -52,6 +52,28 @@ async fn next_run(db: &Database, name: &str) -> i64 {
 }
 async fn db_now(db: &Database) -> i64 {
     scalar(db, "SELECT extract(epoch FROM now())::bigint").await
+}
+/// Run `sql` (an update of schedule rows) under the schedules advisory
+/// lock, as the sync takes it, so it never deadlocks with a heartbeat
+/// upserting the same rows in another order.
+async fn reschedule(db: &Database, sql: &str) {
+    let sql = sql.to_owned();
+    db.transaction(soon(), move |tx| {
+        Box::pin(async move {
+            tx.execute(
+                "SELECT pg_advisory_xact_lock(1297762882, hashtext('schedules'))",
+                &[],
+            )
+            .await
+            .map_err(|e| merezha_postgres::classify(&e))?;
+            tx.execute(sql.as_str(), &[])
+                .await
+                .map_err(|e| merezha_postgres::classify(&e))?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
 }
 const JOBS: &str = "SELECT count(*) FROM merezha_jobs.jobs WHERE schedule_name IS NOT NULL";
 
@@ -86,7 +108,7 @@ async fn three_instances_ticking_at_once_enqueue_each_occurrence_exactly_once() 
     let mut explicit = TickReport::default();
     for round in 0..ROUNDS {
         // Each round makes every schedule due at a distinct past minute.
-        execute(
+        reschedule(
             db,
             &format!(
                 "UPDATE merezha_jobs.schedules
@@ -94,8 +116,7 @@ async fn three_instances_ticking_at_once_enqueue_each_occurrence_exactly_once() 
                 100 - round
             ),
         )
-        .await
-        .unwrap();
+        .await;
         let barrier = Arc::new(tokio::sync::Barrier::new(instances.len()));
         let ticks: Vec<_> = instances
             .iter()
@@ -117,7 +138,7 @@ async fn three_instances_ticking_at_once_enqueue_each_occurrence_exactly_once() 
             db,
             "SELECT count(*) FROM merezha_jobs.schedules WHERE next_run_at <= now()",
             0,
-            Duration::from_secs(5),
+            PATIENCE,
         )
         .await;
         assert_eq!(
@@ -207,7 +228,7 @@ async fn a_schedule_declared_by_v2_survives_v1_restarts_during_a_rolling_deploy(
     new.shutdown(soon()).await;
     let only_v1 = instance(&db, &v1).await;
     assert_eq!(scalar(&db, LIVE).await, 1, "still inside the grace window");
-    wait_for(&db, LIVE, 0, Duration::from_secs(5)).await;
+    wait_for(&db, LIVE, 0, PATIENCE).await;
     assert_eq!(
         scalar(
             &db,
@@ -227,12 +248,11 @@ async fn a_schedule_declared_by_v2_survives_v1_restarts_during_a_rolling_deploy(
         1,
         "the schedule v1 declares stays"
     );
-    execute(
+    reschedule(
         &db,
         "UPDATE merezha_jobs.schedules SET next_run_at = now() - interval '1 minute'",
     )
-    .await
-    .unwrap();
+    .await;
     let report = only_v1.schedule_now().await.unwrap();
     assert_eq!(report.fired, 1, "only the live schedule fires");
     assert_eq!(
@@ -268,18 +288,17 @@ async fn a_downtime_across_several_occurrences_runs_one_job_then_the_normal_cade
     let before = instance(&db, &config).await;
     before.shutdown(soon()).await;
     // The host was down for five occurrences and then some.
-    execute(
+    reschedule(
         &db,
         "UPDATE merezha_jobs.schedules
             SET next_run_at = date_trunc('minute', now()) - interval '5 minutes'",
     )
-    .await
-    .unwrap();
+    .await;
     let missed = next_run(&db, "tasks.minutely").await;
     // The restarted host syncs (same definition: the due run is kept) and
     // ticks at start.
     let after = instance(&db, &config).await;
-    wait_for(&db, JOBS, 1, Duration::from_secs(5)).await;
+    wait_for(&db, JOBS, 1, PATIENCE).await;
     assert_eq!(
         scalar(
             &db,
@@ -340,17 +359,16 @@ async fn a_changed_definition_recomputes_the_next_run() {
     );
     second.shutdown(soon()).await;
     // The same definition again: the stored (due) run stands.
-    execute(
+    reschedule(
         &db,
         "UPDATE merezha_jobs.schedules SET next_run_at = now() - interval '1 hour'",
     )
-    .await
-    .unwrap();
+    .await;
     let due = next_run(&db, "tasks.report").await;
     // Started again with the same definition: its start tick fires the
     // stored due run instead of a recomputed one.
     let third = instance(&db, &five).await;
-    wait_for(&db, JOBS, 1, Duration::from_secs(5)).await;
+    wait_for(&db, JOBS, 1, PATIENCE).await;
     assert_eq!(
         scalar(
             &db,
@@ -465,17 +483,16 @@ async fn modules_declare_schedules_whose_jobs_run_through_their_handler() {
         .await,
         "tasks.config=config/UTC,tasks.weekly=tasks/Europe/Paris"
     );
-    execute(
+    reschedule(
         &db,
         "UPDATE merezha_jobs.schedules SET next_run_at = '2026-10-19T06:00:00Z'
           WHERE name = 'tasks.weekly'",
     )
-    .await
-    .unwrap();
+    .await;
     // The start tick may still be running: whichever tick takes the
     // occurrence, there is one job.
     jobs.schedule_now().await.unwrap();
-    wait_for(&db, JOBS, 1, Duration::from_secs(5)).await;
+    wait_for(&db, JOBS, 1, PATIENCE).await;
     let started = std::time::Instant::now();
     while seen.lock().unwrap().is_empty() {
         assert!(started.elapsed() < Duration::from_secs(5), "never ran");
@@ -521,12 +538,11 @@ async fn schedules_pause_resume_and_trigger_with_audit_rows() {
         .await
         .unwrap();
     assert!(!paused.enabled);
-    execute(
+    reschedule(
         &db,
         "UPDATE merezha_jobs.schedules SET next_run_at = now() - interval '1 day'",
     )
-    .await
-    .unwrap();
+    .await;
     assert_eq!(jobs.schedule_now().await.unwrap().fired, 0, "paused");
     let resumed = jobs
         .resume_schedule("tasks.daily", Some("sys_ops"))

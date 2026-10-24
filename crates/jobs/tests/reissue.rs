@@ -166,12 +166,19 @@ async fn a_dropped_bulk_replay_request_leaves_no_claim_behind() {
     // The client goes away while the first hook runs.
     let dropped = tokio::time::timeout(Duration::from_millis(100), router.oneshot(request)).await;
     assert!(dropped.is_err(), "the request future was dropped mid-run");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PATIENCE;
     while hook.calls.load(Ordering::SeqCst) < 3 {
         assert!(Instant::now() < deadline, "the detached run stopped");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The last hook returned; its settle clears the claim right after.
+    wait_for(
+        &db,
+        "SELECT count(*) FROM merezha_jobs.jobs WHERE reissue_claimed_at IS NOT NULL",
+        0,
+        PATIENCE,
+    )
+    .await;
     for id in ids {
         assert_eq!(claim_of(&db, id).await, ("cancelled".into(), 1, false));
     }
@@ -221,7 +228,7 @@ async fn a_claim_cut_by_a_crash_is_returned_to_dead_by_the_reaper() {
     );
     let hook = Hook::new(Duration::ZERO, false);
     let jobs = runtime(&db, "[jobs]\nreaper_interval_ms = 100", &test, hook).await;
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + PATIENCE;
     while claim_of(&db, crashed).await.0 != "dead" {
         assert!(Instant::now() < deadline, "the claim was never reverted");
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -258,15 +265,16 @@ impl Captured {
     }
 }
 
-/// The first call is slow and fails; every later one succeeds at once.
+/// The first call waits for the test to open `gate`, then fails; every
+/// later one succeeds at once.
 #[derive(Default)]
-struct SlowThenFast(AtomicUsize);
+struct SlowThenFast(AtomicUsize, tokio::sync::Notify);
 impl Reissue for SlowThenFast {
     fn reissue(&self, _: ReissueRequest) -> BoxFuture<'_, Result<(), Failure>> {
         let call = self.0.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
             if call == 0 {
-                tokio::time::sleep(Duration::from_millis(1500)).await;
+                self.1.notified().await;
                 Err(Failure::transient("provider_down"))
             } else {
                 Ok(())
@@ -277,7 +285,8 @@ impl Reissue for SlowThenFast {
 
 /// Re-review F1: a slow hook A outlives its claim, the reaper reverts it, a
 /// replay B claims and reissues; A's late failure is fenced on its own
-/// claim, so it neither kills B's job nor reports `Reissued`.
+/// claim, so it neither kills B's job nor reports `Reissued`. A returns only
+/// once the test opens its gate after B, so the interleaving is forced.
 #[tokio::test]
 async fn a_late_settle_of_a_reverted_claim_is_fenced_out() {
     let Some(test) = TestDatabase::create() else {
@@ -297,7 +306,7 @@ async fn a_late_settle_of_a_reverted_claim_is_fenced_out() {
         RelayMode::Interval,
     )
     .with_reissue_timing(
-        Duration::from_secs(5),
+        PATIENCE * 2,
         Duration::from_millis(300),
         Duration::from_secs(30),
     );
@@ -318,7 +327,7 @@ async fn a_late_settle_of_a_reverted_claim_is_fenced_out() {
     let id = flagged_dead(&db, "tasks:fenced").await;
     let first = jobs.clone();
     let slow = tokio::spawn(async move { first.replay(id, Some("usr_a")).await });
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + PATIENCE;
     while claim_of(&db, id).await != ("cancelled".into(), 1, true) {
         assert!(Instant::now() < deadline, "A never claimed");
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -333,6 +342,7 @@ async fn a_late_settle_of_a_reverted_claim_is_fenced_out() {
         merezha_jobs::Replay::Reissued
     );
     assert_eq!(claim_of(&db, id).await, ("cancelled".into(), 1, false));
+    hook.1.notify_one();
     let late = slow.await.unwrap().unwrap_err();
     assert_eq!(
         (late.code.as_str(), late.classification),
@@ -410,12 +420,19 @@ async fn a_bulk_replay_past_the_wait_answers_202_and_finishes_detached() {
     assert_eq!(body["complete"], false);
     assert_eq!(body["replayed"], 0);
     assert!(body["reissued"].as_u64().unwrap() < 4, "{body}");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PATIENCE;
     while hook.calls.load(Ordering::SeqCst) < 4 {
         assert!(Instant::now() < deadline, "the detached run stopped");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The last hook returned; its settle clears the claim right after.
+    wait_for(
+        &db,
+        "SELECT count(*) FROM merezha_jobs.jobs WHERE reissue_claimed_at IS NOT NULL",
+        0,
+        PATIENCE,
+    )
+    .await;
     for id in ids {
         assert_eq!(claim_of(&db, id).await, ("cancelled".into(), 1, false));
     }

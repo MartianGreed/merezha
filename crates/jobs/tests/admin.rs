@@ -19,7 +19,7 @@ use merezha_platform::{
 };
 use merezha_postgres::TestDatabase;
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc};
 use support::*;
 use tower::ServiceExt;
 
@@ -98,7 +98,7 @@ async fn the_admin_api_lists_replays_purges_and_cancels_with_audit_rows() {
     }
     let waiting = insert_job(&db, "tasks.unhandled", "tasks:waiting", r#"{"n":2}"#, false).await;
     for id in &dead {
-        wait_state(&db, *id, "dead", Duration::from_secs(3)).await;
+        wait_state(&db, *id, "dead", PATIENCE).await;
     }
     // Stop the workers so nothing re-runs what the API replays.
     jobs.shutdown(soon()).await;
