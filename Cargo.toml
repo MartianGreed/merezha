@@ -6,6 +6,7 @@ members = [
     "crates/application",
     "crates/postgres",
     "crates/platform",
+    "crates/content",
 ]
 resolver = "3"
 
@@ -44,6 +45,9 @@ jiff = { version = "0.2.38", default-features = false, features = ["std", "serde
 uuid = { version = "1.29.0", default-features = false }
 bytes = { version = "1.12.1", default-features = false, features = ["std"] }
 futures-core = { version = "0.3.34", default-features = false, features = ["std"] }
+regex = { version = "1.13.1", default-features = false, features = ["std", "unicode"] }
+rust_decimal = { version = "1.43.0", default-features = false, features = ["std"] }
+deunicode = { version = "1.6.2", default-features = false, features = ["alloc"] }
 
 [profile.dev]
 debug = 0

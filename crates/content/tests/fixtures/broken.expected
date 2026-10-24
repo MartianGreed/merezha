@@ -1,0 +1,33 @@
+content_model_invalid: migrations is not accepted in v1: model migrations are a later slice (C10)
+content_model_invalid: version must be between 1 and 2147483647
+content_model_invalid: locales[2].code must be a BCP 47 code of 2 to 35 bytes such as fr-BE
+content_model_invalid: locales[1].fallback names no configured locale
+content_model_invalid: components.block is reserved as a rich text block type
+content_model_invalid: components.seo.fields[0].max_length must be between 1 and 4096
+content_model_invalid: components.seo.fields[1].name is declared twice
+content_model_invalid: components.seo.fields[3].sortable is only allowed on top-level fields of a content type
+content_model_invalid: types.article.kind must be one of "collection", "singleton"
+content_model_invalid: types.article.access is required: "public", "authenticated" or { permission = "<name>" }
+content_model_invalid: types.article.fields[0].max_length must be between 1 and 4096
+content_model_invalid: types.article.fields[2].values[0] must match ^[a-z0-9][a-z0-9_-]{0,63}$
+content_model_invalid: types.article.fields[3].min_items requires cardinality = "many"
+content_model_invalid: types.article.fields[4].styles[1] must be one of normal, h1, h2, h3, h4, h5, h6, blockquote
+content_model_invalid: types.article.fields[5].min must not exceed max
+content_model_invalid: types.article.fields[6].scale must not exceed precision
+content_model_invalid: types.article.fields[7].filterable is only allowed on scalar, reference and scalar list fields
+content_model_invalid: types.article.fields[8].name is reserved for system attributes
+content_model_invalid: types.article.fields[9].pattern is not a valid regular expression
+content_model_invalid: types.article.fields[10].type must be one of string, text, rich_text, integer, float, decimal, boolean, datetime, date, enum, slug, reference, asset, component, list, blocks or json
+content_model_invalid: types.article.fields[11].default does not satisfy the field's rules (type_mismatch)
+content_model_invalid: types.article.fields[12].maxlength is not a known key for string fields
+content_model_invalid: types.article.fields[13].of.type must be a scalar type or component
+content_model_invalid: types.article.fields[1].from must name a string field beside the slug
+content_model_invalid: types.article.title_field must name a string field of the type
+content_model_invalid: types.manage is reserved by the delivery routes
+content_model_invalid: types.partner_brief.access must be "public", "authenticated" or { permission = "<name>" }
+content_model_invalid: types.secret.access names a permission missing from the RBAC catalog
+content_model_invalid: types.secret.fields must declare between 1 and 100 fields
+content_model_invalid: settings is not a known key of the content model
+content_model_invalid: components.seo.fields[2].type needs [modules.content.media] to be configured
+content_model_invalid: types.article.fields[3].to[0] names no declared content type
+content_model_invalid: types.article.fields[4].embeds[0] names no declared component
