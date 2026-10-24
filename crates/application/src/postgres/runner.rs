@@ -357,12 +357,16 @@ impl PostgresStore {
         });
         // The kernel's transaction helper, the session statement timeout and
         // the pool wait share the run's deadline and answer
-        // `database_timeout` or `database_busy` when they reach it first:
-        // that is the run's own cut.
+        // `database_timeout`, `database_busy` or (a commit cut by it)
+        // `commit_outcome_unknown` when they reach it first: that is the
+        // run's own cut. An unknown projection commit is harmless, since
+        // the next run reloads the row and its CAS settles either outcome.
         match result {
             Err(failure)
-                if matches!(failure.code.as_str(), "database_timeout" | "database_busy")
-                    && Instant::now() + DEADLINE_SLACK >= bounds.hard =>
+                if matches!(
+                    failure.code.as_str(),
+                    "database_timeout" | "database_busy" | "commit_outcome_unknown"
+                ) && Instant::now() + DEADLINE_SLACK >= bounds.hard =>
             {
                 Err(bounds.cut())
             }
