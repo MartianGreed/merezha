@@ -221,7 +221,7 @@ The PostgreSQL application core's tables (AP §D.2), all *reserved*:
 ### `[jobs]`
 
 Always present: jobs run whenever the database is configured, and there is
-no `enabled` key (R12). AP-B1 gives `[jobs.relay]` and `max_attempts`
+no `enabled` key (R12). AP-B1 gives `[jobs.relay]`, `[jobs.subscriptions]` and `max_attempts`
 (`[jobs.defaults]` and per queue) their behaviour: the relay and
 `enqueue` stamp each job with its queue's `max_attempts`. The other keys
 are *reserved* until leasing and dispatch (AP-B2) and cron (AP-B3) ship.
@@ -244,6 +244,8 @@ are *reserved* until leasing and dispatch (AP-B2) and cron (AP-B3) ship.
 | | `global_concurrency` | integer | `0` | 0 is unlimited |
 | | `max_attempts`, `backoff_base_ms`, `backoff_max_ms`, `lease_ms`, `timeout_ms` | as `[jobs.defaults]` | inherited | queue settings live only here (R1) |
 | `[jobs.retention]` | `succeeded`, `dead`, `outbox`, `audit` | duration string | `7d`, `30d`, `7d`, `365d` | 1 h to 3650 d |
+| `[jobs.subscriptions]` | `heartbeat` | duration string | `5m` | 100 ms to 1 d; every instance re-declares its subscriptions this often |
+| | `retire_after` | duration string | `1h` | 300 ms to 30 d, at least three heartbeats (`retire_after_too_short`); a subscription nobody declared for this long is retired |
 | `[jobs.readiness]` | `max_lag_ms` | duration | unset | 1 s to 1 day; unset, backlog is no readiness input (R10) |
 
 Queue names are dot-separated `[a-z][a-z0-9_]*` segments, at most 64 bytes
@@ -306,7 +308,7 @@ secrets with the kernel rules.
 `invalid_module_name`, `unknown_module`, `invalid_module_registration`,
 `expected_duration`, `expected_number`, `expected_table_array`,
 `invalid_instance_id`, `invalid_version`, `retry_base_exceeds_max`,
-`backoff_base_exceeds_max`, `invalid_queue_name`,
+`backoff_base_exceeds_max`, `retire_after_too_short`, `invalid_queue_name`,
 `concurrency_total_exceeded`, `invalid_cron`, `invalid_timezone`,
 `invalid_kind`, `invalid_payload`, `duplicate_name`, `invalid_endpoint`,
 `invalid_header_name`, `invalid_signal`, `duplicate_signal`, `invalid_label`,
@@ -448,7 +450,7 @@ its own `invocation.completed` and `registry.*` JSON lines.
 
 | Method | Contract |
 | --- | --- |
-| `name()` | `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not `application`, `api`, `services`, `pipelines`, `reload`, `health` or `jobs` (the jobs runtime). Names the section, route prefix and migration ledger key; never changes. |
+| `name()` | `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not `application`, `api`, `services`, `pipelines`, `reload`, `health`, `jobs` (the jobs runtime), `outbox` or `cron` (job key prefixes the relay and the scheduler mint). Names the section, route prefix and migration ledger key; never changes. |
 | `configure(&ModuleSection)` | validate and keep `[modules.<name>]`; return every issue at once. Default: only an empty section. |
 | `migrations()` | ordered forward-only `Migration::new(version, name, sql)` or `Migration::non_transactional(..)` for its own schema |
 | `errors()` | `ErrorCode { code, status }` it returns, registered at startup; default none |
@@ -717,12 +719,16 @@ state, and the R10 trace columns.
 - **Register and subscribe.** Modules declare handlers and subscriptions
   from `Module::start`; each kind has one owner (`kind_already_registered`),
   a module subscribes only kinds it registered (`kind_not_registered`), and
-  later calls fail `jobs_started`. At start the runtime upserts
-  `merezha_jobs.subscriptions` and sets `deactivated_at` on the rows this
-  version no longer declares (kept as history, no longer routed to,
-  reactivated when declared again), before its first relay pass. It
-  reports ready once that succeeded, so pending migrations in verify mode
-  keep it not ready instead of failing startup; each failure streak logs
+  later calls fail `jobs_started`. At start, before its first relay pass,
+  and then every `jobs.subscriptions.heartbeat`, each instance upserts the
+  subscriptions it declares (`last_declared_at = now()`, reactivating a
+  retired one) and retires, under a transaction advisory lock, those nobody
+  declared for `jobs.subscriptions.retire_after`; retired rows stay as
+  history and are not routed to. No instance deactivates anything from its
+  own registry, so during a rolling deploy every live version's
+  subscriptions keep receiving events. The runtime reports ready once the
+  first sync succeeded, so pending migrations in verify mode keep it not
+  ready instead of failing startup; each failure streak logs
   `job.subscription_sync_failed`.
 - **Relay.** One background task per host, woken by `LISTEN
   merezha_jobs_outbox`, by `jobs.relay.interval_ms` and once at start, so

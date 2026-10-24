@@ -744,7 +744,8 @@ CREATE INDEX outbox_relayed ON merezha_jobs.outbox (relayed_at) WHERE relayed_at
 CREATE TABLE merezha_jobs.subscriptions (
     topic text NOT NULL, job_kind text NOT NULL, queue text NOT NULL, source text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
-    deactivated_at timestamptz NULL,      -- no longer declared by the running version
+    last_declared_at timestamptz NOT NULL DEFAULT now(),   -- refreshed by every declaring instance
+    deactivated_at timestamptz NULL,      -- retired: nobody declared it for retire_after
     PRIMARY KEY (topic, job_kind));
 
 CREATE TABLE merezha_jobs.jobs (
@@ -913,9 +914,16 @@ NT maps its handler outcomes onto this (R1): `Done` is `Ok(())`, `Retry { after,
 `cancel` only cancels a job the calling module owns: its key starts with `{source}:` (enqueued, or
 relayed from the module's own `Job` records) or its kind is one the module registered. Any other id
 returns `false`, whether the job exists or not. `enqueue` notifies `merezha_jobs` with the queue
-inside its transaction, as the relay does. At start the runtime upserts the declared subscriptions
-and sets `deactivated_at` on every row the running version no longer declares; the relay routes only
-to active rows, and a version that declares a row again reactivates it.
+inside its transaction, as the relay does. Subscriptions are declared, never deactivated by an instance's own registry, so rolling deploys
+lose no events. Every instance upserts the subscriptions it declares at start and then every
+`jobs.subscriptions.heartbeat` (default 5 min), setting `last_declared_at = now()` and
+`deactivated_at = NULL`. A subscription is retired (`deactivated_at` set, the row kept) only when its
+`last_declared_at` is older than `jobs.subscriptions.retire_after` (default 1 h, at least three
+heartbeats); any instance runs the retirement on its heartbeat under
+`pg_advisory_xact_lock(MZJB, hashtext('subscriptions'))`. The relay routes to every subscription
+with `deactivated_at IS NULL`. During a deploy's grace window a subscription that any live version
+declares keeps receiving events, so a restarting old instance never cuts off a new version's
+subscription, and an instance that declares nothing retires nothing early.
 
 `register` must run before `start`. A job whose kind has no handler on an instance is never leased
 by that instance, because the lease query filters `kind = ANY($registered)`. During a rolling
@@ -1216,8 +1224,10 @@ A.7). Quarantined outbox rows follow `jobs.retention.dead`:
 | Admin actions | 365 days | `jobs.retention.audit` |
 
 The dedupe window equals retention. Producers whose keys must stay unique for longer must check
-their own state. Reactions do, through reactor checkpoints (C.5). Secrets do not wait for retention:
-flagged payloads are already NULL once relayed or terminal (R3).
+their own state. Reactions do, through reactor checkpoints (C.5). Most secrets do not wait for
+retention: flagged payloads are NULL once relayed, quarantined as `unroutable` or terminal (R3).
+The exception is a flagged record isolated by its own data error (B.4): it keeps its payload until
+it is requeued and relayed, or until `jobs.retention.dead` purges the quarantined row.
 
 ## B.10 Telemetry, readiness, pool
 
@@ -1744,6 +1754,10 @@ concurrency = 16
 max_attempts = 10
 backoff_base_ms = 1000
 backoff_max_ms = 86400000    # NT's 24-hour step (R1)
+
+[jobs.subscriptions]
+heartbeat = "5m"             # every instance re-declares its subscriptions
+retire_after = "1h"          # retire one nobody declared for this long; >= 3 x heartbeat
 
 [jobs.retention]
 succeeded = "7d"

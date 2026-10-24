@@ -48,8 +48,10 @@ CREATE TABLE merezha_jobs.subscriptions (
     queue text NOT NULL,
     source text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
-    -- Set when the running version no longer declares the subscription;
-    -- the relay routes only to rows where it is NULL.
+    -- Refreshed by every instance that declares it, at start and on each
+    -- heartbeat; a row nobody declared for retire_after is retired.
+    last_declared_at timestamptz NOT NULL DEFAULT now(),
+    -- Retirement time; the relay routes only to rows where it is NULL.
     deactivated_at timestamptz NULL,
     PRIMARY KEY (topic, job_kind));
 

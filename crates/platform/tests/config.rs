@@ -464,6 +464,13 @@ fn jobs_take_defaults_queues_and_schedules() {
     assert!(jobs.queues.is_empty() && jobs.schedules.is_empty());
     assert_eq!(jobs.retention.audit, Duration::from_secs(365 * 86_400));
     assert_eq!(jobs.readiness_max_lag, None);
+    assert_eq!(
+        (
+            jobs.subscriptions.heartbeat,
+            jobs.subscriptions.retire_after
+        ),
+        (Duration::from_secs(300), Duration::from_secs(3_600))
+    );
 
     let config = load(
         r#"
@@ -878,4 +885,54 @@ outbound_hosts = ["Bad Host"]
     );
     let local = remote.replace("collector.internal", "127.0.0.1");
     assert!(load(&local, &[("A", "x")], &[]).is_ok());
+}
+
+#[test]
+fn subscription_retirement_waits_at_least_three_heartbeats() {
+    let config = load(
+        "[jobs.subscriptions]\nheartbeat = \"200ms\"\nretire_after = \"1s\"\n",
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        config.jobs.subscriptions.retire_after,
+        Duration::from_secs(1)
+    );
+    let errors = load(
+        "[jobs.subscriptions]\nheartbeat = \"10m\"\nretire_after = \"20m\"\n",
+        &[],
+        &[],
+    )
+    .unwrap_err();
+    assert!(
+        errors
+            .0
+            .iter()
+            .any(|i| i.key == "jobs.subscriptions.retire_after"
+                && i.code == "retire_after_too_short"),
+        "{errors:?}"
+    );
+}
+
+/// A module named after a key namespace the jobs runtime mints.
+struct Named(&'static str);
+impl Module for Named {
+    fn name(&self) -> &'static str {
+        self.0
+    }
+}
+
+#[test]
+fn modules_named_after_reserved_prefixes_are_refused_at_startup() {
+    for name in ["jobs", "outbox", "cron", "api", "application"] {
+        let project = Project::new(&format!("{MINIMAL}\n[modules.{name}]\n"));
+        let errors = configure(&project.input(&[URL], &[]), vec![Box::new(Named(name))])
+            .err()
+            .unwrap();
+        assert!(
+            codes(&errors).contains(&(format!("modules.{name}"), "invalid_module_registration")),
+            "{name}: {errors:?}"
+        );
+    }
 }

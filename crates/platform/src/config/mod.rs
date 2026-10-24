@@ -13,7 +13,8 @@ mod telemetry;
 pub use duration::parse_duration;
 pub use jobs::{
     ApplicationAppend, ApplicationBackground, ApplicationProjections, ApplicationReactors, CatchUp,
-    JobDefaults, JobRetention, JobSchedule, JobsConfig, QueueConfig, RelayConfig, valid_queue_name,
+    JobDefaults, JobRetention, JobSchedule, JobsConfig, QueueConfig, RelayConfig,
+    SubscriptionsConfig, valid_queue_name,
 };
 pub use telemetry::{
     Compression, LogsConfig, MetricsConfig, PrivacyConfig, Protocol, ResourceConfig, Sampler,
@@ -49,7 +50,7 @@ const SECTIONS: [&str; 8] = [
     "modules",
 ];
 /// Nested tables the kernel knows, besides `jobs.queues.<name>`.
-const SUBTABLES: [&str; 19] = [
+const SUBTABLES: [&str; 20] = [
     "http.cors",
     "application.projections",
     "application.reactors",
@@ -61,6 +62,7 @@ const SUBTABLES: [&str; 19] = [
     "jobs.queues",
     "jobs.retention",
     "jobs.readiness",
+    "jobs.subscriptions",
     "telemetry.headers",
     "telemetry.resource",
     "telemetry.resource.attributes",

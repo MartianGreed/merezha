@@ -178,6 +178,17 @@ pub struct JobRetention {
     pub outbox: Duration,
     pub audit: Duration,
 }
+/// `[jobs.subscriptions]`: string durations. Every instance re-declares
+/// its subscriptions every `heartbeat`; one nobody declared for
+/// `retire_after` is retired. `retire_after` is at least three heartbeats
+/// (`retire_after_too_short`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionsConfig {
+    /// 100 ms to 1 day, default 5 min.
+    pub heartbeat: Duration,
+    /// 300 ms to 30 days, default 1 h.
+    pub retire_after: Duration,
+}
 /// One `[[jobs.schedules]]` entry. The cron expression and time zone are
 /// checked for shape here; the scheduler parses them when it starts.
 #[derive(Clone, Debug, PartialEq)]
@@ -207,6 +218,7 @@ pub struct JobsConfig {
     pub defaults: JobDefaults,
     pub queues: BTreeMap<String, QueueConfig>,
     pub retention: JobRetention,
+    pub subscriptions: SubscriptionsConfig,
     /// `[jobs.readiness] max_lag_ms`; unset, backlog is no readiness input.
     pub readiness_max_lag: Option<Duration>,
     pub schedules: Vec<JobSchedule>,
@@ -312,6 +324,20 @@ pub(super) fn jobs(layers: &mut Layers, issues: &mut Vec<ConfigIssue>) -> JobsCo
         audit: r.duration("audit", ms(365 * DAY), keep),
     };
     r.finish();
+    let (mut r, _) = reader(layers, "jobs.subscriptions", issues);
+    let retire_origin = r.origin_of("retire_after");
+    let subscriptions = SubscriptionsConfig {
+        heartbeat: r.duration("heartbeat", ms(300_000), (ms(100), ms(DAY))),
+        retire_after: r.duration("retire_after", ms(3_600_000), (ms(300), ms(30 * DAY))),
+    };
+    if subscriptions.retire_after < subscriptions.heartbeat * 3 {
+        r.issue(
+            "retire_after",
+            "retire_after_too_short",
+            retire_origin.unwrap_or(Origin::Default),
+        );
+    }
+    r.finish();
     let (mut r, _) = reader(layers, "jobs.readiness", issues);
     let readiness_max_lag = r.optional_duration("max_lag_ms", (ms(1_000), ms(DAY)));
     r.finish();
@@ -330,6 +356,7 @@ pub(super) fn jobs(layers: &mut Layers, issues: &mut Vec<ConfigIssue>) -> JobsCo
         defaults,
         queues,
         retention,
+        subscriptions,
         readiness_max_lag,
         schedules,
     }

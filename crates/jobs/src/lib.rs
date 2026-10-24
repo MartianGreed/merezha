@@ -21,7 +21,7 @@ pub use relay::{JOBS_CHANNEL, RelayReport};
 use merezha_domain::{Failure, Identity};
 use merezha_platform::{
     AppContext, BoxFuture, Database, ErrorCode, JobsPorts, JobsRuntime, Migration, Module,
-    config::JobsConfig,
+    config::{JobsConfig, SubscriptionsConfig},
     ports::{Enqueued, JobRegistration, Jobs, NewJob, Source},
 };
 use merezha_postgres::{Listener, classify};
@@ -89,6 +89,8 @@ struct Registry {
 
 struct Inner {
     settings: RelaySettings,
+    subscriptions: SubscriptionsConfig,
+    listen_check: Duration,
     mode: RelayMode,
     database: OnceLock<Database>,
     registry: Mutex<Registry>,
@@ -131,6 +133,8 @@ impl PgJobs {
         Self {
             inner: Arc::new(Inner {
                 settings: RelaySettings::new(config),
+                subscriptions: config.subscriptions.clone(),
+                listen_check: LISTEN_CHECK_INTERVAL,
                 mode,
                 database: OnceLock::new(),
                 registry: Mutex::new(Registry::default()),
@@ -141,6 +145,14 @@ impl PgJobs {
                 task: Mutex::new(None),
             }),
         }
+    }
+    /// Probe an idle `LISTEN` session every `interval` instead of
+    /// [`LISTEN_CHECK_INTERVAL`]; call before sharing the runtime.
+    pub fn with_listen_check(mut self, interval: Duration) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.listen_check = interval;
+        }
+        self
     }
     /// Migration 0001 of `merezha_jobs`, under ledger key `jobs`.
     pub fn migrations() -> &'static [Migration] {
@@ -256,9 +268,12 @@ impl PgJobs {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
         Ok(())
     }
-    /// Upsert every declared subscription and deactivate the rows this
-    /// version no longer declares: the relay stops routing to them, and the
-    /// rows stay as history until a version declares them again.
+    /// Declare this instance's subscriptions (`last_declared_at = now()`,
+    /// reactivated if retired), then retire, under a transaction advisory
+    /// lock, every subscription nobody declared for
+    /// `jobs.subscriptions.retire_after`. No instance deactivates anything
+    /// from its own registry, so during a rolling deploy a subscription any
+    /// live version declares keeps receiving events.
     async fn sync_subscriptions(&self, database: &Database) -> Result<(), Failure> {
         let (topics, kinds, queues, sources) = {
             let registry = self.registry();
@@ -271,6 +286,7 @@ impl PgJobs {
             }
             columns
         };
+        let retire_after = self.inner.subscriptions.retire_after.as_secs_f64();
         database
             .transaction(Instant::now() + OPERATION_DEADLINE, move |tx| {
                 Box::pin(async move {
@@ -279,17 +295,22 @@ impl PgJobs {
                          SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[])
                          ON CONFLICT (topic, job_kind)
                          DO UPDATE SET queue = excluded.queue, source = excluded.source,
-                                       deactivated_at = NULL",
+                                       last_declared_at = now(), deactivated_at = NULL",
                         &[&topics, &kinds, &queues, &sources],
                     )
                     .await
                     .map_err(|e| classify(&e))?;
                     tx.execute(
-                        "UPDATE merezha_jobs.subscriptions s SET deactivated_at = now()
+                        "SELECT pg_advisory_xact_lock(1297762882, hashtext('subscriptions'))",
+                        &[],
+                    )
+                    .await
+                    .map_err(|e| classify(&e))?;
+                    tx.execute(
+                        "UPDATE merezha_jobs.subscriptions SET deactivated_at = now()
                           WHERE deactivated_at IS NULL
-                            AND NOT EXISTS (SELECT 1 FROM unnest($1::text[], $2::text[]) AS d(topic, kind)
-                                             WHERE d.topic = s.topic AND d.kind = s.job_kind)",
-                        &[&topics, &kinds],
+                            AND last_declared_at < now() - make_interval(secs => $1)",
+                        &[&retire_after],
                     )
                     .await
                     .map_err(|e| classify(&e))?;
@@ -305,6 +326,28 @@ fn classification(failure: &Failure) -> &'static str {
         merezha_domain::Classification::Permanent => "permanent",
         merezha_domain::Classification::Transient => "transient",
         merezha_domain::Classification::Conflict => "conflict",
+    }
+}
+
+/// One subscription heartbeat; logs `job.subscription_sync_failed` once
+/// per failure streak. Returns whether it succeeded.
+async fn declare(jobs: &PgJobs, database: &Database, failing: &mut bool) -> bool {
+    match jobs.sync_subscriptions(database).await {
+        Ok(()) => {
+            *failing = false;
+            true
+        }
+        Err(failure) => {
+            if !*failing {
+                tracing::warn!(
+                    event = "job.subscription_sync_failed",
+                    code = failure.code.as_str(),
+                    classification = classification(&failure)
+                );
+            }
+            *failing = true;
+            false
+        }
     }
 }
 
@@ -324,24 +367,16 @@ async fn background(
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     let settings = jobs.inner.settings.clone();
+    let heartbeat = jobs.inner.subscriptions.heartbeat;
+    let check_every = jobs.inner.listen_check;
     let stopped = |stop: &tokio::sync::watch::Receiver<bool>| *stop.borrow();
     // Subscriptions first, so no event relays before its subscribers exist.
     // Pending migrations in verify mode keep this retrying and the runtime
     // not ready.
     let mut failing = false;
     loop {
-        match jobs.sync_subscriptions(&database).await {
-            Ok(()) => break,
-            Err(failure) => {
-                if !failing {
-                    tracing::warn!(
-                        event = "job.subscription_sync_failed",
-                        code = failure.code.as_str(),
-                        classification = classification(&failure)
-                    );
-                }
-                failing = true;
-            }
+        if declare(&jobs, &database, &mut failing).await {
+            break;
         }
         tokio::select! {
             _ = stop.changed() => return,
@@ -352,14 +387,25 @@ async fn background(
         }
     }
     jobs.inner.ready.store(true, Ordering::SeqCst);
+    let mut next_heartbeat = tokio::time::Instant::now() + heartbeat;
     if jobs.inner.mode == RelayMode::Off {
-        let _ = stop.wait_for(|stop| *stop).await;
-        return;
+        loop {
+            tokio::select! {
+                _ = stop.changed() => return,
+                () = tokio::time::sleep_until(next_heartbeat) => {
+                    next_heartbeat = tokio::time::Instant::now() + heartbeat;
+                    declare(&jobs, &database, &mut failing).await;
+                }
+            }
+            if stopped(&stop) {
+                return;
+            }
+        }
     }
     let mut listener: Option<Listener> = None;
-    let mut next_check = tokio::time::Instant::now() + LISTEN_CHECK_INTERVAL;
+    let mut next_check = tokio::time::Instant::now() + check_every;
     let mut lost = false;
-    let mut failing = false;
+    let mut relay_failing = false;
     loop {
         if stopped(&stop) {
             return;
@@ -375,7 +421,7 @@ async fn background(
                     }
                     lost = false;
                     listener = Some(session);
-                    next_check = tokio::time::Instant::now() + LISTEN_CHECK_INTERVAL;
+                    next_check = tokio::time::Instant::now() + check_every;
                 }
                 Err(failure) => {
                     if !lost {
@@ -390,30 +436,39 @@ async fn background(
                 jobs.inner
                     .unrouted
                     .fetch_add(report.unrouted, Ordering::Relaxed);
-                failing = false;
+                relay_failing = false;
                 drained
             }
             Err(failure) => {
                 // Systemic failures abort the batch and retry at the
                 // interval; nothing is quarantined for them.
-                if !failing {
+                if !relay_failing {
                     tracing::error!(
                         event = "outbox.relay_failed",
                         code = failure.code.as_str(),
                         classification = classification(&failure)
                     );
                 }
-                failing = true;
+                relay_failing = true;
                 true
             }
         };
         if !drained {
+            // A backlog never starves the heartbeat.
+            if tokio::time::Instant::now() >= next_heartbeat {
+                next_heartbeat = tokio::time::Instant::now() + heartbeat;
+                declare(&jobs, &database, &mut failing).await;
+            }
             continue;
         }
         tokio::select! {
             _ = stop.changed() => return,
+            () = tokio::time::sleep_until(next_heartbeat) => {
+                next_heartbeat = tokio::time::Instant::now() + heartbeat;
+                declare(&jobs, &database, &mut failing).await;
+            }
             () = tokio::time::sleep_until(next_check), if listener.is_some() => {
-                next_check = tokio::time::Instant::now() + LISTEN_CHECK_INTERVAL;
+                next_check = tokio::time::Instant::now() + check_every;
                 // A half-open session never ends by itself: probe it.
                 let probe = match &listener {
                     Some(session) => session.check(Instant::now() + LISTEN_DEADLINE).await,
@@ -582,6 +637,7 @@ impl Jobs for PgJobs {
         })
     }
     fn cancel<'a>(&'a self, source: &'a Source, id: i64) -> BoxFuture<'a, Result<bool, Failure>> {
+        let valid = validate::source(source.as_str());
         let kinds: Vec<String> = self
             .registry()
             .kinds
@@ -590,6 +646,7 @@ impl Jobs for PgJobs {
             .map(|(name, _)| name.clone())
             .collect();
         Box::pin(async move {
+            valid?;
             let client = self
                 .database()?
                 .acquire(Instant::now() + OPERATION_DEADLINE)

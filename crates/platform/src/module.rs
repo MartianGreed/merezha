@@ -13,8 +13,10 @@ use std::{sync::Arc, time::Instant};
 
 /// Names of route prefixes owned by the host; modules cannot use them.
 /// `api` and `application` are also the kernel-only outbox and notifier
-/// sources; `jobs` is the [`JobsRuntime`].
-pub const RESERVED_NAMES: [&str; 7] = [
+/// sources; `jobs` is the [`JobsRuntime`]; `outbox` and `cron` prefix the
+/// job keys the relay and the scheduler mint, so no module may write or
+/// cancel under them.
+pub const RESERVED_NAMES: [&str; 9] = [
     "application",
     "api",
     "services",
@@ -22,6 +24,8 @@ pub const RESERVED_NAMES: [&str; 7] = [
     "reload",
     "health",
     "jobs",
+    "outbox",
+    "cron",
 ];
 
 /// Integration events a module publishes and consumes through the outbox.

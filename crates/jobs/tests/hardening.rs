@@ -5,6 +5,7 @@ mod support;
 use merezha_jobs::{JOBS_CHANNEL, PgJobs, RelayMode};
 use merezha_platform::{
     JobsRuntime, Module,
+    config::JobsConfig,
     ports::{DedupeKey, KindOptions, NewJob, OnDuplicate},
 };
 use merezha_postgres::{Database, TestDatabase};
@@ -390,53 +391,130 @@ async fn enqueue_notifies_the_queue_on_commit() {
     assert!(listener.try_recv().is_none());
 }
 
-/// Review item 6: subscriptions the running version no longer declares
-/// are deactivated, kept, and no longer routed to.
-#[tokio::test]
-async fn undeclared_subscriptions_are_deactivated_and_no_longer_routed() {
-    let Some(test) = TestDatabase::create() else {
-        return;
-    };
-    let db = database(&test).await;
-    let version = |kinds: &[&str]| {
-        let jobs = PgJobs::with_mode(&jobs_config(&test, ""), RelayMode::Off);
-        jobs.ports(&db);
-        let audit = handle(&jobs, "audit");
-        for kind in kinds {
-            audit
-                .register(kind, "default", Arc::new(Noop), KindOptions::default())
-                .unwrap();
-            audit.subscribe("identity.user_registered", kind).unwrap();
-        }
-        jobs
-    };
-    let active = "SELECT count(*) FROM merezha_jobs.subscriptions WHERE deactivated_at IS NULL";
-    let old = version(&["audit.record", "audit.legacy"]);
-    old.start(context(&db)).await.unwrap();
-    wait_ready(&old).await;
-    assert_eq!(scalar(&db, active).await, 2);
-    let new = version(&["audit.record"]);
-    new.start(context(&db)).await.unwrap();
-    wait_ready(&new).await;
-    assert_eq!(scalar(&db, active).await, 1);
-    assert_eq!(
-        scalar(&db, "SELECT count(*) FROM merezha_jobs.subscriptions").await,
-        2,
-        "history is kept"
-    );
+/// A runtime of one "version": it declares `kinds` on `topic` for source
+/// `audit`, binds to `db` and starts.
+async fn version(db: &Database, config: &JobsConfig, kinds: &[&str]) -> PgJobs {
+    version_in(db, config, kinds, RelayMode::Off).await
+}
+async fn version_in(db: &Database, config: &JobsConfig, kinds: &[&str], mode: RelayMode) -> PgJobs {
+    let jobs = PgJobs::with_mode(config, mode);
+    jobs.ports(db);
+    let audit = handle(&jobs, "audit");
+    for kind in kinds {
+        audit
+            .register(kind, "default", Arc::new(Noop), KindOptions::default())
+            .unwrap();
+        audit.subscribe("identity.user_registered", kind).unwrap();
+    }
+    jobs.start(context(db)).await.unwrap();
+    wait_ready(&jobs).await;
+    jobs
+}
+const ACTIVE: &str = "SELECT count(*) FROM merezha_jobs.subscriptions WHERE deactivated_at IS NULL";
+async fn registered(db: &Database, key: &str) {
     append(
-        &db,
+        db,
         &outbox("identity"),
         vec![event(
             "identity",
             "identity.user_registered",
-            "usr_1:registered",
+            key,
             json!({}),
         )],
         OnDuplicate::Fail,
     )
     .await
     .unwrap();
+}
+
+/// Re-review F2: during a rolling deploy, v1 and v2 instances restart in
+/// turns; v2's new subscription is never deactivated and gets every event.
+#[tokio::test]
+async fn alternating_v1_and_v2_restarts_never_retire_the_new_subscription() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let config = jobs_config(
+        &test,
+        "[jobs.subscriptions]\nheartbeat = \"100ms\"\nretire_after = \"2s\"",
+    );
+    let v1 = &["audit.record"][..];
+    let v2 = &["audit.record", "audit.trail"][..];
+    for round in 0..4 {
+        let declared = if round % 2 == 0 { v2 } else { v1 };
+        let instance = version(&db, &config, declared).await;
+        assert_eq!(scalar(&db, ACTIVE).await, 2, "round {round}");
+        registered(&db, &format!("usr_{round}:registered")).await;
+        instance.relay_now().await.unwrap();
+        instance.shutdown(soon()).await;
+    }
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT count(*) FROM merezha_jobs.jobs WHERE kind = 'audit.trail'"
+        )
+        .await,
+        4,
+        "no event was lost to v2's subscription"
+    );
+}
+
+/// Re-review F2: an instance that declares nothing retires nothing.
+#[tokio::test]
+async fn an_instance_with_an_empty_registry_retires_nothing() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let config = jobs_config(&test, "");
+    let declaring = version(&db, &config, &["audit.record", "audit.trail"]).await;
+    let empty = version(&db, &config, &[]).await;
+    empty.relay_now().await.unwrap();
+    assert_eq!(scalar(&db, ACTIVE).await, 2);
+    empty.shutdown(soon()).await;
+    declaring.shutdown(soon()).await;
+}
+
+/// Re-review F2: a subscription nobody declared for `retire_after` is
+/// retired, kept as history and no longer routed; declaring it again
+/// reactivates it.
+#[tokio::test]
+async fn a_subscription_nobody_declares_is_retired_after_the_grace_window() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let config = jobs_config(
+        &test,
+        "[jobs.subscriptions]\nheartbeat = \"100ms\"\nretire_after = \"500ms\"\n[jobs.relay]\ninterval_ms = 600000",
+    );
+    let all = ["audit.record", "audit.legacy", "audit.extra"];
+    let old = version(&db, &config, &all).await;
+    old.shutdown(soon()).await;
+    // Both background loops heartbeat: a relaying instance and a held one.
+    let new = version_in(&db, &config, &["audit.record"], RelayMode::Interval).await;
+    let held = version(&db, &config, &["audit.extra"]).await;
+    assert_eq!(
+        scalar(&db, ACTIVE).await,
+        3,
+        "still inside the grace window"
+    );
+    wait_for(&db, ACTIVE, 2, Duration::from_secs(3)).await;
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT count(*) FROM merezha_jobs.subscriptions
+              WHERE job_kind = 'audit.legacy' AND deactivated_at IS NOT NULL"
+        )
+        .await,
+        1,
+        "retired, not deleted"
+    );
+    // The declared ones stay active across heartbeats.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(scalar(&db, ACTIVE).await, 2);
+    registered(&db, "usr_1:registered").await;
     new.relay_now().await.unwrap();
     assert_eq!(
         scalar(
@@ -446,19 +524,120 @@ async fn undeclared_subscriptions_are_deactivated_and_no_longer_routed() {
         .await,
         0
     );
+    new.shutdown(soon()).await;
+    held.shutdown(soon()).await;
+    let back = version(&db, &config, &all).await;
+    assert_eq!(scalar(&db, ACTIVE).await, 3);
+    back.shutdown(soon()).await;
+}
+
+/// Re-review F4: a class-22 data error isolates its record; the rest of
+/// the batch relays and the record keeps its payload.
+#[tokio::test]
+async fn a_data_exception_isolates_only_its_record() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    execute(
+        &db,
+        "CREATE FUNCTION poison() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF NEW.idempotency_key = 'tasks:poison' THEN
+             RAISE EXCEPTION 'bad value' USING ERRCODE = '22023';
+           END IF;
+           RETURN NEW;
+         END $$",
+    )
+    .await
+    .unwrap();
+    execute(
+        &db,
+        "CREATE TRIGGER poison BEFORE INSERT ON merezha_jobs.jobs
+             FOR EACH ROW EXECUTE FUNCTION poison()",
+    )
+    .await
+    .unwrap();
+    let mut poison = job_record("poison", "default", json!({"secret": "s"}));
+    poison.contains_secret = true;
+    append(
+        &db,
+        &outbox("tasks"),
+        vec![
+            job_record("one", "default", json!({})),
+            poison,
+            job_record("two", "default", json!({})),
+        ],
+        OnDuplicate::Fail,
+    )
+    .await
+    .unwrap();
+    let jobs = PgJobs::with_mode(&jobs_config(&test, ""), RelayMode::Off);
+    jobs.ports(&db);
+    let report = jobs.relay_now().await.unwrap();
+    assert_eq!((report.relayed, report.quarantined), (2, 1));
     assert_eq!(
         scalar(
             &db,
-            "SELECT count(*) FROM merezha_jobs.jobs WHERE kind = 'audit.record'"
+            "SELECT count(*) FROM merezha_jobs.outbox
+              WHERE dedupe_key = 'poison' AND quarantine_code = 'invalid_record_data'
+                AND payload IS NOT NULL"
         )
         .await,
         1
     );
-    // Declaring it again reactivates it.
-    let back = version(&["audit.record", "audit.legacy"]);
-    back.start(context(&db)).await.unwrap();
-    wait_ready(&back).await;
-    assert_eq!(scalar(&db, active).await, 2);
+}
+
+/// Re-review F4 and F1: a source that prefixes another cannot cancel its
+/// jobs, and an invalid source is refused.
+#[tokio::test]
+async fn cancel_matches_the_whole_source_name() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let jobs = PgJobs::with_mode(&jobs_config(&test, ""), RelayMode::Off);
+    jobs.ports(&db);
+    let job = handle(&jobs, "tasks")
+        .enqueue(new_job("remind:t1", json!({})))
+        .await
+        .unwrap();
+    assert!(!handle(&jobs, "task").cancel(job.id).await.unwrap());
+    assert_eq!(
+        handle(&jobs, "outbox")
+            .cancel(job.id)
+            .await
+            .unwrap_err()
+            .code,
+        "invalid_source"
+    );
+    assert_eq!(state(&db, job.id).await.0, "available");
+    assert!(handle(&jobs, "tasks").cancel(job.id).await.unwrap());
+}
+
+/// Re-review F4: the idle LISTEN session is probed on its interval.
+#[tokio::test]
+async fn the_idle_listen_session_is_probed_on_its_interval() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let config = jobs_config(&test, "[jobs.relay]\ninterval_ms = 600000");
+    let jobs =
+        PgJobs::with_mode(&config, RelayMode::Listen).with_listen_check(Duration::from_millis(200));
+    jobs.ports(&db);
+    jobs.start(context(&db)).await.unwrap();
+    wait_ready(&jobs).await;
+    // The probe's `SELECT 1` replaces `LISTEN` as the session's last query.
+    wait_for(
+        &db,
+        "SELECT count(*) FROM pg_stat_activity
+          WHERE datname = current_database() AND query = 'SELECT 1'",
+        1,
+        Duration::from_secs(3),
+    )
+    .await;
+    jobs.shutdown(soon()).await;
 }
 
 /// Review item 7: a permanent subscription sync failure is logged.
