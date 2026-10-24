@@ -250,6 +250,9 @@ CREATE TABLE captures (                         -- written only by capture drive
   delivery_id uuid NOT NULL, channel text NOT NULL, target text NOT NULL,
   rendered jsonb NOT NULL, captured_at timestamptz NOT NULL
 );
+-- one capture per delivery and idempotency key (email); SMS captures carry no key
+CREATE UNIQUE INDEX captures_idempotency_idx
+  ON captures (delivery_id, (rendered->>'idempotency_key'));
 
 -- Migration 2 (slice N2): inbox
 CREATE TABLE inbox_counters (                   -- one row per user with an inbox item
@@ -604,12 +607,22 @@ startup.
 - `UndefinedBehavior::Strict`: a missing variable fails the render.
 - Auto-escaping is chosen by extension: `AutoEscape::Html` for `.html`,
   `AutoEscape::None` for everything else.
-- `set_fuel(templates.fuel)` (default 50,000) bounds loops.
+- `set_fuel(templates.fuel)` (default 50,000) bounds loops and every other
+  instruction.
+- Output limits cap the output stream: a render writes into a buffer that
+  fails `output_too_large` once the channel's limit is passed. Intermediate
+  values (expressions, `{% set %}` blocks, macro bodies) are built in memory
+  before they are written, so they are bounded only by fuel and the
+  template's author. Templates are operator-authored project code;
+  untrusted templates are not supported.
 - Output limits: HTML 512 KiB, text 128 KiB, subject 255 characters, SMS
   `sms.max_segments`, push payload 3,000 bytes, inbox title 200 characters and
   body 2,000.
 - A rendered subject or SMS that contains CR, LF or another control character
-  fails. SMS may contain `\n`.
+  fails, and so does one with U+2028, U+2029 or a bidirectional override or
+  isolate (U+202A to U+202E, U+2066 to U+2069). SMS may contain `\n`.
+- In the inbox, `secret` is a guard holding no data; any use of it, through
+  partials included, fails the render (`inbox_references_secret`).
 
 The block adds three filters: `url` (accepts `https:` only, or `http:` to
 loopback with `templates.allow_http_links`, and fails otherwise),

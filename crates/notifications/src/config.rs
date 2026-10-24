@@ -8,7 +8,9 @@ use crate::topics::{self, Category, Topic};
 use base64::Engine;
 use merezha_platform::{
     ModuleSection,
-    config::{ConfigIssue, JobDefaults, JobsConfig, Origin, ProjectConfig, parse_duration},
+    config::{
+        ConfigIssue, JobDefaults, JobsConfig, Origin, ProjectConfig, flag_path, parse_duration,
+    },
     net::Cidr,
     ports::Channel,
 };
@@ -69,17 +71,19 @@ struct RawLayers<'a> {
     input: &'a merezha_platform::ConfigInput,
 }
 impl RawLayers<'_> {
-    /// The value of `section.key` and its origin. `section` has no dotted
-    /// segments (`http`, `app`, `jobs.defaults` as two segments).
+    /// The value of `section.key` and its origin. `section` lists path
+    /// segments (`["jobs", "queues", "notify.email"]`); flags are split with
+    /// the kernel's own [`flag_path`], so quoted segments match as they do
+    /// there.
     fn get(&self, section: &[&str], key: &str) -> Option<(toml::Value, Origin)> {
-        let dotted = format!("{}.{key}", section.join("."));
-        if let Some((_, value)) = self
-            .input
-            .overrides
+        let path: Vec<&str> = section
             .iter()
-            .rev()
-            .find(|(k, _)| *k == dotted)
-        {
+            .copied()
+            .chain(std::iter::once(key))
+            .collect();
+        if let Some((_, value)) = self.input.overrides.iter().rev().find(|(k, _)| {
+            flag_path(k).is_some_and(|p| p.iter().map(String::as_str).eq(path.iter().copied()))
+        }) {
             return Some((toml::Value::String(value.clone()), Origin::Flag));
         }
         let wanted: Vec<String> = section
@@ -162,23 +166,12 @@ impl HostFacts {
         let jobs = Self::jobs_alone(&layers, &base_dir);
         let mut jobs_origins = BTreeMap::new();
         for (queue, key) in CHECKED_QUEUE_KEYS {
-            let flag = format!("jobs.queues.\"{queue}\".{key}");
-            let origin = if input.overrides.iter().any(|(k, _)| *k == flag) {
-                Some(Origin::Flag)
-            } else if layers
-                .file
-                .get("jobs")
-                .and_then(|j| j.get("queues"))
-                .and_then(|q| q.get(queue))
-                .and_then(|q| q.get(key))
-                .is_some()
-            {
-                Some(Origin::File)
-            } else {
-                layers.get(&["jobs", "defaults"], key).map(|(_, o)| o)
-            };
+            let origin = layers
+                .get(&["jobs", "queues", queue], key)
+                .or_else(|| layers.get(&["jobs", "defaults"], key))
+                .map(|(_, origin)| origin);
             if let Some(origin) = origin {
-                jobs_origins.insert(flag, origin);
+                jobs_origins.insert(format!("jobs.queues.\"{queue}\".{key}"), origin);
             }
         }
         Self {
@@ -218,7 +211,11 @@ impl HostFacts {
             .input
             .env
             .iter()
-            .filter(|(name, _)| name.to_ascii_uppercase().starts_with("MEREZHA_JOBS__"))
+            .filter(|(name, _)| {
+                name.strip_prefix(merezha_platform::config::ENV_PREFIX)
+                    .and_then(|rest| rest.split("__").next())
+                    .is_some_and(|section| section.eq_ignore_ascii_case("jobs"))
+            })
             .cloned()
             .collect();
         env.push((
@@ -229,7 +226,9 @@ impl HostFacts {
             .input
             .overrides
             .iter()
-            .filter(|(key, _)| key.starts_with("jobs."))
+            .filter(|(key, _)| {
+                flag_path(key).is_some_and(|p| p.first().is_some_and(|s| s == "jobs"))
+            })
             .cloned()
             .collect();
         ProjectConfig::parse(&text, base_dir.to_path_buf(), &env, &overrides)

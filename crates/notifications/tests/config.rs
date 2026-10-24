@@ -565,3 +565,44 @@ fn cross_check_issues_carry_the_layer_that_set_the_key() {
         "{issues:?}"
     );
 }
+
+#[test]
+fn host_facts_split_flags_and_queue_variables_as_the_kernel_does() {
+    let project = Project::new(&format!("{MINIMAL}[modules.notifications.webhooks]\n"));
+    for flag in ["\"http\".public", "http.\"public\""] {
+        let mut input = project.input();
+        input.overrides.push((flag.into(), "true".into()));
+        assert_eq!(HostFacts::load(&input).http_public, Some(true), "{flag}");
+    }
+    let mut input = project.input();
+    input
+        .overrides
+        .push(("\"jobs\".defaults.lease_ms".into(), "45000".into()));
+    let facts = HostFacts::load(&input);
+    assert_eq!(
+        facts.jobs.as_ref().unwrap().defaults.lease,
+        Duration::from_millis(45_000)
+    );
+    assert_eq!(
+        facts.jobs_origins["jobs.queues.\"notify.webhook\".lease_ms"].to_string(),
+        "flag"
+    );
+    // The kernel reads a queue-level variable; the issue names that layer.
+    let project = project.env("MEREZHA_JOBS__QUEUES__NOTIFY.WEBHOOK__LEASE_MS", "1000");
+    let facts = HostFacts::load(&project.input());
+    assert_eq!(
+        facts.jobs.as_ref().unwrap().queues["notify.webhook"]
+            .settings
+            .lease,
+        Duration::from_millis(1000)
+    );
+    let issues = with_origins(&project);
+    assert!(
+        issues
+            .iter()
+            .any(|(k, c, o)| k == "jobs.queues.\"notify.webhook\".lease_ms"
+                && *c == "lease_too_short"
+                && o == "env MEREZHA_JOBS__QUEUES__NOTIFY.WEBHOOK__LEASE_MS"),
+        "{issues:?}"
+    );
+}

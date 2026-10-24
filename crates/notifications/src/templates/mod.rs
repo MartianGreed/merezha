@@ -804,7 +804,10 @@ impl TemplateRegistry {
             Channel::Sms => {
                 let text = self.run(&name(File::Sms, None), &scope, MAX_TEXT_BYTES)?;
                 bounded(&text, MAX_TEXT_BYTES).map_err(fail)?;
-                if text.chars().any(|c| c.is_control() && c != '\n') {
+                if text
+                    .chars()
+                    .any(|c| (c.is_control() && c != '\n') || invisible(c))
+                {
                     return Err(fail("control_character"));
                 }
                 let counted = match &self.rendering.organisation_prefix {
@@ -935,12 +938,14 @@ impl minijinja::value::Object for SecretGuard {
         self.touch();
         false
     }
+    /// Prints nothing and records the use: returning an error here would
+    /// make string conversions (`|string`, `~`) panic inside the engine.
     fn render(self: &Arc<Self>, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
     where
         Self: Sized + 'static,
     {
         self.touch();
-        Err(std::fmt::Error)
+        Ok(())
     }
 }
 
@@ -964,10 +969,17 @@ impl std::io::Write for Capped {
     }
 }
 
+/// Line and paragraph separators and bidirectional overrides and
+/// isolates: not controls to Unicode, but they break lines or reorder text
+/// on the recipient's screen, so subjects, titles and SMS refuse them too.
+fn invisible(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
 /// One line: no control characters at all, at most `max` characters, not
 /// empty.
 fn single_line(text: &str, max: usize) -> Result<(), &'static str> {
-    if text.chars().any(char::is_control) {
+    if text.chars().any(|c| c.is_control() || invisible(c)) {
         Err("control_character")
     } else if text.trim().is_empty() {
         Err("empty_output")

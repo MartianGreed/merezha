@@ -602,12 +602,17 @@ directories must be in `templates.locales`. Every topic needs its template
 in the default locale, so with a default locale other than `en` or `fr` the
 project provides the built-in templates in it too. Rendering uses strict undefined,
 HTML escaping for `.html` files only, `templates.fuel` and the output limits
-of NT §4. Output is written into a buffer capped at the channel's limit, so
-a render stops with `output_too_large` as soon as it passes the limit; a
-single expression can still build a large value before it is written
-(templates are trusted project code). In the inbox, `secret` is a guard
+of NT §4. The output limits cap the output stream: a render fails
+`output_too_large` when what it writes passes the channel's limit, and
+`templates.fuel` bounds the instructions it runs. Intermediate values, such
+as a string built by an expression, a `{% set %}…{% endset %}` block or a
+macro body, are built in memory before anything is written and are bounded
+only by fuel and the template's author. Templates are operator-authored
+project code; untrusted templates are not supported. In the inbox, `secret` is a guard
 holding no data: any use of it, through partials included, refuses the
-render with `inbox_references_secret`. The filters are `url` (`https:`, or `http:` to loopback with
+render with `inbox_references_secret`. Subjects, push and inbox titles and
+SMS also refuse U+2028, U+2029 and the bidirectional overrides and isolates
+(U+202A to U+202E, U+2066 to U+2069). The filters are `url` (`https:`, or `http:` to loopback with
 `templates.allow_http_links`), `datetime(format)` (a jiff `strftime` format,
 default `%Y-%m-%d %H:%M %Z`, in `recipient.timezone`) and `truncate_chars(n)`
 (the first `n` characters).

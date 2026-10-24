@@ -183,7 +183,13 @@ fn a_control_character_in_a_subject_is_rejected() {
         )
         .configure()
         .unwrap();
-    for bad in ["Hi\rthere", "Hi\nthere", "Hi\u{7}"] {
+    for bad in [
+        "Hi\rthere",
+        "Hi\nthere",
+        "Hi\u{7}",
+        "Hi\u{2028}there",
+        "Hi\u{202e}ereht",
+    ] {
         let data = object(json!({"subject": bad}));
         assert_eq!(
             render(&checked, "tasks.assigned", Channel::Email, "en", &data),
@@ -494,8 +500,14 @@ fn inbox_renders_never_see_secret_data_even_through_a_partial() {
         .render("tasks.assigned", Channel::Inbox, "en", &context)
         .unwrap_err();
     assert_eq!(refused.code, "inbox_references_secret");
-    // Testing or printing `secret` itself is refused too.
+    // Testing, printing or converting `secret` itself is refused too, and
+    // never panics in the engine.
     for body in [
+        "{{ secret|string }}",
+        "{{ secret|safe }}",
+        "{{ secret|lower }}",
+        "{{ secret|truncate_chars(3) }}",
+        "{{ secret ~ '' }}",
         "{{ secret }}",
         "{% if secret %}x{% endif %}y",
         "{% for k in secret %}{{ k }}{% endfor %}z",
@@ -567,7 +579,19 @@ fn sms_refuses_every_control_character_but_line_feed() {
     .template("tasks.assigned/template.toml", "[preview]\ntext = \"Hi\"\n")
     .configure()
     .unwrap();
-    for bad in ["a\tb", "a\u{7}b", "a\rb", "a\u{1b}b", "a\u{85}b"] {
+    for bad in [
+        "a\tb",
+        "a\u{7}b",
+        "a\rb",
+        "a\u{1b}b",
+        "a\u{85}b",
+        "a\u{2028}b",
+        "a\u{2029}b",
+        "a\u{202a}b",
+        "a\u{202e}b",
+        "a\u{2066}b",
+        "a\u{2069}b",
+    ] {
         assert_eq!(
             render(
                 &checked,
