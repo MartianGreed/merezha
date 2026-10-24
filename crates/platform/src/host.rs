@@ -148,8 +148,9 @@ pub fn error_registry(modules: &[&dyn Module]) -> Result<ErrorRegistry, StartupE
     for module in modules {
         if let Err(refused) = registry.register(module.name(), module.errors()) {
             for error in &refused {
-                tracing::error!(
-                    event = "error.registration_refused",
+                merezha_telemetry::event!(
+                    ERROR,
+                    "error.registration_refused",
                     module = module.name(),
                     code = error.code.as_str(),
                     reason = error.reason
@@ -208,8 +209,9 @@ impl Host {
             if let Err(failure) =
                 crate::context::check_source_grants(module.name(), module.extra_sources())
             {
-                tracing::error!(
-                    event = "module.source_refused",
+                merezha_telemetry::event!(
+                    ERROR,
+                    "module.source_refused",
                     module = module.name(),
                     sources = ?module.extra_sources()
                 );
@@ -228,13 +230,10 @@ impl Host {
         let reach =
             Instant::now() + config.database.connect_timeout + config.database.acquire_timeout;
         if let Err(failure) = database.ping(reach).await {
-            tracing::error!(event = "db.unavailable", code = failure.code.as_str());
+            merezha_telemetry::event!(ERROR, "db.unavailable", code = failure.code.as_str());
             return Err(StartupError::new("database_unavailable"));
         }
-        tracing::info!(
-            event = "db.connected",
-            pool_size = config.database.pool_size
-        );
+        merezha_telemetry::event!(INFO, "db.connected", pool_size = config.database.pool_size);
         // The jobs runtime is the last module: it starts after every block
         // declared its handlers and stops first.
         let ports = jobs.as_ref().map(|jobs| jobs.ports(&database));
@@ -263,16 +262,24 @@ impl Host {
         let migrations = run_migrations(&database, &declared, mode, deadline)
             .await
             .map_err(|error| {
-                tracing::error!(
-                    event = if error.failure.code == "migration_checksum_mismatch" {
-                        "migration.checksum_mismatch"
-                    } else {
-                        "migration.refused"
-                    },
-                    code = error.failure.code.as_str(),
-                    module = error.module.as_deref(),
-                    version = error.version
-                );
+                let (code, module) = (error.failure.code.as_str(), error.module.as_deref());
+                if code == "migration_checksum_mismatch" {
+                    merezha_telemetry::event!(
+                        ERROR,
+                        "migration.checksum_mismatch",
+                        code,
+                        module,
+                        version = error.version
+                    );
+                } else {
+                    merezha_telemetry::event!(
+                        ERROR,
+                        "migration.refused",
+                        code,
+                        module,
+                        version = error.version
+                    );
+                }
                 StartupError {
                     failure: error.failure.clone(),
                     migration: Some(error),
@@ -280,8 +287,9 @@ impl Host {
                 }
             })?;
         drop(declared);
-        tracing::info!(
-            event = "migration.checked",
+        merezha_telemetry::event!(
+            INFO,
+            "migration.checked",
             mode = if mode == MigrationMode::Apply {
                 "apply"
             } else {
@@ -291,8 +299,9 @@ impl Host {
             pending = migrations.pending.len()
         );
         for pending in &migrations.pending {
-            tracing::warn!(
-                event = "migration.pending",
+            merezha_telemetry::event!(
+                WARN,
+                "migration.pending",
                 module = pending.module.as_str(),
                 version = pending.version
             );
@@ -332,7 +341,12 @@ impl Host {
                     Ok(Err(failure)) => failure.code.as_str(),
                     _ => "timeout",
                 };
-                tracing::error!(event = "module.start_failed", module = module.name(), code);
+                merezha_telemetry::event!(
+                    ERROR,
+                    "module.start_failed",
+                    module = module.name(),
+                    code
+                );
                 stop_modules(&started, parts.timeouts.module_shutdown).await;
                 return Err(StartupError {
                     failure: Failure::permanent("module_start_failed"),
@@ -341,8 +355,9 @@ impl Host {
                 });
             }
             let events = module.events();
-            tracing::info!(
-                event = "module.started",
+            merezha_telemetry::event!(
+                INFO,
+                "module.started",
                 module = module.name(),
                 publishes = ?events.publishes,
                 consumes = ?events.consumes
@@ -418,8 +433,9 @@ impl Host {
         let address = listener
             .local_addr()
             .map_err(|_| Failure::permanent("listener_failed"))?;
-        tracing::info!(
-            event = "listener.ready",
+        merezha_telemetry::event!(
+            INFO,
+            "listener.ready",
             address = address.to_string(),
             app = self.config.app.id.as_str(),
             modules = ?self.modules.iter().map(|m| m.name()).collect::<Vec<_>>()
@@ -435,21 +451,22 @@ impl Host {
         .with_graceful_shutdown(async move {
             shutdown.await;
             readiness.drain();
-            tracing::info!(event = "listener.draining");
+            merezha_telemetry::event!(INFO, "listener.draining");
             notify.notify_one();
         });
         let drain = self.timeouts.drain;
         let result = tokio::select! {
             result = server => result.map_err(|_| Failure::transient("listener_failed")),
             () = async { signalled.notified().await; tokio::time::sleep(drain).await } => {
-                tracing::warn!(event = "listener.drain_timeout", drain_ms = drain.as_millis() as u64);
+                merezha_telemetry::event!(WARN, "listener.drain_timeout", drain_ms = drain.as_millis() as u64);
                 Ok(())
             }
         };
         stop_modules(&self.modules, self.timeouts.module_shutdown).await;
         self.database.close();
-        tracing::info!(
-            event = "listener.stopped",
+        merezha_telemetry::event!(
+            INFO,
+            "listener.stopped",
             code = if result.is_ok() {
                 "ok"
             } else {
@@ -468,9 +485,9 @@ async fn stop_modules(modules: &[Arc<dyn Module>], budget: Duration) {
             .await
             .is_err()
         {
-            tracing::warn!(event = "module.shutdown_timeout", module = module.name());
+            merezha_telemetry::event!(WARN, "module.shutdown_timeout", module = module.name());
         } else {
-            tracing::info!(event = "module.stopped", module = module.name());
+            merezha_telemetry::event!(INFO, "module.stopped", module = module.name());
         }
     }
 }

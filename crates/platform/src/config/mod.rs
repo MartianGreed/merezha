@@ -16,10 +16,12 @@ pub use jobs::{
     JobDefaults, JobRetention, JobSchedule, JobsConfig, QueueConfig, RelayConfig,
     SubscriptionsConfig, valid_queue_name,
 };
-pub use telemetry::{
-    Compression, LogsConfig, MetricsConfig, PrivacyConfig, Protocol, ResourceConfig, Sampler,
-    Signal, Temporality, TracesConfig, TrustInbound,
+pub use merezha_telemetry::config::{
+    Compression, HeaderSecret, LogFormat, LogLevel, LogsConfig, MetricsConfig, PrivacyConfig,
+    Protocol, ResourceConfig, Sampler, Signal, TelemetryConfig, Temporality, TracesConfig,
+    TrustInbound,
 };
+pub use telemetry::{DEFAULT_ENDPOINT, RESOURCE_ATTRIBUTE_PREFIXES};
 
 use crate::net::Cidr;
 use merezha_postgres::{DatabaseConfig, Secret, TlsMode};
@@ -190,43 +192,6 @@ pub struct ApplicationConfig {
     pub background: ApplicationBackground,
     pub append: ApplicationAppend,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LogLevel {
-    Error,
-    Warn,
-    Info,
-    Debug,
-    Trace,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LogFormat {
-    Json,
-    Text,
-}
-/// `[telemetry]`: the kernel's stderr log keys plus the telemetry block's
-/// OTLP settings (TE §3). `Debug` redacts header values.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TelemetryConfig {
-    pub log_level: LogLevel,
-    pub format: LogFormat,
-    pub log_buffer_lines: u32,
-    pub endpoint: String,
-    pub protocol: Protocol,
-    pub compression: Compression,
-    pub timeout: Duration,
-    pub headers: BTreeMap<String, Secret>,
-    pub ca_file: Option<PathBuf>,
-    pub allow_plaintext_headers: bool,
-    pub shutdown_timeout: Duration,
-    pub signals: Vec<Signal>,
-    pub resource: ResourceConfig,
-    pub traces: TracesConfig,
-    pub metrics: MetricsConfig,
-    pub logs: LogsConfig,
-    pub privacy: PrivacyConfig,
-    pub propagation: Vec<String>,
-}
-
 /// A module's opaque `[modules.<name>]` table, validated by that module.
 #[derive(Clone)]
 pub struct ModuleSection {

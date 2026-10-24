@@ -10,6 +10,7 @@ members = [
     "crates/jobs",
     "crates/notifications",
     "crates/blob",
+    "crates/telemetry",
 ]
 resolver = "3"
 
@@ -54,6 +55,13 @@ regex = { version = "1.13.1", default-features = false, features = ["std", "unic
 rust_decimal = { version = "1.43.0", default-features = false, features = ["std"] }
 deunicode = { version = "1.6.2", default-features = false, features = ["alloc"] }
 object_store = { version = "0.14.2", default-features = false, features = ["fs", "aws"] }
+opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs", "internal-logs"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs", "internal-logs", "http-proto", "reqwest-blocking-client", "reqwest-rustls", "gzip-http", "grpc-tonic", "tls-aws-lc", "tls-roots", "gzip-tonic"] }
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
+opentelemetry-semantic-conventions = "0.33.1"
+tracing-appender = "0.2.5"
+libc = "0.2.191"
 
 [profile.dev]
 debug = 0

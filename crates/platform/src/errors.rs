@@ -140,6 +140,8 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("http_client_config", 422),
     ErrorCode::new("module_start_failed", 422),
     ErrorCode::new("telemetry_initialized", 422),
+    ErrorCode::new("invalid_telemetry_ca", 422),
+    ErrorCode::new("telemetry_exporter_failed", 422),
     ErrorCode::new("rate_limited", 429),
     ErrorCode::new("database_busy", 429),
     ErrorCode::new("overloaded", 503),

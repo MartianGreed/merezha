@@ -1,5 +1,8 @@
 use merezha_runtime::Runtime;
-use serde_json::json;
+use merezha_telemetry::{
+    Telemetry,
+    config::{LogLevel, Service, TelemetryConfig},
+};
 use std::{net::SocketAddr, path::PathBuf};
 
 fn arguments() -> anyhow::Result<(PathBuf, Option<PathBuf>, SocketAddr)> {
@@ -40,34 +43,88 @@ fn arguments() -> anyhow::Result<(PathBuf, Option<PathBuf>, SocketAddr)> {
         listen,
     ))
 }
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
-    match std::env::args().nth(1).as_deref() {
-        Some("run") => return merezha_cli::run::main(std::env::args().skip(2)).await,
-        Some("application") => {
-            return merezha_cli::application_cli::main(std::env::args().skip(2)).await;
-        }
-        Some("content") => return merezha_cli::content::main(std::env::args().skip(2)).await,
-        Some("notifications") => return merezha_cli::notifications::main(std::env::args().skip(2)),
-        _ => {}
+fn main() -> std::process::ExitCode {
+    // SAFETY: no other thread exists yet; the runtime is built below.
+    let ignored = unsafe { merezha_telemetry::pipeline::scrub_otel_environment() };
+    // One process-level crypto provider, so no TLS path (database, OTLP,
+    // outbound) can fail for want of one.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    if std::env::args().nth(1).as_deref() == Some("notifications") {
+        return merezha_cli::notifications::main(std::env::args().skip(2));
     }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            startup_failed("internal");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    runtime.block_on(async move {
+        match std::env::args().nth(1).as_deref() {
+            Some("run") => merezha_cli::run::main(std::env::args().skip(2), ignored).await,
+            Some("application") => {
+                merezha_cli::application_cli::main(std::env::args().skip(2)).await
+            }
+            Some("content") => merezha_cli::content::main(std::env::args().skip(2)).await,
+            _ => serve().await,
+        }
+    })
+}
+/// `startup.failed` before any subscriber is installed.
+fn startup_failed(code: &str) {
+    tracing::dispatcher::with_default(&merezha_telemetry::pipeline::bootstrap(), || {
+        merezha_telemetry::event!(ERROR, "startup.failed", code);
+    });
+}
+async fn serve() -> std::process::ExitCode {
     let (manifest, application, address) = match arguments() {
         Ok(args) => args,
         Err(_) => {
-            merezha_cli::emit(
-                "startup.failed",
-                json!({"code":"invalid_arguments","usage":"merezha serve --manifest PATH [--application PATH] [--listen 127.0.0.1:PORT]"}),
-            );
+            tracing::dispatcher::with_default(&merezha_telemetry::pipeline::bootstrap(), || {
+                merezha_telemetry::event!(
+                    ERROR,
+                    "startup.failed",
+                    code = "invalid_arguments",
+                    usage = "merezha serve --manifest PATH [--application PATH] [--listen 127.0.0.1:PORT]"
+                );
+            });
             return std::process::ExitCode::from(2);
         }
+    };
+    // The raw runtime has no project: stderr only, every invocation logged
+    // (its successes are debug events), no OTLP pipeline.
+    let config = TelemetryConfig {
+        log_level: LogLevel::Debug,
+        signals: Vec::new(),
+        ..TelemetryConfig::default()
+    };
+    let telemetry = match Telemetry::init(&config, &Service::raw()) {
+        Ok(telemetry) => telemetry,
+        Err(failure) => {
+            startup_failed(&failure.code);
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let code = serve_with(manifest, application, address).await;
+    let _ = tokio::task::spawn_blocking(move || telemetry.shutdown()).await;
+    code
+}
+async fn serve_with(
+    manifest: PathBuf,
+    application: Option<PathBuf>,
+    address: SocketAddr,
+) -> std::process::ExitCode {
+    let failed = |code: &str| {
+        merezha_telemetry::event!(ERROR, "startup.failed", code);
+        std::process::ExitCode::from(2)
     };
     let runtime =
         match tokio::task::spawn_blocking(move || Runtime::load(manifest).map_err(|_| ())).await {
             Ok(Ok(runtime)) => runtime,
-            _ => {
-                merezha_cli::emit("startup.failed", json!({"code":"invalid_manifest"}));
-                return std::process::ExitCode::from(2);
-            }
+            _ => return failed("invalid_manifest"),
         };
     let router = if let Some(path) = application {
         let guest = runtime.clone();
@@ -86,8 +143,7 @@ async fn main() -> std::process::ExitCode {
                     Ok(Err(e)) => e.code.as_str(),
                     _ => "invalid_application_config",
                 };
-                merezha_cli::emit("startup.failed", json!({"code":code}));
-                return std::process::ExitCode::from(2);
+                return failed(code);
             }
         }
     } else {
@@ -95,24 +151,28 @@ async fn main() -> std::process::ExitCode {
     };
     let listener = match tokio::net::TcpListener::bind(address).await {
         Ok(listener) => listener,
-        Err(_) => {
-            merezha_cli::emit("startup.failed", json!({"code":"listener_failed"}));
-            return std::process::ExitCode::from(2);
-        }
+        Err(_) => return failed("listener_failed"),
     };
     let address = listener
         .local_addr()
         .expect("bound listener has an address");
-    merezha_cli::emit(
+    merezha_telemetry::event!(
+        INFO,
         "listener.ready",
-        json!({"address":address.to_string(),"generation":1}),
+        address = address.to_string(),
+        generation = 1u64
     );
     let result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown())
         .await;
-    merezha_cli::emit(
+    merezha_telemetry::event!(
+        INFO,
         "listener.stopped",
-        json!({"code":if result.is_ok() {"ok"} else {"listener_failed"}}),
+        code = if result.is_ok() {
+            "ok"
+        } else {
+            "listener_failed"
+        }
     );
     if result.is_ok() {
         std::process::ExitCode::SUCCESS
@@ -132,5 +192,5 @@ async fn shutdown() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
-    merezha_cli::emit("listener.draining", json!({}));
+    merezha_telemetry::event!(INFO, "listener.draining");
 }

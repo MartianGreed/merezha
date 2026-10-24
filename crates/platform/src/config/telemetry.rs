@@ -1,8 +1,12 @@
 //! `[telemetry]`: the kernel's stderr log keys and the telemetry block's
-//! extensions (TE §3). The kernel validates every key now; the OTLP
-//! pipeline that uses them arrives with the telemetry block.
-use super::{
-    ConfigIssue, Layers, LogFormat, LogLevel, Origin, SecretResolver, TelemetryConfig, reader,
+//! extensions (TE §3), parsed and validated into the model
+//! `merezha-telemetry` owns. The `merezha` binary builds the OTLP pipeline
+//! from it.
+use super::{ConfigIssue, Layers, Origin, SecretResolver, reader};
+use merezha_telemetry::config::{
+    Compression, HeaderSecret, LogFormat, LogLevel, LogsConfig, MetricsConfig, PrivacyConfig,
+    Protocol, ResourceConfig, Sampler, Signal, TelemetryConfig, Temporality, TracesConfig,
+    TrustInbound,
 };
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
@@ -10,7 +14,7 @@ const fn ms(value: u64) -> Duration {
     Duration::from_millis(value)
 }
 /// The OTLP endpoint when none is configured.
-pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:4318";
+pub use merezha_telemetry::config::DEFAULT_ENDPOINT;
 const MAX_HEADERS: usize = 32;
 const MAX_RESOURCE_ATTRIBUTES: usize = 16;
 /// Resource attribute keys must start with one of these.
@@ -22,85 +26,6 @@ pub const RESOURCE_ATTRIBUTE_PREFIXES: [&str; 6] = [
     "k8s.",
     "os.",
 ];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Protocol {
-    HttpProtobuf,
-    Grpc,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Compression {
-    Gzip,
-    None,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Signal {
-    Traces,
-    Metrics,
-    Logs,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Sampler {
-    ParentBasedRatio,
-    AlwaysOff,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrustInbound {
-    TrustedProxies,
-    Always,
-    Never,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Temporality {
-    Cumulative,
-    Delta,
-}
-/// `[telemetry.resource]`. `None` falls back as TE §3 says: the service
-/// name to `app.id`, the version to `app.version`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResourceConfig {
-    pub service_name: Option<String>,
-    pub service_version: Option<String>,
-    pub service_namespace: Option<String>,
-    pub environment: Option<String>,
-    pub attributes: BTreeMap<String, String>,
-}
-/// `[telemetry.traces]`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TracesConfig {
-    pub sampler: Sampler,
-    /// 0.0 to 1.0, root decisions only.
-    pub ratio: f64,
-    pub trust_inbound: TrustInbound,
-    pub endpoint: Option<String>,
-    pub max_queue: u32,
-    pub max_batch: u32,
-    pub schedule_delay: Duration,
-}
-/// `[telemetry.metrics]`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MetricsConfig {
-    pub interval: Duration,
-    pub temporality: Temporality,
-    pub sample_interval: Duration,
-    pub endpoint: Option<String>,
-}
-/// `[telemetry.logs]`, the OTLP log bridge.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogsConfig {
-    pub level: LogLevel,
-    pub endpoint: Option<String>,
-    pub max_queue: u32,
-    pub max_batch: u32,
-    pub schedule_delay: Duration,
-}
-/// `[telemetry.privacy]`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PrivacyConfig {
-    pub record_tenant_id: bool,
-    pub record_subject_id: bool,
-    pub record_client_address: bool,
-}
 
 const LEVELS: [(&str, LogLevel); 5] = [
     ("error", LogLevel::Error),
@@ -165,6 +90,9 @@ pub(super) fn telemetry(
         &[("json", LogFormat::Json), ("text", LogFormat::Text)],
     );
     let log_buffer_lines = r.integer("log_buffer_lines", 8_192, 64, 1_048_576) as u32;
+    // OTLP export is opt-in: without an endpoint anywhere and without
+    // `signals`, no signal is exported.
+    let endpoint_configured = r.origin_of("endpoint").is_some();
     let endpoint_origin = r.origin_of("endpoint").unwrap_or(Origin::Default);
     let endpoint = match r.string("endpoint") {
         Some((value, origin)) => match valid_endpoint(&value) {
@@ -212,9 +140,6 @@ pub(super) fn telemetry(
             signals.push(signal);
         }
     }
-    if signals_origin.is_none() {
-        signals = vec![Signal::Traces, Signal::Metrics, Signal::Logs];
-    }
     r.finish();
 
     // [telemetry.headers]: every value is a secret.
@@ -241,7 +166,7 @@ pub(super) fn telemetry(
         }
         match resolver.resolve(&entry.value, &entry.origin) {
             Ok(secret) => {
-                headers.insert(name, secret);
+                headers.insert(name, HeaderSecret::new(secret.expose()));
             }
             Err(code) => r.issue(&name, code, entry.origin),
         }
@@ -407,6 +332,10 @@ pub(super) fn telemetry(
         }
     }
     r.finish();
+
+    if signals_origin.is_none() && (endpoint_configured || !endpoints.is_empty()) {
+        signals = Signal::ALL.to_vec();
+    }
 
     // Header secrets never travel in clear to a remote collector unless the
     // operator says so.

@@ -741,15 +741,12 @@ fn app_instance_id_defaults_to_host_and_pid_and_version_is_optional() {
 
 #[test]
 fn telemetry_extensions_validate_and_keep_header_secrets_out_of_debug() {
-    use merezha_platform::config::{Protocol, Sampler, Signal};
+    use merezha_platform::config::{Protocol, Sampler};
     let config = load("", &[], &[]).unwrap();
     let telemetry = &config.telemetry;
     assert_eq!(telemetry.endpoint, "http://127.0.0.1:4318");
     assert_eq!(telemetry.protocol, Protocol::HttpProtobuf);
-    assert_eq!(
-        telemetry.signals,
-        vec![Signal::Traces, Signal::Metrics, Signal::Logs]
-    );
+    assert!(telemetry.signals.is_empty(), "OTLP export is opt-in");
     assert_eq!(telemetry.traces.ratio, 1.0);
     assert_eq!(telemetry.traces.sampler, Sampler::ParentBasedRatio);
     assert_eq!(
@@ -935,4 +932,280 @@ fn modules_named_after_reserved_prefixes_are_refused_at_startup() {
             "{name}: {errors:?}"
         );
     }
+}
+
+#[test]
+fn telemetry_defaults_match_the_documented_table() {
+    use merezha_platform::config::{
+        Compression, LogLevel, Protocol, Sampler, TelemetryConfig, Temporality, TrustInbound,
+    };
+    let t = load("", &[], &[]).unwrap().telemetry;
+    assert_eq!(t, TelemetryConfig::default());
+    let ms = Duration::from_millis;
+    assert_eq!(
+        (t.log_level, t.format, t.log_buffer_lines),
+        (LogLevel::Info, LogFormat::Json, 8192)
+    );
+    assert_eq!(t.endpoint, "http://127.0.0.1:4318");
+    assert_eq!(
+        (t.protocol, t.compression),
+        (Protocol::HttpProtobuf, Compression::Gzip)
+    );
+    assert_eq!((t.timeout, t.shutdown_timeout), (ms(10_000), ms(5_000)));
+    assert!(t.headers.is_empty() && t.ca_file.is_none() && !t.allow_plaintext_headers);
+    assert!(t.signals.is_empty(), "OTLP export is opt-in");
+    let r = &t.resource;
+    assert!(r.service_name.is_none() && r.service_version.is_none());
+    assert!(r.service_namespace.is_none() && r.environment.is_none() && r.attributes.is_empty());
+    let tr = &t.traces;
+    assert_eq!(
+        (tr.sampler, tr.ratio, tr.trust_inbound),
+        (Sampler::ParentBasedRatio, 1.0, TrustInbound::TrustedProxies)
+    );
+    assert_eq!(
+        (
+            tr.endpoint.as_deref(),
+            tr.max_queue,
+            tr.max_batch,
+            tr.schedule_delay
+        ),
+        (None, 2048, 512, ms(5_000))
+    );
+    let m = &t.metrics;
+    assert_eq!(
+        (
+            m.interval,
+            m.temporality,
+            m.sample_interval,
+            m.endpoint.as_deref()
+        ),
+        (ms(30_000), Temporality::Cumulative, ms(15_000), None)
+    );
+    let l = &t.logs;
+    assert_eq!(
+        (
+            l.level,
+            l.endpoint.as_deref(),
+            l.max_queue,
+            l.max_batch,
+            l.schedule_delay
+        ),
+        (LogLevel::Info, None, 2048, 512, ms(1_000))
+    );
+    let p = &t.privacy;
+    assert!(p.record_tenant_id && !p.record_subject_id && !p.record_client_address);
+    assert!(t.propagation.is_empty());
+}
+
+#[test]
+fn every_telemetry_key_is_read_from_the_file_and_the_environment_overrides_it() {
+    use merezha_platform::config::{
+        Compression, LogLevel, Protocol, Sampler, Signal, Temporality, TrustInbound,
+    };
+    let project = Project::new(&format!(
+        r#"{MINIMAL}
+[telemetry]
+log_level = "debug"
+format = "text"
+log_buffer_lines = 128
+endpoint = "https://otlp.example.com:4317"
+protocol = "grpc"
+compression = "none"
+timeout_ms = "2s"
+headers = {{ "x-api-key" = {{ env = "KEY" }} }}
+ca_file = "ca.pem"
+allow_plaintext_headers = true
+shutdown_timeout_ms = 1500
+signals = ["traces", "logs"]
+[telemetry.resource]
+service_name = "shop"
+service_version = "2.0.0"
+service_namespace = "retail"
+environment = "staging"
+attributes = {{ "k8s.namespace.name" = "shop" }}
+[telemetry.traces]
+sampler = "always_off"
+ratio = 0.5
+trust_inbound = "never"
+endpoint = "https://traces.example.com"
+max_queue = 100
+max_batch = 10
+schedule_delay_ms = 250
+[telemetry.metrics]
+interval_ms = 5000
+temporality = "delta"
+sample_interval_ms = "2s"
+endpoint = "https://metrics.example.com"
+[telemetry.logs]
+level = "warn"
+endpoint = "https://logs.example.com"
+max_queue = 50
+max_batch = 5
+schedule_delay_ms = 300
+[telemetry.privacy]
+record_tenant_id = false
+record_subject_id = true
+record_client_address = true
+[telemetry.propagation]
+outbound_hosts = ["api.internal"]
+"#
+    ));
+    let input = |env: &[(&str, &str)]| {
+        let mut env = env.to_vec();
+        env.extend([
+            URL,
+            ("KEY", "k"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4318"),
+        ]);
+        project.input(&env, &[])
+    };
+    let t = merezha_platform::ProjectConfig::load(&input(&[]))
+        .unwrap()
+        .telemetry;
+    let ms = Duration::from_millis;
+    assert_eq!(
+        (t.log_level, t.format, t.log_buffer_lines),
+        (LogLevel::Debug, LogFormat::Text, 128)
+    );
+    // OTEL_* variables are not configuration.
+    assert_eq!(t.endpoint, "https://otlp.example.com:4317");
+    assert_eq!(
+        (t.protocol, t.compression, t.timeout),
+        (Protocol::Grpc, Compression::None, ms(2_000))
+    );
+    assert_eq!(t.headers["x-api-key"].expose(), "k");
+    assert_eq!(t.ca_file, Some(project.base().join("ca.pem")));
+    assert!(t.allow_plaintext_headers);
+    assert_eq!(
+        (t.shutdown_timeout, t.signals.clone()),
+        (ms(1_500), vec![Signal::Traces, Signal::Logs])
+    );
+    let r = &t.resource;
+    assert_eq!(
+        (
+            r.service_name.as_deref(),
+            r.service_version.as_deref(),
+            r.service_namespace.as_deref(),
+            r.environment.as_deref()
+        ),
+        (Some("shop"), Some("2.0.0"), Some("retail"), Some("staging"))
+    );
+    assert_eq!(r.attributes["k8s.namespace.name"], "shop");
+    let tr = &t.traces;
+    assert_eq!(
+        (tr.sampler, tr.ratio, tr.trust_inbound),
+        (Sampler::AlwaysOff, 0.5, TrustInbound::Never)
+    );
+    assert_eq!(
+        (
+            tr.endpoint.as_deref(),
+            tr.max_queue,
+            tr.max_batch,
+            tr.schedule_delay
+        ),
+        (Some("https://traces.example.com"), 100, 10, ms(250))
+    );
+    let m = &t.metrics;
+    assert_eq!(
+        (
+            m.interval,
+            m.temporality,
+            m.sample_interval,
+            m.endpoint.as_deref()
+        ),
+        (
+            ms(5_000),
+            Temporality::Delta,
+            ms(2_000),
+            Some("https://metrics.example.com")
+        )
+    );
+    let l = &t.logs;
+    assert_eq!(
+        (
+            l.level,
+            l.endpoint.as_deref(),
+            l.max_queue,
+            l.max_batch,
+            l.schedule_delay
+        ),
+        (
+            LogLevel::Warn,
+            Some("https://logs.example.com"),
+            50,
+            5,
+            ms(300)
+        )
+    );
+    assert!(
+        !t.privacy.record_tenant_id
+            && t.privacy.record_subject_id
+            && t.privacy.record_client_address
+    );
+    assert_eq!(t.propagation, vec!["api.internal".to_owned()]);
+
+    let t = merezha_platform::ProjectConfig::load(&input(&[
+        ("MEREZHA_TELEMETRY__TRACES__RATIO", "0.125"),
+        ("MEREZHA_TELEMETRY__SIGNALS", ""),
+        ("MEREZHA_TELEMETRY__LOGS__LEVEL", "error"),
+    ]))
+    .unwrap()
+    .telemetry;
+    assert_eq!(t.traces.ratio, 0.125, "the environment overrides the file");
+    assert!(t.signals.is_empty());
+    assert_eq!(t.logs.level, LogLevel::Error);
+}
+
+#[test]
+fn otlp_export_is_opt_in_through_an_endpoint() {
+    use merezha_platform::config::Signal;
+    let all = vec![Signal::Traces, Signal::Metrics, Signal::Logs];
+    let signals = |text: &str, env: &[(&str, &str)], flags: &[(&str, &str)]| {
+        load(text, env, flags).unwrap().telemetry.signals
+    };
+    // A plain project exports nothing.
+    assert!(signals("", &[], &[]).is_empty());
+    assert!(signals("[telemetry]\nlog_level = \"debug\"\n", &[], &[]).is_empty());
+    // An endpoint in any layer, or a per-signal endpoint, enables every signal.
+    assert_eq!(
+        signals(
+            "[telemetry]\nendpoint = \"http://127.0.0.1:4318\"\n",
+            &[],
+            &[]
+        ),
+        all
+    );
+    assert_eq!(
+        signals(
+            "",
+            &[("MEREZHA_TELEMETRY__ENDPOINT", "http://collector:4318")],
+            &[]
+        ),
+        all
+    );
+    assert_eq!(
+        signals("", &[], &[("telemetry.endpoint", "http://collector:4318")]),
+        all
+    );
+    assert_eq!(
+        signals(
+            "[telemetry.traces]\nendpoint = \"https://t.example.com/v1/traces\"\n",
+            &[],
+            &[]
+        ),
+        all
+    );
+    // Explicit signals win either way.
+    assert_eq!(
+        signals("[telemetry]\nsignals = [\"traces\"]\n", &[], &[]),
+        vec![Signal::Traces]
+    );
+    assert!(
+        signals(
+            "[telemetry]\nendpoint = \"http://127.0.0.1:4318\"\nsignals = []\n",
+            &[],
+            &[]
+        )
+        .is_empty()
+    );
 }

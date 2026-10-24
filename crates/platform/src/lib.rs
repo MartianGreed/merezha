@@ -1,6 +1,8 @@
 //! The Merezha platform kernel: project configuration, the [`Module`]
 //! contract, the shared [`AppContext`], cross-module [`ports`], the HTTP
-//! [`edge`], health endpoints, structured logging and the host lifecycle.
+//! [`edge`], health endpoints and the host lifecycle. Logs go through the
+//! `merezha-telemetry` catalog; the `merezha` binary installs the
+//! subscriber.
 pub mod config;
 pub mod context;
 pub mod edge;
@@ -10,7 +12,6 @@ pub mod host;
 pub mod module;
 pub mod net;
 pub mod ports;
-pub mod telemetry;
 
 pub use config::{ConfigErrors, ConfigInput, ConfigIssue, ModuleSection, ProjectConfig};
 pub use context::{AppContext, Clock, OsRandom, OutboundHttp, Random, SystemClock};
