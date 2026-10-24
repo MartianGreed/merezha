@@ -11,6 +11,10 @@ kernel every block builds on:
   the `Module` trait, `AppContext`, the cross-module ports, the HTTP edge,
   health endpoints, structured logging and the host lifecycle.
 
+`merezha-jobs` (`crates/jobs`, AP-B1) is the jobs runtime the host installs
+beside them: the PostgreSQL outbox, the jobs port and the relay (see
+[Jobs and the outbox](#jobs-and-the-outbox)).
+
 `merezha run --config merezha.toml` (`crates/cli/src/run.rs`) puts them
 together with the existing runtime and application layer. `merezha serve`
 is unchanged.
@@ -56,7 +60,9 @@ and one `startup.failed` event carrying a stable `code`:
    stops startup in both modes. Pending migrations in verify mode do not stop
    startup; readiness stays false until they are applied.
 7. Start modules in registration order, each within 10 s
-   (`module_start_failed`; modules already started are shut down).
+   (`module_start_failed`; modules already started are shut down). The
+   jobs runtime starts last, once every module declared its job handlers
+   and subscriptions, and stops first.
 8. Bind `http.listen` and log `listener.ready` with the bound address.
 
 SIGINT or SIGTERM starts a graceful stop: readiness turns false, the listener
@@ -215,7 +221,10 @@ The PostgreSQL application core's tables (AP §D.2), all *reserved*:
 ### `[jobs]`
 
 Always present: jobs run whenever the database is configured, and there is
-no `enabled` key (R12). Every key is *reserved* until the jobs runtime ships.
+no `enabled` key (R12). AP-B1 gives `[jobs.relay]` and `max_attempts`
+(`[jobs.defaults]` and per queue) their behaviour: the relay and
+`enqueue` stamp each job with its queue's `max_attempts`. The other keys
+are *reserved* until leasing and dispatch (AP-B2) and cron (AP-B3) ship.
 
 | Table | Key | Type | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -420,7 +429,9 @@ dot, `<area>.<noun>_<verb>`.
 `listener.draining`, `listener.drain_timeout`, `listener.stopped`,
 `module.source_refused`,
 `http.request.completed`, `health.ready`, `health.not_ready`,
-`notification.captured`.
+`notification.captured`, and from the jobs runtime `outbox.relayed`,
+`outbox.quarantined`, `job.admin_action`, `db.listener_lost`,
+`db.listener_restored`.
 
 K2 renamed `database.connected`, `database.unavailable`,
 `migrations.checked`, `migrations.refused` and `http.request` to the catalog
@@ -436,7 +447,7 @@ its own `invocation.completed` and `registry.*` JSON lines.
 
 | Method | Contract |
 | --- | --- |
-| `name()` | `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not `application`, `api`, `services`, `pipelines`, `reload` or `health`. Names the section, route prefix and migration ledger key; never changes. |
+| `name()` | `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not `application`, `api`, `services`, `pipelines`, `reload`, `health` or `jobs` (the jobs runtime). Names the section, route prefix and migration ledger key; never changes. |
 | `configure(&ModuleSection)` | validate and keep `[modules.<name>]`; return every issue at once. Default: only an empty section. |
 | `migrations()` | ordered forward-only `Migration::new(version, name, sql)` or `Migration::non_transactional(..)` for its own schema |
 | `errors()` | `ErrorCode { code, status }` it returns, registered at startup; default none |
@@ -446,6 +457,13 @@ its own `invocation.completed` and `registry.*` JSON lines.
 | `routes(&AppContext)` | an axum `Router` nested under `/v1/<name>` |
 | `ready()` | readiness contribution, answered within 1 s |
 | `shutdown(deadline)` | stop and drain background work after the listener drained |
+
+`HostParts::jobs` takes the `JobsRuntime`, a `Module` named `jobs` that
+`[jobs]` configures instead of a `[modules.jobs]` section.
+`JobsRuntime::ports(&Database)` returns the `Outbox` and `Jobs`
+implementations the host installs in every context before any module
+starts. `None` keeps the refusing fallbacks. `merezha run` always installs
+`merezha_jobs::PgJobs`.
 
 `host::configure(&ConfigInput, modules)` loads the configuration and lets the
 registered modules validate their sections. `Host::start`, `Host::bind` and
@@ -469,6 +487,8 @@ register blocks.
   `upstream_unavailable` or `upstream_body_limit`.
 - `outbox(source)`: a `SourceOutbox` bound to `source`; it validates every
   append before the implementation runs.
+- `jobs(source)`: a `JobsHandle` bound to `source`, with the same rule:
+  `enqueue`, `cancel`, `register` and `subscribe` (AP §B.3).
 - `notifier(source)`: a `Notifier` bound to `source`; `notifications_deliver()`
   is `false` while only the capture fallback is installed.
 - `module()`: the module the context belongs to. The host hands each module
@@ -486,7 +506,7 @@ register blocks.
 - `directory()`, `authenticator()`, `authorizer()`, `blobs()`: the ports below.
 
 `AppContext::builder` starts from the disabled-block fallbacks; blocks replace
-them through the builder (`outbox`, `notifications`, `directory`,
+them through the builder (`outbox`, `jobs`, `notifications`, `directory`,
 `authenticator`, `blobs`).
 
 ## Ports
@@ -504,7 +524,8 @@ pass what they learned in (`NotificationRequest::members`).
 | `GrantSnapshot` | break-glass, application grants, application-level resource grants, tenant grants, resource grants in the tenant and an API key limit; `evaluate` and `Principal::check` decide synchronously in identity's order (ID §5) and return `Allowed::{Grant, BreakGlass}` or `AccessDenied { reason }` | |
 | `ResourceScope` | `Application`, `Tenant(id)`, `Resource { tenant: Option<id>, kind, id }`; a resource without a tenant is application-level (R5). A tenant grant never satisfies an application check | |
 | `Authorizer` | extends the application `Authorizer` with `check(Option<&Principal>, permission, scope) -> Result<Allowed, AccessDenied>`; synchronous and I/O-free. Without a principal it denies `Unauthenticated` (401), otherwise `unauthorized` (403) | `LoopbackAllowAll` on a private listener (constructible only for loopback addresses), `DenyAll` otherwise (401 anonymous, 403 with a principal) |
-| `Outbox` | `append(tx, source, &[OutboxRecord], OnDuplicate) -> Appended` (AP §B.3); records carry a `DedupeKey` (at most 160 bytes, R4a; `DedupeKey::api(subject, key)` namespaces HTTP keys), an `OutboxTarget` (`Event { topic }` or `Job { queue, kind }`), a JSON payload of at most 64 KiB, `contains_secret`, `run_at`, `priority` and a `MessageContext`; at most 256 records per call. `JobFailure` carries the code, classification and `retry_after` job handlers report | `UnavailableOutbox`: fails `outbox_unavailable`, so the caller's transaction rolls back. The PostgreSQL outbox is AP-B1 |
+| `Outbox` | `append(tx, source, &[OutboxRecord], OnDuplicate) -> Appended` (AP §B.3); records carry a `DedupeKey` (at most 160 bytes, R4a; `DedupeKey::api(subject, key)` namespaces HTTP keys), an `OutboxTarget` (`Event { topic }` or `Job { queue, kind }`), a JSON payload of at most 64 KiB, `contains_secret`, `run_at`, `priority` and a `MessageContext`; at most 256 records per call. `OutboxRecord::event(source, topic, NewEvent)` (or `SourceOutbox::event`) builds an event record whose payload is the `IntegrationEvent` envelope (R11). `JobFailure` carries the code, classification and `retry_after` job handlers report | `UnavailableOutbox`: fails `outbox_unavailable`, so the caller's transaction rolls back. `merezha_jobs::PgOutbox` is the PostgreSQL implementation |
+| `Jobs` | through `JobsHandle`: `enqueue(NewJob) -> Enqueued` in its own transaction, idempotent on the queue and `{source}:{key}`; `cancel(id)`; `register(kind, queue, Arc<dyn JobHandler>, KindOptions)` and `subscribe(topic, kind)` before the jobs runtime starts. `JobHandler`, `JobContext`, `KindOptions` and `Reissue` are AP §B.3's; `NewJob` hides its payload from `Debug` | `UnavailableJobs`: every call fails `jobs_unavailable` |
 | `Notifier` | `validate(&request)` (pure), `request(tx, NotificationRequest)` and `emit_webhook(tx, WebhookEvent)` (NT §3.1); a webhook's `source_event_id` is an `EventId` of up to 225 bytes, room for `{source}:{dedupe_key}`. Requests carry topic, 1 to 100 recipients (`User`, `Tenant`, `Application { roles }`, `Address`), channels, template, `data`, `secret_data`, locale, dedupe key, tenant, `members`, `not_before`, `expires_at`, collapse key and correlation. For sources `application` and `api` with a tenant every user recipient must be in `members` (`recipient_not_in_tenant`). `Debug` never shows data, secret data or addresses. `NotifierFactory::bind(source)` hands out bound notifiers | `CaptureNotifications`: validates structurally, logs a redacted `notification.captured` warning, keeps the last 64 redacted records (never `data`, `secret_data` or addresses) and delivers nothing |
 | `Directory` | `users(ids)` (at most 100) to verified `Contact`s, `tenant_members(tenant, roles?, PageRequest)` and `application_members(roles?, PageRequest)` (pages of at most 500, keyset by user id), `is_member(user, tenant)` (R7) | `EmptyDirectory`: resolves nothing; nobody is a member |
 | `BlobStore` | `put(key, BlobBody, attrs) -> BlobStat` streaming, `get(key, range?) -> BlobRead` streaming, `head`, idempotent `delete`, `signed_get_url(key, ttl) -> Option<String>` (CT §6); `BlobKey` is 1 to 1024 bytes of `[A-Za-z0-9._-]` segments; `BlobError` maps to classified failures | `UnavailableBlobStore`: fails permanent `blob_store_unavailable` |
@@ -537,6 +558,13 @@ first failed use.
   `database_busy` and `database_unavailable` (transient),
   `constraint_violation` and `database_error` (permanent). Server messages
   and SQL never leave it.
+
+- `listen(channels, deadline)` opens a dedicated session outside the
+  pool and the detached budget that `LISTEN`s on up to 8 channels. It hands
+  out notifications as wake-up signals: at most 64 wait unread and later
+  ones are dropped until the reader catches up. `Listener::recv` returns
+  `None` once the session ended, and the caller reconnects. The jobs relay
+  holds one per host.
 
 ### Migrations
 
@@ -654,6 +682,68 @@ container and sets `MEREZHA_TEST_DATABASE_URL` and
 skip. GitHub's macOS runners cannot start service containers. The macOS job
 runs the same checks, and its PostgreSQL tests print the skip message.
 
+## Jobs and the outbox
+
+`merezha-jobs` implements AP §B for AP-B1. Its migration 0001 (ledger key
+`jobs`) creates schema `merezha_jobs`: `outbox`, `subscriptions`, `jobs`,
+`attempts`, `schedules` and `admin_actions`, with AP §B.2's constraints,
+including the R3 rule that a flagged (`contains_secret`) record has no
+payload once relayed or quarantined and a flagged job none at a terminal
+state, and the R10 trace columns.
+
+- **Append.** `PgOutbox::append` inserts every record of a call in one
+  statement inside the caller's transaction, deduplicated on
+  `(source, dedupe_key)`, and notifies `merezha_jobs_outbox`, delivered on
+  commit. Before writing it refuses what the tables would refuse at relay:
+  sources outside `[a-z][a-z0-9_]{0,31}` or named `outbox` or `cron`
+  (`invalid_source`), topics other than `<module>.<name>` (`invalid_topic`),
+  queue names `[jobs.queues]` would refuse (`invalid_queue`), delays over
+  365 days (`invalid_run_at`), and an event record whose payload is not the
+  envelope `OutboxRecord::event` builds for that source
+  (`invalid_event_envelope`). Keys over 160 bytes never reach it
+  (`invalid_dedupe_key`).
+- **Enqueue.** `JobsHandle::enqueue` writes one job in its own transaction
+  under the key `{source}:{key}`, the key a `Job` record of the same source
+  and dedupe key relays to. The same key with the same kind and payload
+  returns the existing id (`existed`); another kind or payload fails
+  `idempotency_mismatch`. `cancel` moves an `available` job to `cancelled`
+  and nulls a flagged payload.
+- **Register and subscribe.** Modules declare handlers and subscriptions
+  from `Module::start`; each kind has one owner (`kind_already_registered`),
+  a module subscribes only kinds it registered (`kind_not_registered`), and
+  later calls fail `jobs_started`. At start the runtime upserts
+  `merezha_jobs.subscriptions` before its first relay pass and reports
+  ready once that succeeded, so pending migrations in verify mode keep it
+  not ready instead of failing startup.
+- **Relay.** One background task per host, woken by `LISTEN
+  merezha_jobs_outbox`, by `jobs.relay.interval_ms` and once at start, so
+  records committed before a crash relay after the restart. Each batch of
+  at most `jobs.relay.batch` records is one transaction (AP §B.4): event
+  records fan out to one job per subscription (key `outbox:{id}:{kind}`),
+  job records become one job (key `{source}:{dedupe_key}`), conflicting
+  jobs are skipped, rows are marked relayed and flagged payloads nulled,
+  and `merezha_jobs` is notified with each queue that got jobs. Events
+  without a subscription are marked relayed and counted
+  (`PgJobs::unrouted`). `FOR UPDATE SKIP LOCKED` lets several hosts relay
+  at once. A record the jobs table would refuse is quarantined with code
+  `unroutable`; any other permanent failure re-runs the batch one record at
+  a time and quarantines the record that fails alone with its error code.
+  Each quarantine logs `outbox.quarantined`. A lost `LISTEN` session logs
+  `db.listener_lost`, falls back to the interval and reconnects.
+- **Requeue.** `PgJobs::requeue_outbox(id, principal)` returns a
+  quarantined record to pending with an `admin_actions` row; a flagged one
+  fails `409 secret_purged` (R4a), others `not_quarantined` or `not_found`.
+  The HTTP route arrives with the jobs admin API (AP-B2).
+
+Error codes it registers: `invalid_topic`, `invalid_queue`,
+`invalid_run_at`, `invalid_event_envelope`, `job_payload_limit`,
+`kind_already_registered`, `kind_not_registered`, `too_many_kinds` and
+`jobs_started` (422), `not_quarantined` (409), `jobs_not_ready` (503).
+
+Process tests hold the relay with `MEREZHA_JOBS_TEST_RELAY=off` (or
+`interval`, no `LISTEN`). Only builds with the `test-hooks` feature read
+it, which `merezha-cli`'s tests enable; release builds ignore it.
+
 ## Dependencies
 
 Checked with `cargo info` on 2026-10-23 (K) and 2026-10-24 (K2). All support
@@ -692,7 +782,10 @@ itself.
   work.
 - `Host::start` installs no `Authenticator` yet, so the edge never
   authenticates until identity's block registers one.
-- The integration event envelope and `OutboxRecord::event` arrive with the
-  PostgreSQL outbox (AP-B1).
+- The outbox and jobs `trace_parent`/`trace_state` columns exist but stay
+  empty until the telemetry block fills them from the current span
+  (TE-T5).
+- Jobs are created but not leased or run: dispatch, retry, drain,
+  retention and the jobs admin API are AP-B2, cron is AP-B3.
 - The application layer still uses memory or SQLite storage. PostgreSQL
   storage is stage 1.

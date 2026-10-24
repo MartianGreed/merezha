@@ -102,6 +102,110 @@ impl OutboxRecord {
         Ok(())
     }
 }
+impl OutboxRecord {
+    /// An integration event record (R11): the payload is the
+    /// [`IntegrationEvent`] envelope, with `event_id` `{source}:{dedupe_key}`,
+    /// `type` the topic, and tenant and correlation from `event.context`.
+    /// Not flagged, no delay, priority 0; set the fields afterwards to
+    /// change that.
+    pub fn event(source: &Source, topic: Identity, event: NewEvent) -> Self {
+        let envelope = IntegrationEvent {
+            event_id: format!("{}:{}", source.as_str(), event.dedupe_key.as_str()),
+            event_type: topic.as_str().to_owned(),
+            version: event.version,
+            occurred_at: event.occurred_at,
+            source: source.as_str().to_owned(),
+            tenant: event.context.tenant.clone(),
+            correlation_id: event.context.correlation_id.clone(),
+            causation_id: event.context.causation_id.clone(),
+            payload: event.payload,
+        };
+        Self {
+            dedupe_key: event.dedupe_key,
+            target: OutboxTarget::Event { topic },
+            payload: envelope.to_value(),
+            contains_secret: false,
+            run_at: None,
+            priority: 0,
+            context: event.context,
+        }
+    }
+}
+
+/// What a module supplies for an integration event; [`OutboxRecord::event`]
+/// builds the envelope from it.
+#[derive(Clone, PartialEq)]
+pub struct NewEvent {
+    /// Stable per logical event; a breaking payload change publishes
+    /// `version + 1` beside the old one, its key suffixed `:v{n}`.
+    pub dedupe_key: DedupeKey,
+    /// At least 1.
+    pub version: u32,
+    pub occurred_at: jiff::Timestamp,
+    /// Ids, not personal data.
+    pub payload: Value,
+    pub context: MessageContext,
+}
+impl std::fmt::Debug for NewEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewEvent")
+            .field("dedupe_key", &self.dedupe_key)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The integration event envelope (AP §B.3, R11), the payload of every
+/// `Event` record and of every job fanned out from one:
+///
+/// ```json
+/// {"event_id": "identity:usr_01JB2X6Q9F3W:registered", "type": "identity.user_registered",
+///  "version": 1, "occurred_at": "2026-10-24T09:00:00Z", "source": "identity", "tenant": null,
+///  "correlation_id": "4bf92f3577b34da6a3ce929d0e0e4736", "causation_id": null,
+///  "payload": {"user_id": "usr_01JB2X6Q9F3W", "method": "password"}}
+/// ```
+///
+/// Subscribers parse it with [`IntegrationEvent::from_value`]. `Debug`
+/// never prints the payload.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct IntegrationEvent {
+    /// `{source}:{dedupe_key}`.
+    pub event_id: String,
+    /// The topic, `<module>.<aggregate>_<past verb>`.
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub version: u32,
+    pub occurred_at: jiff::Timestamp,
+    pub source: String,
+    pub tenant: Option<Identity>,
+    pub correlation_id: Identity,
+    pub causation_id: Option<Identity>,
+    pub payload: Value,
+}
+impl std::fmt::Debug for IntegrationEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IntegrationEvent")
+            .field("event_id", &self.event_id)
+            .field("event_type", &self.event_type)
+            .field("version", &self.version)
+            .field("occurred_at", &self.occurred_at)
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+impl IntegrationEvent {
+    /// Parse an envelope from a record or job payload; fails permanent
+    /// `invalid_job_payload`.
+    pub fn from_value(value: &Value) -> Result<Self, Failure> {
+        serde::Deserialize::deserialize(value)
+            .map_err(|_| Failure::permanent("invalid_job_payload"))
+    }
+    pub fn to_value(&self) -> Value {
+        // Every field serializes infallibly to JSON.
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
 /// What [`Outbox::append`] checks before any write: at most
 /// [`MAX_RECORDS_PER_APPEND`] records (`outbox_batch_limit`), each valid.
 pub fn validate_append(records: &[OutboxRecord]) -> Result<(), Failure> {
@@ -164,6 +268,10 @@ impl SourceOutbox {
     }
     pub fn source(&self) -> &Source {
         &self.source
+    }
+    /// [`OutboxRecord::event`] for this handle's source.
+    pub fn event(&self, topic: Identity, event: NewEvent) -> OutboxRecord {
+        OutboxRecord::event(&self.source, topic, event)
     }
     pub async fn append(
         &self,
@@ -291,6 +399,44 @@ mod tests {
         assert_eq!(big.validate().unwrap_err().code, "outbox_payload_limit");
         let unsafe_number = record("k", serde_json::json!({"n": 9_007_199_254_740_993u64}));
         assert_eq!(unsafe_number.validate().unwrap_err().code, "invalid_number");
+    }
+
+    #[test]
+    fn event_records_carry_the_envelope_and_hide_it_from_debug() {
+        let source = Source::new("identity").unwrap();
+        let record = OutboxRecord::event(
+            &source,
+            Identity::new("identity.user_registered").unwrap(),
+            NewEvent {
+                dedupe_key: DedupeKey::new("usr_01JB2X6Q9F3W:registered").unwrap(),
+                version: 1,
+                occurred_at: "2026-10-24T09:00:00Z".parse().unwrap(),
+                payload: serde_json::json!({"user_id": "usr_01JB2X6Q9F3W", "method": "password"}),
+                context: MessageContext {
+                    correlation_id: Identity::new("4bf92f3577b34da6a3ce929d0e0e4736").unwrap(),
+                    causation_id: None,
+                    tenant: None,
+                },
+            },
+        );
+        assert_eq!(
+            record.payload,
+            serde_json::json!({"event_id": "identity:usr_01JB2X6Q9F3W:registered",
+                "type": "identity.user_registered", "version": 1,
+                "occurred_at": "2026-10-24T09:00:00Z", "source": "identity", "tenant": null,
+                "correlation_id": "4bf92f3577b34da6a3ce929d0e0e4736", "causation_id": null,
+                "payload": {"user_id": "usr_01JB2X6Q9F3W", "method": "password"}})
+        );
+        assert!(!record.contains_secret && record.validate().is_ok());
+        let envelope = IntegrationEvent::from_value(&record.payload).unwrap();
+        assert_eq!(envelope.to_value(), record.payload);
+        assert!(!format!("{envelope:?}").contains("password"));
+        assert_eq!(
+            IntegrationEvent::from_value(&serde_json::json!({"type": "x"}))
+                .unwrap_err()
+                .code,
+            "invalid_job_payload"
+        );
     }
 
     #[test]
