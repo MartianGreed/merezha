@@ -255,7 +255,8 @@ fn failure(error: Error) -> Response {
     };
     coded(status, error.code())
 }
-/// Emit allowlisted metadata. Never pass guest input/output or error text here.
+/// Emit allowlisted metadata at `info`, or at the `level` the fields carry.
+/// Never pass guest input/output or error text here.
 pub fn emit(event: &str, mut fields: Value) {
     fields["event"] = json!(event);
     fields["timestamp_unix_ms"] = json!(
@@ -264,7 +265,9 @@ pub fn emit(event: &str, mut fields: Value) {
             .unwrap_or_default()
             .as_millis()
     );
-    fields["level"] = json!("info");
+    if fields.get("level").is_none() {
+        fields["level"] = json!("info");
+    }
     fields["service"] = json!("merezha");
     fields["version"] = json!(env!("CARGO_PKG_VERSION"));
     eprintln!("{fields}");

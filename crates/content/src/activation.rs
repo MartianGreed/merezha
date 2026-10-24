@@ -29,6 +29,9 @@ pub const ACTIVATION_LOCK: i64 = 0x6d7a_636f_6e74_656e;
 pub const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(300);
 /// Attempts per index build: the first and two retries (section 3).
 pub const BUILD_ATTEMPTS: u32 = 3;
+/// Bound on the work after a committed activation that cannot fail it:
+/// each unneeded index drop, and the tightening count.
+pub const POST_ACTIVATION_BUDGET: Duration = Duration::from_secs(30);
 /// Rows read per query when counting what a tightened rule rejects.
 pub const TIGHTENING_BATCH: i64 = 500;
 /// Most rows per type and table counted for `content.model_tightened`.
@@ -259,6 +262,9 @@ pub struct ActivationReport {
     pub created: Vec<String>,
     /// Derived indexes dropped after activation.
     pub dropped: Vec<String>,
+    /// Unneeded derived indexes whose drop failed; logged as
+    /// `content.index_failed` and retried by the next start.
+    pub undropped: Vec<String>,
     pub tightened: Vec<TightenedCount>,
 }
 
@@ -377,17 +383,33 @@ pub async fn activate(
         deadline,
         attempts: HashMap::new(),
         created: Vec::new(),
+        committed: None,
     };
     let at = tokio::time::Instant::from_std(deadline);
     let mut reconnects = 0;
-    loop {
+    let mut report = loop {
         match tokio::time::timeout_at(at, run.once()).await {
+            // Past the commit only optional work remains: the activation
+            // stands, and the next start finishes the index drops.
+            Err(_) if run.committed.is_some() => {
+                break ActivationReport {
+                    plan: run
+                        .committed
+                        .take()
+                        .unwrap_or_else(|| Plan::new(None, model)),
+                    activated: true,
+                    created: std::mem::take(&mut run.created),
+                    dropped: Vec::new(),
+                    undropped: Vec::new(),
+                    tightened: Vec::new(),
+                };
+            }
             Err(_) => {
                 return Err(ActivationError::new(Failure::transient(
                     "content_activation_timeout",
                 )));
             }
-            Ok(Ok(report)) => return Ok(report),
+            Ok(Ok(report)) => break report,
             Ok(Err(Stop::Failed(error))) => return Err(*error),
             Ok(Err(Stop::Lost)) if reconnects < MAX_RECONNECTS => reconnects += 1,
             Ok(Err(Stop::Lost)) => {
@@ -396,7 +418,28 @@ pub async fn activate(
                 )));
             }
         }
+    };
+    // The lock is released: the tightening count is informational, runs
+    // on a pooled session with its own bound, and never fails activation.
+    if report.activated
+        && report
+            .plan
+            .changes
+            .iter()
+            .any(|c| c.class == ChangeClass::Tightening)
+    {
+        let budget = tokio::time::Instant::now() + POST_ACTIVATION_BUDGET;
+        let count = run.count_tightened(&report.plan);
+        match tokio::time::timeout_at(budget, count).await {
+            Ok(counts) => report.tightened = counts,
+            Err(_) => tracing::warn!(
+                event = "content.model_tightened",
+                version = model.version(),
+                code = "content_activation_timeout"
+            ),
+        }
     }
+    Ok(report)
 }
 
 /// Readiness of a host that does not activate (`database.migrate =
@@ -488,12 +531,16 @@ struct Run<'a> {
     /// Build attempts per index, across reconnects.
     attempts: HashMap<String, u32>,
     created: Vec<String>,
+    /// The plan this run committed, once the activation transaction did.
+    committed: Option<Plan>,
 }
 
 impl Run<'_> {
     /// A database error: `Lost` when the session closed, else classified.
     fn stop(session: &DetachedClient, failure: Failure) -> Stop {
-        if session.is_closed() {
+        // `database_unavailable` is a connection-level failure (lost
+        // connection, terminated backend); the session cannot be trusted.
+        if session.is_closed() || failure.code == "database_unavailable" {
             Stop::Lost
         } else {
             Stop::failed(ActivationError::new(failure))
@@ -532,6 +579,7 @@ impl Run<'_> {
                 activated: false,
                 created: Vec::new(),
                 dropped: Vec::new(),
+                undropped: Vec::new(),
                 tightened: Vec::new(),
             });
         }
@@ -545,29 +593,9 @@ impl Run<'_> {
         let activated = matches!(plan.status, Status::Fresh | Status::Pending);
         if activated {
             self.commit(&mut session, &plan).await?;
+            self.committed = Some(plan.clone());
         }
-        let existing = existing_indexes(&*session)
-            .await
-            .map_err(|f| Self::stop(&session, f))?;
-        let mut dropped = Vec::new();
-        for name in unneeded_indexes(&expected, &existing) {
-            self.statement_timeout(&session).await?;
-            session
-                .batch_execute(&drop_statement(&name))
-                .await
-                .map_err(|e| Self::stop(&session, classify(&e)))?;
-            tracing::info!(event = "content.index_dropped", index = name.as_str());
-            dropped.push(name);
-        }
-        let tightened = if plan
-            .changes
-            .iter()
-            .any(|c| c.class == ChangeClass::Tightening)
-        {
-            self.count_tightened(&session, &plan).await
-        } else {
-            Vec::new()
-        };
+        let (dropped, undropped) = self.drop_unneeded(&session, &expected).await;
         // Dropping the session releases the lock.
         drop(session);
         Ok(ActivationReport {
@@ -575,8 +603,63 @@ impl Run<'_> {
             activated,
             created: std::mem::take(&mut self.created),
             dropped,
-            tightened,
+            undropped,
+            tightened: Vec::new(),
         })
+    }
+
+    /// Drop the derived indexes `expected` does not contain, under the
+    /// lock so no concurrent activation's new index is mistaken for an old
+    /// one. Each drop is bounded by [`POST_ACTIVATION_BUDGET`]; a failure
+    /// is logged and left to the next start, never fatal: the model is
+    /// already active and an extra index only costs writes.
+    async fn drop_unneeded(
+        &self,
+        session: &DetachedClient,
+        expected: &[DerivedIndex],
+    ) -> (Vec<String>, Vec<String>) {
+        let (mut dropped, mut undropped) = (Vec::new(), Vec::new());
+        let existing = match existing_indexes(&**session).await {
+            Ok(existing) => existing,
+            Err(failure) => {
+                tracing::warn!(
+                    event = "content.index_failed",
+                    operation = "drop",
+                    code = failure.code.as_str()
+                );
+                return (dropped, undropped);
+            }
+        };
+        for name in unneeded_indexes(expected, &existing) {
+            let left = self
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .min(POST_ACTIVATION_BUDGET);
+            let set = format!("SET statement_timeout = {}", left.as_millis().max(1));
+            let result = match session.batch_execute(&set).await {
+                Ok(()) => session.batch_execute(&drop_statement(&name)).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => {
+                    tracing::info!(event = "content.index_dropped", index = name.as_str());
+                    dropped.push(name);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "content.index_failed",
+                        operation = "drop",
+                        index = name.as_str(),
+                        code = classify(&error).code.as_str()
+                    );
+                    undropped.push(name);
+                    if session.is_closed() {
+                        break;
+                    }
+                }
+            }
+        }
+        (dropped, undropped)
     }
 
     /// Bound the session's statements by the time left.
@@ -674,7 +757,7 @@ impl Run<'_> {
                 }
                 Err(failure) => failure,
             };
-            let lost = session.is_closed();
+            let lost = session.is_closed() || failure.code == "database_unavailable";
             if !lost {
                 // A failed build is dropped; the next attempt or start
                 // rebuilds it.
@@ -844,7 +927,20 @@ impl Run<'_> {
     /// Count, per top-level field, the drafts and published rows that the
     /// newly active rules reject, and log `content.model_tightened` per
     /// type. Informational: a failed count is logged, never fatal.
-    async fn count_tightened(&self, session: &DetachedClient, plan: &Plan) -> Vec<TightenedCount> {
+    async fn count_tightened(&self, plan: &Plan) -> Vec<TightenedCount> {
+        let deadline = Instant::now() + POST_ACTIVATION_BUDGET;
+        let client = match self.db.acquire(deadline).await {
+            Ok(client) => client,
+            Err(failure) => {
+                tracing::warn!(
+                    event = "content.model_tightened",
+                    version = self.model.version(),
+                    code = failure.code.as_str()
+                );
+                return Vec::new();
+            }
+        };
+        let session: &tokio_postgres::Client = &client;
         let any_component = plan
             .changes
             .iter()
@@ -892,7 +988,7 @@ impl Run<'_> {
 
     async fn count_type(
         &self,
-        session: &DetachedClient,
+        session: &tokio_postgres::Client,
         name: &str,
     ) -> Result<Vec<TightenedCount>, Failure> {
         let Some(content_type) = self.model.content_type(name) else {
@@ -924,9 +1020,6 @@ impl Run<'_> {
                     truncated = true;
                     break;
                 }
-                self.statement_timeout(session)
-                    .await
-                    .map_err(|_| Failure::transient("content_activation_timeout"))?;
                 let rows = session
                     .query(sql, &[&name, &after.0, &after.1, &TIGHTENING_BATCH])
                     .await

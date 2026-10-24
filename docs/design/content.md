@@ -396,7 +396,7 @@ block reads these tables.
 
 ```sql
 CREATE SCHEMA merezha_content;
-SET search_path = merezha_content;
+SET LOCAL search_path = merezha_content;      -- ends with the migration's transaction
 
 -- Every activated model version; exactly one is active.
 CREATE TABLE models (

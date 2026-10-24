@@ -3,7 +3,8 @@
 mod pg;
 
 use merezha_content::{
-    ChangeClass, MIGRATION_1, Status, Verified, derived_indexes, lock_model_version, verify,
+    ACTIVATION_LOCK, ChangeClass, MIGRATION_1, Status, Verified, derived_indexes,
+    lock_model_version, verify,
 };
 use merezha_postgres::TestDatabase;
 use pg::*;
@@ -19,13 +20,7 @@ fn migration_1_is_the_design_sql() {
     let block = &design[start..];
     let sql = &block[block.find("```sql\n").unwrap() + 7..];
     let sql = &sql[..sql.find("```").unwrap()];
-    // The one difference: the search path ends with the migration's
-    // transaction instead of leaking into the session.
-    let expected = sql.replace(
-        "SET search_path = merezha_content;",
-        "SET LOCAL search_path = merezha_content;",
-    );
-    assert_eq!(MIGRATION_1, expected);
+    assert_eq!(MIGRATION_1, sql);
 }
 
 #[tokio::test]
@@ -599,12 +594,12 @@ async fn a_build_killed_mid_way_leaves_the_host_not_ready_and_the_next_start_rep
     let db = database(&test).await;
     let (v1, v2) = (model(V1), model(V2));
     run(&db, &v1).await.unwrap();
-    // A writer holding a lock on `published` makes the concurrent builds
+    // A writer holding locks on both tables makes every concurrent build
     // wait after their catalog entry exists, so killing the backend leaves
     // an invalid index.
     let blocker = db.acquire(soon()).await.unwrap();
     blocker
-        .batch_execute("BEGIN; LOCK TABLE merezha_content.published IN ROW EXCLUSIVE MODE")
+        .batch_execute("BEGIN; LOCK TABLE merezha_content.variants, merezha_content.published IN ROW EXCLUSIVE MODE")
         .await
         .unwrap();
     let host = {
@@ -612,12 +607,16 @@ async fn a_build_killed_mid_way_leaves_the_host_not_ready_and_the_next_start_rep
         let v2 = v2.clone();
         tokio::spawn(async move { run(&db, &v2).await })
     };
+    // Wait until a build waits with its (still invalid) catalog entry in
+    // place, so the kill lands mid-build rather than before it began.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let pid = loop {
         let waiting = scalar_i64(
             &db,
             "SELECT coalesce(max(pid), 0)::int8 FROM pg_stat_activity \
-             WHERE query LIKE 'CREATE %INDEX CONCURRENTLY%' AND wait_event_type = 'Lock'",
+             WHERE datname = current_database() AND query LIKE 'CREATE %INDEX CONCURRENTLY%' AND wait_event_type = 'Lock' \
+               AND EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                           WHERE c.relname LIKE 'content\\_ix\\_%' AND NOT i.indisvalid)",
         )
         .await;
         if waiting != 0 {
@@ -626,20 +625,32 @@ async fn a_build_killed_mid_way_leaves_the_host_not_ready_and_the_next_start_rep
         assert!(std::time::Instant::now() < deadline, "no build waited");
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    // The host dies: its task stops and its build backend is killed.
+    // The host dies mid-build: its task stops and its session drops. No
+    // pg_terminate_backend: the detached session's
+    // client_connection_check_interval ends the backend, and with it the
+    // activation lock, within about half a second.
     host.abort();
     let _ = host.await;
-    execute(&db, &format!("SELECT pg_terminate_backend({pid})")).await;
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while scalar_i64(
-        &db,
-        &format!("SELECT count(*) FROM pg_stat_activity WHERE pid = {pid}"),
-    )
-    .await
-        != 0
-    {
-        assert!(std::time::Instant::now() < deadline);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    let gone = std::time::Instant::now();
+    loop {
+        let alive = scalar_i64(
+            &db,
+            &format!("SELECT count(*) FROM pg_stat_activity WHERE pid = {pid}"),
+        )
+        .await;
+        let free = scalar_i64(
+            &db,
+            &format!("SELECT pg_try_advisory_xact_lock({ACTIVATION_LOCK})::int::int8"),
+        )
+        .await;
+        if alive == 0 && free == 1 {
+            break;
+        }
+        assert!(
+            gone.elapsed() < Duration::from_secs(2),
+            "the build backend or the activation lock outlived the host by 2 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let left = indexes(&db).await;
     assert!(left.values().any(|valid| !valid), "{left:?}");
@@ -878,4 +889,280 @@ async fn a_range_filter_on_a_sortable_field_uses_its_derived_index() {
         plan.iter().any(|line| line.contains(&index.name)),
         "{plan:#?}"
     );
+}
+
+/// The pid of a concurrent index build or drop (a retry drops the invalid
+/// index first) waiting on a lock, other than `not`.
+async fn waiting_build(db: &merezha_platform::Database, not: i64) -> i64 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let pid = scalar_i64(
+            db,
+            &format!(
+                "SELECT coalesce(max(pid), 0)::int8 FROM pg_stat_activity \
+                 WHERE datname = current_database() AND query LIKE '% INDEX CONCURRENTLY%content\\_ix\\_%' \
+                   AND wait_event_type = 'Lock' AND pid <> {not}"
+            ),
+        )
+        .await;
+        if pid != 0 {
+            return pid;
+        }
+        if std::time::Instant::now() >= deadline {
+            let activity = strings(
+                db,
+                "SELECT pid || ' ' || coalesce(wait_event_type, '-') || ' ' || coalesce(wait_event, '-') \
+                        || ' ' || state || ' ' || left(query, 60) \
+                   FROM pg_stat_activity WHERE datname = current_database()",
+            )
+            .await;
+            panic!("no build other than {not} waited: {activity:#?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_lost_session_reconnects_retakes_the_lock_and_keeps_counting_attempts() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let (v1, v2) = (model(V1), model(V2));
+    run(&db, &v1).await.unwrap();
+    let blocker = db.acquire(soon()).await.unwrap();
+    blocker
+        .batch_execute("BEGIN; LOCK TABLE merezha_content.variants, merezha_content.published IN ROW EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    // One lost session: the run reopens one, plans again and finishes.
+    let activation = {
+        let (db, v2) = (db.clone(), v2.clone());
+        tokio::spawn(async move { run(&db, &v2).await })
+    };
+    let first = waiting_build(&db, 0).await;
+    execute(&db, &format!("SELECT pg_terminate_backend({first})")).await;
+    let second = waiting_build(&db, first).await;
+    assert_ne!(first, second, "the build resumed on a new session");
+    blocker.batch_execute("ROLLBACK").await.unwrap();
+    let report = activation.await.unwrap().unwrap();
+    assert!(report.activated);
+    assert_eq!(
+        models(&db).await,
+        [(1, "superseded".to_owned()), (2, "active".to_owned())]
+    );
+    // Every attempt lost: the third one stops activation.
+    let v3 = model(&V2.replace("version = 2", "version = 3").replace(
+        "  { name = \"summary\", type = \"text\" },\n",
+        "  { name = \"summary\", type = \"text\" },\n  { name = \"rank\", type = \"integer\", sortable = true },\n",
+    ));
+    blocker
+        .batch_execute("BEGIN; LOCK TABLE merezha_content.variants, merezha_content.published IN ROW EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let activation = {
+        let db = db.clone();
+        tokio::spawn(async move { run(&db, &v3).await })
+    };
+    let mut previous = 0;
+    for _ in 0..3 {
+        let pid = waiting_build(&db, previous).await;
+        execute(&db, &format!("SELECT pg_terminate_backend({pid})")).await;
+        previous = pid;
+    }
+    let error = activation.await.unwrap().unwrap_err();
+    blocker.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(error.failure.code, "index_build_failed");
+    assert_eq!(error.index.as_ref().unwrap().attempts, 3);
+    assert_eq!(error.index.as_ref().unwrap().code, "database_unavailable");
+    assert_eq!(
+        models(&db).await,
+        [(1, "superseded".to_owned()), (2, "active".to_owned())]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_drop_after_the_commit_keeps_the_activation_and_the_next_start_drops_it() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let (v1, v2) = (model(V1), model(V2));
+    run(&db, &v1).await.unwrap();
+    execute(
+        &db,
+        "CREATE FUNCTION public.fail_drops() RETURNS event_trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF current_query() LIKE 'DROP INDEX CONCURRENTLY IF EXISTS merezha_content.content_ix_%' THEN
+             RAISE EXCEPTION 'injected drop failure' USING ERRCODE = '55P03';
+           END IF;
+         END $$;
+         CREATE EVENT TRIGGER fail_drops ON ddl_command_start WHEN TAG IN ('DROP INDEX')
+           EXECUTE FUNCTION public.fail_drops();",
+    )
+    .await;
+    let report = run(&db, &v2).await.unwrap();
+    assert!(report.activated, "the committed activation stands");
+    assert!(report.dropped.is_empty());
+    assert_eq!(report.undropped.len(), 4);
+    assert_eq!(
+        models(&db).await,
+        [(1, "superseded".to_owned()), (2, "active".to_owned())]
+    );
+    let existing = indexes(&db).await;
+    for name in &report.undropped {
+        assert!(existing.contains_key(name), "{name}");
+    }
+    execute(&db, "DROP EVENT TRIGGER fail_drops").await;
+    let again = run(&db, &v2).await.unwrap();
+    assert_eq!(again.plan.status, Status::Current);
+    let mut dropped = again.dropped.clone();
+    dropped.sort();
+    let mut expected = report.undropped.clone();
+    expected.sort();
+    assert_eq!(dropped, expected);
+}
+
+#[tokio::test]
+async fn the_write_check_tells_a_pending_model_from_a_superseded_one() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    run(&db, &model(V1)).await.unwrap();
+    let mut client = db.acquire(soon()).await.unwrap();
+    // A v2 host before v2 is active: pending, not superseded.
+    let mut tx = client.transaction().await.unwrap();
+    let pending = lock_model_version(&mut tx, 2).await.unwrap_err();
+    assert_eq!(pending.code, "content_model_pending");
+    assert_eq!(
+        pending.classification,
+        merezha_domain::Classification::Transient
+    );
+    drop(tx);
+    // After v3 activates, a v2 host is superseded.
+    run(&db, &model(&V1.replace("version = 1", "version = 3")))
+        .await
+        .unwrap();
+    let mut tx = client.transaction().await.unwrap();
+    assert_eq!(
+        lock_model_version(&mut tx, 2).await.unwrap_err().code,
+        "content_model_superseded"
+    );
+}
+
+/// A type with a localized unique field and a shared (`localized = false`)
+/// unique field.
+const UNIQUE: &str = r#"
+version = 1
+locales = [{ code = "en", default = true }, { code = "fr" }]
+
+[types.book]
+access = "public"
+fields = [
+  { name = "code", type = "string", unique = true },
+  { name = "isbn", type = "string", unique = true, localized = false },
+]
+"#;
+
+/// Run `sql`; `true` when it succeeded, `false` on a unique violation.
+async fn accepted(db: &merezha_platform::Database, sql: &str) -> bool {
+    let client = db.acquire(soon()).await.unwrap();
+    match client.batch_execute(sql).await {
+        Ok(()) => true,
+        Err(error) => {
+            assert_eq!(
+                error.code(),
+                Some(&merezha_postgres::tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
+                "{error}: {sql}"
+            );
+            false
+        }
+    }
+}
+
+fn variant(id: &str, locale: &str, data: &str) -> String {
+    format!(
+        "INSERT INTO merezha_content.variants (entry_id, locale, scope, content_type, draft_revision, \
+         draft_data, draft_updated_at, draft_updated_by) \
+         VALUES ('{id}', '{locale}', 'app', 'book', 1, '{data}', now(), 'sys_test')"
+    )
+}
+
+fn published(id: &str, locale: &str, source: &str, data: &str) -> String {
+    format!(
+        "INSERT INTO merezha_content.published (entry_id, locale, source_locale, scope, content_type, \
+         revision, data, published_at, first_published_at) \
+         VALUES ('{id}', '{locale}', '{source}', 'app', 'book', 1, '{data}', now(), now())"
+    )
+}
+
+#[tokio::test]
+async fn unique_indexes_ignore_fallback_rows_and_shared_copies() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    run(&db, &model(UNIQUE)).await.unwrap();
+    let ids = [
+        "00000000-0000-7000-8000-00000000000a",
+        "00000000-0000-7000-8000-00000000000b",
+        "00000000-0000-7000-8000-00000000000c",
+        "00000000-0000-7000-8000-00000000000d",
+    ];
+    for id in ids {
+        execute(
+            &db,
+            &format!(
+                "INSERT INTO merezha_content.entries (id, scope, content_type, created_at, created_by) \
+                 VALUES ('{id}', 'app', 'book', now(), 'sys_test')"
+            ),
+        )
+        .await;
+    }
+    let [a, b, c, d] = ids;
+    // Drafts. A localized value is unique per locale.
+    assert!(accepted(&db, &variant(a, "en", r#"{"code":"x","isbn":"i1"}"#)).await);
+    assert!(!accepted(&db, &variant(b, "en", r#"{"code":"x"}"#)).await);
+    assert!(accepted(&db, &variant(b, "fr", r#"{"code":"x"}"#)).await);
+    // A's fr variant carries a copy of its shared isbn: no collision.
+    assert!(accepted(&db, &variant(a, "fr", r#"{"code":"y","isbn":"i1"}"#)).await);
+    // Another entry's default variant with that isbn collides.
+    assert!(!accepted(&db, &variant(c, "en", r#"{"isbn":"i1"}"#)).await);
+    assert!(accepted(&db, &variant(c, "en", r#"{"isbn":"i2"}"#)).await);
+    // Delivery rows. A's fr row falls back to en and repeats code x; C's
+    // own fr row with code x does not collide with it.
+    assert!(
+        accepted(
+            &db,
+            &published(a, "en", "en", r#"{"code":"x","isbn":"i1"}"#)
+        )
+        .await
+    );
+    assert!(
+        accepted(
+            &db,
+            &published(a, "fr", "en", r#"{"code":"x","isbn":"i1"}"#)
+        )
+        .await
+    );
+    assert!(
+        accepted(
+            &db,
+            &published(c, "fr", "fr", r#"{"code":"x","isbn":"i2"}"#)
+        )
+        .await
+    );
+    // Two own rows of one locale with one value do collide.
+    assert!(!accepted(&db, &published(d, "fr", "fr", r#"{"code":"x"}"#)).await);
+    // Shared isbn: B's own fr row repeats A's isbn without colliding, a
+    // second default row with it does.
+    assert!(
+        accepted(
+            &db,
+            &published(b, "fr", "fr", r#"{"code":"z","isbn":"i1"}"#)
+        )
+        .await
+    );
+    assert!(!accepted(&db, &published(d, "en", "en", r#"{"isbn":"i1"}"#)).await);
 }

@@ -22,6 +22,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Ceiling on the start bound a module may declare
+/// ([`Module::start_timeout`]).
+pub const MAX_MODULE_START: Duration = Duration::from_secs(3600);
+
 /// Time bounds of the lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeouts {
@@ -308,8 +312,13 @@ impl Host {
         for module in &modules {
             let budget = module
                 .start_timeout()
-                .unwrap_or(parts.timeouts.module_start);
-            let at = tokio::time::Instant::from_std(Instant::now() + budget);
+                .unwrap_or(parts.timeouts.module_start)
+                .min(MAX_MODULE_START);
+            let now = Instant::now();
+            let at = tokio::time::Instant::from_std(
+                now.checked_add(budget)
+                    .unwrap_or(now + parts.timeouts.module_start),
+            );
             let own = ctx
                 .for_module(module.name(), module.extra_sources())
                 .map_err(|failure| StartupError {

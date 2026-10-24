@@ -32,7 +32,7 @@ pub async fn main(args: impl IntoIterator<Item = String>) -> ExitCode {
         Err(failure) => {
             crate::emit(
                 "content.diff_failed",
-                json!({"code": failure.code, "usage": USAGE}),
+                json!({"code": failure.code, "usage": USAGE, "level": "error"}),
             );
             return ExitCode::from(2);
         }
@@ -62,6 +62,11 @@ pub async fn diff(input: &ConfigInput) -> Result<(String, u8), u8> {
     let config = match host::configure(input, crate::blocks(input, module)) {
         Ok((config, _)) => config,
         Err(errors) => {
+            // The model's own messages name rules and TOML paths, never
+            // values: print them as `merezha content diff` promises.
+            if let Some(error) = handle.model_error() {
+                println!("{error}");
+            }
             let issues: Vec<_> = errors
                 .0
                 .iter()
@@ -69,7 +74,7 @@ pub async fn diff(input: &ConfigInput) -> Result<(String, u8), u8> {
                 .collect();
             crate::emit(
                 "content.diff_failed",
-                json!({"code": "invalid_config", "issues": issues}),
+                json!({"code": "invalid_config", "issues": issues, "level": "error"}),
             );
             return Err(2);
         }
@@ -77,12 +82,15 @@ pub async fn diff(input: &ConfigInput) -> Result<(String, u8), u8> {
     let Some(state) = handle.state() else {
         crate::emit(
             "content.diff_failed",
-            json!({"code": "content_not_enabled"}),
+            json!({"code": "content_not_enabled", "level": "error"}),
         );
         return Err(2);
     };
     let unavailable = |failure: Failure| {
-        crate::emit("content.diff_failed", json!({"code": failure.code}));
+        crate::emit(
+            "content.diff_failed",
+            json!({"code": failure.code, "level": "error"}),
+        );
         2
     };
     let database = Database::connect(&config.database).map_err(unavailable)?;

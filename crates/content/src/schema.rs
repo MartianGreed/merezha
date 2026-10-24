@@ -2,8 +2,8 @@
 //! migration runner under the ledger key `content`.
 use merezha_platform::Migration;
 
-/// The schema's tables and static indexes, as written in section 3. Its
-/// `SET LOCAL search_path` ends with the migration's transaction.
+/// The schema's tables and static indexes, exactly as written in section 3.
+/// Its `SET LOCAL search_path` ends with the migration's transaction.
 pub const MIGRATION_1: &str = include_str!("migrations/0001_merezha_content.sql");
 
 /// The content block's migrations, in order.

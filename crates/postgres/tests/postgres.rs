@@ -885,3 +885,59 @@ async fn detached_sessions_are_bounded_and_leave_their_pool_slot_open() {
     config.max_detached = 0;
     assert_eq!(config.validate(), vec![("max_detached", "out_of_range")]);
 }
+
+#[tokio::test]
+async fn a_dropped_detached_session_mid_statement_releases_its_lock_within_seconds() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let mut config = test.config();
+    config.statement_timeout = Duration::from_secs(60);
+    let db = Database::connect(&config).unwrap();
+    let holder = db.detach(soon()).await.unwrap();
+    let interval: String = holder
+        .query_one("SHOW client_connection_check_interval", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(interval, "500ms");
+    let busy = tokio::spawn(async move {
+        holder
+            .batch_execute("SELECT pg_advisory_lock(43); SELECT pg_sleep(30)")
+            .await
+    });
+    let other = db.acquire(soon()).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let held: i64 = other
+            .query_one(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 43",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if held == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the lock was never taken");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The owner goes away mid-statement, without pg_terminate_backend.
+    busy.abort();
+    let _ = busy.await;
+    let dropped = Instant::now();
+    let mut free = false;
+    while dropped.elapsed() < Duration::from_secs(2) {
+        free = other
+            .query_one("SELECT pg_try_advisory_xact_lock(43)", &[])
+            .await
+            .unwrap()
+            .get(0);
+        if free {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(free, "the lock outlived its client by more than 2 s");
+}

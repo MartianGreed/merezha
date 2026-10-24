@@ -168,6 +168,11 @@ fn content_errors_register_with_the_kernel_codes() {
         );
     }
     assert_eq!(ContentModule::new().errors(), ERRORS);
+    // Activation's 300 s plus a 10 s margin, beyond the host's 10 s default.
+    assert_eq!(
+        ContentModule::new().start_timeout(),
+        Some(Duration::from_secs(310))
+    );
     assert_eq!(ContentModule::new().migrations().len(), 1);
 }
 
@@ -331,4 +336,46 @@ async fn without_migrate_a_pending_model_keeps_the_host_not_ready() {
     // Once a migrating host activated v2, the verifying one turns ready.
     run(&db, &model(&v2)).await.unwrap();
     assert!(eventually_ready(&host).await);
+}
+
+#[tokio::test]
+async fn check_writable_marks_the_host_outdated_only_when_a_newer_model_is_active() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    run(&db, &model(V1)).await.unwrap();
+    // A v2 host configured before anyone activated v2.
+    let dir = tempfile::tempdir().unwrap();
+    let v2 = V1.replace("version = 1", "version = 2");
+    project(
+        dir.path(),
+        false,
+        "[modules.content]\n",
+        &[("content.toml", &v2)],
+    );
+    let state = configure_issues(dir.path()).unwrap().state().unwrap();
+    let mut client = db.acquire(soon()).await.unwrap();
+    let mut tx = client.transaction().await.unwrap();
+    assert_eq!(
+        state.check_writable(&mut tx).await.unwrap_err().code,
+        "content_model_pending"
+    );
+    drop(tx);
+    assert!(!state.is_outdated(), "a pending model is not outdated");
+    // v2 activates: its writes pass.
+    run(&db, &model(&v2)).await.unwrap();
+    let mut tx = client.transaction().await.unwrap();
+    state.check_writable(&mut tx).await.unwrap();
+    drop(tx);
+    // v3 activates: the v2 host is superseded for good.
+    run(&db, &model(&V1.replace("version = 1", "version = 3")))
+        .await
+        .unwrap();
+    let mut tx = client.transaction().await.unwrap();
+    assert_eq!(
+        state.check_writable(&mut tx).await.unwrap_err().code,
+        "content_model_superseded"
+    );
+    assert!(state.is_outdated());
 }

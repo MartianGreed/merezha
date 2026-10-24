@@ -82,11 +82,14 @@ impl ContentState {
     }
     /// The model version check every content write transaction starts
     /// with (section 2, mixed model versions): it share-locks the loaded
-    /// model's row while it is active. Without such a row a newer model is
-    /// active: the host marks itself outdated (readiness
-    /// `content_model_outdated`) and the write fails transient
-    /// `content_model_superseded` (503, `Retry-After: 1`), so the caller
-    /// rolls back and the client retries on a current host. C3 onward call
+    /// model's row while it is active. When a newer model is active the
+    /// host marks itself outdated (readiness `content_model_outdated`) and
+    /// the write fails transient `content_model_superseded` (503,
+    /// `Retry-After: 1`), so the caller rolls back and the client retries
+    /// on a current host. When the loaded model is not active yet (a new
+    /// host during a rolling deploy, before the migrating one activated
+    /// it) the write fails transient `content_model_pending` and the host
+    /// stays as it is. C3 onward call
     /// it first in every write; content job handlers do too and stop
     /// leasing once [`ContentState::is_outdated`].
     pub async fn check_writable(&self, tx: &mut Tx<'_>) -> Result<(), Failure> {
@@ -156,11 +159,16 @@ impl ContentState {
 
 const SUPERSEDED: &str = "content_model_superseded";
 
+const PENDING: &str = "content_model_pending";
+
 /// `SELECT 1 FROM merezha_content.models WHERE version = $1 AND state =
 /// 'active' FOR SHARE` inside `tx`: the shared lock makes an activation's
 /// update of that row wait for this write, and a write that waited on an
-/// activation finds no row. Fails transient `content_model_superseded`
-/// when `version` is not the active model.
+/// activation finds no row. When `version` is not the active model, the
+/// active version decides: a newer one fails transient
+/// `content_model_superseded`; an older one (or none), meaning `version`
+/// is pending activation by a migrating host, fails transient
+/// `content_model_pending`. Both are 503 with `Retry-After`.
 pub async fn lock_model_version(tx: &mut Tx<'_>, version: u32) -> Result<(), Failure> {
     let version = i32::try_from(version).map_err(|_| Failure::permanent("invalid_input"))?;
     let row = tx
@@ -170,9 +178,20 @@ pub async fn lock_model_version(tx: &mut Tx<'_>, version: u32) -> Result<(), Fai
         )
         .await
         .map_err(|e| merezha_postgres::classify(&e))?;
-    match row {
-        Some(_) => Ok(()),
-        None => Err(Failure::transient(SUPERSEDED)),
+    if row.is_some() {
+        return Ok(());
+    }
+    let active = tx
+        .query_opt(
+            "SELECT version FROM merezha_content.models WHERE state = 'active'",
+            &[],
+        )
+        .await
+        .map_err(|e| merezha_postgres::classify(&e))?
+        .map(|row| row.get::<_, i32>(0));
+    match active {
+        Some(active) if active > version => Err(Failure::transient(SUPERSEDED)),
+        _ => Err(Failure::transient(PENDING)),
     }
 }
 
@@ -180,15 +199,28 @@ pub async fn lock_model_version(tx: &mut Tx<'_>, version: u32) -> Result<(), Fai
 /// configured, kept by whoever registered the module (the CLI's `merezha
 /// content diff`, tests and C3's routes).
 #[derive(Clone, Debug, Default)]
-pub struct ContentHandle(Arc<RwLock<Option<Arc<ContentState>>>>);
+pub struct ContentHandle {
+    state: Arc<RwLock<Option<Arc<ContentState>>>>,
+    problems: Arc<RwLock<Option<crate::ModelError>>>,
+}
 impl ContentHandle {
     /// `None` until [`Module::configure`] accepted `[modules.content]`.
     pub fn state(&self) -> Option<Arc<ContentState>> {
-        self.0.read().ok().and_then(|state| state.clone())
+        self.state.read().ok().and_then(|state| state.clone())
+    }
+    /// The model file's problems, with their messages, when
+    /// [`Module::configure`] refused the model.
+    pub fn model_error(&self) -> Option<crate::ModelError> {
+        self.problems.read().ok().and_then(|error| error.clone())
     }
     fn set(&self, state: Arc<ContentState>) {
-        if let Ok(mut slot) = self.0.write() {
+        if let Ok(mut slot) = self.state.write() {
             *slot = Some(state);
+        }
+    }
+    fn refuse(&self, error: crate::ModelError) {
+        if let Ok(mut slot) = self.problems.write() {
+            *slot = Some(error);
         }
     }
 }
@@ -339,6 +371,7 @@ impl Module for ContentModule {
                     if error.omitted > 0 {
                         issues.push(ConfigIssue::new(&key, crate::MODEL_INVALID, Origin::File));
                     }
+                    self.handle.refuse(error);
                 }
             }
         }

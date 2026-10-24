@@ -725,7 +725,13 @@ first failed use.
   client for session statements, and `DetachedClient::transaction(deadline,
   work)` has exactly the contract of `Database::transaction`. Dropping it
   closes the session, which releases its locks; after `database_timeout` or
-  `commit_outcome_unknown` drop it rather than reuse it.
+  `commit_outcome_unknown` drop it rather than reuse it. Each detached
+  session sets `client_connection_check_interval = 500ms`
+  (`CONNECTION_CHECK_INTERVAL`), so the server ends a session whose client
+  went away within about half a second even mid-statement: an aborted
+  migration run, content activation or background runner stuck in a
+  `CREATE INDEX CONCURRENTLY` or a lock wait releases its advisory lock
+  then instead of at its statement timeout.
 - `classify(&tokio_postgres::Error)` maps driver errors to stable codes:
   `database_conflict` and `unique_violation` (conflict), `database_timeout`,
   `database_busy` and `database_unavailable` (transient),
@@ -1136,8 +1142,29 @@ At start, after migrations:
 
 Every content write transaction of C3 onward starts with
 `ContentState::check_writable`, a `FOR SHARE` lock on the loaded model's
-active row: without it the write fails `content_model_superseded` (503,
-`Retry-After: 1`) and the host turns outdated.
+active row. Without that row the active version decides: a newer one fails
+the write `content_model_superseded` and turns the host outdated; an older
+one or none (the loaded model is still pending, as on a new host before a
+migrating one activated it) fails `content_model_pending`, and the host
+stays as it is. Both are 503 with `Retry-After: 1`.
+
+After the activation commits, the index drop pass (each drop bounded by
+30 s) and the tightening count (30 s, on a pooled session after the lock is
+released) are best effort: a failure logs `content.index_failed`
+(`operation = "drop"`) or `content.model_tightened` with its `code`, and the
+next start retries the drops.
+
+Operations notes:
+
+- Modules start before the listener binds, so a migrating host with a
+  pending model is not listening (and answers no health probe) while it
+  builds indexes: up to 310 s (the 300 s activation bound plus 10 s).
+  Startup probes should allow for it.
+- The activation transaction's `FOR UPDATE` on the active row waits for
+  every content write holding `FOR SHARE`, bounded by
+  `database.statement_timeout`. A steady stream of overlapping writes can
+  starve it; activation then fails (`database_timeout`) and the next start
+  retries. Deploy model changes at a quieter moment if writes never pause.
 
 `merezha content diff --config merezha.toml [--set SECTION.KEY=VALUE]...`
 prints, without changing anything, the file's model, the active one, the
@@ -1146,8 +1173,10 @@ status (`fresh`, `current`, `pending`, `content_model_outdated`,
 `<class> <path> <change>` line per classified change and the derived
 indexes it would build or drop. It exits 0 when the model is current or
 would activate, 1 when it would not, and 2 when the configuration, the
-model or the database cannot be read (`content.diff_failed` on stderr
-with the code, and the issues for `invalid_config`).
+model or the database cannot be read (`content.diff_failed` at level
+`error` on stderr with the code, and the issues for `invalid_config`; an
+invalid model's problems are printed on stdout with their messages, one
+`content_model_invalid: <toml path> <message>` line each).
 
 Error codes it registers: `content_model_invalid`,
 `content_model_version_unchanged`, `content_model_breaking`,

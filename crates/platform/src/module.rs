@@ -91,7 +91,7 @@ pub trait Module: Send + Sync + 'static {
     /// How long [`Module::start`] may take; `None` keeps the host's
     /// `Timeouts::module_start`. A module whose start runs schema work, such
     /// as content model activation with its index builds, declares a longer
-    /// bound of its own.
+    /// bound of its own, at most `host::MAX_MODULE_START` (one hour).
     fn start_timeout(&self) -> Option<std::time::Duration> {
         None
     }

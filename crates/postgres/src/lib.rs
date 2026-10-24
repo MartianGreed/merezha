@@ -183,6 +183,11 @@ pub struct PoolStatus {
     pub waiting: usize,
 }
 
+/// `client_connection_check_interval` of every detached session: the
+/// server notices a vanished client within about this long, even inside a
+/// running statement, and ends the session, releasing its locks.
+pub const CONNECTION_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
 /// A cloneable handle to the bounded pool.
 #[derive(Clone)]
 pub struct Database {
@@ -318,6 +323,10 @@ impl Database {
     /// transaction, when the [`DetachedClient`] drops, whether the caller
     /// returns, fails or is cancelled.
     ///
+    /// The session sets `client_connection_check_interval` to
+    /// [`CONNECTION_CHECK_INTERVAL`], so a backend whose client went away
+    /// stops within about that long even mid-statement.
+    ///
     /// At most `max_detached` clients exist at once; beyond that the call
     /// waits for one to drop, within `acquire_timeout` and the deadline, and
     /// then fails transient `database_busy`.
@@ -334,8 +343,22 @@ impl Database {
             Err(_) => return Err(Failure::transient("database_busy")),
         };
         let pooled = self.acquire(deadline).await?;
+        let client = deadpool_postgres::Object::take(pooled);
+        // A dropped client only closes its socket. Without this setting a
+        // backend busy in a long statement (a `CREATE INDEX CONCURRENTLY`
+        // waiting for older transactions, say) keeps running, and keeps the
+        // session's advisory locks, until its statement timeout.
+        let set = format!(
+            "SET client_connection_check_interval = {}",
+            CONNECTION_CHECK_INTERVAL.as_millis()
+        );
+        match tokio::time::timeout_at(deadline.into(), client.batch_execute(&set)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(classify(&error)),
+            Err(_) => return Err(Failure::transient("database_timeout")),
+        }
         Ok(DetachedClient {
-            client: deadpool_postgres::Object::take(pooled),
+            client,
             statement_timeout: self.statement_timeout,
             _permit: permit,
         })

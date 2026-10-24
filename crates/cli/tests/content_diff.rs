@@ -154,6 +154,18 @@ async fn the_diff_classifies_against_the_database_and_fails_on_refused_changes()
         text.contains("status content_model_version_unchanged"),
         "{text}"
     );
+    // A newer model is active: the file is outdated, exit 1.
+    activate_model(&test, &V1.replace("version = 1", "version = 3")).await;
+    project(dir.path(), V1);
+    let (text, code) = merezha_cli::content::diff(&input(dir.path(), test.url()))
+        .await
+        .unwrap();
+    assert_eq!(code, 1, "{text}");
+    assert!(text.contains("status content_model_outdated"), "{text}");
+    assert!(
+        !text.contains("index "),
+        "no index plan for an outdated model: {text}"
+    );
 }
 
 #[test]
@@ -169,6 +181,17 @@ fn an_invalid_model_or_a_missing_section_exits_2() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("\"code\":\"invalid_config\""), "{stderr}");
+    assert!(stderr.contains("\"level\":\"error\""), "{stderr}");
+    // The model's problems with their messages, on stdout.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("content_model_invalid: locales is required"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("content_model_invalid: types.page.access is required"),
+        "{stdout}"
+    );
     assert!(stderr.contains("modules.content.model:locales"), "{stderr}");
     std::fs::write(
         dir.path().join("merezha.toml"),
