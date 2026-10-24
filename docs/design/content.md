@@ -8,11 +8,16 @@ under [cross-block dependencies](#cross-block-dependencies).
 
 The content block is a headless CMS API in the Merezha host: content types in
 a TOML file in the project repository, entries with drafts, publishing,
-scheduling, revisions and per-locale variants, and media in a `BlobStore` with
+revisions and per-locale variants, and media in a `BlobStore` with
 local and S3-compatible drivers. There is no admin UI. Editors use a frontend
 the project builds on the management API; sites read the delivery API. It
 ships as `merezha-content` (`crates/content`), a platform `Module` with schema
 `merezha_content` and routes under `/v1/content/`.
+
+Scheduled publishing and model migrations (`[[migrations]]`, `convert`) are
+deferred from v1 ([cross-block decisions](cross-block-decisions.md#deferred-from-v1)).
+They are designed under [later slices](#later-slices-outside-the-v1-order);
+the rest of this document describes v1 without them.
 
 ## What the established CMSs taught us
 
@@ -175,8 +180,8 @@ fields per type.
 | `description` | all | none | Documentation only. |
 | `required` | all | `false` | Value must be present and non-empty at publish time. Empty string, empty list and empty rich text count as absent. |
 | `localized` | all | type's `localized` | `false` makes it a shared field owned by the default-locale variant. Only meaningful in a localized type; not allowed inside components (a component inherits the containing field's setting). |
-| `default` | scalar types | none | Value filled in when a new variant is created without the field, and used by `set_default` migrations. |
-| `unique` | `string`, `slug`, `integer`, `enum` | `false`, `true` for `slug` | Unique per type, scope and locale (per type and scope for shared fields), enforced on drafts and on published rows by database indexes. |
+| `default` | scalar types | none | Value filled in when a new variant is created without the field. |
+| `unique` | `string`, `slug`, `integer`, `enum` | `false`, `true` for `slug` | Unique per type, scope and locale (per type and scope for shared fields), enforced on drafts and on published rows by database indexes. Can be set on a new field only; adding it to an existing field is refused in v1 (see schema changes). |
 | `filterable` | scalars, `reference`, lists of scalars | `false` | Field may appear in equality, `in` and `has` filters. |
 | `sortable` | `string`, `slug`, `integer`, `float`, `decimal`, `date`, `datetime`, `enum` | `false` | Field may be sorted on and used with range filters. Implies `filterable`. |
 
@@ -283,60 +288,70 @@ text. Detail codes: `required`, `type_mismatch`, `min_length`, `max_length`,
 
 `version` must increase whenever the fingerprint changes, or startup fails
 with `content_model_version_unchanged`. At startup the host diffs the active
-model in the database against the file and classifies every change:
+model in the database against the file and classifies every change. v1
+activates only changes that rewrite no stored data and refuses the rest:
 
 | Change | Class | What happens |
 | --- | --- | --- |
-| New type, component, optional field or locale | additive | Activated directly. |
-| New `required` field | additive | Activated. Existing drafts are unaffected; the next publish of each entry needs the field. `default` covers new variants only; a `set_default` step backfills. |
+| New type, component, optional field or locale | additive | Activated. |
+| New `required` field | additive | Activated. Existing drafts are unaffected; the next publish of each entry needs the field. `default` covers new variants only; existing variants are not backfilled. |
+| New field declared `unique`, the slug of a new type included | additive | Activated after its unique indexes are built (section 3). No host can write the field before activation, so the build cannot meet a duplicate. |
 | Relaxed rule: higher `max`, lower `min`, wider `pattern`, new enum value, `required` removed, new `to` target, new `accept` type | additive | Activated. |
 | Tightened rule: lower `max_length`, narrower range, `pattern` added, `required` added on an existing field | tightening | Activated. Rules apply at the next write. The host counts drafts and published rows that would fail and logs `content.model_tightened` with counts per field. Published content keeps being served. |
-| `access` changed | access | Activated. Applies to the next request; the generation bump changes every ETag of the scope. |
-| `filterable` or `sortable` added or removed | index | Activated. The host creates or drops derived indexes (section 3). |
-| `unique` added | index | Activated only if no duplicate exists. Otherwise startup fails with `unique_conflict`, listing the field and the number of duplicate values. |
-| Field removed or renamed, field type changed, enum value removed, type removed or renamed, `localized` changed, `scope` changed, `kind` changed, locale removed, default locale changed | breaking | Needs a `[[migrations]]` block. Without one, startup fails with `content_model_breaking`, listing each change. |
+| `access` changed | access | Activated. Applies to the next request on a current host; the generation bump changes every ETag of the scope. |
+| `filterable` or `sortable` added or removed, `unique` removed | index | Activated. New indexes are built before activation, unneeded ones dropped after it (section 3). |
+| `unique` added to an existing field | refused | Startup fails with `content_model_breaking`. |
+| Field removed or renamed, field type changed, enum value removed, type removed or renamed, `localized` changed, `scope` changed, `kind` changed, locale removed, default locale changed | refused | Startup fails with `content_model_breaking`, listing each change. |
 
-A migration block names the target version and ordered steps:
+`unique` on an existing field is refused because it cannot be made safe
+without stopping writes: values may already collide, and between a duplicate
+check and the end of a concurrent index build any writer can add a duplicate
+that fails the build. The v1 path is a new `unique` field, which activates
+safely, filled through the management API, where each colliding write fails
+with a `unique` detail. A refused change is fixed in the file, never in the
+database: the active model and the hosts running it are untouched.
+`[[migrations]]` blocks are not accepted in v1 (`content_model_invalid`); the
+later slice C10 designs them.
 
-```toml
-[[migrations]]
-to = 4
-steps = [
-  { op = "rename_field", type = "article", from = "summary", to = "excerpt" },
-  { op = "drop_field", type = "article", field = "legacy_id" },
-  { op = "set_default", type = "article", field = "featured", value = false },
-  { op = "map_enum", type = "article", field = "category", map = { release = "news" } },
-  { op = "convert", type = "product", field = "price", to = "decimal" },
-  { op = "rename_type", from = "post", to = "article" },
-  { op = "drop_type", type = "promo" },
-  { op = "retire_locale", code = "fr-BE" },
-]
+With `database.migrate = true` one host activates a pending model under an
+advisory lock. It builds the indexes the new model adds (section 3), then in
+one transaction marks the active `models` row `superseded`, inserts the new
+one as `active`, syncs `locales`, bumps the affected generations and appends
+`content.model_activated`. After that it drops the indexes the new model no
+longer needs and rebuilds the `published` fallback rows that a new locale or
+a changed fallback affects, in batches of 500 entries. Readiness stays false
+until all of it completes. With `database.migrate = false`, a pending model
+change fails readiness with `content_model_pending`.
+
+### Mixed model versions
+
+A rolling deploy runs hosts with different models side by side. Each host
+keeps its loaded model, and every transaction that writes content (saves,
+publishes, deletes, asset changes, job handlers) starts with:
+
+```sql
+SELECT 1 FROM merezha_content.models
+ WHERE version = $loaded_version AND state = 'active'
+   FOR SHARE;
 ```
 
-`convert` covers only well-defined conversions: `integer` to `float` or
-`decimal`, `string` to `text`, `text` to `rich_text` (one block per
-paragraph), `enum` to `string`, `one` to `many` for references and assets, and
-a scalar to a `list` of it. Anything else is `drop_field` plus a new field,
-with data moved through the management API. `retire_locale` hides a locale
-from delivery and keeps its variants readable for export. No step changes
-`localized`, `scope` or `kind`; create a new type and copy entries.
-
-With `database.migrate = true` the host runs a migration under an advisory
-lock. It rewrites `variants.draft_data` and rebuilds `published` in batches of
-500 entries, one transaction each, recording progress on the `models` row so
-a crashed run resumes. Steps are pure functions of the old value, so a rerun
-batch gives the same result. Readiness stays false until the run completes.
-Revisions are not rewritten: each keeps its model version, and restoring one
-replays the stored steps from that version. With `database.migrate = false`,
-a pending model change fails readiness with `content_model_pending`.
-
-A running host keeps its loaded model, so old instances survive a rolling
-deploy of an additive change. A host starting with an older model than the
-active one fails readiness with `content_model_outdated`.
+No row means a newer model is active. The transaction rolls back, the request
+fails with `content_model_superseded` (503, transient, `Retry-After: 1`) so
+the client retries on a current host, a job handler returns a transient
+failure, and the host's readiness turns false with `content_model_outdated`
+so the load balancer drains it. The shared lock makes activation's update of
+that row wait for writes in flight, and a write that waited on activation
+finds no row, so nothing validated against a superseded model commits after
+activation. This holds for additive changes too: an old host would otherwise
+publish entries without a newly required field. Reads keep the loaded model
+until the host is drained, so an old host answers 404 for a new type and
+applies the previous `access` until the deploy completes. A host starting
+with an older model than the active one fails readiness with
+`content_model_outdated`.
 
 `merezha content diff --config merezha.toml` prints the classified diff
 against the configured database without changing anything, and exits non-zero
-on breaking changes without a migration. Projects run it in CI.
+on refused changes. Projects run it in CI.
 
 ## 3. Storage
 
@@ -363,11 +378,8 @@ CREATE TABLE models (
   version integer PRIMARY KEY CHECK (version > 0),
   fingerprint text NOT NULL UNIQUE,              -- SHA-256 hex of canonical JSON
   definition jsonb NOT NULL,                     -- canonical normalized model
-  migration jsonb,                               -- steps that led to this version
-  state text NOT NULL CHECK (state IN ('migrating', 'active', 'superseded')),
-  migration_phase text CHECK (migration_phase IN ('drafts', 'published')),
-  migration_after uuid,                          -- resume cursor: last entry id done
-  activated_at timestamptz);
+  state text NOT NULL CHECK (state IN ('active', 'superseded')),
+  activated_at timestamptz NOT NULL);
 CREATE UNIQUE INDEX models_one_active ON models ((true)) WHERE state = 'active';
 
 -- Synchronized from the model at activation; rows are never deleted.
@@ -375,7 +387,7 @@ CREATE TABLE locales (
   code text PRIMARY KEY CHECK (length(code) BETWEEN 2 AND 35),
   fallback text REFERENCES locales (code),
   is_default boolean NOT NULL DEFAULT false,
-  retired_at timestamptz);
+  retired_at timestamptz);                       -- set by retire_locale (C10)
 CREATE UNIQUE INDEX locales_one_default ON locales ((true)) WHERE is_default;
 
 CREATE TABLE entries (
@@ -384,16 +396,17 @@ CREATE TABLE entries (
   content_type text NOT NULL,
   singleton boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL, created_by text NOT NULL,
-  deleted_at timestamptz, deleted_by text);
+  deleted_at timestamptz, deleted_by text,
+  UNIQUE (id, scope, content_type));             -- target of the composite keys below
 CREATE INDEX entries_by_type ON entries (scope, content_type, id) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX entries_one_singleton ON entries (scope, content_type)
   WHERE singleton AND deleted_at IS NULL;
 CREATE INDEX entries_trash ON entries (deleted_at) WHERE deleted_at IS NOT NULL;
 
 CREATE TABLE variants (
-  entry_id uuid NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+  entry_id uuid NOT NULL,
   locale text NOT NULL REFERENCES locales (code),
-  scope text NOT NULL, content_type text NOT NULL,   -- copied from entries for indexes
+  scope text NOT NULL, content_type text NOT NULL,   -- copied from entries, kept equal by the key below
   deleted boolean NOT NULL DEFAULT false,
   draft_revision bigint NOT NULL CHECK (draft_revision > 0),
   draft_data jsonb NOT NULL,                     -- includes shared fields copied from the default variant
@@ -401,7 +414,9 @@ CREATE TABLE variants (
   draft_updated_at timestamptz NOT NULL, draft_updated_by text NOT NULL,
   published_revision bigint CHECK (published_revision <= draft_revision),
   published_at timestamptz, first_published_at timestamptz,
-  PRIMARY KEY (entry_id, locale));
+  PRIMARY KEY (entry_id, locale),
+  FOREIGN KEY (entry_id, scope, content_type)
+    REFERENCES entries (id, scope, content_type) ON DELETE CASCADE);
 CREATE INDEX variants_list ON variants (scope, content_type, locale, draft_updated_at DESC, entry_id)
   WHERE NOT deleted;
 CREATE INDEX variants_data ON variants USING gin (draft_data jsonb_path_ops) WHERE NOT deleted;
@@ -420,7 +435,7 @@ CREATE TABLE revisions (
 -- Delivery rows, materialized at publish time: one row per entry and per
 -- configured locale whose fallback chain reaches a published variant.
 CREATE TABLE published (
-  entry_id uuid NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+  entry_id uuid NOT NULL,
   locale text NOT NULL REFERENCES locales (code),        -- requested locale
   source_locale text NOT NULL REFERENCES locales (code), -- variant actually served
   scope text NOT NULL, content_type text NOT NULL,
@@ -428,7 +443,9 @@ CREATE TABLE published (
   slug text,
   data jsonb NOT NULL,                           -- source variant data plus shared fields
   published_at timestamptz NOT NULL, first_published_at timestamptz NOT NULL,
-  PRIMARY KEY (entry_id, locale));
+  PRIMARY KEY (entry_id, locale),
+  FOREIGN KEY (entry_id, scope, content_type)
+    REFERENCES entries (id, scope, content_type) ON DELETE CASCADE);
 CREATE INDEX published_list ON published (scope, content_type, locale, published_at DESC, entry_id);
 CREATE INDEX published_slug ON published (scope, content_type, locale, slug) WHERE slug IS NOT NULL;
 CREATE UNIQUE INDEX published_own_slug ON published (scope, content_type, locale, slug)
@@ -472,19 +489,6 @@ CREATE TABLE assets (
 CREATE INDEX assets_list ON assets (scope, created_at DESC, id) WHERE deleted_at IS NULL;
 CREATE INDEX assets_by_blob ON assets (scope, sha256);
 
-CREATE TABLE schedules (
-  id uuid PRIMARY KEY,
-  entry_id uuid NOT NULL, locale text NOT NULL,
-  action text NOT NULL CHECK (action IN ('publish', 'unpublish')),
-  revision bigint,                               -- pinned revision for publish
-  run_at timestamptz NOT NULL,
-  state text NOT NULL CHECK (state IN ('pending', 'done', 'failed', 'cancelled')),
-  failure_code text,
-  created_at timestamptz NOT NULL, created_by text NOT NULL,
-  FOREIGN KEY (entry_id, locale) REFERENCES variants ON DELETE CASCADE);
-CREATE UNIQUE INDEX schedules_one_pending ON schedules (entry_id, locale, action) WHERE state = 'pending';
-CREATE INDEX schedules_due ON schedules (run_at) WHERE state = 'pending';
-
 -- Bumped on every change visible to delivery in a scope; feeds ETags.
 CREATE TABLE generations (scope text PRIMARY KEY, generation bigint NOT NULL);
 ```
@@ -518,30 +522,61 @@ or `locale = <default>` in the predicate for shared fields) and on `published`
 `CREATE INDEX CONCURRENTLY` cannot run in a transaction. This is an accepted
 framework amendment (R15): the kernel runner gains a declared
 non-transactional migration step, and content registers its index
-reconciliation as one, run at activation after the transactional migrations
-under the same advisory lock. Each name is `content_ix_` plus 16 hex
-characters of the definition's hash, so the step computes the expected set
-from the model, compares it with `pg_indexes`, drops extra `content_ix_`
-indexes, and rebuilds those a crashed build left invalid
-(`pg_index.indisvalid = false`). Readiness stays false until every expected
-index exists and is valid; with `database.migrate = false`, a missing one
-fails readiness instead of being built. Unique violations map back to their
-field through the index name.
+reconciliation as one, run in two passes under the activation advisory lock.
+Each name is `content_ix_` plus 16 hex characters of the definition's hash,
+so the step computes the expected sets from the models and compares them
+with `pg_indexes`. Before activation it builds every missing index of the
+pending model and rebuilds those a crashed build left invalid
+(`pg_index.indisvalid = false`), leaving the active model's indexes in place.
+After activation it drops the `content_ix_` indexes the active model does not
+need. Building first means no host writes a new `unique` field during its
+build, since the active model rejects it as `unknown_field`, so the build
+sees only absent values.
+
+A failed build is dropped. A transient failure (lock or statement timeout,
+lost connection) is retried twice with backoff. A unique violation (not
+expected in v1, where only new fields gain `unique`) or a third failure stops
+activation: the host logs `content.index_failed` with the index name and
+field, readiness reports `index_build_failed` with the same, and startup
+fails. Nothing retries in a loop, the pending model stays inactive, and hosts
+on the active model keep serving and writing. The operator fixes the cause
+and redeploys. Readiness stays false until every expected index exists and is
+valid; with `database.migrate = false`, a missing one fails readiness with
+`index_build_pending` instead of being built. Unique violations at write time
+map back to their field through the index name.
+
+### Scope predicates
+
+Every statement on `entries`, `variants`, `published` and `revisions` carries
+the scope and content type the route resolved, never an id alone: the type
+from the path, the scope from the type's declaration and `Principal.tenant`
+(section 8). `entries`, `variants` and `published` filter on their own
+`scope` and `content_type` columns; `revisions` statements join `variants` on
+`(entry_id, locale)` with both predicates. The composite foreign keys keep
+the copied columns equal to the entry's. A row of another scope or type is
+`entry_not_found`, as if absent, so a client-supplied id or a guessed revision
+number never reaches it. `refs`, `assets` and `blobs` statements filter on
+`scope`; only the `if_unreferenced` and `asset_in_use` checks count referrers
+in every scope, without returning them. C3 ships these predicates with the
+first write path; C9 adds organization types without changing a statement.
 
 ### Optimistic concurrency
 
-Every write to a variant is a compare-and-swap on `draft_revision`:
+Every write to a variant is a compare-and-swap on `draft_revision`, after the
+model version check (section 2):
 
 ```sql
 UPDATE merezha_content.variants
-   SET draft_revision = draft_revision + 1, draft_data = $4, draft_slug = $5,
-       draft_updated_at = $6, draft_updated_by = $7
- WHERE entry_id = $1 AND locale = $2 AND draft_revision = $3 AND NOT deleted
+   SET draft_revision = draft_revision + 1, draft_data = $6, draft_slug = $7,
+       draft_updated_at = $8, draft_updated_by = $9
+ WHERE entry_id = $1 AND locale = $2 AND scope = $3 AND content_type = $4
+   AND draft_revision = $5 AND NOT deleted
 RETURNING draft_revision;
 ```
 
-Zero rows is `revision_conflict` (412). HTTP carries the revision as a strong
-ETag, `"r12"`. `PUT`, `PATCH`, publish, unpublish, restore, schedule and
+Zero rows is `revision_conflict` (412) when the variant exists under the same
+predicates, `entry_not_found` otherwise. HTTP carries the revision as a strong
+ETag, `"r12"`. `PUT`, `PATCH`, publish, unpublish, restore and
 variant delete require `If-Match` (missing: `precondition_required`, 428);
 creating a variant uses `If-None-Match: *`. The same transaction writes the
 revision, the variant's `draft` refs, retention pruning, shared-field copies
@@ -566,9 +601,9 @@ frontends should debounce.
 ### Publishing
 
 `POST .../publish` with `If-Match: "r12"` publishes revision 12 in one
-transaction. The host locks the variant (`FOR UPDATE`), checks the revision,
-migrates the revision's data if it predates the active model and runs
-publish-time validation. It then sets `published_revision`, `published_at` and
+transaction. The host locks the variant (`FOR UPDATE`, under the scope
+predicates), checks the revision and runs publish-time validation against the
+active model. It then sets `published_revision`, `published_at` and
 `first_published_at`, rewrites the variant's `published` refs, re-materializes
 the entry's `published` rows for every locale whose chain passes through this
 variant (for the default variant, also the shared fields of every row), bumps
@@ -584,51 +619,23 @@ to `limits.max_batch` items and publishes all or none in one transaction,
 which covers coordinated launches without a release object (owner answer
 CT7).
 
-### Scheduling
-
-`POST .../schedule` with `{"action": "publish", "at": "2026-11-02T08:00:00.000Z"}`
-and `If-Match: "r12"` pins revision 12. Later draft edits do not change what
-goes live; reschedule to pick them up. `at` must be in the future and within
-`schedule.max_horizon` (`schedule_invalid`), and one pending schedule per
-variant and action may exist (`schedule_conflict`). The same transaction
-appends a delayed job record (R1, AP §B.3):
-
-```rust
-outbox.append(tx, "content", &[OutboxRecord {
-    dedupe_key: format!("schedule:{id}"),
-    target: OutboxTarget::Job { queue: "content", kind: "content.schedule_run" },
-    run_at: Some(at), ..
-}], OnDuplicate::Fail)
-```
-
-The handler runs as the system principal `sys_content_scheduler` (R13). It
-locks the schedule and returns at once unless it is pending (duplicate
-delivery), publishes the pinned revision or unpublishes through the API code
-path without `If-Match`, and marks it `done`. A permanent failure
-(`validation_failed`, `entry_deleted`) marks it `failed`, appends
-`content.scheduled_action_failed` and returns a permanent `JobFailure`;
-transient errors retry under the `[jobs.queues.content]` backoff.
-
-Authorization happens when the schedule is created; a later role change does
-not cancel it. Retention never prunes a pinned revision. Publish lag is the job
-runner's poll interval, measured by the schedule lag histogram (section 9).
-
 ### Revisions and restore
 
-Revision reads return data migrated to the active model, with the original in
-`sys.model_version`. Restore creates a new draft revision (`kind = restore`,
+Revision reads return the stored data with its `sys.model_version`. v1 model
+changes never remove or retype a field, so stored data always fits the active
+model's shape, though a tightened rule may now reject it. Restore creates a new draft revision (`kind = restore`,
 `restored_from = n`) and never publishes. It runs save-time validation
 against the current model. Data that no longer passes (a value now over
 `max_length`) still restores and the response lists the violations in
 `warnings`; a `unique` conflict fails the restore.
 
 Retention keeps the newest `revisions.retain` revisions per variant (100 by
-default) plus the published and any schedule-pinned revision.
+default) plus the published revision.
 
 ### Localization
 
-- Each variant has its own draft, published state, revisions, slug and
-  schedules. The first `PUT` with `If-None-Match: *` for a locale creates it;
+- Each variant has its own draft, published state, revisions and slug. The
+  first `PUT` with `If-None-Match: *` for a locale creates it;
   the default variant need not exist first.
 - Shared fields (`localized = false`) belong to the default variant. Writing
   one through another locale fails with `field_not_localized`. The host copies
@@ -651,7 +658,7 @@ default) plus the published and any schedule-pinned revision.
 ### Soft delete and purge
 
 Deleting an entry sets `deleted_at`, marks its variants `deleted`, removes its
-`published` rows and refs, cancels pending schedules and frees its unique
+`published` rows and refs and frees its unique
 values (unique indexes skip deleted rows). It appends
 `content.entry_unpublished` per live locale and one `content.entry_deleted`.
 With `if_unreferenced=true` it fails with `entry_referenced` while anything
@@ -661,7 +668,7 @@ meanwhile fails it with `unique` details.
 The recurring job `content.trash_purge`, declared through
 `JobsHandle::schedule` with `trash.purge_cron` (AP §B.7), hard-deletes entries
 trashed longer than `trash.retention`, 100 per batch, cascading to variants,
-revisions, refs and schedules, and appends `content.entry_purged`.
+revisions and refs, and appends `content.entry_purged`.
 `purge=true` with `content.entries.purge` does it at once, for erasure
 requests. Assets follow the same pattern (section 6).
 
@@ -691,9 +698,9 @@ The content block contributes these permissions to the RBAC catalog:
 | Permission | Grants |
 | --- | --- |
 | `content.model.read` | Read the full content model through the management API. |
-| `content.entries.read` | List and read drafts, revisions, referrers, schedules and trash. |
+| `content.entries.read` | List and read drafts, revisions, referrers and trash. |
 | `content.entries.write` | Create entries, save and patch drafts, restore revisions, delete a non-default variant. |
-| `content.entries.publish` | Publish, unpublish, batch publish, schedule and cancel schedules. |
+| `content.entries.publish` | Publish, unpublish and batch publish. |
 | `content.entries.delete` | Move entries to the trash and undelete them. |
 | `content.entries.purge` | Hard-delete entries immediately. |
 | `content.assets.read` | List assets and read any asset file through the management API. |
@@ -723,8 +730,7 @@ Management, one variant (`GET .../entries/article/{id}/fr`, `ETag: "r12"`):
     "status": "changed", "draft_revision": 12, "published_revision": 9, "model_version": 3,
     "created_at": "2026-10-01T10:00:00.000Z", "created_by": "usr_0192f5c4...",
     "updated_at": "2026-10-22T16:41:07.512Z", "updated_by": "usr_0192f5c4...",
-    "published_at": "2026-10-20T09:12:44.120Z", "first_published_at": "2026-10-02T08:00:00.000Z",
-    "schedules": [{ "id": "0192...", "action": "publish", "revision": 12, "at": "2026-11-02T08:00:00.000Z" }]
+    "published_at": "2026-10-20T09:12:44.120Z", "first_published_at": "2026-10-02T08:00:00.000Z"
   },
   "fields": {
     "title": "Notes de version 1.4", "slug": "notes-de-version-1-4", "category": "release",
@@ -771,7 +777,7 @@ All paths are under `/v1/content/manage`. `{type}` is a content type,
 | Method and path | Permission | Request | Success |
 | --- | --- | --- | --- |
 | `GET /model` | `content.model.read` | none | 200 `{version, fingerprint, locales, components, types}` in model order. |
-| `GET /entries/{type}` | `content.entries.read` | query: `locale`, `status` (`draft`, `published`, `changed`, `any`), `scheduled`, `filter[...]`, `sort`, `limit`, `cursor`, `fields` | 200 `{items: [variant], page: {next_cursor, limit}}` |
+| `GET /entries/{type}` | `content.entries.read` | query: `locale`, `status` (`draft`, `published`, `changed`, `any`), `filter[...]`, `sort`, `limit`, `cursor`, `fields` | 200 `{items: [variant], page: {next_cursor, limit}}` |
 | `POST /entries/{type}` | `content.entries.write` | `{id?, locale?, fields}` | 201 variant, `ETag: "r1"`, `Location` |
 | `GET /entries/{type}/{id}` | `content.entries.read` | none | 200 `{sys: {id, type, created_at, deleted_at}, variants: [{locale, status, draft_revision, published_revision, updated_at}]}` |
 | `GET /entries/{type}/{id}/{locale}` | `content.entries.read` | `fields`, `populate` (drafts) | 200 variant, `ETag` |
@@ -780,7 +786,6 @@ All paths are under `/v1/content/manage`. `{type}` is a content type,
 | `DELETE /entries/{type}/{id}/{locale}` | `content.entries.write` | `If-Match` | 204 |
 | `POST /entries/{type}/{id}/{locale}/publish` | `content.entries.publish` | `{revision?}`, `If-Match` | 200 variant |
 | `POST /entries/{type}/{id}/{locale}/unpublish` | `content.entries.publish` | `If-Match` | 200 variant |
-| `POST /entries/{type}/{id}/{locale}/schedule` | `content.entries.publish` | `{action, at}`, `If-Match` | 201 schedule |
 | `GET /entries/{type}/{id}/{locale}/revisions` | `content.entries.read` | `limit`, `cursor` | 200 `{items: [{revision, kind, restored_from, model_version, created_at, created_by, title, published}], page}` |
 | `GET /entries/{type}/{id}/{locale}/revisions/{n}` | `content.entries.read` | none | 200 variant shape with that revision's fields |
 | `POST /entries/{type}/{id}/{locale}/revisions/{n}/restore` | `content.entries.write` | `If-Match` | 200 variant plus `warnings` |
@@ -790,9 +795,7 @@ All paths are under `/v1/content/manage`. `{type}` is a content type,
 | `GET /trash` | `content.entries.read` | `type`, `limit`, `cursor` | 200 `{items: [{id, type, deleted_at, deleted_by, title}], page}` |
 | `GET /singletons/{type}/{locale}` | `content.entries.read` | as variant GET | 200 variant, or 404 `entry_not_found` before first save |
 | `PUT`, `PATCH /singletons/{type}/{locale}` | `content.entries.write` | as above; the first `PUT` with `If-None-Match: *` creates the entry | 200 or 201 |
-| `POST /singletons/{type}/{locale}/publish`, `/unpublish`, `/schedule`; `GET /singletons/{type}/{locale}/revisions[/{n}]`; `POST .../revisions/{n}/restore` | as for entries | as for entries | as for entries |
-| `GET /schedules` | `content.entries.read` | `from`, `to`, `state`, `limit`, `cursor` | 200 `{items: [schedule], page}` |
-| `DELETE /schedules/{id}` | `content.entries.publish` | none | 204, state becomes `cancelled` |
+| `POST /singletons/{type}/{locale}/publish`, `/unpublish`; `GET /singletons/{type}/{locale}/revisions[/{n}]`; `POST .../revisions/{n}/restore` | as for entries | as for entries | as for entries |
 | `POST /batch/publish` | `content.entries.publish` per item | `{items: [{type, id, locale, revision}]}` | 200 `{items: [variant]}` |
 | `POST /batch/unpublish` | `content.entries.publish` per item | `{items: [{type, id, locale}]}` | 200 `{items: [variant]}` |
 | `POST /assets` | `content.assets.write` | raw body, `Content-Type`, query `filename`, optional `title` | 201 asset |
@@ -899,20 +902,20 @@ Responses vary on `Authorization` and `Cookie`. Management responses are always
 | `unauthenticated` | 401 | permanent | The type's `access` or the route needs a principal and there is none. |
 | `unauthorized` | 403 | permanent | Principal lacks the permission, or an `authenticated` organization type is read with another tenant. |
 | `tenant_required` | 403 | permanent | Organization-scoped type and the principal has no active organization. |
-| `content_type_not_found`, `entry_not_found`, `revision_not_found`, `asset_not_found`, `schedule_not_found` | 404 | permanent | Absent, pruned, or not visible to this caller in this stage. |
+| `content_type_not_found`, `entry_not_found`, `revision_not_found`, `asset_not_found` | 404 | permanent | Absent, pruned, of another scope or type, or not visible to this caller in this stage. |
 | `locale_unknown` | 400 | permanent | Locale not configured or retired. |
 | `invalid_query`, `invalid_filter`, `invalid_sort`, `invalid_cursor`, `populate_limit` | 400 | permanent | Query parameter problems, with `details`. |
 | `invalid_json` | 400 | permanent | Body is not JSON, has duplicate keys at the top level, or has unknown top-level keys. |
 | `validation_failed` | 422 | permanent | Field rules, with `details`. |
-| `schedule_invalid` | 422 | permanent | Time in the past or beyond the horizon. |
 | `variant_exists`, `revision_conflict` | 412 | conflict | `If-None-Match: *` on an existing variant; `If-Match` not the draft revision. |
 | `precondition_required` | 428 | permanent | Missing `If-Match`. |
-| `entry_exists`, `entry_referenced`, `asset_in_use`, `schedule_conflict`, `default_variant_required`, `singleton_exists` | 409 | conflict | Client id taken; referrers exist with `if_unreferenced`; asset referenced without `force`; pending schedule exists; default variant deleted alone; second singleton entry. |
+| `entry_exists`, `entry_referenced`, `asset_in_use`, `default_variant_required`, `singleton_exists` | 409 | conflict | Client id taken; referrers exist with `if_unreferenced`; asset referenced without `force`; default variant deleted alone; second singleton entry. |
 | `body_limit`, `asset_too_large` | 413 | permanent | Body or draft data too large; upload over `media.max_upload_bytes`. |
 | `media_type_rejected` | 415 | permanent | Type not allowed, or the bytes do not match the declared type. |
 | `range_not_satisfiable` | 416 | permanent | |
 | `overloaded` | 503 | transient | `media.max_concurrent_uploads` reached; `Retry-After: 1`. |
 | `blob_unavailable` | 503 | transient | Blob store failure after its bounded retries. |
+| `content_model_superseded` | 503 | transient | Write on a host whose model a newer one replaced; `Retry-After: 1` (section 2). |
 | `timeout` | 504 | transient | Request deadline or statement timeout. |
 | `internal` | 500 | transient | Anything else. Logged with the request id. |
 
@@ -920,8 +923,8 @@ Codes are unprefixed (R8); the cross-cutting ones keep their canonical
 statuses. Startup and readiness codes: `content_model_invalid`,
 `content_model_version_unchanged`, `content_model_outdated`,
 `content_model_breaking`, `content_model_pending` (the domain term "content
-model", not a module prefix), `unique_conflict`, `identity_required`,
-`media_config_invalid`, `index_build_pending`.
+model", not a module prefix), `identity_required`, `media_config_invalid`,
+`index_build_pending`, `index_build_failed`.
 
 ## 6. Media
 
@@ -1127,12 +1130,11 @@ letters.
 | Event type (version 1) | Payload | Emitted by |
 | --- | --- | --- |
 | `content.entry_draft_saved` | `scope, type, id, locale, revision, actor` | create, save, patch, restore |
-| `content.entry_published` | `scope, type, id, locale, revision, slug, published_at, first_publish, actor, schedule_id?` | publish, batch, schedule |
-| `content.entry_unpublished` | `scope, type, id, locale, actor, reason (unpublish, delete, schedule)` | unpublish, delete, schedule |
+| `content.entry_published` | `scope, type, id, locale, revision, slug, published_at, first_publish, actor` | publish, batch |
+| `content.entry_unpublished` | `scope, type, id, locale, actor, reason (unpublish, delete)` | unpublish, delete |
 | `content.entry_deleted` | `scope, type, id, actor` | soft delete |
 | `content.entry_undeleted` | `scope, type, id, actor` | undelete |
 | `content.entry_purged` | `scope, type, id` | purge, retention |
-| `content.scheduled_action_failed` | `scope, type, id, locale, schedule_id, action, code` | schedule handler |
 | `content.asset_uploaded` | `scope, id, content_type, size, sha256, actor` | upload |
 | `content.asset_updated` | `scope, id, actor` | metadata patch |
 | `content.asset_deleted` | `scope, id, actor, forced` | delete |
@@ -1197,7 +1199,6 @@ multi-application platform keeps that rule, so the layout survives it.
 | `revisions.retain` | int | 100 | 2 to 10000. |
 | `trash.retention` | duration | `"30d"` | 1 day to 3650 days. |
 | `trash.purge_cron` | cron | `"23 3 * * *"` | Validated by AP's cron parser (§B.7). |
-| `schedule.max_horizon` | duration | `"365d"` | 1 day to 365 days, AP's delayed-job ceiling. |
 | `delivery.public_base_url` | URL | none | `https` unless the listener is loopback. Makes asset and `Location` URLs absolute. |
 | `delivery.cache_control_public` | string | `"public, max-age=60, stale-while-revalidate=300"` | Header-safe characters only. |
 | `delivery.cache_control_private` | string | `"private, no-cache"` | |
@@ -1245,22 +1246,20 @@ traces; tenant ids follow TE's default (on), user ids are off (TE1). Field
 values, filenames, slugs and filter values never appear in any signal.
 
 - Histograms: `merezha.content.populate.entries`, `merezha.content.query.rows`,
-  `merezha.content.schedule.lag` (s, run time minus `run_at`),
   `merezha.content.upload.bytes`, `merezha.content.blob.duration` (s).
 - Counters: `merezha.content.delivery.not_modified`, `merezha.content.entries.saved`,
   `merezha.content.entries.published`, `merezha.content.entries.unpublished`,
   `merezha.content.validation.failures` (by detail code),
-  `merezha.content.revision_conflicts`, `merezha.content.schedule.failures`,
-  `merezha.content.upload.rejected`, `merezha.content.blobs.cleaned`,
-  `merezha.content.migration.rows`. Blob errors are the `failed` series of
+  `merezha.content.revision_conflicts`, `merezha.content.model_superseded_writes`,
+  `merezha.content.upload.rejected`, `merezha.content.blobs.cleaned`. Blob errors are the `failed` series of
   `merezha.content.blob.duration`.
 - Spans: TE's `content {operation}`, with operations `entry.save`,
   `entry.publish`, `materialize`, `delivery.query`, `populate`,
-  `asset.upload`, `blob.put`, `blob.get`, `schedule.run`.
+  `asset.upload`, `blob.put`, `blob.get`.
 - Log events, in TE's `<area>.<noun>_<verb>` form: `content.model_loaded`,
   `content.model_activated`, `content.model_tightened`, `content.model_breaking`,
-  `content.migration_batch`, `content.index_created`, `content.index_dropped`,
-  `content.schedule_failed`, `content.blob_cleanup`, `content.spool_cleared`.
+  `content.index_created`, `content.index_dropped`, `content.index_failed`,
+  `content.blob_cleanup`, `content.spool_cleared`.
 
 ## 10. Crates
 
@@ -1275,7 +1274,7 @@ and tested on 1.98.0 in their slice.
 | `postgres-types` | 0.2.14 | 1.85 | MIT OR Apache-2.0 | `jsonb` and `uuid` mapping. |
 | `object_store` | 0.14.2 | 1.85 | MIT/Apache-2.0 | Blob drivers; features `fs` (default) and `aws`. |
 | `uuid` | 1.29.0 | 1.89.0 | Apache-2.0 OR MIT | UUIDv7 ids; workspace pin with `v4`, `v5`, `v7`, `serde`. |
-| `jiff` | 0.2.38 | 1.70 | Unlicense OR MIT | The workspace's one time crate (R14), pinned with `default-features = false` and `std`, `serde`, `tz-system`, `tzdb-bundle-platform`: strict RFC 3339 parsing, UTC normalization, schedule times. |
+| `jiff` | 0.2.38 | 1.70 | Unlicense OR MIT | The workspace's one time crate (R14), pinned with `default-features = false` and `std`, `serde`, `tz-system`, `tzdb-bundle-always`: strict RFC 3339 parsing, UTC normalization. |
 | `rust_decimal` | 1.43.0 | 1.67.1 | MIT | `decimal` precision, scale and range checks (28 digits, hence the precision ceiling). |
 | `regex` | 1.13.1 | 1.65 | MIT OR Apache-2.0 | `pattern` validation, linear time with a compiled size limit. |
 | `sha2` | 0.11.1 | 1.88 | MIT OR Apache-2.0 | Blob hashes, model fingerprint, ETags, cursor fingerprints. The workspace version after K2 (R14). |
@@ -1304,29 +1303,119 @@ run against a MinIO service container named by `MEREZHA_TEST_S3_ENDPOINT`,
 when unset. Until ID PR 2 lands, tests use a table-driven fixture `Authorizer`
 over K's scopes.
 
-Dependencies follow the cross-block delivery order. Every write path appends
-outbox records, so only C1 runs without `merezha-jobs`:
+Dependencies follow the cross-block delivery order. v1 is C1 to C7 and C9;
+C8 and C10 are [later slices](#later-slices-outside-the-v1-order) outside it.
+Every write path appends outbox records, so only C1 runs without
+`merezha-jobs`:
 
 - C1: K2 (error `details`). Stage 1, second wave.
 - C2, C3: C1 and AP-B1, because activation and every save append outbox
   records. C2 also needs the kernel runner's non-transactional step (R15).
 - C4: C3 and AP-B3, for the trash purge cron. C5: C4.
 - C6: K2's `BlobStore` trait. Stage 2 opens with C6, after ID PR 2.
-- C7: C3, C6 and AP-B3, for the blob cleanup cron. C8: C4 and AP-B2, for
-  delayed job dispatch.
+- C7: C3, C6 and AP-B3, for the blob cleanup cron.
 - C9: C5, C7 and ID PR 2's application and tenant scopes. Stage 3.
 
 | Slice | Scope | Acceptance criteria | Test plan |
 | --- | --- | --- | --- |
-| C1 Content model | Crate `merezha-content`: parser, validator, canonical form, fingerprint, field value validators, Portable Text validator, slug generation. No database. | The section 2 example parses. Every rule in the field tables has an accepting and a rejecting case. A broken model reports every problem with its TOML path at once. A type without `access` fails model validation. The fingerprint ignores key order and whitespace and changes on any semantic change. Details carry pointer paths and no user text. | Unit tests per field type: safe-integer bounds, `1.0` refused for integers, decimal normalization, U+0000, datetime precision, each rich text rejection, regex size limit. Golden output for a broken model. A type without `access`, with `access = "private"` or with an unknown permission fails at `types.<name>.access`; each of the three accepted forms parses. |
-| C2 Schema and activation | Migration 1, locale sync, activation, diff classification, derived indexes, `merezha content diff`. | Fresh database activates version 1. Additive change activates on restart. Breaking change without migration fails readiness with each change listed. Same version with a new fingerprint fails. `sortable` added creates the index concurrently; removed drops it. An invalid index from a crashed build is rebuilt. Readiness stays false until every expected index is valid. `unique` over duplicates fails `unique_conflict`. Two hosts starting together activate once. | Real PostgreSQL. Concurrent activation from two tasks. `pg_indexes` and `pg_index.indisvalid` assertions. A build killed mid-way leaves the host not ready, and the next start repairs it. `EXPLAIN` shows a range filter on a sortable field using its derived index. |
-| C3 Drafts and revisions | Create, read, `PUT`, `PATCH`, revisions, restore, retention, singletons, shared-field copying, management list with filters, sort and cursors, unique enforcement, reference validation, referrers. | One revision per save. A stale `If-Match` gives 412 and writes nothing; a missing one gives 428. Retention never prunes the published or a pinned revision. Shared fields written through `fr` fail `field_not_localized` and appear in every variant after a default save. Unique violations name the field. A second singleton fails. | HTTP tests over the axum router and a real database. 50 concurrent saves on one variant: exactly one wins per revision. Cursor walk over 1000 entries with concurrent inserts: no duplicates, no gaps. Property test: random filters and sorts over seeded data match an in-memory evaluation. |
-| C4 Publishing and deletion | Publish, unpublish, publish an older revision, batch, fallback materialization, generations, soft delete, undelete, purge, trash job, outbox events. | Publish makes the revision visible in its locale and in every locale falling back to it, in the transaction that appends `content.entry_published`. Unpublishing `fr` makes `fr-BE` fall back to `en`. Publish enforces `required` and `require_published`. One failing batch item rolls back the batch. Delete removes every delivery row and emits one `content.entry_unpublished` per live locale plus `content.entry_deleted`. Undelete restores drafts only. Purge removes only expired trash. | Fault injection between materialization and commit leaves no rows and no outbox record. Each event lands as an `OutboxTarget::Event` record with the change's dedupe key. A fallback matrix over three locales and every publish state. Event count assertions per operation. |
+| C1 Content model | Crate `merezha-content`: parser, validator, canonical form, fingerprint, field value validators, Portable Text validator, slug generation. No database. | The section 2 example parses. Every rule in the field tables has an accepting and a rejecting case. A broken model reports every problem with its TOML path at once. A type without `access` fails model validation. A `[[migrations]]` block fails `content_model_invalid`. The fingerprint ignores key order and whitespace and changes on any semantic change. Details carry pointer paths and no user text. | Unit tests per field type: safe-integer bounds, `1.0` refused for integers, decimal normalization, U+0000, datetime precision, each rich text rejection, regex size limit. Golden output for a broken model. A type without `access`, with `access = "private"` or with an unknown permission fails at `types.<name>.access`; each of the three accepted forms parses. |
+| C2 Schema and activation | Migration 1, locale sync, activation, diff classification, derived indexes, `merezha content diff`. | Fresh database activates version 1. Additive, tightening, access and index changes activate on restart. Each refused change, `unique` added to an existing field included, fails startup with `content_model_breaking` listing it and leaves the active model untouched. Same version with a new fingerprint fails. Indexes the new model adds are valid before its row turns active, including a new `unique` field's; unneeded ones are dropped after. An invalid index from a crashed build is rebuilt. A build failing three times stops startup with `index_build_failed` and the previous model still active. Readiness stays false until every expected index is valid. Two hosts starting together activate once. | Real PostgreSQL. Concurrent activation from two tasks. `pg_indexes` and `pg_index.indisvalid` assertions. A build killed mid-way leaves the host not ready, and the next start repairs it. An injected failure on every build attempt counts exactly three attempts. `EXPLAIN` shows a range filter on a sortable field using its derived index. |
+| C3 Drafts and revisions | Create, read, `PUT`, `PATCH`, revisions, restore, retention, singletons, shared-field copying, management list with filters, sort and cursors, unique enforcement, reference validation, referrers, scope predicates, the model version check. | One revision per save. A stale `If-Match` gives 412 and writes nothing; a missing one gives 428. Retention never prunes the published revision. Shared fields written through `fr` fail `field_not_localized` and appear in every variant after a default save. Unique violations name the field. A second singleton fails. An id of another type, or of a row seeded in another scope, gives 404 `entry_not_found` on every entry route and changes nothing. A host whose model was superseded refuses every write with `content_model_superseded` and reports `content_model_outdated`. | HTTP tests over the axum router and a real database. 50 concurrent saves on one variant: exactly one wins per revision. A route-table-driven test sends every entry route an id of another type and an `org:` row seeded through SQL. Two hosts on versions 1 and 2: saves on host 1 started before, during and after host 2's activation either commit before activation commits or are refused. Cursor walk over 1000 entries with concurrent inserts: no duplicates, no gaps. Property test: random filters and sorts over seeded data match an in-memory evaluation. |
+| C4 Publishing and deletion | Publish, unpublish, publish an older revision, batch, fallback materialization, generations, soft delete, undelete, purge, trash job, outbox events. | Publish makes the revision visible in its locale and in every locale falling back to it, in the transaction that appends `content.entry_published`. Unpublishing `fr` makes `fr-BE` fall back to `en`. Publish enforces `required` and `require_published`. One failing batch item rolls back the batch. Delete removes every delivery row and emits one `content.entry_unpublished` per live locale plus `content.entry_deleted`. Undelete restores drafts only. Purge removes only expired trash. | Fault injection between materialization and commit leaves no rows and no outbox record. Each event lands as an `OutboxTarget::Event` record with the change's dedupe key. A fallback matrix over three locales and every publish state. Event count assertions per operation. Publish, unpublish, delete and undelete join C3's scope-predicate and superseded-model tests. |
 | C5 Delivery API | Delivery routes, access modes, preview, `fields`, `populate`, by-slug, ETag and 304, cache headers, model endpoint. | Anonymous reads work on `public` types and get 401 on others. `authenticated` types serve any principal, and for organization types only one whose tenant is the path's organization (403 `unauthorized` otherwise). A permission type gives 403 without the permission, including to a principal granted it only on another type, and serves one granted it at `Application` scope or on that type. Unpublished and missing both give 404. Preview without `content.preview` gives 403. Population respects depth, the entry cap, stage, locale chain and target access. A publish changes the ETag; an unchanged scope answers 304 without reading entries. Preview is `no-store` without ETag. By-slug prefers an own-locale slug. | Seeded entries in three locales. A reference cycle at maximum depth terminates. A statement counter proves the 304 path reads only `generations`. `EXPLAIN` of the default list uses `published_list`. |
 | C6 BlobStore | Platform trait, `object_store` local and S3 drivers, key validation, readiness probe, bounded retries. | Put from bytes, a file and a stream, get, ranged get, head, idempotent delete and attributes behave the same on both drivers. Invalid keys never reach a driver. A stopped MinIO yields `Unavailable` within the configured timeout. Signed URLs work and expire. A group-writable local root is refused. | One scenario suite run on a temp directory and on MinIO. A 20 MiB streamed put keeps memory near one part. |
 | C7 Assets | Upload flow, sniffing, dimensions, dedupe, asset routes, proxy and redirect serving, asset refs, delete and `force`, cleanup job, upload admission, spool hygiene. | PNG bytes declared as JPEG give 415. HTML declared as text is served as `attachment` with `nosniff` and the sandbox CSP. Oversized uploads give 413 and leave no spool file or blob row. Identical bytes give two assets and one object. Delivery refuses a draft-only asset and serves it after publish. `Range` gives a correct 206. A referenced asset deletes only with `force`. | Local and MinIO drivers. Injected crash after put and before commit is cleaned after the lease. Cleanup and an upload of the same bytes run in parallel 200 times; every asset row's blob still exists. |
-| C8 Scheduling and migrations | Schedule routes and job handler; `[[migrations]]` with resumable batches; lazy revision migration. | A schedule publishes the pinned revision after later edits. Duplicate job delivery publishes once. A deleted entry ends the schedule `failed` with `entry_deleted` and emits `content.scheduled_action_failed`. Cancel prevents publication. Each migration op transforms drafts and published rows as specified. A killed run resumes to the same result. A revision two versions old restores as valid data. Readiness is false during a run. | Job runner with a test clock. Migration over 5000 entries killed between batches, compared with an uninterrupted run. |
 | C9 Organization scope | Organization types, tenant-derived management scope, `/o/{organization}` delivery, cross-scope reference rules, per-organization blob tags, docs, a content section in the stage 3 example. | A key of organization A cannot read or write B through any route. B's public delivery shows only B. Organization entries may reference application entries; the reverse is refused. Identical uploads in two organizations create two objects. | A two-organization matrix generated from the route table, so a new route cannot skip it. |
+
+### Later slices, outside the v1 order
+
+Both are deferred from v1 by the [cross-block decisions](cross-block-decisions.md#deferred-from-v1).
+Each lands after C9 as its own pull request with its own migration, and keeps
+the v1 rules: its writes run the model version check and the scope
+predicates of section 3.
+
+**C8 Scheduled publishing** (needs C4 and AP-B2, for delayed job dispatch).
+`POST .../schedule` with `{"action": "publish", "at": "2026-11-02T08:00:00.000Z"}`
+and `If-Match: "r12"` pins revision 12. Later draft edits do not change what
+goes live; reschedule to pick them up. `at` must be in the future and within
+`schedule.max_horizon` (default and ceiling 365 days, AP's delayed-job
+ceiling; `schedule_invalid`, 422), and one pending schedule per variant and
+action may exist (`schedule_conflict`, 409). The same transaction appends a
+delayed job record (R1, AP §B.3):
+
+```rust
+outbox.append(tx, "content", &[OutboxRecord {
+    dedupe_key: format!("schedule:{id}"),
+    target: OutboxTarget::Job { queue: "content", kind: "content.schedule_run" },
+    run_at: Some(at), ..
+}], OnDuplicate::Fail)
+```
+
+The handler runs as the system principal `sys_content_scheduler` (R13). It
+locks the schedule and returns at once unless it is pending (duplicate
+delivery), publishes the pinned revision or unpublishes through the API code
+path without `If-Match`, and marks it `done`. A permanent failure
+(`validation_failed`, `entry_deleted`) marks it `failed`, appends
+`content.scheduled_action_failed` and returns a permanent `JobFailure`;
+transient errors, `content_model_superseded` included, retry under the
+`[jobs.queues.content]` backoff. Authorization happens when the schedule is
+created; a later role change does not cancel it.
+
+The slice adds a `schedules` table keyed to `variants` with `ON DELETE
+CASCADE` (`id`, `entry_id`, `locale`, `action`, pinned `revision`, `run_at`,
+`state` in `pending`, `done`, `failed`, `cancelled`, `failure_code`), one
+pending row per variant and action. Retention also keeps pinned revisions;
+deleting an entry cancels its pending schedules. It adds the routes
+`POST .../{locale}/schedule` for entries and singletons (`content.entries.publish`),
+`GET /schedules` (`content.entries.read`) and `DELETE /schedules/{id}`
+(`content.entries.publish`, state `cancelled`); `sys.schedules` on variants
+and the `scheduled` list filter; `schedule_not_found` (404); `schedule_id`
+and reason `schedule` on the publish events; and TE rows
+`merezha.content.schedule.lag`, `merezha.content.schedule.failures`, the
+`schedule.run` span and `content.schedule_failed`.
+
+**C10 Model migrations** (needs C4). A `[[migrations]]` block names the
+target version and ordered steps:
+
+```toml
+[[migrations]]
+to = 4
+steps = [
+  { op = "rename_field", type = "article", from = "summary", to = "excerpt" },
+  { op = "drop_field", type = "article", field = "legacy_id" },
+  { op = "set_default", type = "article", field = "featured", value = false },
+  { op = "map_enum", type = "article", field = "category", map = { release = "news" } },
+  { op = "convert", type = "product", field = "price", to = "decimal" },
+  { op = "rename_type", from = "post", to = "article" },
+  { op = "drop_type", type = "promo" },
+  { op = "retire_locale", code = "fr-BE" },
+]
+```
+
+`convert` covers only well-defined conversions: `integer` to `float` or
+`decimal`, `string` to `text`, `text` to `rich_text` (one block per
+paragraph), `enum` to `string`, `one` to `many` for references and assets, and
+a scalar to a `list` of it. `retire_locale` hides a locale from delivery and
+keeps its variants readable for export. No step changes `localized`, `scope`
+or `kind`. The run rewrites `variants.draft_data` and rebuilds `published` in
+batches of 500 entries, one transaction each, with a resume cursor on the
+`models` row (the slice adds `migration`, `migration_phase`,
+`migration_after` and a `migrating` state). Steps are pure functions of the
+old value, so a rerun batch gives the same result. Revisions are not
+rewritten; reads and restores replay the stored steps from the revision's
+model version.
+
+The run supersedes the old model before the first batch, so the version
+check refuses every write except the run's own batches until the new model is
+active: writes pause for the run. The same pause lets C10 accept `unique` on an existing
+field (check duplicates, then build, with no writer). C10 must still decide
+what old hosts serve while `published` holds rows of both shapes: pause
+delivery for migrated types, or have readers accept both.
+
+| Slice | Scope | Acceptance criteria | Test plan |
+| --- | --- | --- | --- |
+| C8 Scheduled publishing | The `schedules` migration, schedule routes and job handler, retention of pinned revisions, schedule events and metrics. | A schedule publishes the pinned revision after later edits. Duplicate job delivery publishes once. A deleted entry ends the schedule `failed` with `entry_deleted` and emits `content.scheduled_action_failed`. Cancel prevents publication. A handler on a superseded host retries and publishes once on a current one. | Job runner with a test clock. |
+| C10 Model migrations | `[[migrations]]` with resumable batches, the write pause, lazy revision migration, `unique` on existing fields. | Each migration op transforms drafts and published rows as specified. A killed run resumes to the same result. No write commits during a run. A revision two versions old restores as valid data. Readiness is false during a run. | Migration over 5000 entries killed between batches, compared with an uninterrupted run. |
 
 ## Cross-block dependencies
 
@@ -1362,6 +1451,9 @@ design, recorded in full in [cross-block decisions](cross-block-decisions.md):
 - **CT6** No guest hooks on entries. Stage 3 reactions to content events cover
   side effects.
 - **CT7** Batch publish only, no named releases.
+- Deferred from v1: scheduled publishing (C8) and model migrations (C10). v1
+  activates only model changes that rewrite no stored data, and refuses
+  `unique` on an existing field.
 - Error `details` are platform-wide (R8). Per-type permissions use identity's
   resource scope (R5). Changing `localized` or `scope` on a live type stays
   unsupported. 100 revisions are kept per variant, with no save coalescing.

@@ -87,7 +87,7 @@ flowchart LR
    send it again. The only way to send it again is an explicit
    redelivery, which increments `generation` and is allowed only from
    `failed`, `unknown` or `expired`.
-6. `security` topics ignore preferences and quiet hours. They do not ignore
+6. `security` topics ignore preferences and quiet hours (N9). They do not ignore
    `invalid` suppressions or the configured channel set.
 7. A `marketing` delivery to a user is created only when that user has an
    explicit `enabled = true` preference for the topic and channel. A marketing
@@ -105,9 +105,11 @@ flowchart LR
 10. An outgoing HTTP request to a URL supplied by a tenant or a browser (webhook
     endpoint, push endpoint) goes only to IP addresses that passed the egress
     guard, with redirects and proxies disabled.
-11. An inbox item's `change_seq` strictly increases on each change, per user and
-    globally. An SSE client that resumes from `Last-Event-ID = n` receives
-    every item whose current `change_seq > n`, once, in order.
+11. An inbox item's `change_seq` strictly increases on each change, per user.
+    It comes from the user's `inbox_counters` row, locked until commit, so a
+    user's changes commit in `change_seq` order (5.4). An SSE client that
+    resumes from `Last-Event-ID = n` receives every item whose current
+    `change_seq > n`, once, in order.
 
 ### 2.3 Delivery state machine
 
@@ -145,7 +147,7 @@ SET search_path = merezha_notify;   -- the migration runner sets it per module; 
 CREATE TABLE notifications (
   id uuid PRIMARY KEY,
   source text NOT NULL CHECK (source ~ '^[a-z][a-z0-9_]{0,31}$'),
-  dedupe_key text NOT NULL CHECK (dedupe_key ~ '^[A-Za-z0-9._:/-]{1,200}$'),
+  dedupe_key text NOT NULL CHECK (dedupe_key ~ '^[A-Za-z0-9_.:/-]{1,200}$'),
   topic text NOT NULL, template text NOT NULL, locale text, tenant_id uuid,
   category text NOT NULL CHECK (category IN ('security','transactional','marketing')),
   priority text NOT NULL CHECK (priority IN ('low','normal','high')),
@@ -229,8 +231,7 @@ CREATE TABLE preferences (
 CREATE TABLE user_settings (
   user_id uuid PRIMARY KEY,
   timezone text,                                -- IANA name, validated with jiff
-  quiet_start time, quiet_end time, updated_at timestamptz NOT NULL,
-  CHECK ((quiet_start IS NULL) = (quiet_end IS NULL))
+  updated_at timestamptz NOT NULL               -- N9 (migration 5) adds quiet_start, quiet_end
 );
 
 CREATE TABLE suppressions (
@@ -251,7 +252,11 @@ CREATE TABLE captures (                         -- written only by capture drive
 );
 
 -- Migration 2 (slice N2): inbox
-CREATE SEQUENCE inbox_change_seq AS bigint;
+CREATE TABLE inbox_counters (                   -- one row per user with an inbox item
+  user_id uuid PRIMARY KEY,
+  last_seq bigint NOT NULL,                     -- highest seq or change_seq handed out
+  purged_through bigint NOT NULL DEFAULT 0      -- highest change_seq ever deleted
+);
 CREATE TABLE inbox_items (
   id uuid PRIMARY KEY,                          -- = delivery id
   user_id uuid NOT NULL, tenant_id uuid, notification_id uuid NOT NULL, topic text NOT NULL,
@@ -259,8 +264,8 @@ CREATE TABLE inbox_items (
   body text NOT NULL CHECK (length(body) <= 2000),
   link text CHECK (length(link) <= 2048),
   payload jsonb CHECK (octet_length(payload::text) <= 4096),
-  seq bigint NOT NULL,                          -- creation order, immutable
-  change_seq bigint NOT NULL,                   -- nextval on every change
+  seq bigint NOT NULL,                          -- per-user creation order, immutable
+  change_seq bigint NOT NULL,                   -- next inbox_counters value on every change
   created_at timestamptz NOT NULL, read_at timestamptz, archived_at timestamptz,
   expires_at timestamptz NOT NULL
 );
@@ -269,11 +274,6 @@ CREATE INDEX inbox_items_list_idx ON inbox_items (user_id, seq DESC) WHERE archi
 CREATE INDEX inbox_items_unread_idx ON inbox_items (user_id)
   WHERE read_at IS NULL AND archived_at IS NULL;
 CREATE INDEX inbox_items_expiry_idx ON inbox_items (expires_at);
-CREATE TABLE inbox_watermark (
-  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
-  purged_through bigint NOT NULL DEFAULT 0      -- highest change_seq ever deleted
-);
-INSERT INTO inbox_watermark DEFAULT VALUES;
 
 -- Migration 3 (slice N6): push
 CREATE TABLE push_subscriptions (
@@ -433,8 +433,9 @@ pub trait Notifier: Send + Sync {
     /// dry-renders every requested channel in the default locale with strict undefined.
     fn validate(&self, request: &NotificationRequest) -> Result<(), NotifyError>;
 
-    /// validate() + the tenant membership check (3.2) + one outbox append in
-    /// the caller's transaction.
+    /// validate() + the tenant membership check against `request.members`
+    /// (3.2) + one outbox append in the caller's transaction. It calls no
+    /// other port, so it never waits on a second pooled connection (R4).
     fn request<'a>(&'a self, tx: &'a mut Tx<'_>, request: NotificationRequest)
         -> BoxFuture<'a, Result<NotificationHandle, NotifyError>>;
 
@@ -453,8 +454,9 @@ pub struct NotificationRequest {
     pub data: serde_json::Map<String, Value>,        // ≤ limits.max_data_bytes serialized
     pub secret_data: serde_json::Map<String, Value>, // links, codes: rendered, never stored (R2)
     pub locale: Option<Locale>,           // overrides the recipient's locale
-    pub dedupe_key: DedupeKey,            // required, ^[A-Za-z0-9._:/-]{1,200}$
+    pub dedupe_key: DedupeKey,            // required, ^[A-Za-z0-9_.:/-]{1,200}$
     pub tenant: Option<TenantId>,         // tenant context: inbox scoping, membership check
+    pub members: Vec<UserId>,             // User recipients confirmed members of `tenant` (3.2)
     pub not_before: Option<Timestamp>,
     pub expires_at: Option<Timestamp>,    // not sent after this instant
     pub collapse_key: Option<String>,     // push Topic header, ≤ 64 chars
@@ -491,14 +493,15 @@ pub enum NotifyError {          // unprefixed codes (R8), all permanent except U
     UnknownTopic, UnknownTemplate, ChannelNotAllowed, TooManyRecipients,
     InvalidRecipient, RecipientNotInTenant, DataTooLarge, ReservedDataKey,
     RenderFailed { channel }, UnknownEventType, WebhooksDisabled,
-    Unavailable,                // outbox write or Directory call failed (transient)
+    Unavailable,                // outbox write failed (transient)
 }
 ```
 
 `Tx` is the `merezha-postgres` transaction that AP's `Outbox::append` takes
 (AP §B.3). The host gives each module a source-bound handle through
-`AppContext::notifier("identity")`. The HTTP send route uses source `api`.
-Reactions use `application`.
+`AppContext::notifier("identity")`. The HTTP send route uses source `api` and
+namespaces the client's key by the calling principal, `api:{subject}:{key}`
+(R4a). Reactions use `application`.
 
 `secret_data` is rendered under the reserved `secret` key into email, SMS and
 push, never into the inbox, and counts toward `limits.max_data_bytes`
@@ -523,10 +526,15 @@ is_member(user, tenant) -> bool
   roles }` through `application_members`, up to `limits.max_targets + 1` to
   detect overflow (`rejected` / `too_many_targets`).
 - When a request from source `application` (reactions) or `api` names a
-  `tenant`, `request` checks every `User` recipient with `is_member` before it
-  appends, and fails with `recipient_not_in_tenant` (R4). Identity is exempt,
-  because an invitation addresses a user who is not a member yet. A `Tenant`
-  recipient must name the request's tenant.
+  `tenant`, every `User` recipient must be in `request.members`, or `request`
+  fails with `recipient_not_in_tenant` (R4). The caller fills `members` from
+  `Directory::is_member` before it opens its transaction (AP before the
+  reactor checkpoint transaction, AP §C.5; the send route before its own); a
+  Directory failure is then the caller's transient error. `request` makes no
+  Directory call. Identity is exempt and leaves `members` empty, because an
+  invitation addresses a user who is not a member yet. A `Tenant` recipient
+  must name the request's tenant. Expansion also calls the Directory before
+  it opens its transaction.
 - Users carry no phone numbers in v1 (ID10). SMS goes only to `Address::Phone`
   recipients that the caller supplies; a user target gets no SMS delivery.
 
@@ -550,8 +558,8 @@ requires, and sends the link in `secret_data.link`. The link survives only in
 the flagged request and delivery job payloads, which the relay nulls at relay
 and the jobs runtime nulls at the terminal state (R3); there is no separate
 link purge. A dead-lettered flagged job cannot be replayed with its secret,
-and `redeliver` on a notification with `has_secret` is refused with
-`secret_data_gone`: the owning module issues a new request (for identity, a
+and `redeliver` on a notification with `has_secret` is refused with 409
+`secret_purged` (R4a): the owning module issues a new request (for identity, a
 new token).
 
 **Reaction effects.** This block owns the effect vocabulary, which AP §C.2 and
@@ -566,9 +574,10 @@ new token).
 ```
 
 `channels` is optional (default: the topic's `default_channels`);
-`{ "address": { "phone": "+33…" } }` is the SMS form. AP validates the reply,
-then calls `Notifier::request` or `emit_webhook` in the reactor checkpoint
-transaction, with source `application` and dedupe key (or `source_event_id`)
+`{ "address": { "phone": "+33…" } }` is the SMS form. AP validates the reply
+and confirms the user recipients' membership (3.2) before it opens the reactor
+checkpoint transaction, then calls `Notifier::request` or `emit_webhook` in
+it, with source `application` and dedupe key (or `source_event_id`)
 `reaction:{reactor}:{event_id}:{index}`, `index` being the effect's position
 in that event's list. It never writes this block's jobs. Guests cannot set the
 key, `tenant` or `source_event_id`; these come from the event, and AP's
@@ -865,17 +874,31 @@ Each callback request is processed in one transaction:
 
 ### 5.4 In-app inbox and SSE
 
+**Ordering.** Every inbox write takes its numbers from the user's counter
+row, in the transaction that writes the items:
+
+```sql
+INSERT INTO inbox_counters (user_id, last_seq) VALUES ($1, $2)
+ON CONFLICT (user_id) DO UPDATE SET last_seq = inbox_counters.last_seq + $2
+RETURNING last_seq;     -- $2 = rows written; they get last_seq - $2 + 1 … last_seq
+```
+
+The row lock lasts until commit, so a second writer for the same user waits
+and commits after the first, with higher numbers: a reader that sees `n` sees
+every value below it, which a global sequence cannot promise. Expansion locks
+counter rows in ascending `user_id` order, so expansions cannot deadlock.
+
 **Writes.** Expansion renders `inbox.toml` and, in the same transaction:
 
-1. inserts `inbox_items` with `seq = change_seq = nextval('inbox_change_seq')`
-   and `expires_at = now + inbox.retention`;
+1. inserts `inbox_items` with `seq = change_seq` from the user's counter and
+   `expires_at = now + inbox.retention`;
 2. inserts the delivery as `delivered` (provider `inbox`);
 3. calls `pg_notify('merezha_notify_inbox', user_id::text)`.
 
-Read, unread, archive and read-all each set `change_seq = nextval(…)` on the
-rows they touch and call `pg_notify` in the same transaction. PostgreSQL
-delivers notifications after commit and merges identical payloads sent within
-one transaction.
+Read, unread, archive and read-all each set `change_seq` from the user's
+counter on the rows they touch and call `pg_notify` in the same transaction.
+PostgreSQL delivers notifications after commit and merges identical payloads
+sent within one transaction.
 
 **Stream: `GET /v1/notifications/inbox/stream`.**
 
@@ -887,12 +910,12 @@ one transaction.
   request deadline and from compression. The stream opens with `retry: 5000`.
 - **Resume.** A `Last-Event-ID` holding a decimal `change_seq` is honoured,
   and anything else counts as absent.
-  - If the id is at or below `purged_through`, or more than `sse.replay_max`
-    (500) rows changed since, the server sends `event: reset` with
-    `data: {}`, and the client refetches over REST.
+  - If the id is at or below the user's `purged_through` or above their
+    `last_seq`, or more than `sse.replay_max` (500) rows changed since, the
+    server sends `event: reset` with `data: {}`, and the client refetches.
   - Otherwise it replays every item with `change_seq > id`, in order.
   - Without the header, it sends `event: hello` with `id:` set to the user's
-    current maximum `change_seq` and `data: {"unread": n}`.
+    `last_seq` (0 without a counter row) and `data: {"unread": n}`.
 - **Events.**
   - `event: item`, with `id: <change_seq>` and the item's current state as
     `data`.
@@ -931,8 +954,9 @@ stream. Readiness is unaffected, because streams still pick up changes at the
 reconcile interval.
 
 **Retention.** `inbox_expire` deletes items past `expires_at` (180 days) or
-archived more than `inbox.archived_retention` (30 days) ago. In the same
-transaction it raises `purged_through` to the highest deleted `change_seq`.
+archived more than `inbox.archived_retention` (30 days) ago, in batches of
+users in ascending `user_id` order. In the same transaction it raises each
+user's `purged_through` to the highest `change_seq` it deleted for them.
 
 ### 5.5 Outgoing webhooks
 
@@ -975,7 +999,17 @@ rows still on the previous key.
 2. Serialize the envelope once, `{"type":"…","timestamp":"<RFC 3339>","data":{…}}`,
    at most `webhooks.max_payload_bytes` (256 KiB).
 3. Insert one delivery per matching active endpoint and append its job
-   record (2.5).
+   record (2.5). The rule is `tenant_id IS NOT DISTINCT FROM $event_tenant`:
+   a tenant event reaches only its tenant's endpoints, a tenantless event only
+   application-level ones. A btree index does not serve `IS NOT DISTINCT
+   FROM`, so the handler runs one of two equivalent statements:
+
+```sql
+SELECT id FROM webhook_endpoints        -- $1 = event tenant, $2 = event type
+ WHERE status = 'active' AND tenant_id = $1   -- tenantless event: tenant_id IS NULL
+   AND (event_types = '{}' OR EXISTS (SELECT 1 FROM unnest(event_types) AS f
+         WHERE f = $2 OR (f LIKE '%.*' AND starts_with($2, left(f, -1)))));
+```
 
 **Request.** `POST <url>` with these headers:
 
@@ -1093,7 +1127,8 @@ guide asks operators to switch Brevo tracking off.
 by default). A delivery over the limit is `skipped` / `target_rate_limited`; it
 guards against application bugs that loop.
 
-**Quiet hours** (on when `[modules.notifications.quiet_hours]` is present).
+**Quiet hours** (slice N9, deferred from v1; on when
+`[modules.notifications.quiet_hours]` is present, which v1 refuses).
 
 - They apply to push and SMS on non-security topics whose priority is not
   `high`. Email and inbox ignore them.
@@ -1126,15 +1161,15 @@ Cookie-authenticated state changes need the Origin check and the CSRF token.
 
 | Method and path | Auth | Request | Response | Errors |
 | --- | --- | --- | --- | --- |
-| `POST send` | `notifications.send` | `NotificationRequest` JSON (`recipients` as `{user}`, `{tenant: {id, roles?}}`, `{application: {roles}}`, `{address: {email, name?}}`, `{address: {phone}}`), `dedupe_key` required | 202 `{ notification_id, duplicate }` | 422 `unknown_topic`, `unknown_template`, `channel_not_allowed`, `invalid_recipient`, `recipient_not_in_tenant`, `data_too_large`, `reserved_data_key`, `render_failed` |
+| `POST send` | `notifications.send` | `NotificationRequest` JSON without `members` (`recipients` as `{user}`, `{tenant: {id, roles?}}`, `{application: {roles}}`, `{address: {email, name?}}`, `{address: {phone}}`), `dedupe_key` required, stored as `api:{subject}:{key}` | 202 `{ notification_id, duplicate }` | 422 `invalid_dedupe_key` (over 200 bytes once namespaced), `unknown_topic`, `unknown_template`, `channel_not_allowed`, `invalid_recipient`, `recipient_not_in_tenant`, `data_too_large`, `reserved_data_key`, `render_failed`; 503 `unavailable` (Directory) |
 | `GET status/{notification_id}` | `notifications.status.read` | none | 200 `{ id, topic, status, status_reason, created_at, settled_at, deliveries: [{ id, channel, status, status_reason, attempt_count, target: "a***@example.com" \| "+33•••••78" \| "push" \| "inbox", accepted_at, settled_at }] }` | 404 `not_found` |
-| `POST deliveries/{id}/redeliver` | `notifications.admin` | none | 202 `{ generation }` | 404; 409 `not_redeliverable` (not `failed` / `unknown` / `expired`); 410 `data_purged`, `secret_data_gone` |
+| `POST deliveries/{id}/redeliver` | `notifications.admin` | none | 202 `{ generation }` | 404; 409 `not_redeliverable` (not `failed` / `unknown` / `expired`), `secret_purged` (R4a); 410 `data_purged` |
 | `GET inbox?cursor=&limit=&state=unread\|all&topic=&tenant=` | self | limit 1 to 100 (default 30) | 200 `{ items: [InboxItem], next_cursor }` | 400 `invalid_cursor` |
 | `GET inbox/unread-count` | self | none | 200 `{ unread }` | none |
 | `POST inbox/{id}/read`, `…/unread`, `…/archive` | self (own item only) | none | 200 `InboxItem` | 404 (also for another user's item) |
 | `POST inbox/read-all` | self | `{ up_to_seq?, tenant? }` | 200 `{ updated }` | none |
 | `GET inbox/stream` | self | `Last-Event-ID` header | `text/event-stream` (5.4) | 401; 429 `stream_limit`; 503 `overloaded` (with `Retry-After`) |
-| `GET preferences` | self | none | 200 `{ topics: [{ topic, category, description, channels: [{ channel, enabled, configurable }] }], settings: { timezone, quiet_start, quiet_end } }` | none |
+| `GET preferences` | self | none | 200 `{ topics: [{ topic, category, description, channels: [{ channel, enabled, configurable }] }], settings: { timezone } }` (N9 adds `quiet_start`, `quiet_end`) | none |
 | `PUT preferences` | self | `{ preferences: [{ topic \| "*", channel, enabled }], settings?: {…} }` (max 200 entries, upsert) | 200 same as GET | 422 `topic_not_configurable`, `invalid_timezone` |
 | `GET push/vapid-public-key` | none (public) | none | 200 `{ public_key: base64url(65 bytes), key_id }` | 404 `push_disabled` |
 | `POST push/subscriptions` | self | `{ endpoint, expirationTime, keys: { p256dh, auth }, label? }` | 201 `{ id, key_id, created_at }` | 422 `subscription_invalid`, `push_host_not_allowed` |
@@ -1185,7 +1220,7 @@ application-level role assignments (R5), chosen by the project.
 Defaults are shown. Secrets accept `{ env = "…" }` or `{ file = "…" }`, never
 a literal. Unknown keys fail startup. Durations use K's duration type (R12).
 There are no `enabled` keys: the block is on when `[modules.notifications]` is
-present, and push, webhooks and quiet hours are on when their section is.
+present, and push and webhooks are on when their section is.
 
 ```toml
 [modules.notifications]
@@ -1261,7 +1296,7 @@ alert_roles = ["owner", "admin"]  # tenant roles told about a disabled endpoint
 application_alert_roles = []    # application roles, for application-level endpoints; empty = no alert
 event_types = { "tasks.task_completed" = { description = "A task was completed" } }
 
-# [modules.notifications.quiet_hours]   # optional; present = on
+# [modules.notifications.quiet_hours]   # N9, after v1; optional, present = on
 # max_jitter = "5m"
 
 [modules.notifications.topics."tasks.assigned"]
@@ -1446,7 +1481,7 @@ Versions were checked with `cargo info` on 2026-10-23, with
 | `uuid` | 1.29.0 | 1.89 | Workspace pin with `v4`, `v5`, `v7`, `serde`; the block uses `v5` and `v7` |
 | `ipnet` | 2.12.2 | n/a | CIDR sets for the egress guard and Brevo CIDRs |
 | `url` | 2.5.8 | 1.63 | Endpoint parsing |
-| `jiff` | 0.2.38 | 1.70 | The one time crate (R14): quiet hours, timezone validation, the `datetime` filter; no `chrono`. Workspace pin: `default-features = false, features = ["std", "serde", "tz-system", "tzdb-bundle-platform"]`. |
+| `jiff` | 0.2.38 | 1.70 | The one time crate (R14): quiet hours, timezone validation, the `datetime` filter; no `chrono`. Workspace pin: `default-features = false, features = ["std", "serde", "tz-system", "tzdb-bundle-always"]`. |
 | `tokio-stream` | 0.1.19 | 1.71 | `ReceiverStream` for SSE (axum 0.8.9 `response::sse`) |
 | `tokio-postgres` / `deadpool-postgres` | 0.7.18 / 0.14.2 | 1.85 | From the kernel. The LISTEN connection uses `tokio_postgres::connect` directly and polls `AsyncMessage::Notification`. |
 | `axum`, `tokio`, `serde`, `serde_json` | workspace | | Already pinned |
@@ -1474,7 +1509,8 @@ Each slice is one PR. A PR merges only with tests against real PostgreSQL,
 independent review. N1 is stage 1. N2 to N8 need K2 (the R1 outbox shape, the
 R2 port, R7 `Directory`, R8 error registry, R12 durations), AP-B1 to AP-B3,
 and identity's `Authenticator` and `Directory` (ID PR 2), so they start in
-stage 2; the reaction part of N8 lands in stage 3 with AP-C3.
+stage 2; the reaction part of N8 lands in stage 3 with AP-C3. N9 is outside
+the v1 order (record, "Deferred from v1").
 
 **N1: crate, config, templates, capture** (core tables of migration 1).
 *Scope:* the `Module` implementation; full `[modules.notifications]` parsing
@@ -1496,9 +1532,11 @@ same dedupe key twice gives one notification with the same id; going over
 `max_targets` gives `rejected` / `too_many_targets`; marketing without an opt-in
 is skipped; security ignores `enabled = false`; a user and an explicit address
 with the same email give one delivery; data is purged after settlement; a
-non-member user fails `recipient_not_in_tenant`; after a send with
+non-member user fails `recipient_not_in_tenant`, and `request` completes on a
+pool of one connection that the caller's transaction holds; two API callers
+sending the same key get two notifications; after a send with
 `secret_data`, no table, log line or span holds the secret, the outbox and job
-payloads are null, and `redeliver` gets 410 `secret_data_gone`. *Tests:*
+payloads are null, and `redeliver` gets 409 `secret_purged`. *Tests:*
 **duplicate delivery**, where the expansion job runs twice through lease expiry
 and row counts stay the same; a caller transaction rolled back after `request`
 leaves nothing; a forged unsubscribe MAC gets 400; another user's inbox item
@@ -1534,12 +1572,16 @@ N3.
 the LISTEN task, limits, re-authentication. *Acceptance:* with two host
 instances on one database, an item created through B reaches a stream on A
 within 1 s; `Last-Event-ID` replays exactly the missed items, once and in order;
-an id at or below `purged_through` gives `reset`; a user's 9th stream gets 429;
+an id at or below the user's `purged_through` gives `reset`; a user's 9th
+stream gets 429;
 a revoked session ends the stream within `reauth_interval`; after
 `pg_terminate_backend` on the LISTEN connection, items still arrive within
 `reconcile_interval`, and `notification.sse_listen_lost` and
 `notification.sse_listen_restored` are logged. *Tests:* an event-stream parser
-in the test kit; a slow consumer is disconnected without blocking writers.
+in the test kit; a slow consumer is disconnected without blocking writers;
+**concurrent writers**, where A takes a user's next `change_seq` and pauses
+before commit while B writes for the same user: B waits, and a live stream and
+a resume from before A both get A's and B's items, once, in order.
 
 **N6: Web Push** (migration 3). *Scope:* VAPID config and CLI, the
 subscription routes, the push worker, the guarded client, `FakePushService`,
@@ -1557,8 +1599,10 @@ schedule, auto-disable, audit, `WebhookReceiver`, `TestResolver`. *Acceptance:*
 signatures verify against the Standard Webhooks reference vector; a rotation
 window carries two signatures; `webhook-id` stays stable across retries; 410
 disables the endpoint at once; five days of failures disable it and email the
-tenant's `alert_roles`; a tenantless content event reaches application-level
-endpoints only; URLs for `127.0.0.1`, `[::ffff:127.0.0.1]`, `0x7f000001` and a
+tenant's `alert_roles`; with endpoints for tenants A and B and at application
+level, an event of A reaches only A's, and a tenantless content event only the
+application-level ones; URLs for `127.0.0.1`, `[::ffff:127.0.0.1]`,
+`0x7f000001` and a
 host resolving to `10.0.0.5` are refused; a 3xx to a private address is not
 followed; when `TestResolver` returns one public and one private address, only
 the public one is dialled. *Tests:* a duplicated fan-out job still gives one
@@ -1566,18 +1610,22 @@ delivery per endpoint; a receiver outage follows the schedule on an injected
 clock; `after_provider_call` resends with the same `webhook-id`; the 24-hour
 step is honoured with `backoff_max_ms = 86400000`.
 
-**N8: integrations, quiet hours, operations.** *Scope:* the identity topics of
+**N8: integrations, operations.** *Scope:* the identity topics of
 R2, which can merge right after N3; the AP subscriptions to content events;
-reaction effects, which land with stage 3 reactions; quiet hours;
+reaction effects, which land with stage 3 reactions;
 `max_per_target_per_hour`; the `webhook_disabled` alert; the operations guide.
 *Acceptance:* a password reset gives one captured email with the link from
 `secret_data`, and repeating the command with the same token sends no second
 email; publishing an entry delivers `content.entry_published` without content
 calling the `Notifier`; an invalid reaction topic is recorded as rejected and
 the checkpoint still advances, while a malformed reply halts the reactor; two
-reactors on one event give two notifications; quiet hours move a push to the end
-of the window in `Europe/Paris` across a DST change. *Tests:* an example
+reactors on one event give two notifications. *Tests:* an example
 application end to end, from guest event to reaction to inbox item to SSE event.
+
+**N9: quiet hours** (migration 5, after v1). *Scope:* the section, the
+settings fields and the rule of section 6. *Acceptance:* a push moves to the
+end of the window in `Europe/Paris` across a DST change; a `high` or security
+push is not moved; a delivery expiring inside the window is `expired`.
 
 ## 12. Decisions
 

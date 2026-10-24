@@ -22,11 +22,11 @@ transaction that reactions (C) write into. The outbox (B) is the only way out fo
 | Global positions | One `merezha_app.head` counter row, locked `FOR UPDATE` inside the append. Positions have no gaps, and commit order equals position order. The append is a single `plpgsql` function call in autocommit mode, so the lock is held for one statement plus the WAL flush. |
 | Sync vs async | `Application` stays synchronous. `PostgresStore` holds a `tokio::runtime::Handle` and calls `block_on` on blocking-pool threads only. Jobs, relay, LISTEN and runners are async-native. |
 | Idempotency across instances | Receipts are rows in the append transaction, keyed `(tag, tenant, actor, key)` and bound to a SHA-256 fingerprint. Each instance keeps only an in-process pending registry. A concurrent duplicate on another instance replays the stored receipt after commit. |
-| Projections | A JSON state and checkpoint row with `row_revision` compare-and-swap. A session advisory lock per projection revision. Background catch-up runs on in-process wake, `LISTEN merezha_app_events` and an interval. Rebuild runs in the background, can resume, and swaps atomically. |
+| Projections | A JSON state and checkpoint row with `row_revision` compare-and-swap. A session advisory lock per projection revision, held on a connection detached from the pool, so a cancelled run releases it. Background catch-up runs on in-process wake, `LISTEN merezha_app_events` and an interval. Rebuild runs in the background, can resume, and swaps atomically. |
 | Projection revisions | A new `revision` is a new row that builds in the background. An instance is ready only when its revisions are warm. Rolling deploys keep the old revision serving. |
 | Tenancy | Tenant streams are `"{tenant}:{aggregate}/{stream}"`, composed by the host from the principal. Clients cannot name another tenant's stream. Tenant-scoped queries read tenant-partitioned projections. |
-| Outbox | `merezha_jobs.outbox`, appended by every module inside its own transaction (R1). A relay turns records into jobs. Dedup is `(source, dedupe_key)`. `contains_secret` payloads are nulled at relay and at the job's terminal state (R3). |
-| Jobs | Lease with `FOR UPDATE SKIP LOCKED` and a per-claim `lease_token` fence. Heartbeats, a reaper, equal-jitter exponential backoff and classification-driven retry. Queue settings live only under `[jobs.queues.<name>]`. Dead letters stay in the same table (`state = 'dead'`). Cron uses `croner =4.0.2` with `chrono-tz =0.10.4`. |
+| Outbox | `merezha_jobs.outbox`, appended by every module inside its own transaction (R1). A relay turns records into jobs. Dedup is `(source, dedupe_key)`, keys ≤ 160 bytes (R4a). The relay quarantines a record it cannot route instead of rolling back its batch. `contains_secret` payloads are nulled at relay and at the job's terminal state (R3). |
+| Jobs | Lease with `FOR UPDATE SKIP LOCKED` and a per-claim `lease_token` fence. Heartbeats, a reaper, equal-jitter exponential backoff and classification-driven retry. Queue settings live only under `[jobs.queues.<name>]`. Dead letters stay in the same table (`state = 'dead'`). Cron uses `croner =4.0.2` with its `jiff` feature (R14). |
 | Protocol 2 | Opt in per service with `application_protocol = 2` in the runtime manifest. Adds `metadata.principal`, the `react` and `describe` ops and `project.partition`. The host downgrades metadata for version 1 guests. |
 | Reactions | Batched `react` in NT's effect vocabulary (R4). The checkpoint transaction calls `Notifier::request`/`emit_webhook` and appends command effects, keyed `reaction:{reactor}:{event_id}:{index}`. A malformed reply halts; a rejected effect is recorded and skipped. No rebuild, no replay. |
 | Trace context | `trace_parent`/`trace_state` columns on events, outbox and jobs (R10), filled from the current span; job retries continue the original trace. |
@@ -424,8 +424,17 @@ Command flow (bold marks a change from today):
 7. `merezha_app.append(...)`, then **an in-process wake to the local projection and reactor
    runners**.
 
-Queries read one row: `projections (name, revision)`, or `projection_partitions` at the current
-generation for tenant-scoped queries. New optional `Query.min_position: Option<u64>`
+Queries read one row: `projections (name, revision)`, or for tenant-scoped queries the partition at
+the current generation in one statement, so no rebuild swap can fall between the two reads:
+
+```sql
+SELECT p.checkpoint, p.warm_position, pp.state     -- pp.state NULL: absent row, initial state
+  FROM merezha_app.projections p LEFT JOIN merezha_app.projection_partitions pp
+    ON (pp.name, pp.revision, pp.generation, pp.tenant) = (p.name, p.revision, p.generation, $3)
+ WHERE p.name = $1 AND p.revision = $2;
+```
+
+New optional `Query.min_position: Option<u64>`
 (`serde(default)`): when set, the host waits until the projection checkpoint reaches that position.
 It is woken by local commits and polls every 50 ms, bounded by the admitted deadline. If the
 deadline passes, it fails `projection_behind` (transient, HTTP 503). This gives read-your-writes
@@ -457,19 +466,35 @@ compares it.
 
 ## A.7 Projections: state, CAS, locks, background catch-up
 
-**Locks.** Each runner takes a session advisory lock on a dedicated pooled connection, held for the
-run and released explicitly:
+**Locks.** Each run (live, rebuild, reactor, explicit catch-up) holds a session advisory lock on its
+own connection, **detached from the pool** as kernel `migrate.rs` does (`db.acquire` then
+`deadpool_postgres::Object::take`; no kernel change). The run sets `statement_timeout` and
+`application_name = 'merezha {key}'` on that session and issues all its reads and commits there:
 
 ```sql
 SELECT pg_try_advisory_lock(1297760592 /* 'MZAP' */, hashtext('p:' || $1 || ':' || $2));  -- live catch-up
 SELECT pg_try_advisory_lock(1297760592, hashtext('b:' || $1 || ':' || $2));               -- rebuild
 SELECT pg_try_advisory_lock(1297760592, hashtext('r:' || $1));                            -- reactor
-SELECT pg_advisory_unlock(1297760592, hashtext(...));
 ```
 
-No transaction is open while the guest computes, so the connection is idle, not idle-in-transaction.
-The application pool uses deadpool `RecyclingMethod::Clean` (`DISCARD ALL`), so a leaked lock cannot
-outlive a connection's return to the pool. A hash collision only adds needless mutual exclusion.
+There is no unlock: the run owns the client, and dropping it closes the session, which releases the
+lock and rolls back any open transaction, on success, error, panic or a cancelling `timeout_at`
+alike. The kernel pool recycles with `RecyclingMethod::Fast`, which resets nothing,
+so a session lock left on a pooled connection would stop that projection on every instance: pooled
+connections take only `pg_advisory_xact_lock` (B.5, B.9). Transaction-scoped locks were rejected for
+runs, because they keep a transaction open across guest calls and exclude only per batch. A run costs
+one connection setup; the linger in step 4 below keeps that near one per projection per
+`run_timeout_ms` under load. A hash collision only adds needless mutual exclusion.
+
+**Lock age.** Every statement of a run is awaited under its hard deadline (`run_timeout_ms` + 5 s)
+and every guest call has its own, so only a wedged process holds a lock longer; a run cut at the
+deadline logs `projection.failed` with code `run_timeout`. A stuck holder shows as
+`merezha.projection.lag.age` (or `merezha.reactor.lag.age`) above `run_timeout_ms` while other
+instances keep counting `merezha.projection.lock.contended`; the holder reports its lock age in
+`merezha.projection.lock.held` (reactors: `merezha.reactor.lock.contended` and
+`merezha.reactor.lock.held`), and TE's alert rules key on those. Operators find the holder in `pg_locks`
+(`classid = 1297760592`) and end it with `pg_terminate_backend`.
+
 **The advisory lock limits duplicate work. It is not what keeps the data correct.** If the lock
 connection dies, another instance may start, and the first instance's next CAS fails
 `projection_conflict`. The runner then reloads.
@@ -494,9 +519,18 @@ publishes state and checkpoint together, and a failed batch leaves both untouche
 2. Group them by `events.tenant`. Events without a tenant only advance the checkpoint.
 3. Load each touched partition of the current generation (or the initial state), and call the guest
    once per tenant group with `project { partition: tenant, ... }`.
-4. `BEGIN`; `INSERT ... ON CONFLICT (name, revision, generation, tenant) DO UPDATE SET state =
-   EXCLUDED.state` for each partition; the CAS `UPDATE projections` above, with `state` left NULL;
-   `COMMIT`.
+4. Commit, CAS first, so a lost CAS writes nothing and its row lock orders the batch against a
+   rebuild swap, which locks the same row:
+
+   ```sql
+   BEGIN;
+   -- the CAS UPDATE above with state left NULL, plus AND generation = $6 (the generation loaded);
+   -- zero rows: ROLLBACK, projection_conflict, before any partition write
+   INSERT INTO merezha_app.projection_partitions (name, revision, generation, tenant, state)
+   SELECT $1, $2, $6, u.tenant, u.state FROM unnest($7::text[], $8::json[]) AS u (tenant, state)
+   ON CONFLICT (name, revision, generation, tenant) DO UPDATE SET state = EXCLUDED.state;
+   COMMIT;
+   ```
 
 At most `batch_size` guest calls run per batch.
 
@@ -516,11 +550,12 @@ For each wake, the scheduler starts at most one run per projection on this insta
 globally by `application.background.max_concurrent`. A run:
 
 1. `spawn_blocking`;
-2. `pg_try_advisory_lock`; if held elsewhere, return quietly;
+2. detach a connection and `pg_try_advisory_lock` on it; if held elsewhere, drop it and return
+   quietly;
 3. snapshot the head;
-4. loop over batches until the checkpoint reaches the snapshot or `run_timeout_ms` (default 30000)
-   expires;
-5. unlock.
+4. loop over batches until the checkpoint reaches the snapshot, then take a new snapshot while wakes
+   keep arriving within 1 s, until `run_timeout_ms` (default 30000) expires;
+5. drop the connection, which releases the lock.
 
 If the head moved during the run, the scheduler re-arms. Failures record `status = 'failing'` and
 `failure_code`, and retry with backoff from 1 s to 5 min. The data is not touched, and queries keep
@@ -556,7 +591,8 @@ resume:
 
    The checkpoint may move backwards to the rebuild target. Live catch-up then carries the new state
    from there with `live = true`. A live runner holding the old `row_revision` fails CAS once and
-   reloads. Old-generation partitions are deleted after the swap in chunks of 1000.
+   reloads. Old-generation partitions are deleted after the swap in chunks of 1000; queries join on
+   the current generation (A.6), so none reads a half-deleted generation.
 4. A failed batch sets `projection_rebuilds.status = 'failed'`. The live model is untouched. `POST
    .../rebuild` with `{"resume": true}` retries, and `DELETE .../rebuild` abandons the rebuild.
 
@@ -582,7 +618,7 @@ old revision. Old revision rows stay until `DELETE
 | Projection state | `max_state_bytes` ≤ 256 KiB per row or partition |
 | Partitions touched per batch | ≤ `batch_size` |
 | Background runs per instance | `application.background.max_concurrent` (default 2, max 16) |
-| Advisory-lock connections | one per active run |
+| Advisory-lock connections | one detached connection per active run, outside the pool (`take` shrinks the pool, which reopens a slot): server connections ≤ pool size + `background.max_concurrent` + 1 (`Listener`) + explicit catch-ups in flight |
 | Pool size guidance | ≥ `limits.max_concurrent` + `background.max_concurrent` + jobs needs (B.10) + 2; a startup warning when below |
 | Guest runtime concurrency | Startup validation: runtime `max_concurrent_invocations` ≥ `limits.max_concurrent` + `background.max_concurrent`, otherwise background runs make HTTP fail `overloaded`. Fails with `invalid_concurrency_budget`. |
 | NOTIFY payload | a decimal position (≤ 20 bytes) |
@@ -677,7 +713,7 @@ CREATE SCHEMA merezha_jobs;
 CREATE TABLE merezha_jobs.outbox (
     id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     source text NOT NULL CHECK (source ~ '^[a-z][a-z0-9_]{0,31}$'),           -- module name
-    dedupe_key text NOT NULL CHECK (octet_length(dedupe_key) BETWEEN 1 AND 200),
+    dedupe_key text NOT NULL CHECK (octet_length(dedupe_key) BETWEEN 1 AND 160),   -- R4a
     record_kind text NOT NULL CHECK (record_kind IN ('event', 'job')),
     topic text NULL CHECK (topic ~ '^[a-z][a-z0-9_]{0,31}\.[a-z][a-z0-9_]{0,63}$'),   -- R11
     queue text NULL, job_kind text NULL,
@@ -689,11 +725,14 @@ CREATE TABLE merezha_jobs.outbox (
     trace_parent text NULL, trace_state text NULL,                           -- R10
     created_at timestamptz NOT NULL DEFAULT now(),
     relayed_at timestamptz NULL,
+    quarantined_at timestamptz NULL, quarantine_code text NULL,              -- B.4
     UNIQUE (source, dedupe_key),
-    CHECK ((payload IS NULL) = (contains_secret AND relayed_at IS NOT NULL)),
+    CHECK ((quarantined_at IS NULL) = (quarantine_code IS NULL)),
+    CHECK (relayed_at IS NULL OR quarantined_at IS NULL),
+    CHECK ((payload IS NULL) = (contains_secret AND coalesce(relayed_at, quarantined_at) IS NOT NULL)),
     CHECK ((record_kind = 'event' AND topic IS NOT NULL AND queue IS NULL AND job_kind IS NULL)
         OR (record_kind = 'job' AND topic IS NULL AND queue IS NOT NULL AND job_kind IS NOT NULL)));
-CREATE INDEX outbox_pending ON merezha_jobs.outbox (id) WHERE relayed_at IS NULL;
+CREATE INDEX outbox_pending ON merezha_jobs.outbox (id) WHERE relayed_at IS NULL AND quarantined_at IS NULL;
 CREATE INDEX outbox_relayed ON merezha_jobs.outbox (relayed_at) WHERE relayed_at IS NOT NULL;
 
 CREATE TABLE merezha_jobs.subscriptions (
@@ -772,7 +811,7 @@ dispatch path.
 
 ```rust
 pub struct OutboxRecord {
-    pub dedupe_key: String,                 // ≤ 200 bytes, stable per logical effect
+    pub dedupe_key: String,                 // ≤ 160 bytes (R4a), stable per logical effect
     pub target: OutboxTarget,
     pub payload: serde_json::Value,         // ≤ 65_536 encoded bytes, compatible_json
     pub contains_secret: bool,              // R3: payload nulled at relay, and at the job's terminal state
@@ -807,7 +846,9 @@ module: the `AppContext` hands each module an `Outbox` wrapper bound to its name
 spoof each other's dedupe namespace. The implementation issues one multi-row `INSERT ... SELECT *
 FROM unnest(...) ON CONFLICT (source, dedupe_key) DO NOTHING RETURNING id`. With `Fail`, any
 duplicate returns `outbox_duplicate` (conflict), and the caller's transaction is expected to roll
-back. At most 256 records per call. Attempts, backoff and concurrency are not record fields: they
+back. At most 256 records per call. A key over 160 bytes fails `invalid_dedupe_key` before the
+INSERT, so `source:dedupe_key` (≤ 193 bytes) always fits the job key (R4a). Attempts, backoff and
+concurrency are not record fields: they
 come from `[jobs.queues.<name>]` at relay time (R1).
 
 **Integration event envelope (R11).** An `Event` record's payload is the envelope, extending ID §8's
@@ -877,9 +918,12 @@ WITH queues (queue, max_attempts) AS (
     SELECT * FROM unnest($2::text[], $3::int[])          -- resolved [jobs.queues.<name>] max_attempts
 ), batch AS (
     SELECT id, source, dedupe_key, record_kind, topic, queue, job_kind, priority, run_at, payload,
-           contains_secret, correlation_id, causation_id, tenant, trace_parent, trace_state
+           contains_secret, correlation_id, causation_id, tenant, trace_parent, trace_state,
+           record_kind = 'event'                           -- mirrors the jobs CHECKs (B.2)
+             OR (queue ~ '^[a-z][a-z0-9_.-]{0,63}$' AND octet_length(job_kind) BETWEEN 1 AND 128
+                 AND octet_length(source || ':' || dedupe_key) <= 200) AS routable
       FROM merezha_jobs.outbox
-     WHERE relayed_at IS NULL
+     WHERE relayed_at IS NULL AND quarantined_at IS NULL
      ORDER BY id
      LIMIT $1                                              -- jobs.relay.batch, default 100, max 1000
      FOR UPDATE SKIP LOCKED
@@ -894,7 +938,7 @@ WITH queues (queue, max_attempts) AS (
            b.priority, b.run_at, b.payload, b.contains_secret,
            b.correlation_id, b.causation_id, b.tenant, b.trace_parent, b.trace_state
       FROM batch b
-     WHERE b.record_kind = 'job'
+     WHERE b.record_kind = 'job' AND b.routable
 ), inserted AS (
     INSERT INTO merezha_jobs.jobs (queue, kind, idempotency_key, payload, payload_digest, contains_secret,
                                    priority, run_at, max_attempts, outbox_id, correlation_id, causation_id,
@@ -907,12 +951,15 @@ WITH queues (queue, max_attempts) AS (
     RETURNING queue
 ), marked AS (
     UPDATE merezha_jobs.outbox o
-       SET relayed_at = now(),
+       SET relayed_at = CASE WHEN b.routable THEN now() END,
+           quarantined_at = CASE WHEN b.routable THEN NULL ELSE now() END,
+           quarantine_code = CASE WHEN b.routable THEN NULL ELSE 'unroutable' END,
            payload = CASE WHEN o.contains_secret THEN NULL ELSE o.payload END   -- R3
       FROM batch b WHERE o.id = b.id
-    RETURNING o.id
+    RETURNING o.id, b.routable
 )
-SELECT (SELECT count(*) FROM marked) AS relayed,
+SELECT (SELECT count(*) FROM marked WHERE routable) AS relayed,
+       (SELECT count(*) FROM marked WHERE NOT routable) AS quarantined,
        (SELECT count(*) FROM batch b
          WHERE b.record_kind = 'event'
            AND NOT EXISTS (SELECT 1 FROM fanned f WHERE f.id = b.id)) AS unrouted,
@@ -925,6 +972,13 @@ Data-modifying CTEs run exactly once and share the statement's snapshot, so `ins
 payload that `marked` nulls. An event with no subscription is marked relayed and counted in
 `unrouted` (D.1 `GET outbox`). `SKIP LOCKED` lets several relays run on several instances, and the
 job `ON CONFLICT` makes re-relaying harmless.
+
+**Quarantine.** `routable` sets aside a job record the jobs table would refuse, so the rest of the
+batch relays. On any other permanent error the relay re-runs the batch one record at a time and
+quarantines the record that fails alone, with its error code. A flagged record loses its payload
+(R3). Each quarantine counts in `merezha.outbox.quarantined` and logs `outbox.quarantined`;
+quarantined rows also count in `merezha.outbox.pending` and `merezha.outbox.lag` until requeued
+(D.1).
 
 **Crash between commit and relay.** The row stays `relayed_at IS NULL`. Any instance's relay picks
 it up at the next notification or interval after restart. Relay and mark happen in one transaction,
@@ -1068,16 +1122,18 @@ Defaults are `backoff_base = 1 s`, `backoff_max = 1 h` and `max_attempts = 10`: 
 Delayed jobs set `run_at` (a `jiff::Timestamp`), either through `NewJob.run_at`/`delay` or
 `OutboxRecord.run_at`. The ceiling is 365 days.
 
-**Cron:** `croner = { version = "=4.0.2", default-features = false, features = ["chrono"] }` and
-`chrono-tz = "=0.10.4"` for IANA zones. Versions were checked with `cargo info` on 2026-10-23:
-croner 4.0.2 is MIT; chrono-tz 0.10.4 is MIT OR Apache-2.0 with rust-version 1.65. Croner was chosen
-over `cron 0.17.0` because it handles DST gaps and overlaps OCPS/Vixie-style, supports `L`, `W` and
-`#`, and makes seconds configurable. The parser is
+**Cron:** `croner = { version = "=4.0.2", default-features = false, features = ["jiff"] }`, so cron
+needs no `chrono` (R14). Checked with `cargo info` on 2026-10-24: croner 4.0.2 is MIT, and its `jiff`
+feature depends on `jiff >= 0.2.35` (`alloc`), which the workspace pin `=0.2.38` satisfies; it
+implements croner's `CronDateTime` for `jiff::Zoned`. The workspace jiff pin enables `tzdb-bundle-always`
+(`jiff-tzdb` 0.1.9, Unlicense OR MIT) so `TimeZone::get` finds IANA zones on Linux, where
+`tzdb-bundle-platform` bundles nothing and `tzdb-zoneinfo` is off. Croner was
+chosen over `cron 0.17.0` because it handles DST gaps and overlaps OCPS/Vixie-style, supports `L`,
+`W` and `#`, and makes seconds configurable. The parser is
 `CronParser::builder().seconds(Seconds::Disallowed).build()`, so only 5-field expressions are
-accepted and the finest granularity is one minute. `find_next_occurrence(&now.with_timezone(&tz),
-false)` gives the next run. Pinning `=` follows the workspace style (`wasmtime`, `rusqlite`).
-`chrono` stays inside this cron adapter (R14): it converts to and from `jiff::Timestamp` at its
-boundary, and nothing else in the crate names a `chrono` type.
+accepted and the finest granularity is one minute. `find_next_occurrence(&now.to_zoned(tz), false)`
+gives the next run as a `Zoned`, stored as its `jiff::Timestamp`. Pinning `=` follows the workspace
+style (`wasmtime`, `rusqlite`).
 
 Schedules are declared in `merezha.toml` (`[[jobs.schedules]]`, source `config`) and by modules
 (`JobsHandle::schedule`, source = the module name). They are upserted at start by name. A changed
@@ -1129,7 +1185,9 @@ Releasing refunds the attempt, so deploys never push jobs toward a dead letter.
 
 ## B.9 Retention
 
-Purges run hourly, on any instance, under the `MZJB/'retention'` try-lock, in batches of 1000:
+Purges run hourly, on any instance, in batches of 1000, each batch's transaction under
+`pg_try_advisory_xact_lock(MZJB, hashtext('retention'))` (pooled connections take no session locks,
+A.7). Quarantined outbox rows follow `jobs.retention.dead`:
 
 | Kept rows | Default | Key |
 | --- | --- | --- |
@@ -1445,7 +1503,11 @@ Runner: the same scheduler, triggers, `r:` advisory lock and bounds as projectio
    call.
 3. Call the guest `react` outside SQL, check the reply (C.2) and run NT's pure
    `Notifier::validate` on each effect, so the transaction only writes.
-4. Run one transaction:
+4. Before any transaction (R4), for each `notify` effect on a tenant event, call
+   `Directory::is_member(user, tenant)` for its `user` recipients (pairs deduplicated per batch) and
+   fill `NotificationRequest.members` with the confirmed users; `request` rejects a user left out
+   with `recipient_not_in_tenant`. A Directory failure is transient (failure table).
+5. Run one transaction on the run's detached connection (A.7); no call in it reaches another port:
 
    ```sql
    BEGIN;
@@ -1481,8 +1543,9 @@ Every effect uses dedupe key `reaction:{reactor}:{event_id}:{index}` and source 
 since two reactors can react to one event. The context is the event's correlation id,
 `causation_id = event_id` and the stream's tenant.
 
-**Tenant safety of effects.** On a tenant event, `user` recipients must be members (NT checks
-`Directory::is_member`), a `tenant` recipient must name that tenant, and webhooks reach only its
+**Tenant safety of effects.** On a tenant event, `user` recipients must be members (step 4 fills
+`members` from `Directory::is_member`, and NT refuses any user outside it), a `tenant` recipient
+must name that tenant, and webhooks reach only its
 endpoints. `application` recipients resolve through `Directory::application_members`. Command
 effects run as `{subject: "sys_reactor_{name}", kind: system, tenant: event tenant, roles: []}`
 (R13), holding only the reactor's `permissions`, so tenant routes compose the same tenant. Events
@@ -1511,7 +1574,7 @@ Duplicate job delivery is harmless, because the receipt replays.
 
 | Failure | Behaviour |
 | --- | --- |
-| Transient guest failure (`timeout`, `overloaded`, `trap` classified transient), storage failure or `NotifyError::Unavailable` | Checkpoint not advanced; `failures += 1`; `retry_at = now() + equal-jitter backoff(1 s .. 5 min)`; status stays `active` |
+| Transient guest failure (`timeout`, `overloaded`, `trap` classified transient), storage failure, a Directory failure in step 4, or `NotifyError::Unavailable` | Checkpoint not advanced; `failures += 1`; `retry_at = now() + equal-jitter backoff(1 s .. 5 min)`; status stays `active` |
 | Permanent guest failure or malformed reply on a batch of more than one event | Retry the same range with batch size 1 to isolate the poison event |
 | Malformed reply on a single event (any `on_error`), or permanent guest failure with `on_error = "halt"` | `status = 'halted'`, `halted_position = position`, error log `reactor.halted`. The runner retries at `retry_at` with the same backoff, so a fixed guest and a reload resume it; an admin can `retry` now or `skip`. |
 | Permanent guest failure on a single event, `on_error = "skip"` | Insert `reactor_skips (reason = 'on_error_skip')` and advance the checkpoint past it in the same transaction |
@@ -1586,7 +1649,8 @@ only on loopback (`AllowAll`). Durations are in seconds (R9).
 | `POST dead/replay` | body `{"queue", "kind"?, "code"?, "dead_after"?, "dead_before"?, "limit": ≤1000}`; `{"replayed":N,"reissued":R,"refused":M}` |
 | `POST dead/purge` | body `{"queue", "before"}`; `{"purged":N}` |
 | `POST jobs/{id}/cancel` | `available` to `cancelled` (a flagged payload is nulled); `409 not_cancellable` when running or terminal |
-| `GET outbox` | `{"pending","oldest_age_s","unrouted"}` (`unrouted`: this instance's count since start) |
+| `GET outbox` | `{"pending","oldest_age_s","unrouted","quarantined":[{"id","source","record_kind","quarantine_code","quarantined_at"}]}` (`unrouted`: this instance's count since start; at most 100 quarantined rows, oldest first) |
+| `POST outbox/{id}/requeue` | a quarantined record back to pending once the cause is fixed; `{"id"}`. `409 secret_purged` for a flagged record, whose payload is gone (R4a): the owning module issues it again. |
 | `GET schedules` | `{"schedules":[{"name","source","cron","timezone","enabled","next_run_at","last_run_at","last_job_id"}]}` |
 | `POST schedules/{name}/pause`, `/resume`, `/trigger` | `trigger` enqueues a job keyed `cron:{name}:manual:{unix_ms}` |
 
@@ -1706,7 +1770,7 @@ A2, B2, B3 (ID PR 1 needs it) and A3; stage 3 runs C1 to C3. There is no A4 (AP2
 | A3 | Scheduler, `Listener`, advisory locks, background rebuild, revisions and warm readiness, `min_position`, application admin API and `Application::status()` | A2 |
 | B1 | `merezha-jobs`, migration 0001 `merezha_jobs` with `contains_secret` and the trace columns, `Outbox` port and envelope, `JobsHandle` enqueue/cancel/subscribe/register, relay | K2 |
 | B2 | Dispatcher, leasing, heartbeat, reaper, retry, global concurrency, drain, retention, terminal payload nulling, jobs admin API with reissue, `queue_status()` for TE-T5 | B1 |
-| B3 | Cron (`croner`, `chrono-tz`), schedules sync, scheduler tick, schedule admin | B2 |
+| B3 | Cron (`croner` with `jiff`), schedules sync, scheduler tick, schedule admin | B2 |
 | C1 | SDK protocol 2, `application_protocol`, `describe` check, version 1 downgrade, `command_as`/`query_as`, `task-domain` v2 | A2 |
 | C2 | Route permission syntax and enforcement (R6), tenant streams, partitioned projections (migration 0002) | C1, ID PR 2 |
 | C3 | Reactors (migration 0003), `react` runner, Notifier calls in the checkpoint transaction, command effects, rejections, `application.command` handler, reactor admin, `task-notifier` | C2, B2, NT-N2, NT-N8 (reaction part, same stage) |
@@ -1756,6 +1820,10 @@ description (not gated).
 5. A new revision is not ready until warm, while an old-revision instance keeps serving.
 6. `min_position` gives read-your-write, or `projection_behind` at the deadline.
 7. The guest concurrency budget check, and `catch_up = "manual"` keeps the old behaviour.
+8. *Cancellation mid-batch.* A test hook cancels live, rebuild and reactor runs by dropping the
+   future during the commit, by a `timeout_at`, and by a guest panic. Each time another instance
+   and this one's next run take the lock within 1 s and proceed, the batch left no rows, and no
+   pooled session holds an `MZAP` lock (`pg_locks`). A partitioned batch losing its CAS writes none.
 
 `application.md` gains a PostgreSQL section, exercised as written.
 
@@ -1773,6 +1841,9 @@ description (not gated).
    the CHECK constraints refuse a non-NULL flagged payload after relay.
 8. *In-transaction use.* An identity-style use case appends an event record and a `Job` record in
    one transaction with its own rows; a rollback leaves none of them. The event envelope round-trips.
+9. *Keys and quarantine.* A 161-byte `dedupe_key` fails `invalid_dedupe_key` at `append`. A batch
+   holding one unroutable record (inserted by a test hook) relays the rest and quarantines it;
+   `requeue` returns it, or `409 secret_purged` when flagged.
 
 **B2 tests.**
 
@@ -1825,7 +1896,8 @@ description (not gated).
 3. A tenant A principal cannot read or write tenant B: the same local stream id gives distinct
    histories, and queries see only their own partition.
 4. Two-tenant concurrent load keeps partitions independent, and `verify` passes.
-5. Partitioned rebuild swaps generations atomically and deletes the old ones.
+5. Partitioned rebuild swaps generations atomically and deletes the old ones. Tenant queries looping
+   through the swap and the deletion never return the initial state for a tenant that has one.
 6. `route_access_undeclared`, an unknown permission, and a tenant query on an unpartitioned
    projection each fail startup.
 7. A client-supplied `actor` that differs from the principal gets `403 actor_mismatch`. An
@@ -1856,6 +1928,8 @@ description (not gated).
    a command effect runs as `sys_reactor_task-notifier` and composes the event's tenant, and a
    webhook effect on an event without tenant goes to application-level endpoints.
 10. Memory and SQLite reject reactors at startup.
+11. A test Directory that fails if called while a checkpoint transaction is open is never tripped;
+    a Directory outage retries the batch without advancing.
 
 # F. Decisions
 

@@ -74,12 +74,25 @@ NT's vocabulary wins; AP §C.2 and §C.5 adopt it:
 - A malformed guest reply halts the reactor (retry with backoff, alert),
   whatever its `on_error` setting. A well-formed effect that fails validation
   is recorded as rejected and the reactor advances.
+- Callers resolve recipients and membership through the Directory before
+  opening their transaction; no port call inside a transaction waits on
+  another pooled connection.
 - For requests from sources `application` (reactions) and `api`, NT checks that
   every user recipient is a member of the named tenant through
   `Directory::is_member` and rejects with `recipient_not_in_tenant`. Identity's
   own requests are exempt, since an invitation targets a user who is not a
   member yet.
 - Reactions never re-fire on projection rebuild (AP §C.5 stands).
+
+### R4a. Dedupe keys and purged secrets
+
+- Dedupe keys supplied over HTTP (source `api`) are namespaced by the calling
+  principal: `api:{subject}:{key}`.
+- An outbox dedupe key is at most 160 bytes, so derived job keys
+  (`source:dedupe_key`) stay under the 200-byte job key limit. Longer keys are
+  refused at `append`, never at relay.
+- Replaying or reading a record whose secret was nulled returns 409
+  `secret_purged` in every module.
 
 ### R5. Permission scopes (owner answer ID5)
 
@@ -214,9 +227,12 @@ names. Other designs reference it instead of defining names:
 ### R14. Dependencies and platform floor
 
 - `sha2` 0.11 everywhere (K bumps from 0.10); `hmac` 0.13.
-- One time crate: `jiff`. `chrono` appears only inside adapters whose
-  dependencies require it (the cron adapter for `croner`, the OAuth/OIDC
-  provider adapter for `oauth2` and `openidconnect`) and never in a public type.
+- One time crate: `jiff`. `croner` is used with its `jiff` feature, so cron
+  needs no `chrono`. `chrono` appears only inside the OAuth/OIDC provider
+  adapter, because `oauth2` and `openidconnect` require it, and never in a
+  public type.
+- Workspace `jiff` pin: `default-features = false`, features `std`, `serde`,
+  `tz-system`, `tzdb-bundle-always`, so IANA zones resolve on Linux too.
 - PostgreSQL 14 minimum, CI on 16 (owner answer P2). The Contremaitre
   environment may keep 17.
 
@@ -234,6 +250,18 @@ FW records these as accepted deviations:
 - TE: `/health/startup`, an early listener that answers health before modules
   start, admin status under `/v1/admin/status`, logs on stderr.
 - K/AP: the Directory port (R7), the error registry and `details` (R8).
+
+## Deferred from v1
+
+The PR #15 review flagged these as beyond the owner's scope. They stay in the
+designs as later slices, outside the v1 delivery order: notification quiet
+hours, scheduled publishing in content, and content model migrations with
+`convert` operations (v1 supports additive model changes and refuses the rest).
+"Additive" means the change rewrites no stored data: new types and fields,
+tightened validation, and `access`, `filterable` or `sortable` changes activate
+in v1; adding `unique` to an existing field does not. During a rolling deploy an
+old instance serves the old `access` rules until it drains. Later slices:
+NT-N9 (quiet hours), CT-C8 (scheduled publishing), CT-C10 (model migrations).
 
 ## Owner answers
 
@@ -311,7 +339,7 @@ Slice ids are the designs' own; AP-C* and CT-C* disambiguate the two C series.
 - **Stage 2**
   - First: ID PR 2 (Directory implementation, application scope).
   - Then: NT-N2 and NT-N3 (production email for identity), NT-N5, NT-N4, NT-N6,
-    NT-N7; ID PR 3; CT-C6, then CT-C2 to CT-C5, CT-C7, CT-C8; the identity and
+    NT-N7; ID PR 3; CT-C6, then CT-C2 to CT-C5, CT-C7; the identity and
     content parts of NT-N8. TE-T6 metric rows land inside each of these PRs.
 - **Stage 3**: AP-C1, AP-C2, AP-C3 with NT-N8's reaction part; CT-C9, TE-T7;
   `merezha new` and the example application.

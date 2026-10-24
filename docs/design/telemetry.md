@@ -177,9 +177,11 @@ dependency beyond `tracing` and its `Meter`.
 | `merezha.projection.catch_up.duration` | B: HTTP buckets, `s` | `merezha.projection.name`, `merezha.projection.trigger` (`commit`, `interval`, `background`, `admin`, `rebuild`), `merezha.outcome` |
 | `merezha.projection.events.processed` | C `{event}` | `merezha.projection.name` |
 | `merezha.projection.lock.contended` | C `{attempt}` | `merezha.projection.name` |
+| `merezha.projection.lock.held` | G `s` (age of the run lock this instance holds; absent when none) | `merezha.projection.name` |
 | `merezha.projection.warm` | G `1` (0 or 1, this instance's configured revision) | `merezha.projection.name` |
 | `merezha.projection.rebuild.remaining` | G `{event}` (target minus checkpoint; absent without a rebuild) | `merezha.projection.name` |
 | `merezha.reactor.lag.events` / `merezha.reactor.lag.age` | G `{event}` / G `s` | `merezha.reactor.name` |
+| `merezha.reactor.lock.contended` / `merezha.reactor.lock.held` | C `{attempt}` / G `s` | `merezha.reactor.name` |
 | `merezha.reactor.batch.duration` | B: HTTP buckets, `s` | `merezha.reactor.name`, `merezha.outcome` (`accepted`, `failed`, `halted`) |
 | `merezha.reactor.effects` | C `{effect}` | `merezha.reactor.name`, `merezha.reactor.effect` (`notify`, `webhook`, `command`), `merezha.outcome` (`accepted`, `rejected`) |
 | `merezha.reactor.halted` | G `1` (0 or 1) | `merezha.reactor.name` |
@@ -246,6 +248,7 @@ Pool gauges read `deadpool` `Pool::status()`, which does no I/O.
 | `merezha.job.schedule.fired` | C `{run}` | `job.schedule` (configured names, at most 256) |
 | `merezha.outbox.appended` | C `{record}` | `merezha.module` (the record's `source`), `job.record_kind` (`event`, `job`) |
 | `merezha.outbox.relayed` / `merezha.outbox.unrouted` (event records the relay found no subscription for) | C `{record}` | `merezha.module` |
+| `merezha.outbox.quarantined` | C `{record}` (records the relay set aside; see AP B.4) | `merezha.module`, `error.type` (the quarantine code) |
 | `merezha.outbox.pending` / `merezha.outbox.lag` | G `{record}` / G `s` (age of the oldest unrelayed record) | none |
 
 AP's per-outcome counters (`leased`, `succeeded`, `retried`, `lease_lost`,
@@ -716,6 +719,7 @@ Block events (AP's former `jobs.*` events are `job.*`):
 | `job.retry_scheduled` / `job.dead_lettered` / `job.lease_lost` | warn / error / warn | `job_id`, `queue`, `kind`, `attempt`, `code`, `classification` |
 | `job.replayed` / `job.cancelled` / `job.admin_action` / `job.drain_abandoned` | info / info / info / warn | `job_id` or `count`, `queue`, `action` / `job_ids` (at most 64) |
 | `outbox.relayed` | debug | `relayed`, `unrouted` |
+| `outbox.quarantined` | warn | `outbox_id`, `source`, `code` |
 | `identity.login_failed` | debug (the metric and the audit log carry the signal) | `method`, `outcome` |
 | `identity.grants_truncated` (grants past `max_resource_assignments`) / `identity.audit_write_failed` | warn / error | `count` / `code` |
 | `identity.dev_link` | info, stderr only, never bridged to OTLP | `purpose`, `link`; emitted only with `dev_print_links = true` on loopback, the one catalog event that carries a secret |

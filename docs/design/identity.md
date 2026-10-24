@@ -90,11 +90,11 @@ The TypeScript `@structure-ai/auth-pg` made the same call. Keep it.
 | Unit | Kind | Consistency boundary and invariants |
 | --- | --- | --- |
 | User | Aggregate root over `users`, `password_credentials`, `passkeys`, `oauth_identities` | Normalized email unique. At least one usable credential after any removal. A disabled user has no live sessions and its API keys stop authenticating. Writes lock the `users` row (`SELECT ... FOR UPDATE`). |
-| Organization | Aggregate root over `organizations`, `memberships`, `role_assignments`, custom `roles`, `invitations`, tenant `service_accounts` | At least one member holds `owner` at organization scope. Slug unique. A tenant role assignment references a tenant role of the same organization or a built-in one, and a holder of the same organization (composite foreign keys). An assignment cannot grant a permission its creator lacks. Writes lock the `organizations` row, which serializes owner changes. |
+| Organization | Aggregate root over `organizations`, `memberships`, `role_assignments`, custom `roles`, `invitations`, `invitation_roles`, tenant `service_accounts` | At least one member holds `owner` at organization scope. Slug unique. A tenant role assignment or invitation role names a built-in tenant role or a custom role of the same organization, and a holder of the same organization (composite foreign keys), so a custom role grants nothing outside its organization. An assignment cannot grant a permission its creator lacks. Writes lock the `organizations` row, which serializes owner changes. |
 | Application grants | Records `application_role_assignments` and application `service_accounts` | An application assignment references an application role. A tenant service account never holds one, and `platform_admin` goes only to users (constraints in section 3). An assignment cannot grant a permission its creator lacks at application scope. |
 | Session | Lifecycle record | Belongs to one user. Dead when idle or absolute expiry passes, when deleted, or when the user is disabled. Token digest unique. |
 | One-time token | Lifecycle record | One live token per `(purpose, subject_key)`. A new request replaces the old one. Consumption deletes the row. |
-| API key | Lifecycle record | One owner (user or service account) and one scope (application or one organization). A tenant service account's keys are pinned to its organization. Permissions are a subset of the catalog. Usable only while the owner is active. Its power shrinks with the owner's grants on the next request. |
+| API key | Lifecycle record | One owner (user or service account) and one scope (application or one organization). A tenant service account's keys are pinned to its organization. A user's tenant key works only while its owner is a member there: membership removal revokes it, and authentication refuses it without one. Permissions are a subset of the catalog. Usable only while the owner is active. Its power shrinks with the owner's grants on the next request. |
 | OAuth flow, WebAuthn ceremony | Ephemeral records | Single use, consumed by `DELETE ... RETURNING`, expire in minutes. |
 | Rate-limit bucket | Counter | One GCRA timestamp per hashed key. |
 | Audit event | Append-only record | Never updated. Deleted only by the retention job. |
@@ -144,8 +144,13 @@ default configuration only the password is ever present. The TypeScript
 service marked such accounts verified and kept the attacker's password. That
 is the main correctness fix carried over.
 
-Unverified accounts older than `unverified_account_ttl` (default 7 days) are
-deleted by the cleanup job.
+Only while `require_verified_email = true`, the cleanup job deletes
+unverified accounts older than `unverified_account_ttl` (default 7 days)
+that never signed in (`last_signed_in_at IS NULL`) and hold no membership or
+application role, so never an organization owner. It locks candidates
+`FOR UPDATE SKIP LOCKED`, then deletes in a second statement whose snapshot
+postdates the locks and re-checks every condition; sign-in and every
+attachment lock the user row first. Otherwise unverified accounts stay.
 
 ## 3. SQL schema (first migrations)
 
@@ -169,13 +174,15 @@ CREATE TABLE merezha_identity.users (
     locale             text,
     status             text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
     authz_version      bigint NOT NULL DEFAULT 0,
+    last_signed_in_at  timestamptz,             -- set by every session creation
     created_at         timestamptz NOT NULL,
     updated_at         timestamptz NOT NULL,
     CONSTRAINT users_email_normalized_key UNIQUE (email_normalized),
     CHECK (octet_length(email_normalized) <= 254)
 );
 CREATE INDEX users_unverified_created_idx
-    ON merezha_identity.users (created_at) WHERE email_verified_at IS NULL;
+    ON merezha_identity.users (created_at)
+    WHERE email_verified_at IS NULL AND last_signed_in_at IS NULL;
 
 CREATE TABLE merezha_identity.password_credentials (
     user_id     uuid PRIMARY KEY REFERENCES merezha_identity.users (id) ON DELETE CASCADE,
@@ -316,7 +323,8 @@ CREATE TABLE merezha_identity.roles (
     updated_at       timestamptz NOT NULL,
     CHECK (organization_id IS NOT NULL OR permissions = '{}'),
     CHECK (scope = 'tenant' OR organization_id IS NULL),
-    CONSTRAINT roles_id_scope_key UNIQUE (id, scope)
+    CONSTRAINT roles_id_scope_key UNIQUE (id, scope),
+    CONSTRAINT roles_id_org_key UNIQUE (id, organization_id)   -- target of custom role FKs
 );
 CREATE UNIQUE INDEX roles_shared_key ON merezha_identity.roles (key)
     WHERE organization_id IS NULL;
@@ -328,14 +336,15 @@ INSERT INTO merezha_identity.roles (id, scope, organization_id, key, name, creat
     ('00000000-0000-7000-8000-000000000003', 'tenant',      NULL, 'member',         'Member',         now(), now()),
     ('00000000-0000-7000-8000-000000000004', 'application', NULL, 'platform_admin', 'Platform admin', now(), now());
 
--- Tenant scope: the organization or one resource in it.
+-- Tenant scope: the organization or one resource in it. The custom role FK
+-- includes the NOT NULL organization_id, so it is always checked.
 CREATE TABLE merezha_identity.role_assignments (
     id                  uuid PRIMARY KEY,
     organization_id     uuid NOT NULL REFERENCES merezha_identity.organizations (id) ON DELETE CASCADE,
     membership_id       uuid,
     service_account_id  uuid,
-    role_id             uuid NOT NULL,
-    role_scope          text NOT NULL DEFAULT 'tenant' CHECK (role_scope = 'tenant'),
+    builtin_role        text CHECK (builtin_role IN ('owner', 'admin', 'member')),
+    custom_role_id      uuid,
     resource_kind       text CHECK (resource_kind ~ '^[a-z][a-z0-9_]{0,62}$'),
     resource_id         text CHECK (octet_length(resource_id) BETWEEN 1 AND 128),
     created_by          uuid,
@@ -344,14 +353,17 @@ CREATE TABLE merezha_identity.role_assignments (
         REFERENCES merezha_identity.memberships (id, organization_id) ON DELETE CASCADE,
     FOREIGN KEY (service_account_id, organization_id)
         REFERENCES merezha_identity.service_accounts (id, organization_id) ON DELETE CASCADE,
-    FOREIGN KEY (role_id, role_scope)
-        REFERENCES merezha_identity.roles (id, scope) ON DELETE RESTRICT,
+    FOREIGN KEY (custom_role_id, organization_id)
+        REFERENCES merezha_identity.roles (id, organization_id),   -- NO ACTION: see below
     CHECK (num_nonnulls(membership_id, service_account_id) = 1),
+    CHECK (num_nonnulls(builtin_role, custom_role_id) = 1),
     CHECK ((resource_kind IS NULL) = (resource_id IS NULL))
 );
 CREATE UNIQUE INDEX role_assignments_unique ON merezha_identity.role_assignments
-    (coalesce(membership_id, service_account_id), role_id, coalesce(resource_kind, ''), coalesce(resource_id, ''));
-CREATE INDEX role_assignments_org_role_idx ON merezha_identity.role_assignments (organization_id, role_id);
+    (coalesce(membership_id, service_account_id), coalesce(builtin_role, custom_role_id::text),
+     coalesce(resource_kind, ''), coalesce(resource_id, ''));
+CREATE INDEX role_assignments_org_role_idx ON merezha_identity.role_assignments (organization_id, builtin_role);
+CREATE INDEX role_assignments_custom_role_idx ON merezha_identity.role_assignments (custom_role_id);
 CREATE INDEX role_assignments_resource_idx ON merezha_identity.role_assignments
     (organization_id, resource_kind, resource_id) WHERE resource_kind IS NOT NULL;
 
@@ -388,15 +400,31 @@ CREATE TABLE merezha_identity.invitations (
     organization_id   uuid NOT NULL REFERENCES merezha_identity.organizations (id) ON DELETE CASCADE,
     email             text NOT NULL,
     email_normalized  text NOT NULL,
-    role_ids          uuid[] NOT NULL CHECK (cardinality(role_ids) BETWEEN 1 AND 16),
     token_hash        bytea NOT NULL CHECK (octet_length(token_hash) = 32),
     invited_by        uuid,
     created_at        timestamptz NOT NULL,
     expires_at        timestamptz NOT NULL,
     CONSTRAINT invitations_token_hash_key UNIQUE (token_hash),
-    CONSTRAINT invitations_org_email_key UNIQUE (organization_id, email_normalized)
+    CONSTRAINT invitations_org_email_key UNIQUE (organization_id, email_normalized),
+    CONSTRAINT invitations_id_org_key UNIQUE (id, organization_id)
 );
 CREATE INDEX invitations_expiry_idx ON merezha_identity.invitations (expires_at);
+
+-- The 1 to 16 roles an invitation grants, same rule as role_assignments.
+CREATE TABLE merezha_identity.invitation_roles (
+    invitation_id    uuid NOT NULL,
+    organization_id  uuid NOT NULL,
+    builtin_role     text CHECK (builtin_role IN ('owner', 'admin', 'member')),
+    custom_role_id   uuid,
+    FOREIGN KEY (invitation_id, organization_id)
+        REFERENCES merezha_identity.invitations (id, organization_id) ON DELETE CASCADE,
+    FOREIGN KEY (custom_role_id, organization_id)
+        REFERENCES merezha_identity.roles (id, organization_id),
+    CHECK (num_nonnulls(builtin_role, custom_role_id) = 1)
+);
+CREATE UNIQUE INDEX invitation_roles_unique ON merezha_identity.invitation_roles
+    (invitation_id, coalesce(builtin_role, custom_role_id::text));
+CREATE INDEX invitation_roles_custom_role_idx ON merezha_identity.invitation_roles (custom_role_id);
 
 CREATE TABLE merezha_identity.api_keys (
     id               uuid PRIMARY KEY,
@@ -430,9 +458,14 @@ revocation is audited as such, then the cleanup job deletes them.
 
 The composite foreign keys carry the scope rules: no tenant role or tenant
 service account in an application assignment, no holder of one organization
-in another's assignments, and the fixed-id check keeps `platform_admin` from
-service accounts. Code, with the owner's row locked, keeps a service
-account's keys in its own scope.
+in another's assignments, no custom role of one organization in another's
+assignments or invitations, and the fixed-id check keeps `platform_admin`
+from service accounts. The API names built-in tenant roles by their seeded
+ids, which storage maps to `builtin_role`. The custom role keys are
+`NO ACTION`, checked at statement end, so deleting an organization cascades
+in one statement while deleting a role still used by an assignment or a
+pending invitation fails `409 role_in_use`. Code, with the owner's row
+locked, keeps a service account's keys in its own scope.
 
 ### Migration 3: `oauth_passkeys`
 
@@ -522,6 +555,13 @@ LEFT JOIN merezha_identity.memberships m ON m.organization_id = o.id AND m.user_
 WHERE s.token_hash = $1;
 ```
 
+API key authentication looks the key up by public id with the same joins,
+plus `memberships m ON m.organization_id = k.organization_id AND
+m.user_id = k.user_id`. It fails `401 unauthenticated` when the key is
+revoked or expired, its owner is not `active`, or it is a user's tenant key
+(`user_id` and `organization_id` set) with no `m` row, on every request,
+cache hit or not.
+
 Single-use consumption of tokens, flows and ceremonies is
 `DELETE ... WHERE token_hash = $1 AND purpose = $2 RETURNING ...`. An expired
 row is deleted and then rejected, so the same token never gets a second try.
@@ -607,7 +647,7 @@ sent by the browser on its own.
 
 | Rule | Behavior | Reference |
 | --- | --- | --- |
-| Creation | A new 256-bit token per sign-in. There are no pre-authentication sessions, so fixation has nothing to fix. | ASVS V7 |
+| Creation | A new 256-bit token per sign-in, which also sets `users.last_signed_in_at` under the user row lock. There are no pre-authentication sessions, so fixation has nothing to fix. | ASVS V7 |
 | Idle expiry | `idle_timeout` (default 7 days). Each authenticated request extends `idle_expires_at` to `min(now + idle_timeout, absolute_expires_at)`, writing only when `last_seen_at` is older than `touch_interval` (60 s). | 800-63B reauthentication |
 | Absolute expiry | `absolute_timeout` (default 30 days) from creation. Never extended. | 800-63B |
 | Reauthentication | Sensitive routes require `authenticated_at` within `reauthentication_window` (10 min), else `401 reauthentication_required`. `POST /v1/identity/session/reauthenticate` refreshes it. | ASVS V7 |
@@ -722,8 +762,8 @@ start with `/v1/identity/`. Checks are at `Tenant(org_id)`.
 | `GET /me/permissions` | user | | `200 {organization_id, roles, permissions:[...]}` | `not_found` |
 | `GET /members` | `identity.members.read` | `?cursor&limit` | `200 {items:[member]}` | |
 | `PATCH /members/{membership_id}` | `identity.members.update_roles` | `{role_ids:[...]}` | `200 {member}` | `permission_escalation`, `sole_owner` |
-| `DELETE /members/{membership_id}` | `identity.members.remove`, or self | | `204` | `sole_owner` |
-| `POST /invitations` | `identity.members.invite` | `{email, role_ids}` | `201 {invitation}` | `already_member`, `permission_escalation`, `rate_limited` |
+| `DELETE /members/{membership_id}` | `identity.members.remove`, or self | | `204` (revokes the member's keys for the organization) | `sole_owner` |
+| `POST /invitations` | `identity.members.invite` | `{email, role_ids}` | `201 {invitation}` | `already_member`, `permission_escalation`, `not_found` (role of another organization), `rate_limited` |
 | `GET /invitations` | `identity.members.invite` | | `200 {items:[invitation]}` | |
 | `DELETE /invitations/{invitation_id}` | `identity.members.invite` | | `204` | `not_found` |
 | `POST /v1/identity/invitations/inspect` | none | `{token}` | `200 {organization:{name, slug}, inviter_display_name, email_masked, expires_at, account_exists}` | `invalid_token` |
@@ -731,16 +771,16 @@ start with `/v1/identity/`. Checks are at `Tenant(org_id)`.
 | `GET /roles` | `identity.roles.read` | | `200 {items:[role]}` (built-in and custom) | |
 | `POST /roles` | `identity.roles.manage` | `{key, name, description?, permissions}` | `201 {role}` | `role_key_taken`, `unknown_permission`, `permission_escalation`, `role_limit` |
 | `PATCH /roles/{role_id}` | `identity.roles.manage` | `{name?, description?, permissions?}` | `200 {role}` | `builtin_role`, `unknown_permission`, `permission_escalation` |
-| `DELETE /roles/{role_id}` | `identity.roles.manage` | | `204` | `builtin_role`, `role_in_use` |
+| `DELETE /roles/{role_id}` | `identity.roles.manage` | | `204` | `builtin_role`, `role_in_use` (assignments or pending invitations) |
 | `GET /role-assignments` | `identity.roles.read` | `?membership_id&service_account_id&resource_kind&resource_id` | `200 {items:[assignment]}` | |
-| `POST /role-assignments` | `identity.roles.assign` | `{membership_id \| service_account_id, role_id, resource?: {kind, id}}` | `201 {assignment}` | `permission_escalation`, `assignment_limit`, `unknown_resource_kind`, `conflict` |
+| `POST /role-assignments` | `identity.roles.assign` | `{membership_id \| service_account_id, role_id, resource?: {kind, id}}` | `201 {assignment}` | `permission_escalation`, `assignment_limit`, `unknown_resource_kind`, `not_found` (role of another organization), `conflict` |
 | `DELETE /role-assignments/{assignment_id}` | `identity.roles.assign` | | `204` | `sole_owner` |
 | `GET /service-accounts` | `identity.service_accounts.read` | `?cursor&limit` | `200 {items:[service_account]}` | |
 | `POST /service-accounts` | `identity.service_accounts.manage` + recent | `{name, description?}` | `201 {service_account}` | `service_account_limit`, `validation_failed` |
 | `PATCH /service-accounts/{service_account_id}` | `identity.service_accounts.manage` + recent | `{name?, description?, status?}` | `200 {service_account}` | `not_found` |
 | `DELETE /service-accounts/{service_account_id}` | `identity.service_accounts.manage` + recent | | `204` (keys and assignments go with it) | `not_found` |
 | `GET /api-keys` | `identity.api_keys.read`, or own keys | `?service_account_id` | `200 {items:[api_key]}` | |
-| `POST /api-keys` | own key: `identity.api_keys.create` + recent; service account key: `identity.service_accounts.manage` + recent | `{name, permissions, expires_at, service_account_id?}` | `201 {api_key, key}` | `unknown_permission`, `permission_escalation`, `api_key_limit`, `validation_failed` |
+| `POST /api-keys` | own key: `identity.api_keys.create` + recent + membership; service account key: `identity.service_accounts.manage` + recent | `{name, permissions, expires_at, service_account_id?}` | `201 {api_key, key}` | `unknown_permission`, `permission_escalation`, `api_key_limit`, `validation_failed`, `unauthorized` (own key without membership) |
 | `DELETE /api-keys/{key_id}` | own key, or `identity.api_keys.revoke` | | `204` | `not_found` |
 | `GET /audit-events` | `identity.audit.read` | `?cursor&limit&action&actor_id` | `200 {items:[audit_event], next_cursor}` | |
 | `GET /v1/identity/permissions` | user | | `200 {items:[{name, description, source}]}` | |
@@ -767,13 +807,19 @@ the same bodies and errors.
 Behavior notes:
 
 - Invitations are delivered through `identity.invitation`. Acceptance rules:
-  a signed-in user whose verified email equals the invited address joins.
+  a signed-in user whose email equals the invited address joins (an
+  unverified address becomes verified).
   A signed-in user with another address gets `403 email_mismatch`. An
-  anonymous caller whose address has no account gets a new verified account
-  and a session (the token proves inbox control). An anonymous caller whose
-  address has an account gets `401 sign_in_required`. The front end then
-  signs in and retries with the same token. That token is consumed only on
-  success.
+  anonymous caller whose address has no account, or only an unverified one,
+  gets a verified account and a session (the token proves inbox control);
+  an unverified account is claimed under the pre-hijacking rule first. Only
+  a verified account gets `401 sign_in_required`, and `inspect` reports
+  `account_exists` for verified accounts only. The front end then signs in
+  and retries with the same token, which is consumed only on success.
+- Every `role_id` in a tenant request resolves, under the organization
+  lock, to a built-in tenant role or a custom role of that organization
+  (`404 not_found` otherwise). Invitations store them in `invitation_roles`,
+  and acceptance copies them into `role_assignments` under the same lock.
 - `permission_escalation`: a caller can create or edit a role, assign a role,
   invite with roles, mint an API key, or change a user's status only if the
   caller holds every permission involved in the same scope (for a status
@@ -783,7 +829,13 @@ Behavior notes:
   `Merezha-Organization` header, which wins) must be one the caller belongs
   to, or any organization when the caller holds `identity.organization.enter`
   at `Application` (audited as `organization.entered`). A tenant key is
-  always active in its own organization; a header naming another is `404`.
+  active in its own organization only (a header naming another is `404`),
+  and a user's one only while its owner is a member there (else 401).
+- Removing a membership locks the organization row and, in one transaction,
+  deletes it, revokes the user's unrevoked keys for that organization
+  (audited `api_key.revoked`, reason `membership_removed`, not revived by
+  rejoining) and bumps `users.authz_version`. Minting a user's tenant key
+  takes the same lock and requires membership, so it cannot race a removal.
 - A service account's keys share its scope. A user can hold both kinds.
   Disabling a service account stops its keys on the next request.
 - The sole-owner invariant is checked with the organization row locked, so
@@ -888,7 +940,7 @@ organization without a membership).
 | Role | Scope | Grants |
 | --- | --- | --- |
 | `platform_admin` | application | `*` at every scope: the break-glass grant (R5). Users only, never reachable through an API key. Assigned only through `merezha identity platform-admin grant\|revoke <email>` (CLI, audited). |
-| `user` | application, implicit | Held by every active user without an assignment row: `[modules.identity.rbac.builtin_grants].user`, empty by default. Baseline grants for applications without organizations. |
+| `user` | application, implicit | Held by every active user without an assignment row: `[modules.identity.rbac.builtin_grants].user`, empty by default. Baseline grants for applications without organizations. Being application grants, they apply in every organization (evaluation step 4), so tenant-data permissions belong in `member`; startup warns when `user` grants one a route checks at `scope = "tenant"`. |
 | `owner` | tenant | `*` |
 | `admin` | tenant | every permission except `identity.organization.delete` and `identity.organization.transfer`; cannot assign `owner` |
 | `member` | tenant | `identity.organization.read`, `identity.members.read`, `identity.roles.read`, `identity.api_keys.create`, plus `[modules.identity.rbac.builtin_grants].member` |
@@ -907,8 +959,10 @@ over HTTP: they are application-wide policy and belong in reviewed
 configuration. Startup syncs them into `roles`. Removing a declared role that
 still has assignments fails startup with the role key and the count.
 
-Custom roles are tenant roles of one organization, have a key unique within
-it, and list permissions. Unknown permissions are rejected at write time. If
+Custom roles are tenant roles of one organization, usable only there
+(section 3 foreign keys), so the escalation check at that `Tenant` covers
+every grant they make. Keys are unique per organization. Unknown
+permissions are rejected at write time. If
 a later release removes a permission from the catalog, stored roles keep the
 string, evaluation ignores it, and startup logs a warning with a count.
 
@@ -989,7 +1043,10 @@ pub struct KeyLimit { permissions: PermissionSet, tenant: Option<TenantId> }  //
 
 For an API key, `application`, `tenant` and `resources` are its owner's
 live grants: the user's, or the service account's (a tenant service account
-has an empty `application`). Evaluation, in order:
+has an empty `application`). A user's tenant key without its owner's live
+membership never becomes a principal (section 3), so step 4 cannot apply
+the owner's application grants, `user` included, to an ex-member's key.
+Evaluation, in order:
 
 1. `break_glass` set: allow with `Allowed::BreakGlass`. It is never set for
    an API key, so break-glass needs a user session.
@@ -1043,7 +1100,8 @@ repeating them while staying exact across host instances:
   to that user's memberships, tenant or application role assignments, or
   status. `service_accounts.authz_version` does the same for a service
   account. `organizations.authz_version` increments on any change to that
-  organization's custom role definitions.
+  organization's custom role definitions, enough since a custom role is
+  held only in its organization.
 - The per-request authentication query (section 3) already returns the
   versions; the API key lookup joins the owner's row the same way. The
   in-process LRU cache, keyed by `(credential id, organization id)`, holds
@@ -1199,7 +1257,7 @@ Limits: `max_per_user = 20` passkeys. Removing the last credential fails
 | `magic_link` | 15 min | normalized email | Signs in, creating the account if allowed. Applies the pre-hijacking rule. |
 | `password_reset` | 30 min | normalized email | Sets the password, deletes all sessions, signs in, marks the email verified, applies the pre-hijacking rule. |
 | `email_change` | 1 h | user id | Swaps the email, revokes other sessions. |
-| invitation | 7 days | (organization, email) in `invitations` | Membership; account creation if none. |
+| invitation | 7 days | (organization, email) in `invitations` | Membership; account creation if none; claims an unverified account (pre-hijacking rule). |
 
 Common lifecycle: 32 random bytes from the OS CSPRNG, base64url in the link,
 SHA-256 digest at rest, one live token per subject key (a new request
@@ -1301,7 +1359,8 @@ IPv6 addresses are keyed by their /64.
 | `sign_in.account_ip` | email + IP | 5 per 15 min | on failure |
 | `sign_in.account` | email | 50 per 24 h | on failure (800-63B caps consecutive failures at 100) |
 | `registration.ip` | IP | 10 per hour | on arrival |
-| `email.address` | email | 5 per hour | on arrival, all email-sending routes |
+| `email.address_ip` | email + IP | 5 per hour | on arrival, all email-sending routes |
+| `email.address` | email | 30 per hour | on arrival, after `email.address_ip` admitted the request |
 | `email.ip` | IP | 20 per hour | on arrival, all email-sending routes |
 | `token.ip` | IP | 30 per 10 min | on failure, token consumption routes |
 | `reauth.session` | session | 5 per 15 min | on failure |
@@ -1310,10 +1369,13 @@ IPv6 addresses are keyed by their /64.
 | `invitation.organization` | organization | 100 per day | on arrival |
 | `api_key.invalid.ip` | IP | 60 per min | on failure |
 
-When `sign_in.account` is exhausted, password sign-in for that account stops
-until the bucket drains, but magic links, password reset, passkeys and OAuth
-keep working. An attacker can therefore block one method for a victim but
-cannot lock the victim out.
+Naming a victim's address spends the address-and-IP budgets of the
+attacker's IPs, not the victim's. Two caps are shared per address: one IP
+can drain `sign_in.account` and stop password sign-in for a day, and
+`email.address` (also the ceiling on mail to one inbox) needs six IPs every
+hour to keep email sign-in blocked. Passkeys and OAuth are keyed by IP only.
+A distributed attacker can delay password and email sign-in for one account;
+nothing blocks passkey or OAuth sign-in.
 
 ### Enumeration resistance
 
@@ -1389,7 +1451,7 @@ identity defines none. Spans are TE's `identity {operation}`.
 | Threat | Mitigation |
 | --- | --- |
 | Credential stuffing, password spraying | Per-IP and per-account-and-IP GCRA limits, Argon2id cost, blocklist, passkeys available. |
-| Account pre-hijacking | Verified email required to sign in by default. Ownership proof strips unverified accounts. Unverified accounts expire. |
+| Account pre-hijacking | Verified email required to sign in by default. Ownership proof, invitation acceptance included, strips unverified accounts. Never-used unverified accounts expire while verification is required. |
 | Session theft through XSS | HttpOnly cookie. Token never in JS for cookie transport. Short idle timeout configurable. Log out everywhere. |
 | Session fixation | No pre-auth sessions. New token on every sign-in and reauthentication. |
 | CSRF, login CSRF | `SameSite=Lax`, Origin allowlist, HMAC CSRF token, JSON-only bodies. |
@@ -1404,11 +1466,11 @@ identity defines none. Spans are TE's `identity {operation}`.
 | WebAuthn ceremony replay | State stored server-side, consumed once, bound to user and session, 5-minute TTL. |
 | Cloned authenticator | Counter regression check for nonzero counters. |
 | WebAuthn origin spoofing | RP id and origins from configuration. webauthn-rs checks origin and RP id hash. |
-| Privilege escalation through roles, keys or service accounts | Escalation check on every grant path at the target scope, owner-only owner assignment, `platform_admin` CLI-only and unreachable from keys, key power intersected live with the owner's, scope rules in foreign keys. |
+| Privilege escalation through roles, keys or service accounts | Escalation check on every grant path at the target scope, owner-only owner assignment, `platform_admin` CLI-only and unreachable from keys, key power intersected live with the owner's, scope rules in foreign keys, custom roles bound to their organization. |
 | Cross-tenant access (IDOR) | Organization in every scoped check, tenant match required unless an application grant matches, tenant keys pinned, 404 for foreign ids. |
 | Last owner lockout | Sole-owner invariant under row lock. |
 | Leaked API key | Prefixed format for secret scanning, mandatory expiry, revocation, last-use stamps, audit of use after revocation, dies when the owner leaves or is disabled. |
-| Ex-member keeps access | Membership removal bumps `authz_version`; sessions lose the organization, the user's tenant keys stop working. |
+| Ex-member keeps access | Membership removal bumps `authz_version` and revokes the user's keys for the organization in one transaction; sessions lose the organization; authentication refuses a user's tenant key without a live membership. |
 | Argon2 denial of service | Semaphore with queue timeout, per-IP limits before hashing, 1 KiB password byte cap. |
 | Rate-limit table growth | Keys are fixed-size digests. Cleanup removes drained buckets. |
 | SSRF through OIDC | Issuers come only from configuration. Redirects disabled. Response size cap. |
@@ -1428,7 +1490,7 @@ identity defines none. Spans are TE's `identity {operation}`.
 | `Notifier` | Calls `request(tx, NotificationRequest)` inside the use case's transaction for the topics below (R2). Never calls `emit_webhook`: NT turns identity events into webhooks through AP subscriptions (R11). |
 | `Outbox` | `append(tx, "identity", records, OnDuplicate::Ignore)` with `OutboxTarget::Event { topic }` for integration events, in the use case's transaction (R1). |
 | `Directory` | Implements K's port (R7). See below. |
-| Jobs | Registers the recurring `identity.cleanup` job (default every 10 minutes): expired sessions, tokens, flows, ceremonies, invitations, drained rate buckets, revoked keys past 30 days, unverified accounts past their TTL, audit rows past retention. Each pass deletes in batches of 1,000 to keep transactions short. |
+| Jobs | Registers the recurring `identity.cleanup` job (default every 10 minutes): expired sessions, tokens, flows, ceremonies, invitations, drained rate buckets, revoked keys past 30 days, unverified accounts past their TTL under section 2's conditions, audit rows past retention. Each pass deletes in batches of 1,000 to keep transactions short. |
 
 ### Notification topics
 
@@ -1537,7 +1599,7 @@ secret_key = { env = "MEREZHA_IDENTITY_SECRET_KEY" }   # required, >= 32 bytes
 secret_key_previous = { env = "MEREZHA_IDENTITY_SECRET_KEY_PREVIOUS" }  # optional
 registration = "open"                      # open | invite_only | closed
 require_verified_email = true
-unverified_account_ttl = "7d"
+unverified_account_ttl = "7d"                # cleanup runs only when require_verified_email = true
 dev_print_links = false                    # loopback only
 notify_new_sign_in = false                 # identity.new_sign_in notice
 
@@ -1589,7 +1651,7 @@ max_custom_roles = 100                     # per organization
 max_resource_assignments = 500             # per holder per organization
 
 [modules.identity.rbac.builtin_grants]
-user = ["tasks.read"]                      # implicit application role of every active user
+user = []                                  # implicit application role of every active user, valid in every organization
 admin = ["tasks.*"]
 member = ["tasks.read", "tasks.create"]
 
@@ -1689,7 +1751,7 @@ PR 1's build is its compile check.
 | `getrandom` | 0.4.3 | MIT OR Apache-2.0 | 1.85 | default | OS entropy |
 | `base64` | 0.23.1 | MIT OR Apache-2.0 | 1.71 | default | base64url for tokens |
 | `uuid` | 1.29.0 | Apache-2.0 OR MIT | 1.89 | workspace pin: `v4`, `v5`, `v7`, `serde` | Ids, WebAuthn handles |
-| `jiff` | 0.2.38 | Unlicense OR MIT | 1.70 | workspace pin: `default-features = false`, `std`, `serde`, `tz-system`, `tzdb-bundle-platform` | Timestamps and durations, the one time crate (R14) |
+| `jiff` | 0.2.38 | Unlicense OR MIT | 1.70 | workspace pin: `default-features = false`, `std`, `serde`, `tz-system`, `tzdb-bundle-always` | Timestamps and durations, the one time crate (R14) |
 | `tokio-postgres` | 0.7.18 | MIT OR Apache-2.0 | 1.85 | `with-uuid-1`, `with-jiff-0_2`, `with-serde_json-1` | Through `merezha-postgres` |
 | `deadpool-postgres` | 0.14.2 | MIT OR Apache-2.0 | 1.85 | default | Through `merezha-postgres` |
 | `secrecy` | 0.10.3 | Apache-2.0 OR MIT | 1.60 | default | Secret wrappers |
@@ -1796,6 +1858,11 @@ Acceptance criteria:
     `contains_secret` and its payload is null after relay.
 12. Identity refuses to start with email flows and no delivery path, except
     `dev_print_links` on loopback.
+13. Cleanup deletes a never-used unverified account after its TTL only with
+    `require_verified_email = true`; with `false`, or once it has signed in,
+    it survives every pass.
+14. Requests naming one address from five IPs exhaust only their own
+    `email.address_ip` buckets: the victim's IP still gets its magic link.
 
 Test plan:
 
@@ -1848,13 +1915,21 @@ Acceptance criteria:
    owner's application grants, revoking the owner's role shrinks the key on
    the next request, and a `platform_admin`'s key gets no break-glass. Keys
    die with their owner's membership, status or deletion.
-6. The section 3 scope constraints reject every forbidden row shape.
+6. The section 3 scope constraints reject every forbidden row shape,
+   including organization A's custom role in a row of organization B.
 7. An application with `user_can_create = false` works on the implicit
    `user` role and declared roles alone.
 8. `Directory` returns only active verified users in bounded pages, and
    `is_member` is false for a holder of only application grants.
 9. Ids from another organization return 404; integration events commit with
    the change, under R11 names.
+10. X owns A and is admin in B: assigning or inviting with A's custom role in
+    B returns `404 not_found`, and editing it changes no grant in B.
+11. With `builtin_grants.user = ["tasks.read"]`, Bob's tenant key in K gets
+    401 on both instances once he is removed, also after rejoining, and also
+    when his membership row is deleted directly in SQL.
+12. Anonymous acceptance of an invitation for an unverified account's
+    address returns a session and leaves no attacker credential or session.
 
 Test plan:
 
@@ -1866,7 +1941,8 @@ Test plan:
   two invitations accepted in parallel for one user (one membership,
   `already_member` for the other); custom role deleted while being assigned
   (`role_in_use` or success, never a dangling assignment); an application
-  role revoked while its holder's key is in use (the next request is denied).
+  role revoked while its holder's key is in use (the next request is denied);
+  key minting racing the minter's removal (no live key without membership).
 - Failure cases: a failed role change does not bump versions; catalog shrink
   with stored roles holding removed permissions; a declared role removed
   while assigned (startup fails); API key presented after revocation (401
