@@ -3,149 +3,17 @@
 //! `MEREZHA_TEST_DATABASE_URL` and skip with a message when it is unset.
 mod support;
 use merezha_postgres::{Database, TestDatabase};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
     fs::{self, File},
-    io::{Read, Write},
-    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::Command,
     sync::Arc,
     time::{Duration, Instant},
 };
+use support::{Host, request};
 
 const DATABASE_ENV: &str = "RUN_TEST_DATABASE_URL";
-
-struct Host {
-    child: Child,
-    log: PathBuf,
-}
-impl Host {
-    fn spawn(config: &Path, env: &[(&str, &str)], name: &str) -> Self {
-        let log = config.with_file_name(format!("{name}.log"));
-        let mut command = Command::new(env!("CARGO_BIN_EXE_merezha"));
-        command
-            .args(["run", "--config"])
-            .arg(config)
-            .stdout(Stdio::null())
-            .stderr(File::create(&log).unwrap());
-        for (key, value) in env {
-            command.env(key, value);
-        }
-        Self {
-            child: command.spawn().unwrap(),
-            log,
-        }
-    }
-    fn events(&self) -> Vec<Value> {
-        fs::read_to_string(&self.log)
-            .unwrap()
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
-    }
-    fn ready(&mut self) -> SocketAddr {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Some(event) = self
-                .events()
-                .into_iter()
-                .find(|e| e["event"] == "listener.ready")
-            {
-                return event["address"].as_str().unwrap().parse().unwrap();
-            }
-            let text = fs::read_to_string(&self.log).unwrap();
-            assert!(
-                self.child.try_wait().unwrap().is_none(),
-                "host exited before readiness: {text}"
-            );
-            assert!(Instant::now() < deadline, "readiness timeout: {text}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-    /// Wait for exit code 2 and return the `startup.failed` event.
-    fn failed(&mut self) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                assert_eq!(status.code(), Some(2));
-                return self
-                    .events()
-                    .into_iter()
-                    .find(|e| e["event"] == "startup.failed")
-                    .expect("startup.failed event");
-            }
-            assert!(Instant::now() < deadline, "host failure timeout");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-    fn stop(&mut self) {
-        assert!(
-            Command::new("kill")
-                .args(["-TERM", &self.child.id().to_string()])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                assert!(status.success(), "graceful host exit: {status}");
-                return;
-            }
-            assert!(Instant::now() < deadline, "host shutdown timeout");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
-impl Drop for Host {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-struct Reply {
-    status: u16,
-    headers: String,
-    body: Value,
-}
-fn request(address: SocketAddr, method: &str, path: &str, body: &str) -> Reply {
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    write!(
-        stream,
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
-    Reply {
-        status: headers.split_whitespace().nth(1).unwrap().parse().unwrap(),
-        headers: headers.to_ascii_lowercase(),
-        body: serde_json::from_str(body).unwrap_or_else(|_| json!(body)),
-    }
-}
-fn wait_for_ready_status(address: SocketAddr, status: u16) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let reply = request(address, "GET", "/health/ready", "");
-        if reply.status == status {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "readiness stayed {} {}",
-            reply.status,
-            reply.body
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
 
 /// A project directory with the runtime, application and `merezha.toml`.
 fn project(dir: &Path, extra: &str) -> PathBuf {
@@ -292,13 +160,13 @@ fn run_serves_health_runtime_and_application_behind_the_edge_and_stops_gracefull
         "ALTER DATABASE \"{0}\" ALLOW_CONNECTIONS false; SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{0}'",
         test.name()
     ));
-    wait_for_ready_status(address, 503);
+    host.wait_for_readiness(address, 503);
     assert_eq!(request(address, "GET", "/health/live", "").status, 200);
     test.admin_execute(&format!(
         "ALTER DATABASE \"{}\" ALLOW_CONNECTIONS true",
         test.name()
     ));
-    wait_for_ready_status(address, 200);
+    host.wait_for_readiness(address, 200);
 
     host.stop();
     let events: Vec<String> = host
@@ -340,7 +208,7 @@ fn a_public_listener_without_identity_denies_application_and_hides_the_raw_runti
         let dir = tempfile::tempdir().unwrap();
         let config = project(dir.path(), "");
         let mut host = Host::spawn(&config, &[(DATABASE_ENV, test.url()), setting], name);
-        let address = host.ready();
+        let address = host.listening();
         for path in ["/v1/services/echo/invoke", "/v1/reload", "/health"] {
             let method = if path == "/health" { "GET" } else { "POST" };
             let raw = request(address, method, path, "");
@@ -501,8 +369,7 @@ fn outbox_records_committed_before_a_crash_are_relayed_exactly_once_after_restar
         ],
         "held",
     );
-    let address = held.ready();
-    wait_for_ready_status(address, 200);
+    held.ready();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
