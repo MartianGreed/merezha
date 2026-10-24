@@ -1209,6 +1209,45 @@ fn a_slow_pool_acquire_still_bounds_the_lock_wait_by_the_time_left() {
 }
 
 #[test]
+fn an_append_never_waits_past_the_database_statement_timeout() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let mut c = config();
+    c.limits.timeout_ms = 30_000;
+    let mut database = pg.test.config();
+    database.statement_timeout = Duration::from_secs(1);
+    let db = Database::connect(&database).unwrap();
+    let store = pg
+        .runtime
+        .block_on(PostgresStore::connect(
+            &db,
+            &c,
+            PostgresOptions::default(),
+            deadline(),
+        ))
+        .unwrap();
+    let app =
+        Application::with_postgres(c, guest(&probe), Arc::new(AllowAll), Arc::new(store)).unwrap();
+    let holder = pg.hold_head();
+    let started = Instant::now();
+    assert_eq!(
+        code(app.command(command("one", json!(1), None))),
+        "storage_busy"
+    );
+    let waited = started.elapsed();
+    assert!(waited < Duration::from_millis(2000), "{waited:?}");
+    assert!(waited >= Duration::from_millis(900), "{waited:?}");
+    pg.release_head(holder);
+    // The pooled session is back at the operator's default and works.
+    assert_eq!(
+        app.command(command("one", json!(1), None))
+            .unwrap()
+            .position,
+        1
+    );
+}
+
+#[test]
 fn lowering_payload_and_state_limits_keeps_stored_history_readable() {
     let Some(pg) = Pg::new() else { return };
     let probe = Arc::new(Probe::default());

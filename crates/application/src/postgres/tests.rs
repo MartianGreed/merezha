@@ -206,3 +206,60 @@ fn killed_process_keeps_history_and_receipts_exact_at_each_append_cut() {
         assert!(report.ok, "{cut}: {report:?}");
     }
 }
+
+#[test]
+fn an_append_that_answered_keeps_its_outcome_when_only_the_reset_fails_or_is_late() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let runtime = runtime();
+    let db = Database::connect(&test.config()).unwrap();
+    runtime.block_on(async {
+        let modules = [ModuleMigrations {
+            module: MODULE,
+            migrations: MIGRATIONS,
+        }];
+        run_migrations(
+            &db,
+            &modules,
+            MigrationMode::Apply,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    });
+    let mut short = config();
+    short.limits.timeout_ms = 1000;
+    for (position, reset) in [
+        // The reset fails outright.
+        (1, "RESET no_such_parameter"),
+        // The reset answers only after the caller's deadline: the session
+        // default (5 s) bounds the sleep, not the append's 1 s.
+        (2, "RESET statement_timeout; SELECT pg_sleep(10)"),
+    ] {
+        let mut store = runtime
+            .block_on(PostgresStore::connect(
+                &db,
+                &short,
+                PostgresOptions::default(),
+                Instant::now() + Duration::from_secs(10),
+            ))
+            .unwrap();
+        store.reset_statement = reset;
+        let app = Application::with_postgres(
+            short.clone(),
+            Arc::new(Counter::default()),
+            Arc::new(AllowAll),
+            Arc::new(store),
+        )
+        .unwrap();
+        let before = db.status().size;
+        let started = Instant::now();
+        let receipt = app.command(command(None)).unwrap();
+        assert_eq!(receipt.position, position, "{reset}");
+        assert!(started.elapsed() < Duration::from_millis(1500), "{reset}");
+        // The session whose statement timeout was not restored is closed.
+        assert_eq!(db.status().size, before - 1, "{reset}");
+    }
+    assert_eq!(count(&runtime, test.url(), "events"), 2);
+}

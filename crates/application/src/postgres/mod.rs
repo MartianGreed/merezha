@@ -139,7 +139,12 @@ pub struct PostgresStore {
     application: Identity,
     projections: BTreeSet<(Identity, u32)>,
     options: PostgresOptions,
+    /// What restores the session's statement timeout after an append; a
+    /// test replaces it to make the reset fail or come late.
+    reset_statement: &'static str,
 }
+/// Restores the session default after an append.
+const RESET_STATEMENT: &str = "RESET statement_timeout";
 impl std::fmt::Debug for PostgresStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PostgresStore")
@@ -281,6 +286,7 @@ impl PostgresStore {
                 .map(|p| (p.name.clone(), p.revision))
                 .collect(),
             options,
+            reset_statement: RESET_STATEMENT,
         })
     }
     /// `storage_configuration` unless `config` is the one this store was
@@ -368,20 +374,28 @@ impl PostgresStore {
             i32::try_from(p.revision).map_err(|_| configuration())?,
         ))
     }
-    /// Server-side bounds of an append about to be sent: its head-lock wait
-    /// is what is left of the deadline minus [`APPEND_MARGIN`] (capped by
-    /// the configured maximum), and the whole statement gets half the margin
-    /// less than what is left. The server thus gives up before the caller
-    /// does, with a definite rollback. `None` below the margin: the append
-    /// is not sent.
+    /// Server-side bounds of an append about to be sent. The statement gets
+    /// half of [`APPEND_MARGIN`] less than what is left of the deadline,
+    /// never more than the database's configured `statement_timeout` (as
+    /// for kernel transactions), and its head-lock wait half the margin less
+    /// again, capped by the configured maximum. The server thus gives up
+    /// first, at the lock with `storage_busy` where it can, before the
+    /// caller does. `None` below the margin: the append is not sent.
     fn append_bounds(&self, deadline: Instant) -> Option<(i32, u128)> {
         let left = deadline.checked_duration_since(Instant::now())?;
-        let budget = left
-            .checked_sub(APPEND_MARGIN)
+        left.checked_sub(APPEND_MARGIN)
             .filter(|budget| *budget >= Duration::from_millis(1))?;
-        let lock = i32::try_from(budget.min(self.options.lock_timeout_max).as_millis()).ok()?;
-        let statement = left.checked_sub(APPEND_MARGIN / 2)?.as_millis();
-        Some((lock, statement))
+        let statement = left
+            .checked_sub(APPEND_MARGIN / 2)?
+            .min(self.db.statement_timeout());
+        let lock = statement
+            .saturating_sub(APPEND_MARGIN / 2)
+            .min(self.options.lock_timeout_max)
+            .max(Duration::from_millis(1));
+        Some((
+            i32::try_from(lock.as_millis()).ok()?,
+            statement.as_millis().max(1),
+        ))
     }
 }
 
@@ -630,6 +644,7 @@ impl DurableStore for PostgresStore {
                 application: self.application.clone(),
                 projections: self.projections.clone(),
                 options: self.options.clone(),
+                reset_statement: self.reset_statement,
             }),
             Default::default(),
         ))
@@ -698,24 +713,28 @@ impl PostgresStore {
         // Pipelined in order in one round trip: the session statement
         // timeout, the autocommit append, then the session default again.
         // The head lock is held only by the middle statement.
-        let sent = tokio::time::timeout_at(deadline.into(), async {
-            tokio::join!(
-                biased;
-                client.batch_execute(&bound),
-                client.query_one(&statement, &params),
-                client.batch_execute("RESET statement_timeout"),
-            )
-        })
-        .await;
-        let Ok((bounded, result, reset)) = sent else {
+        // Each is bounded on its own, so an append that answered keeps its
+        // known outcome even when only the reset is late.
+        let at = tokio::time::Instant::from_std(deadline);
+        let (bounded, result, reset) = tokio::join!(
+            biased;
+            tokio::time::timeout_at(at, client.batch_execute(&bound)),
+            tokio::time::timeout_at(at, client.query_one(&statement, &params)),
+            tokio::time::timeout_at(at, client.batch_execute(self.reset_statement)),
+        );
+        let (bounded, reset) = (
+            bounded.ok().and_then(Result::ok),
+            reset.ok().and_then(Result::ok),
+        );
+        let Ok(result) = result else {
             drop(PooledClient::take(client));
             return Err(commit_unknown());
         };
         let failure = result.as_ref().err().map(append_error);
         // A session whose statement timeout may not be the default again,
         // or whose outcome is unknown, is closed instead of pooled.
-        if bounded.is_err()
-            || reset.is_err()
+        if bounded.is_none()
+            || reset.is_none()
             || failure
                 .as_ref()
                 .is_some_and(|f| f.code == "commit_outcome_unknown")

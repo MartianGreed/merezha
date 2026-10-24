@@ -381,9 +381,12 @@ a backstop only.
 computed after the pooled session is acquired and the statement prepared, so a slow acquire shortens
 the lock wait instead of outliving the caller. With less than 50 ms left at that point the host fails
 `timeout` without sending the append. The append is pipelined in one round trip between `SET
-statement_timeout = remaining − 25 ms` and `RESET statement_timeout`, so the server ends the
-statement (a definite rollback, `timeout`) before the caller's deadline; a session whose reset failed
-or whose outcome is unknown is closed rather than returned to the pool.
+statement_timeout = min(remaining − 25 ms, database.statement_timeout_ms)` and `RESET
+statement_timeout`, so the server ends the statement (a definite rollback, `timeout`) before the
+caller's deadline and never past the operator's ceiling; the lock wait is a further 25 ms shorter, so
+a held lock answers `storage_busy`. Each of the three statements is bounded on its own: an append that
+answered keeps its known outcome even when only the reset fails or comes late. A session whose reset
+failed or whose outcome is unknown is closed rather than returned to the pool.
 
 **Same-key races.** The stream fail-fast check runs before the receipt lookup, and every `conflict`
 branch with a key looks the receipt up again before answering. A same-key commit by another
