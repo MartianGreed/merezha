@@ -53,6 +53,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 http = { version = "1.5.0", default-features = false, features = ["std"] }
 regex = { version = "1.13.1", default-features = false, features = ["std", "unicode"] }
 rust_decimal = { version = "1.43.0", default-features = false, features = ["std"] }
+base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 deunicode = { version = "1.6.2", default-features = false, features = ["alloc"] }
 object_store = { version = "0.14.2", default-features = false, features = ["fs", "aws"] }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }

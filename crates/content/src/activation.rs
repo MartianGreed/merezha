@@ -432,8 +432,9 @@ pub async fn activate(
         let count = run.count_tightened(&report.plan);
         match tokio::time::timeout_at(budget, count).await {
             Ok(counts) => report.tightened = counts,
-            Err(_) => tracing::warn!(
-                event = "content.model_tightened",
+            Err(_) => merezha_telemetry::event!(
+                WARN,
+                "content.model_tightened",
                 version = model.version(),
                 code = "content_activation_timeout"
             ),
@@ -493,8 +494,9 @@ pub fn log_breaking(error: &ActivationError, version: u32) {
         .iter()
         .filter(|c| c.class == ChangeClass::Refused)
     {
-        tracing::error!(
-            event = "content.model_breaking",
+        merezha_telemetry::event!(
+            ERROR,
+            "content.model_breaking",
             code = error.failure.code.as_str(),
             version,
             path = change.path.as_str(),
@@ -502,8 +504,9 @@ pub fn log_breaking(error: &ActivationError, version: u32) {
         );
     }
     if error.failure.code == "content_model_version_unchanged" {
-        tracing::error!(
-            event = "content.model_breaking",
+        merezha_telemetry::event!(
+            ERROR,
+            "content.model_breaking",
             code = "content_model_version_unchanged",
             version
         );
@@ -622,8 +625,9 @@ impl Run<'_> {
         let existing = match existing_indexes(&**session).await {
             Ok(existing) => existing,
             Err(failure) => {
-                tracing::warn!(
-                    event = "content.index_failed",
+                merezha_telemetry::event!(
+                    WARN,
+                    "content.index_failed",
                     operation = "drop",
                     code = failure.code.as_str()
                 );
@@ -642,12 +646,13 @@ impl Run<'_> {
             };
             match result {
                 Ok(()) => {
-                    tracing::info!(event = "content.index_dropped", index = name.as_str());
+                    merezha_telemetry::event!(INFO, "content.index_dropped", index = name.as_str());
                     dropped.push(name);
                 }
                 Err(error) => {
-                    tracing::warn!(
-                        event = "content.index_failed",
+                    merezha_telemetry::event!(
+                        WARN,
+                        "content.index_failed",
                         operation = "drop",
                         index = name.as_str(),
                         code = classify(&error).code.as_str()
@@ -718,8 +723,9 @@ impl Run<'_> {
                 .batch_execute(&drop_statement(name))
                 .await
                 .map_err(|e| classify(&e))?;
-            tracing::warn!(
-                event = "content.index_dropped",
+            merezha_telemetry::event!(
+                WARN,
+                "content.index_dropped",
                 index = name,
                 reason = "invalid"
             );
@@ -744,8 +750,9 @@ impl Run<'_> {
             };
             let failure = match result {
                 Ok(()) => {
-                    tracing::info!(
-                        event = "content.index_created",
+                    merezha_telemetry::event!(
+                        INFO,
+                        "content.index_created",
                         index = index.name.as_str(),
                         content_type = index.content_type.as_str(),
                         field = index.field.as_str(),
@@ -765,8 +772,9 @@ impl Run<'_> {
             }
             let retry = failure.classification == Classification::Transient;
             if !retry || attempt >= BUILD_ATTEMPTS {
-                tracing::error!(
-                    event = "content.index_failed",
+                merezha_telemetry::event!(
+                    ERROR,
+                    "content.index_failed",
                     code = "index_build_failed",
                     index = index.name.as_str(),
                     content_type = index.content_type.as_str(),
@@ -882,13 +890,12 @@ impl Run<'_> {
             .await;
         match result {
             Ok(()) => {
-                tracing::info!(
-                    event = "content.model_activated",
-                    version = self.model.version(),
-                    previous_version = plan.previous_version,
-                    fingerprint = self.model.fingerprint(),
-                    change_classes = ?plan.change_classes()
-                );
+                merezha_telemetry::event!(
+                INFO, "content.model_activated", version = self.model.version(),
+                                    previous_version = plan.previous_version,
+                                    fingerprint = self.model.fingerprint(),
+                                    change_classes = ?plan.change_classes()
+                                );
                 Ok(())
             }
             Err(failure) => Err(Self::stop(session, failure)),
@@ -932,8 +939,9 @@ impl Run<'_> {
         let client = match self.db.acquire(deadline).await {
             Ok(client) => client,
             Err(failure) => {
-                tracing::warn!(
-                    event = "content.model_tightened",
+                merezha_telemetry::event!(
+                    WARN,
+                    "content.model_tightened",
                     version = self.model.version(),
                     code = failure.code.as_str()
                 );
@@ -966,17 +974,17 @@ impl Run<'_> {
                         .iter()
                         .map(|c| (c.field.as_str(), c.drafts, c.published))
                         .collect();
-                    tracing::warn!(
-                        event = "content.model_tightened",
-                        version = self.model.version(),
-                        content_type = name,
-                        truncated = counts.iter().any(|c| c.truncated),
-                        counts = ?summary
-                    );
+                    merezha_telemetry::event!(
+                    WARN, "content.model_tightened", version = self.model.version(),
+                                            content_type = name,
+                                            truncated = counts.iter().any(|c| c.truncated),
+                                            counts = ?summary
+                                        );
                     out.extend(counts);
                 }
-                Err(failure) => tracing::warn!(
-                    event = "content.model_tightened",
+                Err(failure) => merezha_telemetry::event!(
+                    WARN,
+                    "content.model_tightened",
                     version = self.model.version(),
                     content_type = name,
                     code = failure.code.as_str()

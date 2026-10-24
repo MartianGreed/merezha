@@ -1148,6 +1148,12 @@ state, and the R10 trace columns.
   exits, never run, and released the same way. `merezha run` sets the
   module shutdown budget to the 10 s default plus `drain_timeout_ms` plus
   3 s, so the modules after the jobs runtime keep their 10 s.
+- **Give back.** A handler that cannot do the work on this instance returns
+  `JobFailure::release()` (reserved code `job_released`): the worker
+  releases that lease at once with the drain's fenced statement
+  (`available` now, attempt refunded, attempts row `released`) and logs
+  `job.released`. `JobHandler::accepts_leases()` (default `true`) is read
+  before every lease; the worker leases only kinds whose handler accepts.
 - **Secrets (R3).** A flagged job's payload is nulled by the same
   statement that makes it terminal: success, dead letter (handler or
   reaper), cancel. The admin API never returns a flagged payload.
@@ -1218,16 +1224,39 @@ such as `cargo build --release -p merezha-cli` or `cargo build
 
 ## Content
 
-`merezha-content` (`crates/content`, CT-C1 and CT-C2) is the content block,
+`merezha-content` (`crates/content`, CT-C1 to CT-C3) is the content block,
 a `Module` named `content` with schema `merezha_content` (ledger key
-`content`). C2 ships its schema, model activation and readiness; entry,
-delivery and asset routes come with C3 onward. The design is
+`content`). C2 ships its schema, model activation and readiness; C3 the
+management routes for drafts and revisions. Publishing and deletion (C4),
+delivery (C5) and assets (C7) come later. The design is
 [content.md](../design/content.md).
 
 ```toml
 [modules.content]          # the section's presence enables the block
 model = "content.toml"     # the default
+limits = { max_request_bytes = 1048576, max_entry_bytes = 262144,
+           default_page_size = 25, max_page_size = 100, max_filters = 10,
+           max_sort_keys = 2, query_timeout = "5s" }   # the defaults
+revisions = { retain = 100 }                           # the default
 ```
+
+| Key | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `limits.max_request_bytes` | 1048576 | 1024 to 8388608 | Largest management request body (`body_limit`, 413). The edge's `http.body_limit` applies first. |
+| `limits.max_entry_bytes` | 262144 | 1024 to 1048576 | Largest encoded fields of one variant, before and after normalization (`body_limit`). |
+| `limits.default_page_size` | 25 | 1 to `max_page_size` | `limit` of a list that names none. |
+| `limits.max_page_size` | 100 | 1 to 500 | Largest `limit`. |
+| `limits.max_filters` | 10 | 1 to 32 | Filter clauses per list. |
+| `limits.max_sort_keys` | 2 | 1 to 4 | `sort` keys per list. |
+| `limits.query_timeout` | `"5s"` | 100 ms to 30 s | Deadline of each request's transaction, which sets `statement_timeout` (capped by `database.statement_timeout_ms`); an expired one answers `timeout` (504). |
+| `revisions.retain` | 100 | 2 to 10000 | Revisions kept per variant; the published one is kept besides them. |
+
+The tables take only these keys in C3. `max_populate_depth`,
+`max_populated_entries`, `max_batch`, `trash`, `delivery` and `media`
+stay `unknown_key` until their slices. Problems are reported with the
+configuration, every one at once (`out_of_range`, `expected_integer`,
+`expected_duration`, `expected_table`, `unknown_key`), keyed
+`modules.content.limits.<key>` or `modules.content.revisions.retain`.
 
 `model` follows the runtime manifest's path rules: relative to
 `merezha.toml`, no `..` or absolute paths, and it must resolve (symlinks
@@ -1268,7 +1297,7 @@ At start, after migrations:
   active one starts but reports `content_model_outdated`, as does a host
   whose model another host superseded; such a host drains.
 
-Every content write transaction of C3 onward starts with
+Every content write transaction starts with
 `ContentState::check_writable`, a `FOR SHARE` lock on the loaded model's
 active row. Without that row the active version decides: a newer one fails
 the write `content_model_superseded` and turns the host outdated; an older
@@ -1313,6 +1342,58 @@ Error codes it registers: `content_model_invalid`,
 `content_model_superseded`, `content_model_outdated`,
 `content_model_pending`, `content_model_conflict`,
 `content_activation_timeout`, `index_build_pending` (503).
+
+Once a host is outdated its content job kinds stop leasing: content
+registers its handlers through `ContentState::guard_jobs`, whose
+`JobHandler::accepts_leases` turns false, and the jobs worker leases only
+kinds whose handler accepts (a kind that refuses stays `available` for the
+other instances). A job leased in the instant before, or one whose
+handler meets `content_model_superseded` mid-run, is given back with
+`JobFailure::release()`: available again at once with its attempt
+refunded, for a current host to run.
+
+### Content management routes
+
+All under `/v1/content/manage`, answered `private, no-store`:
+
+| Route | Permission |
+| --- | --- |
+| `GET /entries/{type}` (list: `locale`, `status`, `filter[<field>][<op>]`, `sort`, `limit`, `cursor`, `fields`) | `content.entries.read` |
+| `POST /entries/{type}` (`{id?, locale?, fields}`, 201 with `ETag` and `Location`) | `content.entries.write` |
+| `GET /entries/{type}/{id}`, `GET /entries/{type}/{id}/referrers` (`stage`, `limit`, `cursor`) | `content.entries.read` |
+| `GET /entries/{type}/{id}/{locale}` (`fields`), `.../revisions` (`limit`, `cursor`), `.../revisions/{n}` | `content.entries.read` |
+| `PUT` and `PATCH /entries/{type}/{id}/{locale}`, `POST .../revisions/{n}/restore` | `content.entries.write` |
+| the same under `/singletons/{type}/{locale}` (no entry id; the first `PUT` with `If-None-Match: *` creates the entry) | as above |
+
+Each route checks its permission through the host's `Authorizer` before
+anything else, at `ResourceScope::Resource { tenant, kind: "content_type",
+id: <type> }` (an `Application` grant satisfies it), or at `Application`
+for a type the model does not have, so an unauthorized caller cannot tell
+types apart. Without the identity block a private listener allows
+everything and a public one denies everything: `401 unauthenticated`
+without a principal, `403 unauthorized` with one.
+
+`PUT`, `PATCH` and restore need `If-Match: "r<n>"` (missing:
+`precondition_required`, 428); any other value, or a revision that is no
+longer the draft's, is `revision_conflict` (412) and writes nothing.
+`If-None-Match: *` creates a variant (`variant_exists`, 412, when it
+exists). `PATCH` takes `application/merge-patch+json` only
+(`unsupported_media_type`, 415). An id of another type or scope, or one
+that is not a UUID, is `entry_not_found` (404) on every route.
+
+Codes added by C3: `entry_not_found`, `revision_not_found` (404),
+`locale_unknown`, `invalid_query`, `invalid_filter`, `invalid_sort`,
+`invalid_cursor` (400), `variant_exists` (412), `precondition_required`
+(428), `entry_exists`, `singleton_exists` (409). Every save appends
+`content.entry_draft_saved` to the outbox in its transaction.
+
+A cursor carries its sort values in the exact form the list selects
+(timestamps `YYYY-MM-DDTHH:MM:SS.ffffffZ`, PostgreSQL's float8 and
+numeric text); anything else, and any value PostgreSQL then refuses
+(SQLSTATE class 22), is `invalid_cursor`. Migration 2 of
+`merezha_content` is a declared non-transactional step building
+`variants_by_update` (`draft_updated_at DESC, entry_id DESC`), the index
+of the default `-sys.updated_at` list and its reverse.
 
 ## Dependencies
 

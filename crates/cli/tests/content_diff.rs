@@ -118,7 +118,7 @@ async fn the_diff_classifies_against_the_database_and_fails_on_refused_changes()
         text.contains("additive types.page.fields.rank field_added\n"),
         "{text}"
     );
-    assert_eq!(text.matches("index build content_ix_").count(), 2, "{text}");
+    assert_eq!(text.matches("index build content_ix_").count(), 4, "{text}");
     // A refused change exits 1, from the binary too.
     let refused = V1
         .replace("version = 1", "version = 2")

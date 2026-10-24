@@ -1,16 +1,19 @@
 //! The content block as a platform [`Module`]: `[modules.content]`, the
 //! model file, migration 1, activation at start and readiness.
+use crate::store::Store;
 use crate::{
     ERRORS,
     activation::{ActivationOptions, Verified, activate, log_breaking, verify},
     model::ContentModel,
     parse::{CONTENT_PERMISSIONS, MAX_MODEL_BYTES, ModelOptions},
     schema::MIGRATIONS,
+    settings::{ContentSettings, KEYS},
 };
 use merezha_domain::Failure;
 use merezha_platform::{
     AppContext, BoxFuture, Database, ErrorCode, Migration, Module, ModuleEvents, ModuleSection, Tx,
     config::{ConfigIssue, Origin},
+    ports::{JobContext, JobFailure, JobHandler},
 };
 use std::{
     io::Read,
@@ -51,6 +54,7 @@ pub const PUBLISHES: [&str; 10] = [
 pub struct ContentState {
     model: Arc<ContentModel>,
     path: PathBuf,
+    settings: ContentSettings,
     database: OnceLock<Database>,
     /// The loaded model was found active with every derived index valid.
     current: AtomicBool,
@@ -75,6 +79,28 @@ impl ContentState {
     /// The resolved model file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+    /// `[modules.content]` limits and revision retention.
+    pub fn settings(&self) -> &ContentSettings {
+        &self.settings
+    }
+    /// The pool, once [`Module::start`] ran.
+    pub(crate) fn database(&self) -> Option<&Database> {
+        self.database.get()
+    }
+    /// Wrap a content job handler so this host stops leasing its kind once
+    /// a newer model is active (section 2, mixed model versions): the
+    /// wrapper's [`JobHandler::accepts_leases`] turns `false` with
+    /// [`ContentState::is_outdated`]. A job leased just before, or one whose
+    /// handler meets `content_model_superseded` mid-run, is given back with
+    /// [`JobFailure::release`]: available again at once with its attempt
+    /// refunded, for a current host. C4's trash purge and C7's blob cleanup
+    /// register through it.
+    pub fn guard_jobs(self: &Arc<Self>, handler: Arc<dyn JobHandler>) -> Arc<dyn JobHandler> {
+        Arc::new(GuardedHandler {
+            state: self.clone(),
+            handler,
+        })
     }
     /// A newer model replaced the loaded one.
     pub fn is_outdated(&self) -> bool {
@@ -154,6 +180,34 @@ impl ContentState {
             Ok(result) => result,
             Err(_) => Err(Failure::transient("database_timeout")),
         }
+    }
+}
+
+/// A content job handler that refuses work on an outdated host.
+struct GuardedHandler {
+    state: Arc<ContentState>,
+    handler: Arc<dyn JobHandler>,
+}
+impl JobHandler for GuardedHandler {
+    fn handle<'a>(
+        &'a self,
+        ctx: JobContext,
+        payload: serde_json::Value,
+    ) -> BoxFuture<'a, Result<(), JobFailure>> {
+        Box::pin(async move {
+            if self.state.is_outdated() {
+                return Err(JobFailure::release());
+            }
+            match self.handler.handle(ctx, payload).await {
+                // The write check found a newer model mid-run: give the job
+                // back for a current host, attempt refunded.
+                Err(failure) if failure.code == SUPERSEDED => Err(JobFailure::release()),
+                other => other,
+            }
+        })
+    }
+    fn accepts_leases(&self) -> bool {
+        !self.state.is_outdated() && self.handler.accepts_leases()
     }
 }
 
@@ -326,7 +380,14 @@ impl Module for ContentModule {
         NAME
     }
     fn configure(&mut self, section: &ModuleSection) -> Result<(), Vec<ConfigIssue>> {
-        let mut issues = section.unknown_keys(&["model"]);
+        let mut issues = section.unknown_keys(&KEYS);
+        let settings = match ContentSettings::parse(section) {
+            Ok(settings) => settings,
+            Err(found) => {
+                issues.extend(found);
+                ContentSettings::default()
+            }
+        };
         let key = section.key("model");
         let origin = section.origin("model");
         let value = match section.table.get("model") {
@@ -348,6 +409,7 @@ impl Module for ContentModule {
                     self.handle.set(Arc::new(ContentState {
                         model: Arc::new(model),
                         path,
+                        settings,
                         database: OnceLock::new(),
                         current: AtomicBool::new(false),
                         outdated: AtomicBool::new(false),
@@ -400,8 +462,9 @@ impl Module for ContentModule {
         Box::pin(async move {
             let state = self.state()?;
             let model = state.model.clone();
-            tracing::info!(
-                event = "content.model_loaded",
+            merezha_telemetry::event!(
+                INFO,
+                "content.model_loaded",
                 version = model.version(),
                 fingerprint = model.fingerprint(),
                 types = model.types().len(),
@@ -446,6 +509,16 @@ impl Module for ContentModule {
                 Ok(())
             }
         })
+    }
+    fn routes(&self, ctx: &AppContext) -> axum::Router {
+        let Some(state) = self.handle.state() else {
+            return axum::Router::new();
+        };
+        let Ok(outbox) = ctx.outbox(NAME) else {
+            return axum::Router::new();
+        };
+        let store = Store::new(state, ctx.clone(), outbox);
+        crate::http::router(store, ctx.authorizer().clone())
     }
     fn ready(&self) -> BoxFuture<'_, Result<(), Failure>> {
         Box::pin(async move { self.state()?.readiness().await })

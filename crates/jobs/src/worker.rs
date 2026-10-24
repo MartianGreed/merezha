@@ -329,7 +329,17 @@ impl Worker {
 
     async fn lease(&self, lane: &Lane, free: usize) -> Result<Vec<Leased>, Failure> {
         let queue = lane.plan.name.clone();
-        let kinds = self.kinds.clone();
+        // Kinds whose handler turned leasing off stay available for other
+        // instances (content on an outdated host, CT §2).
+        let kinds: Vec<String> = self
+            .kinds
+            .iter()
+            .filter(|kind| self.handlers.get(*kind).is_some_and(|h| h.accepts_leases()))
+            .cloned()
+            .collect();
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
         let wanted = i64::try_from(free).unwrap_or(i64::MAX);
         let owner = self.owner.clone();
         let lease_secs = lane.plan.settings.lease.as_secs_f64();
@@ -448,6 +458,14 @@ impl Worker {
             attempt = job.attempt
         );
         let outcome = self.execute(&lane, &job, cancelled).await;
+        if matches!(&outcome, Outcome::Failed(failure) if failure.is_release())
+            && self.cut(&job.token) == Some(false)
+        {
+            // The handler gave the job back: released now with the attempt
+            // refunded, like a drain release, for another instance to run.
+            self.give_back(&lane, &job).await;
+            return;
+        }
         if self.cut(&job.token) == Some(true) && !matches!(outcome, Outcome::Succeeded) {
             // Drain cutoff: released with the attempt refunded, not retried.
             self.park(&job.token);
@@ -492,6 +510,37 @@ impl Worker {
             Ok(false) => {}
             // The lease expires and the reaper decides.
             Err(failure) if entry.is_some() => self.failed("settle", &failure),
+            Err(_) => {}
+        }
+    }
+
+    /// Release one job its handler gave back ([`JobFailure::release`]).
+    /// A failed release leaves the lease to expire and the reaper retries
+    /// it, as for any settle failure.
+    async fn give_back(&self, lane: &Lane, job: &Leased) {
+        let mut result = self.release(std::slice::from_ref(&job.token)).await;
+        for pause in SETTLE_RETRIES {
+            match &result {
+                Err(failure)
+                    if failure.classification != merezha_domain::Classification::Permanent =>
+                {
+                    tokio::time::sleep(pause).await;
+                    result = self.release(std::slice::from_ref(&job.token)).await;
+                }
+                _ => break,
+            }
+        }
+        let entry = self.untrack(&job.token);
+        match result {
+            Ok(ids) if !ids.is_empty() => tracing::info!(
+                event = "job.released",
+                job_id = job.id,
+                queue = lane.plan.name.as_str(),
+                kind = job.kind.as_str(),
+                attempt = job.attempt
+            ),
+            Ok(_) => {}
+            Err(failure) if entry.is_some() => self.failed("release", &failure),
             Err(_) => {}
         }
     }

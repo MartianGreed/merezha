@@ -106,15 +106,15 @@ async fn a_fresh_database_activates_version_1() {
         json!({"version": 1, "fingerprint": v1.fingerprint(), "previous_version": null,
                "change_classes": ["additive"]})
     );
-    // Sortable `reading_minutes` and unique `slug` and `legacy_code`, on
-    // both tables.
+    // Sortable `reading_minutes` (one index per direction) and unique
+    // `slug` and `legacy_code`, on both tables.
     let expected = derived_indexes(&v1);
-    assert_eq!(expected.len(), 6);
+    assert_eq!(expected.len(), 8);
     let existing = indexes(&db).await;
     for index in &expected {
         assert_eq!(existing.get(&index.name), Some(&true), "{}", index.name);
     }
-    assert_eq!(report.created.len(), 6);
+    assert_eq!(report.created.len(), 8);
     // A second run on the same model changes nothing.
     let again = run(&db, &v1).await.unwrap();
     assert_eq!(again.plan.status, Status::Current);
@@ -282,8 +282,8 @@ async fn additive_tightening_access_and_index_changes_activate() {
         sorted
     });
     assert!(after.values().all(|valid| *valid));
-    assert_eq!(report.created.len(), 4);
-    assert_eq!(report.dropped.len(), 4);
+    assert_eq!(report.created.len(), 6);
+    assert_eq!(report.dropped.len(), 6);
     for name in &report.dropped {
         assert!(before.contains_key(name) && !after.contains_key(name));
     }
@@ -528,7 +528,7 @@ async fn new_indexes_are_valid_before_the_row_turns_active_and_unneeded_ones_dro
         .iter()
         .filter(|n| !new_names.contains(n))
         .collect();
-    assert_eq!(unneeded.len(), 4);
+    assert_eq!(unneeded.len(), 6);
     let after = indexes(&db).await;
     for name in unneeded {
         assert!(present.contains(name), "{name} dropped before activation");
@@ -1004,7 +1004,7 @@ async fn a_failed_drop_after_the_commit_keeps_the_activation_and_the_next_start_
     let report = run(&db, &v2).await.unwrap();
     assert!(report.activated, "the committed activation stands");
     assert!(report.dropped.is_empty());
-    assert_eq!(report.undropped.len(), 4);
+    assert_eq!(report.undropped.len(), 6);
     assert_eq!(
         models(&db).await,
         [(1, "superseded".to_owned()), (2, "active".to_owned())]

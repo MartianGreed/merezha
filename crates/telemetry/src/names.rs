@@ -1079,6 +1079,9 @@ pub const EVENTS: &[Event] = &[
     // Jobs and outbox.
     ev("job.leased", DEBUG, &[JOB_ID, QUEUE, KIND, ATTEMPT]),
     ev("job.completed", DEBUG, &[JOB_ID, QUEUE, KIND, ATTEMPT]),
+    // A handler gave its job back (`JobFailure::release`, content on an
+    // outdated host): available again with the attempt refunded.
+    ev("job.released", INFO, &[JOB_ID, QUEUE, KIND, ATTEMPT]),
     ev(
         "job.retry_scheduled",
         WARN,

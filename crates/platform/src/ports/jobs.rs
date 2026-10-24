@@ -81,6 +81,13 @@ pub trait JobHandler: Send + Sync {
         ctx: JobContext,
         payload: Value,
     ) -> BoxFuture<'a, Result<(), JobFailure>>;
+    /// Whether this instance may lease jobs of the kind now. Read before
+    /// every lease; `false` leaves the kind's jobs available for other
+    /// instances. Content turns it off on a host whose model a newer one
+    /// superseded (CT §2, mixed model versions).
+    fn accepts_leases(&self) -> bool {
+        true
+    }
 }
 
 /// What a reissue hook learns about a dead flagged job whose payload is

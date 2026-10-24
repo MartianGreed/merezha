@@ -33,8 +33,10 @@ impl IndexTable {
 /// Why a derived index exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IndexPurpose {
-    /// A `sortable` field: range filters and keyset sorts.
+    /// A `sortable` field: range filters and ascending keyset sorts.
     Sort,
+    /// A `sortable` field: descending keyset sorts, nulls still last.
+    SortDescending,
     /// A `unique` field, slugs included: unique per type, scope and locale
     /// (per type and scope for shared fields).
     Unique,
@@ -43,6 +45,7 @@ impl IndexPurpose {
     pub fn as_str(self) -> &'static str {
         match self {
             IndexPurpose::Sort => "sort",
+            IndexPurpose::SortDescending => "sort_desc",
             IndexPurpose::Unique => "unique",
         }
     }
@@ -85,8 +88,10 @@ pub fn is_derived_name(name: &str) -> bool {
 }
 
 /// Every derived index `model` needs, in type, field and table order: for
-/// each `sortable` field a partial B-tree on `variants` and `published`,
-/// for each `unique` field a partial unique index on both.
+/// each `sortable` field two partial B-trees on `variants` and on
+/// `published`, one per sort direction (nulls last both ways, `entry_id`
+/// in the key's direction), for each `unique` field a partial unique index
+/// on both.
 ///
 /// ```
 /// use merezha_content::{ContentModel, ModelOptions, derived_indexes};
@@ -99,8 +104,8 @@ pub fn is_derived_name(name: &str) -> bool {
 /// fields = [{ name = "reading_minutes", type = "integer", sortable = true }]
 /// "#, &options).unwrap();
 /// let indexes = derived_indexes(&model);
-/// assert_eq!(indexes.len(), 2);
-/// assert!(indexes[1].create.ends_with(
+/// assert_eq!(indexes.len(), 4);
+/// assert!(indexes[2].create.ends_with(
 ///     "ON merezha_content.published (scope, locale, ((data->'reading_minutes') IS NULL), \
 ///      (((data->>'reading_minutes'))::bigint), entry_id) WHERE content_type = 'article'"));
 /// ```
@@ -111,7 +116,8 @@ pub fn derived_indexes(model: &ContentModel) -> Vec<DerivedIndex> {
         for field in &content_type.fields {
             if field.sortable {
                 for table in [IndexTable::Variants, IndexTable::Published] {
-                    out.push(sort_index(content_type, field, table));
+                    out.push(sort_index(content_type, field, table, false));
+                    out.push(sort_index(content_type, field, table, true));
                 }
             }
             if field.unique {
@@ -142,26 +148,32 @@ fn cast(kind: &FieldKind) -> &'static str {
     }
 }
 
-fn sort_index(content_type: &ContentType, field: &Field, table: IndexTable) -> DerivedIndex {
+fn sort_index(
+    content_type: &ContentType,
+    field: &Field,
+    table: IndexTable,
+    descending: bool,
+) -> DerivedIndex {
     let data = data_column(table);
     let key = literal(&field.name);
     let value = match cast(&field.kind) {
         "" => format!("(({data}->>{key}))"),
         cast => format!("((({data}->>{key})){cast})"),
     };
-    let columns = format!("(scope, locale, (({data}->{key}) IS NULL), {value}, entry_id)");
+    // Nulls last in both directions: the `IS NULL` column stays ascending.
+    let (direction, purpose) = if descending {
+        (" DESC", IndexPurpose::SortDescending)
+    } else {
+        ("", IndexPurpose::Sort)
+    };
+    let columns = format!(
+        "(scope, locale, (({data}->{key}) IS NULL), {value}{direction}, entry_id{direction})"
+    );
     let mut predicate = format!("content_type = {}", literal(&content_type.name));
     if table == IndexTable::Variants {
         predicate.push_str(" AND NOT deleted");
     }
-    index(
-        content_type,
-        field,
-        table,
-        IndexPurpose::Sort,
-        &columns,
-        &predicate,
-    )
+    index(content_type, field, table, purpose, &columns, &predicate)
 }
 
 fn unique_index(
