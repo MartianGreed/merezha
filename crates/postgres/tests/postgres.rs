@@ -657,3 +657,198 @@ async fn transactions_hand_out_a_mutable_tx_for_ports() {
         .unwrap();
     assert_eq!(value, 7);
 }
+
+/// Runs a transaction on either a pooled or a detached connection.
+enum Session {
+    Pooled(Database),
+    Detached(merezha_postgres::DetachedClient),
+}
+impl Session {
+    async fn run<T: Send>(
+        &mut self,
+        deadline: Instant,
+        work: impl for<'t> FnOnce(
+            &'t mut merezha_postgres::Tx<'_>,
+        )
+            -> merezha_postgres::BoxFuture<'t, Result<T, merezha_domain::Failure>>
+        + Send,
+    ) -> Result<T, merezha_domain::Failure> {
+        match self {
+            Session::Pooled(db) => db.transaction(deadline, work).await,
+            Session::Detached(client) => client.transaction(deadline, work).await,
+        }
+    }
+}
+
+#[tokio::test]
+async fn detached_transactions_behave_like_pooled_ones() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = Database::connect(&test.config()).unwrap();
+    let setup = db.acquire(soon()).await.unwrap();
+    // A deferred constraint trigger that sleeps at commit makes the commit
+    // itself outlast the deadline.
+    setup
+        .batch_execute(
+            "CREATE TABLE items (id int);
+             CREATE FUNCTION slow_commit() RETURNS trigger LANGUAGE plpgsql AS
+               $$ BEGIN PERFORM pg_sleep(3); RETURN NULL; END $$;
+             CREATE TABLE slow (id int);
+             CREATE CONSTRAINT TRIGGER slow_commit AFTER INSERT ON slow
+               DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION slow_commit();",
+        )
+        .await
+        .unwrap();
+    drop(setup);
+    for detached in [false, true] {
+        let mut session = if detached {
+            Session::Detached(db.detach(soon()).await.unwrap())
+        } else {
+            Session::Pooled(db.clone())
+        };
+        let label = if detached { "detached" } else { "pooled" };
+        session
+            .run(soon(), |tx| {
+                Box::pin(async move {
+                    tx.batch_execute("INSERT INTO items VALUES (1)")
+                        .await
+                        .map_err(|e| classify(&e))
+                })
+            })
+            .await
+            .unwrap();
+        let error = session
+            .run(soon(), |tx| {
+                Box::pin(async move {
+                    tx.batch_execute("INSERT INTO items VALUES (2)")
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    Err::<(), _>(merezha_domain::Failure::conflict("caller_refused"))
+                })
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "caller_refused", "{label}");
+        let timeout: String = session
+            .run(Instant::now() + Duration::from_millis(1500), |tx| {
+                Box::pin(async move {
+                    Ok(tx
+                        .query_one("SHOW statement_timeout", &[])
+                        .await
+                        .map_err(|e| classify(&e))?
+                        .get(0))
+                })
+            })
+            .await
+            .unwrap();
+        let millis: u64 = timeout.trim_end_matches("ms").parse().unwrap_or(0);
+        assert!(
+            timeout.ends_with("ms") && (1..=1500).contains(&millis),
+            "{label}: {timeout}"
+        );
+        let unique = session
+            .run(soon(), |tx| {
+                Box::pin(async move {
+                    tx.batch_execute(
+                        "CREATE TEMP TABLE u (id int PRIMARY KEY); INSERT INTO u VALUES (1), (1)",
+                    )
+                    .await
+                    .map_err(|e| classify(&e))
+                })
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            unique.code, "unique_violation",
+            "{label}: same classification"
+        );
+        let started = Instant::now();
+        let late = session
+            .run(Instant::now() + Duration::from_millis(200), |tx| {
+                Box::pin(async move {
+                    tx.batch_execute("SELECT pg_sleep(5)")
+                        .await
+                        .map_err(|e| classify(&e))
+                })
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(late.code, "database_timeout", "{label}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // A session's state is unknown after a timeout: start a new one.
+        let mut session = if detached {
+            Session::Detached(db.detach(soon()).await.unwrap())
+        } else {
+            Session::Pooled(db.clone())
+        };
+        let started = Instant::now();
+        let unknown = session
+            .run(Instant::now() + Duration::from_millis(1000), |tx| {
+                Box::pin(async move {
+                    tx.batch_execute("INSERT INTO slow VALUES (1)")
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    // Start the commit well before the server-side bound.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(unknown.code, "commit_outcome_unknown", "{label}");
+        assert!(started.elapsed() < Duration::from_millis(1300), "{label}");
+    }
+    let client = db.acquire(soon()).await.unwrap();
+    let rows: i64 = client
+        .query_one("SELECT count(*) FROM items", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 2, "one commit per session kind; refusals rolled back");
+}
+
+#[tokio::test]
+async fn a_detached_session_keeps_its_lock_across_transactions_and_releases_it_on_drop() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = Database::connect(&test.config()).unwrap();
+    let mut holder = db.detach(soon()).await.unwrap();
+    let locked: bool = holder
+        .query_one("SELECT pg_try_advisory_lock(42)", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(locked);
+    holder
+        .transaction(soon(), |tx| {
+            Box::pin(async move { tx.batch_execute("SELECT 1").await.map_err(|e| classify(&e)) })
+        })
+        .await
+        .unwrap();
+    let other = db.acquire(soon()).await.unwrap();
+    let taken: bool = other
+        .query_one("SELECT pg_try_advisory_lock(42)", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!taken, "the detached session still holds the lock");
+    drop(holder);
+    let mut free = false;
+    for _ in 0..50 {
+        free = other
+            .query_one("SELECT pg_try_advisory_xact_lock(42)", &[])
+            .await
+            .unwrap()
+            .get(0);
+        if free {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(free, "dropping the detached client closed its session");
+    // The pool slot reopened.
+    assert!(db.status().max_size >= 1);
+    db.ping(soon()).await.unwrap();
+}
