@@ -1,8 +1,11 @@
-//! Bounded application orchestration with memory or owned SQLite storage. The host follows
-//! the versioned guest contract in `merezha-domain`.
+//! Bounded application orchestration with memory, owned SQLite or (feature
+//! `postgres`) shared PostgreSQL storage. The host follows the versioned
+//! guest contract in `merezha-domain`.
 mod application;
 pub mod config;
 mod durable;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 mod sqlite;
 pub mod store;
 pub use application::{Application, ProjectionState, QueryResult};

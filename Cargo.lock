@@ -1538,11 +1538,13 @@ version = "0.1.0"
 dependencies = [
  "merezha-application",
  "merezha-domain",
+ "merezha-postgres",
  "merezha-runtime",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "toml",
  "wat",
 ]

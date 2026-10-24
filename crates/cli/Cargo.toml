@@ -10,7 +10,7 @@ name = "merezha"
 path = "src/main.rs"
 
 [dependencies]
-merezha-application = { path = "../application" }
+merezha-application = { path = "../application", features = ["postgres"] }
 merezha-domain = { path = "../domain" }
 merezha-runtime = { path = "../runtime" }
 merezha-platform = { path = "../platform" }

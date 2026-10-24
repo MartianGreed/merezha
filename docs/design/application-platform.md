@@ -107,9 +107,20 @@ crates/application/src/
 ```
 
 `postgres` is a cargo feature of `merezha-application`, on in `merezha-cli`. It pulls in
-`merezha-postgres` (pool, migrations, test harness) and `merezha-platform` (`Outbox`, `Notifier`,
-`Principal`, `Authorizer`, `ResourceScope`). It is not a separate crate, because it needs the
-crate-private `Key`, `Record` and `ProjectionState` internals and the `Storage` enum.
+`merezha-postgres` (pool, migrations, test harness) and `tokio` (the runtime handle), and nothing
+else. It is not a separate crate, because it needs the crate-private `Key`, `Record` and
+`ProjectionState` internals and the `Storage` enum.
+
+**Dependency direction (decided in AP-A2).** `merezha-platform` already depends on
+`merezha-application`: the kernel `Authorizer` extends the application one (`ports/access.rs`). So
+`merezha-application` never depends on `merezha-platform`, with or without the `postgres` feature;
+that would be a cycle. Whatever the application core later needs from the platform ports
+(`Notifier`, `Outbox`, `Principal`, `ResourceScope` for C2 and C3) goes through small traits defined
+in `merezha-application` and implemented by adapters in `merezha-platform` or `merezha-cli`. A2
+needs none. The host side lives in `merezha-cli`: `run` adds the PostgreSQL application as the
+host-provided module `application` (a reserved name no block can register), so the kernel host
+applies or verifies its migrations with every module's, then starts it on the project pool and nests
+its routes under `/v1/application`.
 
 ```rust
 pub(crate) trait DurableStore: Send + Sync {
@@ -134,8 +145,8 @@ Option<Identity>`, serialized with `skip_serializing_if = "Option::is_none"`, so
 receipt keys keep encoding byte for byte. PostgreSQL-only operations (partitions, rebuild staging,
 reactors, advisory locks) are inherent methods of `PostgresStore` used by `postgres/runner.rs`.
 
-Opening: `PostgresStore::connect(ctx: &AppContext, config: &Config) -> impl Future` runs in the
-async startup. It verifies that migrations are current (the kernel runner), checks or inserts the
+Opening: `PostgresStore::connect(db: &Database, config: &Config, options: PostgresOptions,
+deadline: Instant) -> impl Future` runs in the async startup (the module's `start`). It verifies that migrations are current (the kernel runner), checks or inserts the
 manifest row, and syncs projection and reactor rows. Then `Application::with_postgres(config, guest,
 authorizer, store)` constructs synchronously.
 
@@ -273,7 +284,7 @@ LANGUAGE sql SET search_path = '' AS $$
      WHERE r.tag = p_tag AND r.tenant = p_tenant AND r.actor = p_actor AND r.key = p_key $$;
 
 CREATE FUNCTION merezha_app.append(
-    p_stream text, p_tenant text,                  -- p_tenant NULL for global streams
+    p_stream text, p_tenant text,                  -- p_tenant NULL for application streams
     p_expected bigint,
     p_tags text[], p_schema_versions integer[], p_payloads json[],
     p_metadata json, p_accepted_unix_ms bigint,
@@ -291,13 +302,22 @@ DECLARE
 BEGIN
     IF p_key IS NOT NULL THEN
         v_digest := sha256(convert_to(p_fingerprint, 'UTF8'));
-        RETURN QUERY SELECT * FROM merezha_app.lookup_receipt(p_key_tag, p_key_tenant, p_key_actor, p_key, v_digest);
-        IF FOUND THEN RETURN; END IF;
     END IF;
-    -- Fail fast without the lock when the precondition is already stale.
+    -- Fail fast without the lock when the precondition is already stale. The
+    -- stream check runs before the receipt lookup: a same-key commit landing
+    -- between the two is then found by the lookup, and one landing before the
+    -- check by the lookup of the conflict branch, so it replays either way.
     SELECT coalesce(max(s.version), 0) INTO v_current FROM merezha_app.streams s WHERE s.stream = p_stream;
     IF v_current <> p_expected THEN
+        IF p_key IS NOT NULL THEN
+            RETURN QUERY SELECT * FROM merezha_app.lookup_receipt(p_key_tag, p_key_tenant, p_key_actor, p_key, v_digest);
+            IF FOUND THEN RETURN; END IF;
+        END IF;
         RETURN QUERY SELECT 'conflict'::text, v_current, 0::bigint, 0; RETURN;
+    END IF;
+    IF p_key IS NOT NULL THEN
+        RETURN QUERY SELECT * FROM merezha_app.lookup_receipt(p_key_tag, p_key_tenant, p_key_actor, p_key, v_digest);
+        IF FOUND THEN RETURN; END IF;
     END IF;
 
     IF v_n > 0 THEN
@@ -311,6 +331,10 @@ BEGIN
         END IF;
         SELECT coalesce(max(s.version), 0) INTO v_current FROM merezha_app.streams s WHERE s.stream = p_stream;
         IF v_current <> p_expected THEN
+            IF p_key IS NOT NULL THEN
+                RETURN QUERY SELECT * FROM merezha_app.lookup_receipt(p_key_tag, p_key_tenant, p_key_actor, p_key, v_digest);
+                IF FOUND THEN RETURN; END IF;
+            END IF;
             RETURN QUERY SELECT 'conflict'::text, v_current, v_base, 0; RETURN;
         END IF;
         UPDATE merezha_app.head SET position = v_base + v_n WHERE id = 1;
@@ -353,11 +377,30 @@ and `conflict` to `concurrency_conflict`. SQLSTATE `55P03` (lock timeout) maps t
 `SqliteStore::commit_command` does. The `UNIQUE (stream, version)` and `head` CHECK constraints are
 a backstop only.
 
-`p_lock_timeout_ms` is `min(remaining deadline − 50 ms, 5000)`. With less than 50 ms left, the host
-fails `timeout` before calling.
+`p_lock_timeout_ms` is `min(remaining deadline − 50 ms, application.append.lock_timeout_max_ms)`,
+computed after the pooled session is acquired and the statement prepared, so a slow acquire shortens
+the lock wait instead of outliving the caller. With less than 50 ms left at that point the host fails
+`timeout` without sending the append. The append is pipelined in one round trip between `SET
+statement_timeout = min(remaining − 25 ms, database.statement_timeout_ms)` and `RESET
+statement_timeout`, so the server ends the statement (a definite rollback, `timeout`) before the
+caller's deadline and never past the operator's ceiling; the lock wait is a further 25 ms shorter, so
+a held lock answers `storage_busy`. Each of the three statements is bounded on its own: an append that
+answered keeps its known outcome even when only the reset fails or comes late. A session whose reset
+failed or whose outcome is unknown is closed rather than returned to the pool.
+
+**Same-key races.** The stream fail-fast check runs before the receipt lookup, and every `conflict`
+branch with a key looks the receipt up again before answering. A same-key commit by another
+instance at any point of the call therefore replays instead of surfacing as a conflict. One level
+up, a keyed command whose explicit `expected_version` turns stale after the fast-path replay checks
+`receipt()` once more before failing `concurrency_conflict`. Stored events and projection states are
+read up to the hard ceilings (65,536 and 262,144 bytes); the configured `max_payload_bytes` and
+`max_state_bytes` bind writes only, so lowering them in a rolling deploy keeps history readable.
 
 The trace columns hold the command span's context (TE §2.2). They are not part of `StoredEvent`
-and never reach guests; `read_all` returns them only for span links.
+and never reach guests; `read_all` returns them only for span links. The store reads the context through
+`postgres::TraceSource::current()` on the committing thread, so it sees the command span; TE-T3
+implements the source from the current span, and without one the columns stay NULL. A malformed
+context is stored as NULL rather than failing the command.
 
 ## A.5 Contiguous positions with several instances
 

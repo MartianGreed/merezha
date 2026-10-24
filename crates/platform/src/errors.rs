@@ -159,6 +159,7 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("storage_unavailable", 503),
     ErrorCode::new("store_capacity", 503),
     ErrorCode::new("store_unavailable", 503),
+    ErrorCode::new("event_feed_gap", 503),
     ErrorCode::new("migration_lock_timeout", 503),
     ErrorCode::new("migration_timeout", 503),
     ErrorCode::new("listener_failed", 503),

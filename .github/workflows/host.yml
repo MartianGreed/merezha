@@ -34,6 +34,10 @@ jobs:
       - run: cargo +1.98.0 check --locked --workspace
       - run: cargo +1.98.0 clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo +1.98.0 test --locked --workspace
+      # AP §E: the append throughput is recorded in the log, never gated.
+      - name: Append throughput (recorded, not gated)
+        continue-on-error: true
+        run: cargo +1.98.0 test --locked -p merezha-application --test postgres -- --ignored --nocapture append_throughput
       - run: cargo +1.98.0 test --locked --workspace --doc
       - run: cargo +1.98.0 doc --locked --workspace --no-deps
       - run: cargo +1.98.0 build --locked --workspace

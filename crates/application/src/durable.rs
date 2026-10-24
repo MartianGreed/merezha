@@ -1,6 +1,6 @@
 //! The internal seam between `Application` and its durable stores (SQLite
-//! now, PostgreSQL from AP-A2). Every method runs SQL only, never guest
-//! code, and is bounded by the admitted deadline.
+//! and PostgreSQL). Every method runs SQL only, never guest code, and is
+//! bounded by the admitted deadline.
 use crate::application::{Key, ProjectionState};
 use merezha_domain::{Event, Failure, Identity, Metadata, Receipt, StoredEvent};
 use std::time::Instant;
@@ -21,9 +21,12 @@ pub(crate) struct CommitCommand<'a> {
 /// join here in AP-C2.
 pub(crate) struct ProjectionRef<'a> {
     pub name: &'a Identity,
-    #[expect(
-        dead_code,
-        reason = "SQLite fingerprints revisions; PostgreSQL keys rows by (name, revision) from AP-A2"
+    #[cfg_attr(
+        not(feature = "postgres"),
+        expect(
+            dead_code,
+            reason = "SQLite fingerprints revisions; PostgreSQL keys rows by (name, revision)"
+        )
     )]
     pub revision: u32,
 }

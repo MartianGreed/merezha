@@ -54,7 +54,9 @@ pub fn app_with_application(
 ) -> Router {
     app(runtime).merge(application_http::router(application, None))
 }
+pub mod application_cli;
 pub mod application_http;
+pub mod application_module;
 pub mod notifications;
 pub mod run;
 
@@ -76,6 +78,15 @@ pub fn open_application(
     runtime: Runtime,
     authorizer: Arc<dyn merezha_application::Authorizer>,
 ) -> Result<merezha_application::Application, merezha_domain::Failure> {
+    let config = read_application_config(path)?;
+    merezha_application::Application::open(config, Arc::new(runtime), authorizer)
+}
+/// Read and validate an application configuration file. Blocking. Fails
+/// `invalid_application_config` for an unreadable or oversized file, or the
+/// configuration codes of the application layer.
+pub fn read_application_config(
+    path: &std::path::Path,
+) -> Result<merezha_application::config::Config, merezha_domain::Failure> {
     use merezha_domain::Failure;
     use std::io::Read;
     let invalid = || Failure::permanent("invalid_application_config");
@@ -90,8 +101,7 @@ pub fn open_application(
     file.take(65_537)
         .read_to_string(&mut text)
         .map_err(|_| invalid())?;
-    let config = merezha_application::config::Config::parse(&text)?;
-    merezha_application::Application::open(config, Arc::new(runtime), authorizer)
+    merezha_application::config::Config::parse(&text)
 }
 
 async fn admission(State(state): State<AppState>, request: Request, next: Next) -> Response {
