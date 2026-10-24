@@ -142,9 +142,12 @@ pub trait Jobs: Send + Sync {
         source: &'a Source,
         job: NewJob,
     ) -> BoxFuture<'a, Result<Enqueued, Failure>>;
-    /// `available` to `cancelled`, nulling a flagged payload; `false` when
-    /// the job is missing, running or terminal.
-    fn cancel(&self, id: i64) -> BoxFuture<'_, Result<bool, Failure>>;
+    /// `available` to `cancelled`, nulling a flagged payload, for a job
+    /// `source` owns: its key starts with `{source}:` (enqueued or relayed
+    /// from its own `Job` records) or its kind is one `source` registered.
+    /// `false` when the job is missing, running, terminal or another
+    /// module's, without telling those apart.
+    fn cancel<'a>(&'a self, source: &'a Source, id: i64) -> BoxFuture<'a, Result<bool, Failure>>;
     /// Declare the handler of a kind. A kind has one owner.
     fn register(&self, source: &Source, registration: JobRegistration) -> Result<(), Failure>;
     /// Fan event records on `topic` out to jobs of `kind`, which `source`
@@ -179,7 +182,7 @@ impl JobsHandle {
     }
     /// See [`Jobs::cancel`].
     pub async fn cancel(&self, id: i64) -> Result<bool, Failure> {
-        self.inner.cancel(id).await
+        self.inner.cancel(&self.source, id).await
     }
     /// Declare the handler of `kind` on `queue`; must run before the jobs
     /// runtime starts. Fails permanent `validation_failed` for names that
@@ -216,7 +219,7 @@ impl Jobs for UnavailableJobs {
     fn enqueue<'a>(&'a self, _: &'a Source, _: NewJob) -> BoxFuture<'a, Result<Enqueued, Failure>> {
         Box::pin(async { Err(Failure::permanent("jobs_unavailable")) })
     }
-    fn cancel(&self, _: i64) -> BoxFuture<'_, Result<bool, Failure>> {
+    fn cancel<'a>(&'a self, _: &'a Source, _: i64) -> BoxFuture<'a, Result<bool, Failure>> {
         Box::pin(async { Err(Failure::permanent("jobs_unavailable")) })
     }
     fn register(&self, _: &Source, _: JobRegistration) -> Result<(), Failure> {

@@ -31,7 +31,11 @@ CREATE TABLE merezha_jobs.outbox (
     UNIQUE (source, dedupe_key),
     CHECK ((quarantined_at IS NULL) = (quarantine_code IS NULL)),
     CHECK (relayed_at IS NULL OR quarantined_at IS NULL),
-    CHECK ((payload IS NULL) = (contains_secret AND coalesce(relayed_at, quarantined_at) IS NOT NULL)),
+    -- R3: a flagged record loses its payload once relayed or quarantined as
+    -- unroutable; a record isolated by its own data error keeps it, so a
+    -- requeue can relay it.
+    CHECK ((payload IS NULL) = (contains_secret
+        AND (relayed_at IS NOT NULL OR quarantine_code IS NOT DISTINCT FROM 'unroutable'))),
     CHECK ((record_kind = 'event' AND topic IS NOT NULL AND queue IS NULL AND job_kind IS NULL)
         OR (record_kind = 'job' AND topic IS NULL AND queue IS NOT NULL AND job_kind IS NOT NULL)));
 CREATE INDEX outbox_pending ON merezha_jobs.outbox (id)
@@ -44,6 +48,9 @@ CREATE TABLE merezha_jobs.subscriptions (
     queue text NOT NULL,
     source text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
+    -- Set when the running version no longer declares the subscription;
+    -- the relay routes only to rows where it is NULL.
+    deactivated_at timestamptz NULL,
     PRIMARY KEY (topic, job_kind));
 
 CREATE TABLE merezha_jobs.jobs (

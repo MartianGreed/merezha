@@ -430,7 +430,8 @@ dot, `<area>.<noun>_<verb>`.
 `module.source_refused`,
 `http.request.completed`, `health.ready`, `health.not_ready`,
 `notification.captured`, and from the jobs runtime `outbox.relayed`,
-`outbox.quarantined`, `job.admin_action`, `db.listener_lost`,
+`outbox.quarantined`, `outbox.relay_failed`, `job.admin_action`,
+`job.subscription_sync_failed`, `db.listener_lost`,
 `db.listener_restored`.
 
 K2 renamed `database.connected`, `database.unavailable`,
@@ -563,7 +564,9 @@ first failed use.
   pool and the detached budget that `LISTEN`s on up to 8 channels. It hands
   out notifications as wake-up signals: at most 64 wait unread and later
   ones are dropped until the reader catches up. `Listener::recv` returns
-  `None` once the session ended, and the caller reconnects. The jobs relay
+  `None` once the session ended, and the caller reconnects;
+  `Listener::check(deadline)` runs `SELECT 1` to detect a half-open
+  session. The jobs relay
   holds one per host.
 
 ### Migrations
@@ -706,15 +709,21 @@ state, and the R10 trace columns.
   under the key `{source}:{key}`, the key a `Job` record of the same source
   and dedupe key relays to. The same key with the same kind and payload
   returns the existing id (`existed`); another kind or payload fails
-  `idempotency_mismatch`. `cancel` moves an `available` job to `cancelled`
-  and nulls a flagged payload.
+  `idempotency_mismatch`. A new job notifies `merezha_jobs` with its queue
+  on commit. `cancel` moves an `available` job to `cancelled` and nulls a
+  flagged payload, for jobs the calling module owns only: the key starts
+  with `{source}:` or the kind is one it registered. Any other id returns
+  `false`, whether the job exists or not.
 - **Register and subscribe.** Modules declare handlers and subscriptions
   from `Module::start`; each kind has one owner (`kind_already_registered`),
   a module subscribes only kinds it registered (`kind_not_registered`), and
   later calls fail `jobs_started`. At start the runtime upserts
-  `merezha_jobs.subscriptions` before its first relay pass and reports
-  ready once that succeeded, so pending migrations in verify mode keep it
-  not ready instead of failing startup.
+  `merezha_jobs.subscriptions` and sets `deactivated_at` on the rows this
+  version no longer declares (kept as history, no longer routed to,
+  reactivated when declared again), before its first relay pass. It
+  reports ready once that succeeded, so pending migrations in verify mode
+  keep it not ready instead of failing startup; each failure streak logs
+  `job.subscription_sync_failed`.
 - **Relay.** One background task per host, woken by `LISTEN
   merezha_jobs_outbox`, by `jobs.relay.interval_ms` and once at start, so
   records committed before a crash relay after the restart. Each batch of
@@ -726,23 +735,35 @@ state, and the R10 trace columns.
   without a subscription are marked relayed and counted
   (`PgJobs::unrouted`). `FOR UPDATE SKIP LOCKED` lets several hosts relay
   at once. A record the jobs table would refuse is quarantined with code
-  `unroutable`; any other permanent failure re-runs the batch one record at
-  a time and quarantines the record that fails alone with its error code.
-  Each quarantine logs `outbox.quarantined`. A lost `LISTEN` session logs
-  `db.listener_lost`, falls back to the interval and reconnects.
+  `unroutable`, and a flagged one loses its payload. A data error of the
+  batch's rows (SQLSTATE classes 22 and 23) re-runs the batch one record at
+  a time and quarantines the record that fails alone with its code
+  (`constraint_violation`, `invalid_record_data`), keeping its payload so a
+  requeue can relay it. Each quarantine logs `outbox.quarantined`. Any
+  other error, such as a revoked privilege or a failing trigger, aborts the
+  batch without quarantining anything, logs `outbox.relay_failed` once per
+  failure streak and is retried at the interval. A lost `LISTEN` session
+  logs `db.listener_lost`, falls back to the interval and reconnects; an
+  idle session is probed with `SELECT 1` every 30 s, so a half-open one is
+  noticed too.
 - **Requeue.** `PgJobs::requeue_outbox(id, principal)` returns a
   quarantined record to pending with an `admin_actions` row; a flagged one
-  fails `409 secret_purged` (R4a), others `not_quarantined` or `not_found`.
+  quarantined as `unroutable` fails `409 secret_purged` (R4a), others
+  `not_quarantined` or `not_found`.
   The HTTP route arrives with the jobs admin API (AP-B2).
 
 Error codes it registers: `invalid_topic`, `invalid_queue`,
-`invalid_run_at`, `invalid_event_envelope`, `job_payload_limit`,
+`invalid_run_at`, `invalid_event_envelope`, `invalid_record_data`, `job_payload_limit`,
 `kind_already_registered`, `kind_not_registered`, `too_many_kinds` and
 `jobs_started` (422), `not_quarantined` (409), `jobs_not_ready` (503).
 
 Process tests hold the relay with `MEREZHA_JOBS_TEST_RELAY=off` (or
 `interval`, no `LISTEN`). Only builds with the `test-hooks` feature read
-it, which `merezha-cli`'s tests enable; release builds ignore it.
+it. `merezha-cli`'s dev-dependency enables it, and Cargo unifies that into
+every build that compiles the dev-dependencies: the `merezha` binary built
+by `cargo test` or `--all-targets` reads the variable. Builds without them,
+such as `cargo build --release -p merezha-cli` or `cargo build
+--workspace`, ignore it.
 
 ## Dependencies
 

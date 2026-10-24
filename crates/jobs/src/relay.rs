@@ -33,7 +33,8 @@ WITH queues (queue, max_attempts) AS (
     SELECT b.id, s.queue, s.job_kind AS kind, 'outbox:' || b.id || ':' || s.job_kind AS key,
            b.priority, b.run_at, b.payload, b.contains_secret,
            b.correlation_id, b.causation_id, b.tenant, b.trace_parent, b.trace_state
-      FROM batch b JOIN merezha_jobs.subscriptions s ON s.topic = b.topic
+      FROM batch b JOIN merezha_jobs.subscriptions s
+                    ON s.topic = b.topic AND s.deactivated_at IS NULL
      WHERE b.record_kind = 'event'
     UNION ALL
     SELECT b.id, b.queue, b.job_kind, b.source || ':' || b.dedupe_key,
@@ -73,10 +74,11 @@ SELECT (SELECT count(*) FROM marked WHERE routable) AS relayed,
 const PENDING_IDS: &str = "SELECT id FROM merezha_jobs.outbox
  WHERE relayed_at IS NULL AND quarantined_at IS NULL ORDER BY id LIMIT $1";
 
-/// Sets one record aside with the code of the failure it caused alone.
+/// Sets one record aside with the code of the data error it caused alone.
+/// Its payload stays, flagged or not, so a requeue can relay it once the
+/// cause is fixed; R3 nulls it at the resulting job's terminal state.
 const QUARANTINE: &str = "UPDATE merezha_jobs.outbox
-   SET quarantined_at = now(), quarantine_code = $2,
-       payload = CASE WHEN contains_secret THEN NULL ELSE payload END
+   SET quarantined_at = now(), quarantine_code = $2
  WHERE id = $1 AND relayed_at IS NULL AND quarantined_at IS NULL
  RETURNING source";
 
@@ -135,6 +137,23 @@ impl RelayReport {
     }
 }
 
+/// Relay failures: a data error the batch's rows caused (SQLSTATE classes
+/// 22 and 23) is permanent, so the batch is re-run record by record; any
+/// other error, a revoked privilege, a broken trigger or a missing table,
+/// is systemic and becomes transient, so the relay retries at the interval
+/// and quarantines nothing.
+fn relay_failure(error: &merezha_postgres::tokio_postgres::Error) -> Failure {
+    let failure = classify(error);
+    match error.code().map(|code| &code.code()[..2]) {
+        Some("23") => Failure::permanent(&failure.code),
+        Some("22") => Failure::permanent("invalid_record_data"),
+        _ if failure.classification == Classification::Permanent => {
+            Failure::transient(&failure.code)
+        }
+        _ => failure,
+    }
+}
+
 fn count(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
@@ -161,7 +180,7 @@ async fn pass(
                         ],
                     )
                     .await
-                    .map_err(|e| classify(&e))?;
+                    .map_err(|e| relay_failure(&e))?;
                 let queues: Option<Vec<String>> = row.get(3);
                 if let Some(queues) = queues.filter(|q| !q.is_empty()) {
                     tx.execute(
@@ -169,7 +188,7 @@ async fn pass(
                         &[&queues],
                     )
                     .await
-                    .map_err(|e| classify(&e))?;
+                    .map_err(|e| relay_failure(&e))?;
                 }
                 let ids: Option<Vec<i64>> = row.get(4);
                 let sources: Option<Vec<String>> = row.get(5);
@@ -211,7 +230,7 @@ async fn batch(
         client
             .query(PENDING_IDS, &[&settings.batch])
             .await
-            .map_err(|e| classify(&e))?
+            .map_err(|e| relay_failure(&e))?
             .iter()
             .map(|row| row.get(0))
             .collect()
@@ -230,7 +249,7 @@ async fn batch(
                             let row = tx
                                 .query_opt(QUARANTINE, &[&id, &code])
                                 .await
-                                .map_err(|e| classify(&e))?;
+                                .map_err(|e| relay_failure(&e))?;
                             Ok(row.map(|row| row.get::<_, String>(0)))
                         })
                     })

@@ -41,6 +41,7 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("invalid_queue", 422),
     ErrorCode::new("invalid_run_at", 422),
     ErrorCode::new("invalid_event_envelope", 422),
+    ErrorCode::new("invalid_record_data", 422),
     ErrorCode::new("job_payload_limit", 422),
     ErrorCode::new("kind_already_registered", 422),
     ErrorCode::new("kind_not_registered", 422),
@@ -55,7 +56,9 @@ pub const MAX_KINDS: usize = 1024;
 const MAX_BATCHES_PER_WAKE: usize = 64;
 /// Bound on enqueue, cancel, requeue and subscription sync.
 const OPERATION_DEADLINE: Duration = Duration::from_secs(10);
-/// Bound on opening the `LISTEN` session.
+/// How often an idle `LISTEN` session is probed with `SELECT 1`.
+pub const LISTEN_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// Bound on opening and probing the `LISTEN` session.
 const LISTEN_DEADLINE: Duration = Duration::from_secs(5);
 /// The process-test hook (feature `test-hooks`): `off` keeps the relay
 /// stopped, `interval` relays on the interval only.
@@ -181,8 +184,10 @@ impl PgJobs {
     /// Return a quarantined record to pending once its cause is fixed
     /// (D.1 `POST outbox/{id}/requeue`), with an `admin_actions` row for
     /// `principal`. Fails `not_found`, conflict `secret_purged` for a
-    /// flagged record, whose payload is gone (the owning module issues it
-    /// again), or conflict `not_quarantined`.
+    /// flagged record quarantined as `unroutable`, whose payload is gone
+    /// (the owning module issues it again), or conflict `not_quarantined`.
+    /// A record isolated by its own data error kept its payload and can be
+    /// requeued, flagged or not.
     pub async fn requeue_outbox(&self, id: i64, principal: Option<&str>) -> Result<(), Failure> {
         let principal = principal.map(str::to_owned);
         self.database()?
@@ -191,7 +196,8 @@ impl PgJobs {
                     let requeued = tx
                         .query_opt(
                             "UPDATE merezha_jobs.outbox SET quarantined_at = NULL, quarantine_code = NULL
-                              WHERE id = $1 AND quarantined_at IS NOT NULL AND NOT contains_secret
+                              WHERE id = $1 AND quarantined_at IS NOT NULL
+                                AND NOT (contains_secret AND payload IS NULL)
                              RETURNING id",
                             &[&id],
                         )
@@ -200,7 +206,7 @@ impl PgJobs {
                     if requeued.is_none() {
                         let row = tx
                             .query_opt(
-                                "SELECT contains_secret, quarantined_at IS NOT NULL
+                                "SELECT contains_secret AND payload IS NULL, quarantined_at IS NOT NULL
                                    FROM merezha_jobs.outbox WHERE id = $1",
                                 &[&id],
                             )
@@ -250,7 +256,9 @@ impl PgJobs {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
         Ok(())
     }
-    /// Upsert every declared subscription.
+    /// Upsert every declared subscription and deactivate the rows this
+    /// version no longer declares: the relay stops routing to them, and the
+    /// rows stay as history until a version declares them again.
     async fn sync_subscriptions(&self, database: &Database) -> Result<(), Failure> {
         let (topics, kinds, queues, sources) = {
             let registry = self.registry();
@@ -263,23 +271,40 @@ impl PgJobs {
             }
             columns
         };
-        if topics.is_empty() {
-            return Ok(());
-        }
-        let client = database
-            .acquire(Instant::now() + OPERATION_DEADLINE)
-            .await?;
-        client
-            .execute(
-                "INSERT INTO merezha_jobs.subscriptions (topic, job_kind, queue, source)
-                 SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[])
-                 ON CONFLICT (topic, job_kind)
-                 DO UPDATE SET queue = excluded.queue, source = excluded.source",
-                &[&topics, &kinds, &queues, &sources],
-            )
+        database
+            .transaction(Instant::now() + OPERATION_DEADLINE, move |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO merezha_jobs.subscriptions (topic, job_kind, queue, source)
+                         SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[])
+                         ON CONFLICT (topic, job_kind)
+                         DO UPDATE SET queue = excluded.queue, source = excluded.source,
+                                       deactivated_at = NULL",
+                        &[&topics, &kinds, &queues, &sources],
+                    )
+                    .await
+                    .map_err(|e| classify(&e))?;
+                    tx.execute(
+                        "UPDATE merezha_jobs.subscriptions s SET deactivated_at = now()
+                          WHERE deactivated_at IS NULL
+                            AND NOT EXISTS (SELECT 1 FROM unnest($1::text[], $2::text[]) AS d(topic, kind)
+                                             WHERE d.topic = s.topic AND d.kind = s.job_kind)",
+                        &[&topics, &kinds],
+                    )
+                    .await
+                    .map_err(|e| classify(&e))?;
+                    Ok(())
+                })
+            })
             .await
-            .map_err(|e| classify(&e))?;
-        Ok(())
+    }
+}
+
+fn classification(failure: &Failure) -> &'static str {
+    match failure.classification {
+        merezha_domain::Classification::Permanent => "permanent",
+        merezha_domain::Classification::Transient => "transient",
+        merezha_domain::Classification::Conflict => "conflict",
     }
 }
 
@@ -308,8 +333,12 @@ async fn background(
         match jobs.sync_subscriptions(&database).await {
             Ok(()) => break,
             Err(failure) => {
-                if !failing && failure.classification != merezha_domain::Classification::Permanent {
-                    tracing::error!(event = "db.unavailable", code = failure.code.as_str());
+                if !failing {
+                    tracing::warn!(
+                        event = "job.subscription_sync_failed",
+                        code = failure.code.as_str(),
+                        classification = classification(&failure)
+                    );
                 }
                 failing = true;
             }
@@ -328,6 +357,7 @@ async fn background(
         return;
     }
     let mut listener: Option<Listener> = None;
+    let mut next_check = tokio::time::Instant::now() + LISTEN_CHECK_INTERVAL;
     let mut lost = false;
     let mut failing = false;
     loop {
@@ -345,6 +375,7 @@ async fn background(
                     }
                     lost = false;
                     listener = Some(session);
+                    next_check = tokio::time::Instant::now() + LISTEN_CHECK_INTERVAL;
                 }
                 Err(failure) => {
                     if !lost {
@@ -363,8 +394,14 @@ async fn background(
                 drained
             }
             Err(failure) => {
+                // Systemic failures abort the batch and retry at the
+                // interval; nothing is quarantined for them.
                 if !failing {
-                    tracing::error!(event = "db.unavailable", code = failure.code.as_str());
+                    tracing::error!(
+                        event = "outbox.relay_failed",
+                        code = failure.code.as_str(),
+                        classification = classification(&failure)
+                    );
                 }
                 failing = true;
                 true
@@ -375,6 +412,19 @@ async fn background(
         }
         tokio::select! {
             _ = stop.changed() => return,
+            () = tokio::time::sleep_until(next_check), if listener.is_some() => {
+                next_check = tokio::time::Instant::now() + LISTEN_CHECK_INTERVAL;
+                // A half-open session never ends by itself: probe it.
+                let probe = match &listener {
+                    Some(session) => session.check(Instant::now() + LISTEN_DEADLINE).await,
+                    None => Ok(()),
+                };
+                if let Err(failure) = probe {
+                    listener = None;
+                    tracing::warn!(event = "db.listener_lost", code = failure.code.as_str());
+                    lost = true;
+                }
+            }
             alive = notified(&mut listener) => {
                 if alive {
                     // Coalesce a burst into one pass.
@@ -499,6 +549,10 @@ impl Jobs for PgJobs {
                             .await
                             .map_err(|e| classify(&e))?;
                         if let Some(row) = inserted {
+                            // Wake the queue's dispatchers (AP-B2), on commit.
+                            tx.execute("SELECT pg_notify('merezha_jobs', $1)", &[&queue])
+                                .await
+                                .map_err(|e| classify(&e))?;
                             return Ok(Enqueued {
                                 id: row.get(0),
                                 existed: false,
@@ -527,7 +581,14 @@ impl Jobs for PgJobs {
                 .await
         })
     }
-    fn cancel(&self, id: i64) -> BoxFuture<'_, Result<bool, Failure>> {
+    fn cancel<'a>(&'a self, source: &'a Source, id: i64) -> BoxFuture<'a, Result<bool, Failure>> {
+        let kinds: Vec<String> = self
+            .registry()
+            .kinds
+            .iter()
+            .filter(|(_, kind)| kind.source == *source)
+            .map(|(name, _)| name.clone())
+            .collect();
         Box::pin(async move {
             let client = self
                 .database()?
@@ -538,8 +599,9 @@ impl Jobs for PgJobs {
                     "UPDATE merezha_jobs.jobs
                         SET state = 'cancelled', finished_at = now(), updated_at = now(),
                             payload = CASE WHEN contains_secret THEN NULL ELSE payload END
-                      WHERE id = $1 AND state = 'available'",
-                    &[&id],
+                      WHERE id = $1 AND state = 'available'
+                        AND (starts_with(idempotency_key, $2::text || ':') OR kind = ANY($3::text[]))",
+                    &[&id, &source.as_str(), &kinds],
                 )
                 .await
                 .map_err(|e| classify(&e))?;

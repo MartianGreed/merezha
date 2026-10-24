@@ -35,7 +35,7 @@ pub struct Notification {
 
 /// A session listening on its channels. Dropping it closes the session.
 pub struct Listener {
-    _client: Client,
+    client: Client,
     receiver: tokio::sync::mpsc::Receiver<Notification>,
     driver: tokio::task::JoinHandle<()>,
 }
@@ -48,6 +48,18 @@ impl Listener {
     /// The next notification, or `None` once the session ended.
     pub async fn recv(&mut self) -> Option<Notification> {
         self.receiver.recv().await
+    }
+    /// Prove the session still answers: `SELECT 1` before `deadline`. A
+    /// half-open connection never ends by itself, so a reader that waits
+    /// long between notifications probes it and reconnects on failure.
+    /// Fails like [`crate::Database::ping`].
+    pub async fn check(&self, deadline: Instant) -> Result<(), Failure> {
+        let at = tokio::time::Instant::from_std(deadline);
+        match tokio::time::timeout_at(at, self.client.simple_query("SELECT 1")).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(classify(&error)),
+            Err(_) => Err(Failure::transient("database_timeout")),
+        }
     }
     /// A waiting notification without blocking, for draining a burst.
     pub fn try_recv(&mut self) -> Option<Notification> {
@@ -109,7 +121,7 @@ pub(crate) async fn open(
         Err(_) => return Err(Failure::transient("database_timeout")),
     };
     let listener = Listener {
-        _client: client,
+        client,
         receiver,
         driver,
     };
@@ -117,7 +129,7 @@ pub(crate) async fn open(
         .iter()
         .map(|channel| format!("LISTEN {channel};"))
         .collect();
-    match tokio::time::timeout_at(at, listener._client.batch_execute(&statements)).await {
+    match tokio::time::timeout_at(at, listener.client.batch_execute(&statements)).await {
         Ok(Ok(())) => Ok(listener),
         Ok(Err(error)) => Err(classify(&error)),
         Err(_) => Err(Failure::transient("database_timeout")),
