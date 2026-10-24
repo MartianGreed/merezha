@@ -134,6 +134,9 @@ pub struct Pause {
     entered: AtomicBool,
     millis: AtomicU64,
     projection: Mutex<String>,
+    /// Pause in a server-side `pg_sleep` instead, so the backend is busy
+    /// in a statement when the run is cut.
+    statement: AtomicBool,
 }
 impl Pause {
     /// Pause the next commit of `projection` for `duration`.
@@ -141,8 +144,14 @@ impl Pause {
         *self.projection.lock().unwrap_or_else(|e| e.into_inner()) = projection.to_owned();
         self.millis
             .store(duration.as_millis() as u64, Ordering::SeqCst);
+        self.statement.store(false, Ordering::SeqCst);
         self.entered.store(false, Ordering::SeqCst);
         self.armed.store(true, Ordering::SeqCst);
+    }
+    /// Like [`Pause::arm`], with the backend running `pg_sleep` meanwhile.
+    pub fn arm_statement(&self, projection: &str, duration: Duration) {
+        self.arm(projection, duration);
+        self.statement.store(true, Ordering::SeqCst);
     }
     /// Whether a commit is pausing (or paused) since the last `arm`.
     pub fn entered(&self) -> bool {
@@ -539,7 +548,7 @@ impl Session<'_> {
                         )
                         .await
                         .map_err(|e| read_error(&e))?;
-                    pause_in(sleep, &name).await;
+                    pause_in(tx, sleep, &name).await?;
                     row.map(|row| row.get(0))
                         .ok_or_else(|| Failure::conflict("projection_conflict"))
                 })
@@ -548,15 +557,28 @@ impl Session<'_> {
     }
 }
 /// The test hook's pause inside a commit transaction: the transaction
-/// stays open, idle, so only the run's own bounds can end it.
-async fn pause_in(pause: Option<Arc<Pause>>, projection: &str) {
+/// stays open, idle or in a `pg_sleep`, so only the run's own bounds can
+/// end it.
+async fn pause_in(
+    tx: &merezha_postgres::Tx<'_>,
+    pause: Option<Arc<Pause>>,
+    projection: &str,
+) -> Result<(), Failure> {
     if let Some(pause) = pause
         && *pause.projection.lock().unwrap_or_else(|e| e.into_inner()) == projection
         && pause.armed.swap(false, Ordering::SeqCst)
     {
         pause.entered.store(true, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(pause.millis.load(Ordering::SeqCst))).await;
+        let duration = Duration::from_millis(pause.millis.load(Ordering::SeqCst));
+        if pause.statement.load(Ordering::SeqCst) {
+            tx.batch_execute(&format!("SELECT pg_sleep({})", duration.as_secs_f64()))
+                .await
+                .map_err(|e| read_error(&e))?;
+        } else {
+            tokio::time::sleep(duration).await;
+        }
     }
+    Ok(())
 }
 
 /// Which head a live run works towards.
@@ -721,7 +743,7 @@ impl Session<'_> {
                         )
                         .await
                         .map_err(|e| read_error(&e))?;
-                    pause_in(sleep, &name).await;
+                    pause_in(tx, sleep, &name).await?;
                     Ok(row.map(|row| row.get(0)))
                 })
             }),
@@ -772,7 +794,7 @@ impl Session<'_> {
                     )
                     .await
                     .map_err(|e| read_error(&e))?;
-                    pause_in(sleep, &name).await;
+                    pause_in(tx, sleep, &name).await?;
                     Ok(Some((state, checkpoint)))
                 })
             }),

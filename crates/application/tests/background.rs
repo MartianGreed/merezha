@@ -620,6 +620,9 @@ fn a_run_without_the_lock_loses_its_cas_and_writes_nothing() {
 enum Cut {
     /// The future is dropped while its commit transaction is open.
     Drop,
+    /// The future is dropped while its backend runs a statement: the
+    /// session's `client_connection_check_interval` ends it (CT-C2).
+    Statement,
     /// The run's hard deadline (`timeout_at`) ends the commit.
     Deadline,
     /// The guest panics inside the run.
@@ -632,7 +635,7 @@ enum Cut {
 /// left no rows and no pooled session holds a run lock.
 #[test]
 fn cancelled_runs_release_their_lock_and_leave_no_rows() {
-    for cut in [Cut::Drop, Cut::Deadline, Cut::Panic] {
+    for cut in [Cut::Drop, Cut::Statement, Cut::Deadline, Cut::Panic] {
         for rebuild in [false, true] {
             cancelled_run(cut, rebuild);
         }
@@ -660,6 +663,7 @@ fn cancelled_run(cut: Cut, rebuild: bool) {
     }
     match cut {
         Cut::Drop | Cut::Deadline => pause.arm("count", Duration::from_secs(3)),
+        Cut::Statement => pause.arm_statement("count", Duration::from_secs(4)),
         Cut::Panic => probe.panic_once.store(true, Ordering::SeqCst),
     }
     let kind = if rebuild { "b" } else { "p" };
@@ -687,7 +691,7 @@ fn cancelled_run(cut: Cut, rebuild: bool) {
             .collect::<Vec<_>>()
     };
     let first = match cut {
-        Cut::Drop | Cut::Deadline => {
+        Cut::Drop | Cut::Statement | Cut::Deadline => {
             until(
                 Duration::from_secs(5),
                 &format!("{what}: the commit pauses"),
@@ -710,12 +714,14 @@ fn cancelled_run(cut: Cut, rebuild: bool) {
     // Nothing of the paused batch is visible.
     assert_eq!(progress(), 0, "{what}");
     let b = pg.start(c.clone(), &probe, manual.clone());
-    if let Cut::Drop = cut {
+    if let Cut::Drop | Cut::Statement = cut {
         a.scheduler.as_ref().unwrap().cancel_runs();
     }
     // The lock is released and the work proceeds within 1 s of the cut.
     let cut_at = match cut {
         Cut::Deadline => Duration::from_millis(1700),
+        // The server notices the closed socket at its next check.
+        Cut::Statement => Duration::from_secs(2),
         _ => Duration::from_millis(1000),
     };
     until(cut_at, &format!("{what}: the lock is released"), || {
