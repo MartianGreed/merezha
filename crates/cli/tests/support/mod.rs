@@ -31,6 +31,9 @@ impl Host {
         command
             .args(["run", "--config"])
             .arg(config)
+            // No load balancer to wait for: stop at once on SIGTERM unless
+            // a test sets the delay itself.
+            .env("MEREZHA_HTTP__DRAIN_DELAY_MS", "0")
             .stdout(Stdio::null())
             .stderr(File::create(&log).unwrap());
         for (key, value) in env {
@@ -48,9 +51,10 @@ impl Host {
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
     }
-    /// Wait for `listener.ready` and return the bound address. The listener
-    /// accepts from then on; `/health/ready` may still answer 503.
-    pub fn listening(&mut self) -> SocketAddr {
+    /// Wait for `listener.ready` and return the bound address. The early
+    /// listener answers `/health/*` from then on and every other route
+    /// `503 starting` until startup completes.
+    pub fn bound(&mut self) -> SocketAddr {
         let deadline = Instant::now() + PROCESS_BOUND;
         loop {
             if let Some(event) = self
@@ -68,6 +72,23 @@ impl Host {
             assert!(Instant::now() < deadline, "listening timeout: {text}");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+    /// Wait for `listener.ready`, then for `/health/startup` to answer 200:
+    /// startup completed and every route is mounted. `/health/ready` may
+    /// still answer 503.
+    pub fn listening(&mut self) -> SocketAddr {
+        let address = self.bound();
+        let deadline = Instant::now() + PROCESS_BOUND;
+        while request(address, "GET", "/health/startup", "").status != 200 {
+            let text = fs::read_to_string(&self.log).unwrap();
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "host exited during startup: {text}"
+            );
+            assert!(Instant::now() < deadline, "startup timeout: {text}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        address
     }
     /// Wait for `listener.ready`, then for `/health/ready` to answer 200.
     pub fn ready(&mut self) -> SocketAddr {

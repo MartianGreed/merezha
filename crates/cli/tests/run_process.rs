@@ -655,3 +655,111 @@ fn sigterm_releases_a_running_job_with_its_attempt_refunded() {
     );
     fresh.stop();
 }
+
+/// TE §5 and §8 "Health", end to end: `/v1/admin/status` on loopback
+/// embeds the jobs admin data as `GET /v1/jobs/admin/queues` and `outbox`
+/// return it and carries no planted canary; a ten-minute job backlog
+/// leaves readiness at 200 until `jobs.readiness.max_lag_ms` is set.
+#[test]
+fn status_embeds_the_jobs_admin_data_and_backlog_counts_only_with_max_lag() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    const CANARY: &str = "rUn-StAtUs-CaNaRy";
+    let separator = if test.url().contains('?') { '&' } else { '?' };
+    let url = format!("{}{separator}application_name={CANARY}", test.url());
+    let dir = tempfile::tempdir().unwrap();
+    let config = project(dir.path(), "[jobs]\nreaper_interval_ms = 100");
+    let mut relaxed = Host::spawn(&config, &[(DATABASE_ENV, url.as_str())], "relaxed");
+    let address = relaxed.ready();
+    let status = request(
+        address,
+        "GET",
+        &format!("/v1/admin/status?token={CANARY}"),
+        "",
+    );
+    assert_eq!(status.status, 200, "{}", status.body);
+    assert!(status.headers.contains("cache-control: no-store"));
+    assert!(!status.body.to_string().contains(CANARY));
+    let queues = request(address, "GET", "/v1/jobs/admin/queues", "");
+    let outbox = request(address, "GET", "/v1/jobs/admin/outbox", "");
+    assert_eq!(
+        status.body["jobs"],
+        json!({"queues": queues.body["queues"], "outbox": outbox.body}),
+        "the jobs section is AP's admin data as returned (R10)"
+    );
+    assert_eq!(status.body["startup"]["state"], "started");
+    assert_eq!(status.body["catalog"]["generation"], 1);
+    assert_eq!(status.body["catalog"]["services"], 2);
+    assert_eq!(status.body["telemetry"]["enabled"], false);
+    // The memory application's `Application::status()` (R10).
+    assert_eq!(status.body["application"]["head"], 0);
+    assert_eq!(
+        status.body["application"]["projections"][0]["name"],
+        "total"
+    );
+    let modules: Vec<&str> = status.body["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(modules, ["jobs"]);
+
+    // A job no worker serves, due ten minutes ago: the backlog is an
+    // alert, not routing.
+    let runtime = current_thread();
+    let db = Database::connect(&test.config()).unwrap();
+    let id: i64 = query_cell(
+        &runtime,
+        &db,
+        "INSERT INTO merezha_jobs.jobs (queue, kind, idempotency_key, payload, payload_digest,
+             max_attempts, correlation_id, run_at)
+         VALUES ('default', 'tasks.nobody', 'tasks:old', '{}', sha256(convert_to('{}', 'UTF8')), 5,
+             'c1', now() - interval '10 minutes')
+         RETURNING id",
+    );
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert_eq!(request(address, "GET", "/health/ready", "").status, 200);
+    let status = request(address, "GET", "/v1/admin/status", "");
+    assert_eq!(status.body["jobs"]["queues"][0]["ready"], 1);
+    relaxed.stop();
+
+    let strict_config = project(
+        dir.path(),
+        "[jobs]\nreaper_interval_ms = 100\n[jobs.readiness]\nmax_lag_ms = 1000",
+    );
+    let mut strict = Host::spawn(&strict_config, &[(DATABASE_ENV, test.url())], "strict");
+    let address = strict.listening();
+    strict.wait_for_readiness(address, 503);
+    // Still refused once the jobs runtime has synced and measured the lag.
+    std::thread::sleep(Duration::from_millis(2_500));
+    assert_eq!(request(address, "GET", "/health/ready", "").status, 503);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let not_ready = loop {
+        // The stderr writer is buffered; wait for the line.
+        if let Some(event) = strict
+            .events()
+            .into_iter()
+            .find(|e| e["event"] == "health.not_ready")
+        {
+            break event;
+        }
+        assert!(Instant::now() < deadline, "no health.not_ready logged");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(not_ready["check"], "module:jobs", "{not_ready}");
+    assert_eq!(not_ready["code"], "jobs_not_ready");
+    let _: i64 = query_cell(
+        &runtime,
+        &db,
+        &format!(
+            "UPDATE merezha_jobs.jobs SET state = 'cancelled', finished_at = now()
+             WHERE id = {id} RETURNING id"
+        ),
+    );
+    strict.wait_for_readiness(address, 200);
+    strict.stop();
+    let log = fs::read_to_string(&strict.log).unwrap() + &fs::read_to_string(&relaxed.log).unwrap();
+    assert!(!log.contains(CANARY), "the database URL was logged");
+}

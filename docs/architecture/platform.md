@@ -67,22 +67,28 @@ and one `startup.failed` event carrying a stable `code`:
 2. Build the telemetry pipeline from `[telemetry]` and install the log
    subscriber (`telemetry_initialized`, `invalid_telemetry_ca`,
    `telemetry_exporter_failed`). Exporters connect lazily, so a collector
-   that is down never fails or delays startup. From here on, startup runs
-   inside the `startup` span.
-3. Load the runtime manifest (`invalid_manifest`).
-4. Read and validate the optional application configuration, then open a
+   that is down never fails or delays startup.
+3. Bind `http.listen` (`listener_failed`) and log `listener.ready` with the
+   bound address: the early listener (TE §5). Until startup completes it
+   answers `/health/live` with 200, `/health/startup` and `/health/ready`
+   with 503, and every other route with
+   `503 {"error":{"code":"starting","classification":"transient"}}` and
+   `Retry-After: 1`, so a startup probe can cover long migrations. From
+   here on, startup runs inside the `startup` span.
+4. Load the runtime manifest (`invalid_manifest`).
+5. Read and validate the optional application configuration, then open a
    memory or SQLite application as `serve` does. A PostgreSQL application
    (`[storage] backend = "postgres"`) is only validated here, including the
-   refusal of total-capacity limits (`invalid_limits`); it opens in step 7
+   refusal of total-capacity limits (`invalid_limits`); it opens in step 8
    as the host module `application`.
-5. Register every enabled module's error codes (`error_code_conflict`, see
+6. Register every enabled module's error codes (`error_code_conflict`, see
    [Errors](#errors)), then open the pool and prove it with `SELECT 1`
    (`database_unavailable`).
-6. Apply pending migrations when `database.migrate = true`, otherwise verify
+7. Apply pending migrations when `database.migrate = true`, otherwise verify
    them. A changed checksum, unknown applied version or out-of-order version
    stops startup in both modes. Pending migrations in verify mode do not stop
    startup; readiness stays false until they are applied.
-7. Start modules in registration order, each within 10 s or the bound it
+8. Start modules in registration order, each within 10 s or the bound it
    declares through `Module::start_timeout` (`module_start_failed`, logged
    as `module.start_failed` with the module's own `code`, or `timeout`;
    modules already started are shut down). The
@@ -91,20 +97,32 @@ and one `startup.failed` event carrying a stable `code`:
    `storage_configuration` when the database belongs to another
    application identity. The jobs runtime starts last, once every module
    declared its job handlers and subscriptions, and stops first.
-8. Bind `http.listen` and log `listener.ready` with the bound address.
+9. Evaluate readiness once, switch the listener to the full router and log
+   `startup.completed` with `duration_ms` since the process started;
+   `/health/startup` answers 200 from then on.
 
-SIGINT or SIGTERM starts a graceful stop: readiness turns false, the listener
-stops accepting, in-flight requests drain for up to 30 s, modules shut down in
-reverse order within 10 s, the pool closes, `listener.stopped` is logged,
-traces, logs and metrics are flushed within `telemetry.shutdown_timeout_ms`
-and the process exits 0. A serving failure exits 1.
+A failed step logs `startup.failed`, closes the early listener
+(`listener.stopped`) and exits 2. SIGINT or SIGTERM during startup stops it
+and exits 0.
+
+SIGINT or SIGTERM after startup runs the drain sequence: `shutdown.started`
+and `listener.draining` are logged and readiness answers 503 at once while
+liveness stays 200; the listener keeps serving for `http.drain_delay_ms`
+(default 5 s) so load balancers stop routing, then stops accepting, and
+in-flight requests drain for up to 30 s (`listener.drain_timeout` past that).
+Modules shut down in reverse order within 10 s (the jobs runtime first), the
+pool closes, `listener.stopped` and `shutdown.completed` are logged, traces,
+logs and metrics are flushed within `telemetry.shutdown_timeout_ms` and the
+process exits 0. A serving failure exits 1.
 
 ### Routes
 
 | Path | Owner | Mounted when |
 | --- | --- | --- |
-| `GET /health/live` | kernel | always |
-| `GET /health/ready` | kernel | always |
+| `GET /health/live` | kernel | always, from the early listener on |
+| `GET /health/startup` | kernel | always, from the early listener on |
+| `GET /health/ready` | kernel | always, from the early listener on |
+| `GET /v1/admin/status` | kernel (TE §5) | always; see [Status](#status) |
 | `/v1/<module>/...` | each enabled module | its `[modules.<module>]` section exists |
 | `/v1/application/...` | application layer (the `application` module on PostgreSQL) | `[application]` is set |
 | `/v1/jobs/admin/...` | jobs runtime (AP §D.1) | always; each route is a permission check |
@@ -186,6 +204,7 @@ contain secret values.
 | `public` | boolean | `false` | no | see [Routes](#routes) |
 | `trusted_proxies` | list of CIDR or addresses | `[]` | no | at most 64; IPv4 and IPv6 |
 | `body_limit` | integer, bytes | `1048576` | no | 1024 to 67108864 |
+| `drain_delay_ms` | duration | `5000` | no | 0 to 10 min; after SIGTERM, readiness answers 503 for this long before the listener stops accepting |
 
 ### `[http.cors]`
 
@@ -198,8 +217,8 @@ CORS is off while `allowed_origins` is empty.
 | `max_age_seconds` | integer | `600` | no | 0 to 86400 |
 
 Allowed methods are GET, POST, PUT, PATCH and DELETE. Allowed request
-headers are `content-type`, `authorization`, `x-request-id` and
-`traceparent`. `x-request-id` is exposed to scripts.
+headers are `content-type`, `authorization`, `x-request-id`, `traceparent`
+and `tracestate`. `x-request-id` is exposed to scripts.
 
 ### `[database]`
 
@@ -316,8 +335,9 @@ payload = { only = ["late"] }
 
 `log_level` and `format` drive the stderr log stream; the other keys drive
 the OTLP pipeline (TE §3). Every value is checked at startup and all
-problems are reported together. `trust_inbound` takes effect with the edge
-spans (TE-T2), `metrics.sample_interval_ms` with the database-backed gauges
+problems are reported together. `traces.trust_inbound` decides which
+callers' `traceparent` the edge honors (see [The HTTP edge](#the-http-edge)).
+`metrics.sample_interval_ms` takes effect with the database-backed gauges
 (TE-T3, TE-T5) and `propagation.outbound_hosts` with the outbound client
 (TE-T6); they validate now.
 
@@ -400,16 +420,39 @@ directory relative paths resolve against (the canonical directory of
   removed before handlers run; handlers read `ClientInfo`.
 - accepts `X-Request-Id` only from a trusted proxy (1 to 128 bytes of
   `[A-Za-z0-9._:/-]`), otherwise generates 128 random bits, and returns it in
-  the response.
-- continues a valid W3C `traceparent` with a new span id or starts a new
-  trace. Handlers read `TraceContext`; `OutboundHttp::send` propagates it.
+  every response.
+- opens the server span `{METHOD} {http.route}` (`{METHOD}` when no route
+  matched; methods outside the HTTP registry are `_OTHER`), kind SERVER,
+  with `http.request.method`, `http.route` (the router's template, never the
+  path), `url.scheme`, `http.response.status_code`, `error.type` (the
+  status, 5xx only) and `merezha.request_id`. Only 5xx responses set the
+  span status to error. `/health/*` requests get metrics but no span.
+- applies the trust policy `telemetry.traces.trust_inbound` (TE §2.1) to a
+  valid W3C `traceparent` (version `00`) and `tracestate` (at most 512
+  bytes): `trusted_proxies` (default) trusts peers in
+  `http.trusted_proxies` and loopback, `always` every peer, `never` none. A
+  trusted caller's context parents the server span and its sampled flag is
+  honored. An untrusted caller's context starts a new root under the ratio
+  sampler and becomes a span link with
+  `merezha.link.reason = untrusted_parent`, so public clients cannot force
+  sampling. Malformed headers are ignored. Only trusted callers get a
+  `traceparent` response header. Handlers read `TraceContext`, the server
+  span's ids.
+- records `http.server.request.duration` (method, route, status,
+  `error.type`, scheme), `http.server.active_requests` (method, scheme),
+  `http.server.request.body.size` (declared `Content-Length`; method,
+  route) and `merezha.http.server.rejected` (`merezha.reason`: `starting`,
+  `overloaded`, `body_limit`, `timeout`), through the meter the binary
+  passes in `HostOptions::meter`.
 - refuses bodies over `http.body_limit`: a larger `Content-Length` fails at
   once and an undeclared body fails while it is read. The same limit replaces
   the 2 MiB default of axum's `Bytes` and `Json` extractors.
 - applies CORS and the optional `Authenticator`.
 - logs one `http.request.completed` event with method, matched route, status, duration,
-  request id and trace id (the line's `trace_id`). It never logs paths,
-  query strings, headers or bodies.
+  request id and trace id (the line's `trace_id`): at error for 500, at
+  info for other 5xx and for requests of 1 s or more, at debug otherwise, so
+  the default `info` stream shows failures and slow requests only. It never
+  logs paths, query strings, headers or bodies.
 
 Every error response has one shape (R8):
 
@@ -455,7 +498,7 @@ registers:
 | 415 | `unsupported_media_type` |
 | 422 | `validation_failed` and every other permanent code the kernel emits (domain, application, port and startup codes) |
 | 429 | `rate_limited`, `database_busy` (with `Retry-After`) |
-| 503 | `overloaded` and every transient code the kernel emits (`database_unavailable`, `database_timeout`, `commit_outcome_unknown`, `internal`, `storage_*`, ...), with `Retry-After` |
+| 503 | `overloaded`, `starting` (the early listener) and every transient code the kernel emits (`database_unavailable`, `database_timeout`, `commit_outcome_unknown`, `internal`, `storage_*`, ...), with `Retry-After` |
 | 504 | `timeout`, `upstream_timeout` |
 
 `errors::KERNEL_CODES` is the complete list. A unit test scans the kernel
@@ -477,15 +520,64 @@ with K2.
 
 ## Health
 
-`GET /health/live` answers `{"status":"live"}` while the process serves.
+| Endpoint | 200 | 503 |
+| --- | --- | --- |
+| `GET /health/live` | `{"status":"live"}` while the process serves, draining included | never set deliberately |
+| `GET /health/startup` | `{"status":"started"}` once startup completed (step 9 above) | `{"status":"starting"}` before |
+| `GET /health/ready` | `{"status":"ready"}`: started, not draining, and the cached checks pass | `{"status":"not_ready"}` |
 
-`GET /health/ready` answers `200 {"status":"ready"}` or
-`503 {"status":"not_ready"}`. It checks, each bounded by 1 s: not draining,
+Readiness checks run in a background task every 2 s, each bounded by 1 s:
 the pool answers `SELECT 1`, migrations are current, and every module's
-`ready()`. If migrations were pending at startup, readiness verifies them
-again until another host has applied them. Concurrent probes within 250 ms
-share one evaluation. The response never names the failing check; the log
-gets `health.not_ready` with check names on each transition.
+`ready()`. Probes read the cached result and never touch the database. If
+migrations were pending at startup, readiness verifies them again until
+another host has applied them. A module may hold readiness for a bounded
+warm-up (R10): the jobs runtime until its first subscription sync, and,
+with `jobs.readiness.max_lag_ms`, while the job backlog is older; content
+while its index builds run. Projection lag past warm-up and the job backlog
+without that key never count, and neither does the OTLP collector or any
+outbound provider. The response never names the failing check; the log gets
+`health.not_ready` with the first failing `check`, all failing `checks` and
+the first `code` on each transition (`health.ready` on recovery), and
+`/v1/admin/status` shows every check.
+
+## Status
+
+`GET /v1/admin/status` (`crates/platform/src/status.rs`, TE §5) is the
+protected diagnostics document. With the identity block (an authenticator
+in `HostOptions::authenticator`) it requires `system.status.read` at
+`ResourceScope::Application`; a tenant-scoped grant is not enough,
+`platform_admin` passes, and failures are `401 unauthenticated` and
+`403 unauthorized`. Without identity it is served only on a private listener
+(see [Routes](#routes)) to a loopback TCP peer, and is `404 not_found`
+otherwise. One request runs at a time (a concurrent one gets
+`429 rate_limited` with `Retry-After: 1`), each section is read within 2 s
+(a failed one shows `{"code": ...}`), and responses carry
+`Cache-Control: no-store`.
+
+Every field is a code, a count, a configured name or a timestamp:
+
+- `service`: `name`, `version` (as in `service.name`/`service.version`),
+  `host_version`, `instance_id`, `started_at`, `uptime_s`.
+- `startup`: `state` (`starting`, `started`), `completed_at`,
+  `duration_ms`.
+- `readiness`: `ready`, `draining`, `checks` (`name`, `ok`, `code`,
+  `duration_ms`, `checked_at`) from the last evaluation.
+- `database`: `pool` (`max`, `size`, `idle`, `waiting`, from the pool
+  without I/O) and `migrations` per module (`applied`, `pending`).
+- `jobs`: `JobsHandle::queue_status()` as returned, the data behind
+  `GET /v1/jobs/admin/queues` and `outbox`; the endpoint queries no jobs
+  table itself (R10).
+- `application`: AP's `Application::status()` as returned, the body of
+  `GET /v1/application/status` (head, projections, reactors, instance,
+  listener); present when `[application]` is set.
+- `catalog` (`generation`, `services`, `pipelines`, `loaded_at`) and
+  `telemetry` (`Telemetry::status()`: exporter counts per signal, the
+  endpoint's scheme, host and port only, never header values).
+- `application`, `catalog` and `telemetry` are `StatusSection`s that
+  `merezha run` passes in `HostOptions::status`; the endpoint embeds what
+  they return and queries no table of theirs.
+- `modules`: each module's `name`, `ready` and `code` from the last
+  evaluation.
 
 ## Logging
 
@@ -525,12 +617,13 @@ fails a suite that emits anything else. The `merezha` binary installs one
 `startup.failed` is an error, including the `invalid_config` and
 `invalid_arguments` lines written before the subscriber exists.
 
-Kernel events: `startup.failed`, `runtime.loaded`, `error.registration_refused`,
+Kernel events: `startup.failed`, `startup.completed`, `runtime.loaded`, `error.registration_refused`,
 `db.connected`, `db.unavailable`, `migration.checked`, `migration.pending`,
 `migration.applied`, `migration.checksum_mismatch`, `migration.refused`,
 `migration.invalid_index_dropped`, `module.started`, `module.start_failed`,
 `module.stopped`, `module.shutdown_timeout`, `listener.ready`,
 `listener.draining`, `listener.drain_timeout`, `listener.stopped`,
+`shutdown.started`, `shutdown.completed`,
 `module.source_refused`, `http.request.completed`, `health.ready`,
 `health.not_ready`, `notification.captured`, `telemetry.otel_env_ignored`
 and `telemetry.export_failed` (at most once per signal per minute, with the
@@ -551,8 +644,8 @@ dropped and counted in `merezha.telemetry.attributes.dropped`, strings cut to
 256 bytes, at most 64 attributes, 32 events and 8 links per span. Exports
 are accounted exactly: `exported + failed + dropped + pending == emitted`
 per signal, reported by `merezha.telemetry.exported`,
-`merezha.telemetry.dropped` and the status document (`Telemetry::status`;
-the `/v1/admin/status` route is TE-T2).
+`merezha.telemetry.dropped` and the `telemetry` section of
+`/v1/admin/status` (`Telemetry::status`).
 
 The raw runtime (`merezha serve`) writes the same JSON lines to stderr with
 `service = merezha`, logs at `debug` so each `invocation.completed` appears
@@ -564,7 +657,7 @@ as before, and runs no OTLP pipeline.
 
 | Method | Contract |
 | --- | --- |
-| `name()` | `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not `application`, `api`, `services`, `pipelines`, `reload`, `health`, `jobs` (the jobs runtime), `outbox` or `cron` (job key prefixes the relay and the scheduler mint), or `config` (the source of configured schedules). Names the section, route prefix and migration ledger key; never changes. |
+| `name()` | `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not `admin` (the host's `/v1/admin/status`), `application`, `api`, `services`, `pipelines`, `reload`, `health`, `jobs` (the jobs runtime), `outbox` or `cron` (job key prefixes the relay and the scheduler mint), or `config` (the source of configured schedules). Names the section, route prefix and migration ledger key; never changes. |
 | `configure(&ModuleSection)` | validate and keep `[modules.<name>]`; return every issue at once. Default: only an empty section. |
 | `migrations()` | ordered forward-only `Migration::new(version, name, sql)` or `Migration::non_transactional(..)` for its own schema |
 | `errors()` | `ErrorCode { code, status }` it returns, registered at startup; default none |

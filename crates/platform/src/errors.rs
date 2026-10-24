@@ -152,6 +152,8 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("rate_limited", 429),
     ErrorCode::new("database_busy", 429),
     ErrorCode::new("overloaded", 503),
+    ErrorCode::new("starting", 503),
+    ErrorCode::new("migrations_pending", 503),
     ErrorCode::new("unavailable", 503),
     ErrorCode::new("internal", 503),
     ErrorCode::new("database_unavailable", 503),
@@ -385,6 +387,7 @@ mod tests {
             ("body_limit", 413),
             ("rate_limited", 429),
             ("overloaded", 503),
+            ("starting", 503),
             ("secret_purged", 409),
         ] {
             assert_eq!(

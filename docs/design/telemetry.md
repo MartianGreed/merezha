@@ -32,6 +32,8 @@ merezha-telemetry  (new crate)
                    parses and validates every key into it
   feature "propagation" (adds tracing-opentelemetry; no exporter, no network code)
     propagation.rs traceparent parse/format, trust policy, links, stored context
+  feature "http" (adds axum's types only; the platform edge)
+    names.rs       attr::route(&MatchedPath)
   feature "pipeline" (the merezha binary only)
     pipeline.rs    providers, guarded processors, exporters, shutdown
     subscriber.rs  tracing registry: JSON writer + span bridge + OTLP log bridge
@@ -784,7 +786,7 @@ diagnostic logs, as the framework requires.
 
 | Endpoint | 200 when | 503 when | Body |
 | --- | --- | --- | --- |
-| `/health/live` | the async runtime answers the request | never set deliberately; a wedged runtime times out, which is the signal | `{"status":"ok"}` |
+| `/health/live` | the async runtime answers the request | never set deliberately; a wedged runtime times out, which is the signal | `{"status":"live"}` (K's body, kept by T2) |
 | `/health/startup` | startup is complete: config valid, migrations applied or verified, catalog compiled, every module `start()` returned | before that point | `{"status":"started"}` / `{"status":"starting"}` |
 | `/health/ready` | started, not draining, the cached checks pass | otherwise | `{"status":"ready"}` / `{"status":"not_ready"}` |
 | `/health` (raw runtime contract) | unchanged | unchanged | `{"status":"ok","generation":N}` |

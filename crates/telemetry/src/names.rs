@@ -774,9 +774,70 @@ impl TelemetrySignal {
     }
 }
 
+/// `merezha.link.reason` values, on span links only (TE §2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkReason {
+    /// An inbound `traceparent` the trust policy refused (§2.1).
+    UntrustedParent,
+    /// A projection or reactor batch linking its source events' traces.
+    SourceEvent,
+    /// An operator replay linking the dead-lettered job's trace.
+    Replay,
+}
+impl LinkReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UntrustedParent => "untrusted_parent",
+            Self::SourceEvent => "source_event",
+            Self::Replay => "replay",
+        }
+    }
+}
+
+/// `url.scheme` values at the edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UrlScheme {
+    Http,
+    Https,
+}
+impl UrlScheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+}
+
+/// The HTTP methods semantic conventions know (`http.request.method`);
+/// any other method records [`OTHER_METHOD`] (TE §1.4 rule 4).
+pub const HTTP_METHODS: [&str; 9] = [
+    "CONNECT", "DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "TRACE",
+];
+/// The `http.request.method` value of a method outside [`HTTP_METHODS`].
+pub const OTHER_METHOD: &str = "_OTHER";
+/// `method` as `http.request.method` records it: one of [`HTTP_METHODS`],
+/// else [`OTHER_METHOD`].
+pub fn http_method(method: &str) -> &'static str {
+    HTTP_METHODS
+        .iter()
+        .find(|known| **known == method)
+        .copied()
+        .unwrap_or(OTHER_METHOD)
+}
+/// The server span name (TE §1.2): `{METHOD} {http.route}`, or `{METHOD}`
+/// without a matched route. `method` is normalized by [`http_method`].
+pub fn http_server_span(method: &str, route: Option<&str>) -> String {
+    let method = http_method(method);
+    match route {
+        Some(route) => format!("{method} {route}"),
+        None => method.to_owned(),
+    }
+}
+
 /// Typed attribute constructors. No public API in this crate takes an
 /// arbitrary key and value; later slices add constructors here for their
-/// closed sets (`route(&MatchedPath)` lands with the edge, T2).
+/// closed sets.
 pub mod attr {
     use super::*;
     pub fn outcome(outcome: Outcome) -> KeyValue {
@@ -787,6 +848,32 @@ pub mod attr {
     }
     pub fn signal(signal: TelemetrySignal) -> KeyValue {
         KeyValue::new(key::TELEMETRY_SIGNAL, signal.as_str())
+    }
+    pub fn link_reason(reason: LinkReason) -> KeyValue {
+        KeyValue::new(key::LINK_REASON, reason.as_str())
+    }
+    /// `http.request.method`, normalized by [`http_method`].
+    pub fn method(method: &str) -> KeyValue {
+        KeyValue::new(key::HTTP_REQUEST_METHOD, http_method(method))
+    }
+    pub fn url_scheme(scheme: UrlScheme) -> KeyValue {
+        KeyValue::new(key::URL_SCHEME, scheme.as_str())
+    }
+    pub fn status_code(status: u16) -> KeyValue {
+        KeyValue::new(key::HTTP_RESPONSE_STATUS_CODE, i64::from(status))
+    }
+    /// `error.type` of a server response: the status code for 5xx, none
+    /// otherwise (client errors are not server errors).
+    pub fn server_error(status: u16) -> Option<KeyValue> {
+        (500..=599)
+            .contains(&status)
+            .then(|| KeyValue::new(key::ERROR_TYPE, status.to_string()))
+    }
+    /// `http.route` from the router's matched template, never the raw path
+    /// (TE §1.5).
+    #[cfg(feature = "http")]
+    pub fn route(path: &axum::extract::MatchedPath) -> KeyValue {
+        KeyValue::new(key::HTTP_ROUTE, path.as_str().to_owned())
     }
 }
 
@@ -1623,6 +1710,40 @@ mod tests {
                     "{key}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn http_constructors_keep_closed_sets() {
+        assert_eq!(http_method("GET"), "GET");
+        assert_eq!(http_method("PROPFIND"), OTHER_METHOD);
+        assert_eq!(
+            http_method("get"),
+            OTHER_METHOD,
+            "methods are case sensitive"
+        );
+        assert_eq!(http_server_span("PROPFIND", None), "_OTHER");
+        assert_eq!(
+            http_server_span("POST", Some("/v1/notes/{id}")),
+            "POST /v1/notes/{id}"
+        );
+        assert_eq!(attr::method("BREW").value.as_str(), OTHER_METHOD);
+        assert_eq!(attr::server_error(404), None);
+        assert_eq!(
+            attr::server_error(503).map(|kv| kv.value.as_str().into_owned()),
+            Some("503".to_owned())
+        );
+        assert_eq!(
+            attr::link_reason(LinkReason::UntrustedParent).key.as_str(),
+            key::LINK_REASON
+        );
+        for kv in [
+            attr::method("GET"),
+            attr::url_scheme(UrlScheme::Https),
+            attr::status_code(200),
+        ] {
+            let row = attribute(kv.key.as_str()).unwrap();
+            assert!(row.span && row.metric, "{}", kv.key);
         }
     }
 

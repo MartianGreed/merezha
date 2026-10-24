@@ -8,6 +8,8 @@ license.workspace = true
 [features]
 default = []
 propagation = ["dep:tracing-opentelemetry", "opentelemetry/trace"]
+# The HTTP edge's typed constructors over axum's types (`attr::route`).
+http = ["dep:axum"]
 pipeline = [
     "propagation",
     "opentelemetry/trace",
@@ -29,6 +31,7 @@ opentelemetry-semantic-conventions.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 tracing-opentelemetry = { workspace = true, optional = true }
+axum = { workspace = true, optional = true, features = ["matched-path"] }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 merezha-domain = { path = "../domain", optional = true }
@@ -40,7 +43,7 @@ jiff = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Integration tests run the pipeline and the harness.
-merezha-telemetry = { path = ".", features = ["testing"] }
+merezha-telemetry = { path = ".", features = ["testing", "http"] }
 axum.workspace = true
 libc.workspace = true
 reqwest.workspace = true

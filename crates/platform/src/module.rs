@@ -16,8 +16,10 @@ use std::{sync::Arc, time::Instant};
 /// sources; `jobs` is the [`JobsRuntime`]; `outbox` and `cron` prefix the
 /// job keys the relay and the scheduler mint, so no module may write or
 /// cancel under them; `config` is the source of `[[jobs.schedules]]` rows,
-/// so no module can pass its schedules off as configured ones.
-pub const RESERVED_NAMES: [&str; 10] = [
+/// so no module can pass its schedules off as configured ones; `admin`
+/// holds the host's `/v1/admin/status`.
+pub const RESERVED_NAMES: [&str; 11] = [
+    "admin",
     "application",
     "api",
     "services",

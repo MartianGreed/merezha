@@ -12,14 +12,20 @@ use merezha_application::{
 use merezha_domain::Failure;
 use merezha_platform::config::CatchUp as ConfiguredCatchUp;
 use merezha_platform::{
-    ConfigInput, HostParts, Module, Timeouts,
+    BoxFuture, ConfigInput, EarlyListener, HostOptions, HostParts, Module, StatusSection, Timeouts,
     host::{self, Host},
     ports::{Authorizer, DenyAll, LoopbackAllowAll},
 };
 use merezha_runtime::Runtime;
 use merezha_telemetry::{Service, Telemetry, names, pipeline};
-use serde_json::json;
-use std::{future::Future, path::PathBuf, process::ExitCode, sync::Arc};
+use serde_json::{Value, json};
+use std::{
+    future::Future,
+    path::PathBuf,
+    process::ExitCode,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tracing::Instrument;
 
 pub const USAGE: &str = "merezha run --config PATH [--listen ADDRESS] [--set SECTION.KEY=VALUE]...";
@@ -157,55 +163,154 @@ pub async fn run(
             names = otel_ignored.join(",").as_str()
         );
     }
-    let code = serve(config, modules, shutdown).await;
+    let options = HostOptions {
+        meter: Some(telemetry.meter(EDGE_METER)),
+        status: vec![Arc::new(TelemetrySection(telemetry.status_reader()))],
+        ..HostOptions::default()
+    };
+    let code = serve(config, modules, shutdown, options).await;
     // Flush traces, logs and metrics within `shutdown_timeout_ms`, then the
     // stderr writer.
     let _ = tokio::task::spawn_blocking(move || telemetry.shutdown()).await;
     code
 }
 
+/// The instrumentation scope of the edge's HTTP instruments.
+const EDGE_METER: &str = "merezha.edge";
+/// How long requests already admitted by the early listener may finish
+/// when startup fails or is interrupted.
+const CLOSE_WITHIN: Duration = Duration::from_secs(5);
+
+/// The `telemetry` section of `/v1/admin/status`.
+struct TelemetrySection(pipeline::StatusReader);
+impl StatusSection for TelemetrySection {
+    fn name(&self) -> &'static str {
+        "telemetry"
+    }
+    fn read(&self) -> BoxFuture<'_, Result<Value, Failure>> {
+        let status = self.0.read().to_json();
+        Box::pin(async move { Ok(status) })
+    }
+}
+/// The `catalog` section: the runtime's active generation.
+struct CatalogSection {
+    runtime: Runtime,
+    loaded_at: jiff::Timestamp,
+}
+impl StatusSection for CatalogSection {
+    fn name(&self) -> &'static str {
+        "catalog"
+    }
+    fn read(&self) -> BoxFuture<'_, Result<Value, Failure>> {
+        let catalog = self.runtime.catalog();
+        let loaded_at = self.loaded_at.to_string();
+        Box::pin(async move {
+            let catalog = catalog.map_err(|error| Failure::transient(error.code()))?;
+            Ok(json!({
+                "generation": catalog.generation,
+                "services": catalog.services.len(),
+                "pipelines": catalog.pipelines.len(),
+                "loaded_at": loaded_at,
+            }))
+        })
+    }
+}
+
+/// The `application` section: AP's `Application::status()` as returned,
+/// the body of `GET /v1/application/status` (R10).
+struct ApplicationSection(Arc<OnceLock<merezha_application::Application>>);
+impl StatusSection for ApplicationSection {
+    fn name(&self) -> &'static str {
+        "application"
+    }
+    fn read(&self) -> BoxFuture<'_, Result<Value, Failure>> {
+        let application = self.0.get().cloned();
+        Box::pin(async move {
+            let application = application.ok_or_else(|| Failure::transient("unavailable"))?;
+            let status =
+                merezha_telemetry::spawn_blocking_in_span(move || application.status()).await;
+            let status = status.map_err(|_| Failure::transient("internal"))??;
+            serde_json::to_value(status).map_err(|_| Failure::transient("internal"))
+        })
+    }
+}
+
+/// Bind the early listener, run startup inside the `startup` span, then
+/// serve until `shutdown` and drain. A shutdown signal during startup stops
+/// it and exits 0.
 async fn serve(
     config: merezha_platform::ProjectConfig,
     modules: Vec<Box<dyn Module>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    mut options: HostOptions,
 ) -> ExitCode {
-    let started = start(config, modules)
-        .instrument(tracing::info_span!(names::span::STARTUP))
-        .await;
-    let (host, listener) = match started {
-        Ok(started) => started,
-        Err(code) => {
-            merezha_telemetry::event!(ERROR, "startup.failed", code = code.as_str());
+    let (signal, stopped) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown.await;
+        let _ = signal.send(true);
+    });
+    let stop = move || {
+        let mut stopped = stopped.clone();
+        async move {
+            let _ = stopped.wait_for(|stopped| *stopped).await;
+        }
+    };
+    let early = match EarlyListener::bind(&config, None, &options).await {
+        Ok(early) => early,
+        Err(error) => {
+            merezha_telemetry::event!(ERROR, "startup.failed", code = error.failure.code.as_str());
             return ExitCode::from(2);
         }
     };
-    match host.serve(listener, shutdown).await {
+    options.lifecycle = Some(early.lifecycle().clone());
+    let startup =
+        start(config, modules, options).instrument(tracing::info_span!(names::span::STARTUP));
+    let started = tokio::select! {
+        started = startup => started,
+        () = stop() => {
+            merezha_telemetry::event!(INFO, "listener.draining");
+            early.close(CLOSE_WITHIN).await;
+            return ExitCode::SUCCESS;
+        }
+    };
+    let host = match started {
+        Ok(host) => host,
+        Err(code) => {
+            merezha_telemetry::event!(ERROR, "startup.failed", code = code.as_str());
+            early.close(CLOSE_WITHIN).await;
+            return ExitCode::from(2);
+        }
+    };
+    match early.serve(host, stop()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(1),
     }
 }
 
-/// Everything from the runtime to the bound listener, inside the
-/// `startup` span. Fails with the `startup.failed` code.
+/// Everything from the runtime to the started host, inside the `startup`
+/// span. Fails with the `startup.failed` code.
 async fn start(
     config: merezha_platform::ProjectConfig,
     modules: Vec<Box<dyn Module>>,
-) -> Result<(Host, tokio::net::TcpListener), String> {
+    mut options: HostOptions,
+) -> Result<Host, String> {
     let manifest = config.runtime.manifest.clone();
     let runtime =
         match tokio::task::spawn_blocking(move || Runtime::load(manifest).map_err(|_| ())).await {
             Ok(Ok(runtime)) => runtime,
             _ => return Err("invalid_manifest".to_owned()),
         };
+    options.status.push(Arc::new(CatalogSection {
+        runtime: runtime.clone(),
+        loaded_at: jiff::Timestamp::now(),
+    }));
     // Without the identity block, only a private loopback listener keeps the
     // explicit allow-all policy and the unauthenticated raw runtime
     // endpoints. A public listener denies application messages and
     // projection administration and does not mount the raw runtime at all.
     // A trusted proxy means requests arrive from elsewhere even on a
     // loopback listener, so it counts as public too.
-    let private = !config.http.public
-        && config.http.listen.ip().is_loopback()
-        && config.http.trusted_proxies.is_empty();
+    let private = host::private_listener(&config);
     let authorizer: Arc<dyn Authorizer> = match LoopbackAllowAll::new(config.http.listen) {
         Ok(allow) if private => Arc::new(allow),
         _ => Arc::new(DenyAll),
@@ -250,6 +355,9 @@ async fn start(
                     2 + config.jobs.queues.len(),
                 );
                 application_failure = Some(module.failure());
+                options
+                    .status
+                    .push(Arc::new(ApplicationSection(module.application())));
                 modules.insert(0, Box::new(module) as Box<dyn Module>);
                 None
             } else {
@@ -258,7 +366,12 @@ async fn start(
                 })
                 .await
                 {
-                    Ok(Ok(application)) => Some(application),
+                    Ok(Ok(application)) => {
+                        options.status.push(Arc::new(ApplicationSection(Arc::new(
+                            OnceLock::from(application.clone()),
+                        ))));
+                        Some(application)
+                    }
                     Ok(Err(failure)) => return Err(failure.code),
                     Err(_) => return Err("invalid_application_config".to_owned()),
                 }
@@ -303,16 +416,14 @@ async fn start(
             merezha_jobs::PgJobs::new(&config.jobs).with_app_version(config.app.version.clone()),
         )),
     };
-    let host = match Host::start(config, modules, parts).await {
-        Ok(host) => host,
+    match Host::start_with(config, modules, parts, options).await {
+        Ok(host) => Ok(host),
         // The application module's own reason, not `module_start_failed`.
         Err(error) => match application_failure.as_ref().and_then(|f| f.get()) {
-            Some(failure) if error.module == Some(MODULE) => return Err(failure.code.clone()),
-            _ => return Err(error.failure.code),
+            Some(failure) if error.module == Some(MODULE) => Err(failure.code.clone()),
+            _ => Err(error.failure.code),
         },
-    };
-    let listener = host.bind(None).await.map_err(|error| error.failure.code)?;
-    Ok((host, listener))
+    }
 }
 
 #[cfg(test)]

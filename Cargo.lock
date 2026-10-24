@@ -1719,6 +1719,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "jiff",
  "merezha-application",
  "merezha-content",
  "merezha-domain",
@@ -1828,6 +1829,7 @@ dependencies = [
  "merezha-domain",
  "merezha-postgres",
  "merezha-telemetry",
+ "opentelemetry",
  "reqwest",
  "serde",
  "serde_json",

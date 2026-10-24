@@ -111,6 +111,7 @@ impl Host {
         command
             .args(["run", "--config"])
             .arg(config)
+            .env("MEREZHA_HTTP__DRAIN_DELAY_MS", "0")
             .stdout(Stdio::null())
             .stderr(fs::File::create(&log).unwrap());
         for (key, value) in env {
@@ -435,27 +436,37 @@ interval_ms = 1000
         .unwrap();
     wait_until_ready(address);
     let ready_lines = host.events().len();
-    // Keep the pipeline busy: every request makes spans and logs.
+    // Keep the pipeline busy: every request makes a server span. Readiness
+    // never depends on the collector (TE §5).
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until {
         assert_eq!(
-            support::request(address, "GET", "/health/live", "").status,
-            200
+            support::request(address, "GET", "/v1/nothing", "").status,
+            404
+        );
+        assert_eq!(
+            support::request(address, "GET", "/health/ready", "").status,
+            200,
+            "readiness follows the collector"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Request lines are the edge's own (info until TE-T2 sets their level).
+    // Request lines are the edge's own (debug for 4xx, TE §4).
     let after: Vec<Value> = host
         .events()
         .split_off(ready_lines)
         .into_iter()
         .filter(|e| e["event"] != "http.request.completed")
         .collect();
-    let warnings = after
+    // The first failure may come before readiness (the startup span and
+    // logs), and the next warning of that signal waits a minute.
+    let warnings = host
+        .events()
         .iter()
         .filter(|e| e["event"] == "telemetry.export_failed")
         .count();
     assert!(warnings >= 1, "the failure is reported: {after:?}");
+    assert!(warnings <= 3, "at most one warning per signal: {warnings}");
     assert!(after.len() <= 6, "{} lines in 5 s: {after:?}", after.len());
     assert!(
         !after.iter().any(|e| e["event"] == "dependency.log"),

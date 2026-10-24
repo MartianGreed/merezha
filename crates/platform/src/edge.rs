@@ -1,7 +1,8 @@
-//! The HTTP edge: client address through trusted proxies, request id, W3C
-//! trace context, request logging, CORS, body limits, authentication and the
-//! single error shape `{ "error": { "code", "classification", "details"? } }`
-//! with statuses from the [`ErrorRegistry`].
+//! The HTTP edge: client address through trusted proxies, request id, the
+//! server span with the W3C trace context trust policy (TE §2.1), HTTP
+//! server metrics, request logging, CORS, body limits, authentication and
+//! the single error shape `{ "error": { "code", "classification",
+//! "details"? } }` with statuses from the [`ErrorRegistry`].
 use crate::{
     config::{CorsConfig, HttpConfig},
     context::{OsRandom, Random, hex},
@@ -9,7 +10,7 @@ use crate::{
         ErrorBody, ErrorRegistry, FieldError, MAX_DETAILS, kernel_registry, needs_retry_after,
     },
     net::Cidr,
-    ports::{Authenticator, Principal},
+    ports::{Authenticator, Principal, PrincipalKind},
 };
 use axum::{
     Router,
@@ -20,22 +21,34 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use merezha_domain::{Classification, Failure};
+use merezha_telemetry::{
+    config::TrustInbound,
+    names::{self, Reason, UrlScheme, attr},
+    propagation::{self, Inbound},
+};
+use opentelemetry::{
+    KeyValue,
+    metrics::{Counter, Histogram, Meter, UpDownCounter},
+};
 use serde_json::json;
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
-use tracing::Instrument;
+use tracing::{Instrument, field::Empty};
 
 pub const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 pub const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
+pub const TRACESTATE: HeaderName = HeaderName::from_static("tracestate");
 const FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
 const FORWARDED: HeaderName = HeaderName::from_static("forwarded");
 /// Hops read from `X-Forwarded-For`; longer chains use the last ones.
 const MAX_FORWARDED_HOPS: usize = 32;
+/// Requests at least this slow log `http.request.completed` at info.
+const SLOW_REQUEST: Duration = Duration::from_secs(1);
 
 /// HTTP status for a classified failure from the kernel's codes alone. Behind
 /// the edge, [`ErrorReply`] responses get the host registry's status instead,
@@ -159,11 +172,13 @@ pub struct ClientInfo {
 #[derive(Clone, Debug)]
 pub struct Authenticated(pub Option<Arc<Principal>>);
 
-/// W3C trace context for one server span.
+/// W3C trace context of one server span. With the OTLP pipeline these are
+/// the span's own ids; without it the edge mints them the same way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TraceContext {
     pub trace_id: [u8; 16],
-    /// The caller's span, when the request carried a valid `traceparent`.
+    /// The caller's span, when a trusted caller sent a valid `traceparent`
+    /// (TE §2.1). An untrusted caller's context is a link, not a parent.
     pub parent_id: Option<[u8; 8]>,
     /// This request's span.
     pub span_id: [u8; 8],
@@ -249,32 +264,141 @@ fn valid_request_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-:/".contains(&b))
 }
 
+/// HTTP server instruments (TE §1.3, "HTTP edge"), built once from the
+/// host's meter; a no-op meter records nothing.
+#[derive(Clone, Debug)]
+pub struct HttpMetrics {
+    duration: Histogram<f64>,
+    active: UpDownCounter<i64>,
+    body_size: Histogram<u64>,
+    rejected: Counter<u64>,
+}
+impl HttpMetrics {
+    pub fn new(meter: &Meter) -> Self {
+        use names::metric::{
+            HTTP_SERVER_ACTIVE_REQUESTS as ACTIVE, HTTP_SERVER_REJECTED as REJECTED,
+            HTTP_SERVER_REQUEST_BODY_SIZE as BODY, HTTP_SERVER_REQUEST_DURATION as DURATION,
+        };
+        Self {
+            duration: meter
+                .f64_histogram(DURATION.name)
+                .with_unit(DURATION.unit)
+                .with_boundaries(DURATION.buckets.to_vec())
+                .build(),
+            active: meter
+                .i64_up_down_counter(ACTIVE.name)
+                .with_unit(ACTIVE.unit)
+                .build(),
+            body_size: meter
+                .u64_histogram(BODY.name)
+                .with_unit(BODY.unit)
+                .with_boundaries(BODY.buckets.to_vec())
+                .build(),
+            rejected: meter
+                .u64_counter(REJECTED.name)
+                .with_unit(REJECTED.unit)
+                .build(),
+        }
+    }
+    /// Instruments on a no-op meter.
+    pub fn noop() -> Self {
+        use opentelemetry::metrics::MeterProvider;
+        Self::new(&opentelemetry::metrics::noop::NoopMeterProvider::new().meter("merezha.edge"))
+    }
+}
+impl Default for HttpMetrics {
+    fn default() -> Self {
+        Self::noop()
+    }
+}
+
+/// What [`apply`] wraps a router with.
+#[derive(Clone)]
+pub struct EdgeSettings {
+    http: HttpConfig,
+    authenticator: Option<Arc<dyn Authenticator>>,
+    errors: Arc<ErrorRegistry>,
+    trust: TrustInbound,
+    metrics: HttpMetrics,
+    starting: bool,
+}
+impl std::fmt::Debug for EdgeSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EdgeSettings")
+            .field("trust", &self.trust)
+            .field("starting", &self.starting)
+            .finish_non_exhaustive()
+    }
+}
+impl EdgeSettings {
+    /// `http` limits, proxies and CORS with `errors` statuses; no
+    /// authenticator, the default `trusted_proxies` trust policy and no
+    /// metrics.
+    pub fn new(http: &HttpConfig, errors: Arc<ErrorRegistry>) -> Self {
+        Self {
+            http: http.clone(),
+            authenticator: None,
+            errors,
+            trust: TrustInbound::TrustedProxies,
+            metrics: HttpMetrics::noop(),
+            starting: false,
+        }
+    }
+    pub fn authenticator(mut self, authenticator: Option<Arc<dyn Authenticator>>) -> Self {
+        self.authenticator = authenticator;
+        self
+    }
+    /// `telemetry.traces.trust_inbound`.
+    pub fn trust(mut self, trust: TrustInbound) -> Self {
+        self.trust = trust;
+        self
+    }
+    pub fn metrics(mut self, metrics: HttpMetrics) -> Self {
+        self.metrics = metrics;
+        self
+    }
+    /// Unmatched routes answer `503 starting` with `Retry-After: 1` instead
+    /// of `404 not_found`: the early listener while startup runs.
+    pub fn starting(mut self) -> Self {
+        self.starting = true;
+        self
+    }
+}
+
 #[derive(Clone)]
 struct EdgeState {
     trusted: Arc<[Cidr]>,
     body_limit: usize,
     authenticator: Option<Arc<dyn Authenticator>>,
     errors: Arc<ErrorRegistry>,
+    trust: TrustInbound,
+    metrics: HttpMetrics,
 }
 
 /// Wrap a composed router with the edge layers. Handlers can extract
 /// [`RequestId`], [`ClientInfo`], [`TraceContext`] and, when an
 /// authenticator is set, [`Authenticated`] from request extensions. Error
-/// statuses come from `errors`.
-pub fn apply(
-    router: Router,
-    http: &HttpConfig,
-    authenticator: Option<Arc<dyn Authenticator>>,
-    errors: Arc<ErrorRegistry>,
-) -> Router {
+/// statuses come from the settings' registry.
+pub fn apply(router: Router, settings: EdgeSettings) -> Router {
+    let http = &settings.http;
     let state = EdgeState {
         trusted: http.trusted_proxies.clone().into(),
         body_limit: http.body_limit,
-        authenticator,
-        errors,
+        authenticator: settings.authenticator.clone(),
+        errors: settings.errors.clone(),
+        trust: settings.trust,
+        metrics: settings.metrics.clone(),
+    };
+    let router = if settings.starting {
+        router.fallback(|| async {
+            ErrorReply::new(Failure::transient("starting"))
+                .retry_after(Duration::from_secs(1))
+                .into_response()
+        })
+    } else {
+        router.fallback(|| async { error_response(&Failure::permanent("not_found")) })
     };
     let router = router
-        .fallback(|| async { error_response(&Failure::permanent("not_found")) })
         .method_not_allowed_fallback(|| async {
             error_response(&Failure::permanent("method_not_allowed"))
         })
@@ -324,6 +448,7 @@ fn cors(config: &CorsConfig) -> Option<tower_http::cors::CorsLayer> {
                 header::AUTHORIZATION,
                 REQUEST_ID,
                 TRACEPARENT,
+                TRACESTATE,
             ])
             .expose_headers([REQUEST_ID])
             .allow_credentials(config.allow_credentials)
@@ -375,6 +500,79 @@ fn last_value(headers: &axum::http::HeaderMap, name: &HeaderName) -> Option<Stri
     line.rsplit(',').next().map(|v| v.trim().to_owned())
 }
 
+/// The one value of a header that may appear once, if valid text.
+fn single(headers: &axum::http::HeaderMap, name: &HeaderName) -> Option<String> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok().map(str::to_owned)
+}
+/// Every `tracestate` line joined in order, as W3C allows splitting it;
+/// `None` past the stored bound, so the parent is kept without state.
+fn trace_state(headers: &axum::http::HeaderMap) -> Option<String> {
+    let mut joined = String::new();
+    for value in headers.get_all(&TRACESTATE) {
+        let line = value.to_str().ok()?;
+        if !joined.is_empty() {
+            joined.push(',');
+        }
+        joined.push_str(line);
+        if joined.len() > propagation::MAX_TRACE_STATE {
+            return None;
+        }
+    }
+    (!joined.is_empty()).then_some(joined)
+}
+/// The handler-visible context: the server span's own ids when a span
+/// bridge records it, otherwise ids minted here, continuing a trusted
+/// parent's trace.
+fn trace_context(span: &tracing::Span, inbound: &Inbound) -> TraceContext {
+    let parent = match inbound {
+        Inbound::Parent(parent) => Some(parent),
+        _ => None,
+    };
+    if let Some(own) = propagation::span_context(span) {
+        return TraceContext {
+            trace_id: own.trace_id().to_bytes(),
+            parent_id: parent.map(|p| p.span_id().to_bytes()),
+            span_id: own.span_id().to_bytes(),
+            sampled: own.is_sampled(),
+        };
+    }
+    let mut context = TraceContext::root(&OsRandom);
+    if let Some(parent) = parent {
+        context.trace_id = parent.trace_id().to_bytes();
+        context.parent_id = Some(parent.span_id().to_bytes());
+        context.sampled = parent.is_sampled();
+    }
+    context
+}
+/// Counts a request in `http.server.active_requests` until dropped, so a
+/// cancelled request is not left counted.
+struct Active<'a> {
+    metrics: &'a HttpMetrics,
+    attributes: [KeyValue; 2],
+}
+impl Drop for Active<'_> {
+    fn drop(&mut self) {
+        self.metrics.active.add(-1, &self.attributes);
+    }
+}
+/// `merezha.principal.kind` values (TE §1.5), in [`principal_kind`] order.
+const PRINCIPAL_KINDS: [&str; 4] = ["anonymous", "user", "api_key", "system"];
+/// `merezha.principal.kind` of an authenticated principal.
+fn principal_kind(principal: Option<&Principal>) -> &'static str {
+    let index = match principal.map(|p| p.kind) {
+        None => 0,
+        Some(PrincipalKind::User) => 1,
+        Some(PrincipalKind::ApiKey) => 2,
+        Some(PrincipalKind::System) => 3,
+    };
+    PRINCIPAL_KINDS[index]
+}
+
 async fn context(State(state): State<EdgeState>, mut request: Request, next: Next) -> Response {
     let started = Instant::now();
     let peer = request
@@ -419,42 +617,138 @@ async fn context(State(state): State<EdgeState>, mut request: Request, next: Nex
         }
         hex(&bytes)
     });
-    let trace = text(&TRACEPARENT)
-        .and_then(|h| TraceContext::parse(&h))
-        .unwrap_or_else(|| TraceContext::root(&OsRandom));
+    let traceparent = single(headers, &TRACEPARENT);
+    let tracestate = trace_state(headers);
+    let declared_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
     let headers = request.headers_mut();
     for name in [FORWARDED_FOR, FORWARDED_PROTO, FORWARDED_HOST, FORWARDED] {
         headers.remove(name);
     }
     let method = request.method().clone();
-    let route = request
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|p| p.as_str().to_owned());
+    let matched = request.extensions().get::<MatchedPath>().cloned();
+    let route = matched.as_ref().map(|p| p.as_str().to_owned());
+    let scheme = match info.forwarded_proto.as_deref() {
+        Some("https") => UrlScheme::Https,
+        _ => UrlScheme::Http,
+    };
+    // `/health/*` requests get metrics, never spans (TE §1.2).
+    let health = route
+        .as_deref()
+        .is_some_and(|r| r == "/health" || r.starts_with("/health/"));
+    let span = if health {
+        tracing::Span::none()
+    } else {
+        let span = tracing::info_span!(
+            parent: None,
+            "http.server",
+            otel.name = names::http_server_span(method.as_str(), route.as_deref()),
+            otel.kind = "server",
+            otel.status_code = Empty,
+            http.request.method = names::http_method(method.as_str()),
+            url.scheme = scheme.as_str(),
+            http.route = Empty,
+            http.response.status_code = Empty,
+            error.type = Empty,
+            merezha.request_id = request_id.as_str(),
+            merezha.principal.kind = Empty,
+        );
+        if let Some(route) = &route {
+            span.record("http.route", route.as_str());
+        }
+        span
+    };
+    let trusted = propagation::trusts(state.trust, peer, via_trusted_proxy);
+    let inbound = propagation::continue_inbound(
+        &span,
+        traceparent.as_deref(),
+        tracestate.as_deref(),
+        trusted,
+    );
+    let trace = trace_context(&span, &inbound);
     let extensions = request.extensions_mut();
     extensions.insert(RequestId(request_id.clone()));
     extensions.insert(info);
     extensions.insert(trace);
-    let span = tracing::info_span!(
-        "request",
-        request_id = request_id.as_str(),
-        trace_id = trace.trace_id_hex().as_str()
-    );
-    let mut response = next.run(request).instrument(span).await;
+    let method_attribute = attr::method(method.as_str());
+    let route_attribute = matched.as_ref().map(attr::route);
+    let metrics = &state.metrics;
+    let active = Active {
+        metrics,
+        attributes: [method_attribute.clone(), attr::url_scheme(scheme)],
+    };
+    metrics.active.add(1, &active.attributes);
+    if let Some(length) = declared_length {
+        let mut attributes = vec![method_attribute.clone()];
+        attributes.extend(route_attribute.clone());
+        metrics.body_size.record(length, &attributes);
+    }
+    let mut response = next.run(request).instrument(span.clone()).await;
+    drop(active);
+    let status = response.status().as_u16();
+    let elapsed = started.elapsed();
+    span.record("http.response.status_code", i64::from(status));
+    if response.status().is_server_error() {
+        span.record("error.type", status.to_string().as_str());
+        span.record("otel.status_code", "error");
+    }
+    let mut attributes = vec![method_attribute, attr::status_code(status)];
+    attributes.extend(route_attribute);
+    attributes.extend(attr::server_error(status));
+    attributes.push(attr::url_scheme(scheme));
+    metrics.duration.record(elapsed.as_secs_f64(), &attributes);
+    if let Some(Rejected(reason)) = response.extensions_mut().remove::<Rejected>() {
+        metrics.rejected.add(1, &[attr::reason(reason)]);
+    }
+    drop(span);
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert(REQUEST_ID, value);
     }
-    merezha_telemetry::event!(
-        INFO,
-        "http.request.completed",
-        method = method.as_str(),
-        route = route.as_deref().unwrap_or("unmatched"),
-        status = response.status().as_u16(),
-        duration_ms = started.elapsed().as_millis() as u64,
-        request_id = request_id.as_str(),
-        trace_id = trace.trace_id_hex().as_str()
-    );
+    // Only trusted callers learn the server span's context (TE §2.1).
+    if trusted && let Ok(value) = HeaderValue::from_str(&trace.child_header()) {
+        response.headers_mut().insert(TRACEPARENT, value);
+    }
+    let duration_ms = elapsed.as_millis() as u64;
+    let trace_id = trace.trace_id_hex();
+    macro_rules! completed {
+        ($level:ident) => {
+            merezha_telemetry::event!(
+                $level,
+                "http.request.completed",
+                method = names::http_method(method.as_str()),
+                route = route.as_deref().unwrap_or("unmatched"),
+                status,
+                duration_ms,
+                request_id = request_id.as_str(),
+                trace_id = trace_id.as_str()
+            )
+        };
+    }
+    // TE §4: error for 500, info for other 5xx and slow requests, debug
+    // otherwise.
+    match status {
+        500 => completed!(ERROR),
+        501..=599 => completed!(INFO),
+        _ if elapsed >= SLOW_REQUEST => completed!(INFO),
+        _ => completed!(DEBUG),
+    }
     response
+}
+
+/// A refused request, counted in `merezha.http.server.rejected`.
+#[derive(Clone, Copy, Debug)]
+struct Rejected(Reason);
+/// The rejection reason of an error code, if it is one.
+fn rejection(code: &str) -> Option<Reason> {
+    match code {
+        "starting" => Some(Reason::Starting),
+        "overloaded" => Some(Reason::Overloaded),
+        "body_limit" => Some(Reason::BodyLimit),
+        "timeout" => Some(Reason::Timeout),
+        _ => None,
+    }
 }
 
 /// Largest error body inspected by [`normalize_errors`].
@@ -522,6 +816,9 @@ async fn normalize_errors(
     if let Some(registered) = response.extensions_mut().remove::<Registered>() {
         *response.status_mut() = state.errors.status(&registered.failure);
         set_retry_after(&mut response, registered.retry_after);
+        if let Some(reason) = rejection(&registered.failure.code) {
+            response.extensions_mut().insert(Rejected(reason));
+        }
         return response;
     }
     let status = response.status();
@@ -553,6 +850,13 @@ async fn normalize_errors(
         if error.is_some() {
             set_retry_after(&mut response, None);
         }
+        if let Some(reason) = error
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str())
+            .and_then(rejection)
+        {
+            response.extensions_mut().insert(Rejected(reason));
+        }
         return response;
     }
     let code = error
@@ -569,6 +873,9 @@ async fn normalize_errors(
     let body = serde_json::to_vec(&json!({ "error": failure })).unwrap_or_default();
     let mut response = Response::from_parts(parts, Body::from(body));
     set_retry_after(&mut response, None);
+    if let Some(reason) = rejection(&failure.code) {
+        response.extensions_mut().insert(Rejected(reason));
+    }
     response
 }
 
@@ -594,6 +901,10 @@ async fn authenticate(State(state): State<EdgeState>, request: Request, next: Ne
     let (mut parts, body) = request.into_parts();
     match authenticator.authenticate(&parts).await {
         Ok(principal) => {
+            tracing::Span::current().record(
+                "merezha.principal.kind",
+                principal_kind(principal.as_deref()),
+            );
             parts.extensions.insert(Authenticated(principal));
             next.run(Request::from_parts(parts, body)).await
         }

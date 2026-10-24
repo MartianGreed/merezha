@@ -32,7 +32,7 @@ pub struct ApplicationModule {
     options: PostgresOptions,
     /// Connections the jobs runtime needs from the pool (AP §B.10).
     jobs_connections: usize,
-    application: OnceLock<Application>,
+    application: Arc<OnceLock<Application>>,
     scheduler: OnceLock<Scheduler>,
     failure: Arc<OnceLock<Failure>>,
 }
@@ -52,7 +52,7 @@ impl ApplicationModule {
             policy,
             options,
             jobs_connections,
-            application: OnceLock::new(),
+            application: Arc::new(OnceLock::new()),
             scheduler: OnceLock::new(),
             failure: Arc::new(OnceLock::new()),
         }
@@ -62,6 +62,11 @@ impl ApplicationModule {
     /// `module_start_failed`.
     pub fn failure(&self) -> Arc<OnceLock<Failure>> {
         self.failure.clone()
+    }
+    /// The application once [`Module::start`] opened it, for the
+    /// `application` section of `/v1/admin/status`.
+    pub fn application(&self) -> Arc<OnceLock<Application>> {
+        self.application.clone()
     }
     /// The pool-size guidance of AP §A.8: HTTP admission, background runs,
     /// the jobs runtime and two spare connections. Below it requests wait
