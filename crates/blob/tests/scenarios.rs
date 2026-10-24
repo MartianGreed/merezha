@@ -343,8 +343,11 @@ async fn the_suite_passes_with_a_key_prefix() {
     assert!(
         mock.seen()
             .iter()
-            .all(|r| r.path.starts_with("/media/tenant-a/media/content/")),
-        "every request carries the prefix"
+            .all(|r| r.path.starts_with("/media/tenant-a/media/content/")
+                || r.path == "/media"
+                    && r.query
+                        .contains("prefix=tenant-a%2Fmedia%2Fcontent%2Freadiness%2F")),
+        "every request carries the prefix, the readiness list included"
     );
 }
 

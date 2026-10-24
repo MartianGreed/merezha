@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 /// Create `path` with mode 0700 if missing (parents included) and return
 /// its canonical form. Fails permanent `blob_root_unusable` when `path` is
 /// relative, cannot be created or is not a directory, and
-/// `blob_root_insecure` when the directory is writable by group or others.
+/// `blob_root_insecure` when the directory grants group or others any
+/// permission (mode `& 0o077`). The 0700 directory is the access boundary;
+/// files and subdirectories below it follow the process umask.
 pub fn ensure_private_dir(path: &Path) -> Result<PathBuf, Failure> {
     if !path.is_absolute() {
         return Err(Failure::permanent(ROOT_UNUSABLE));
@@ -19,7 +21,7 @@ pub fn ensure_private_dir(path: &Path) -> Result<PathBuf, Failure> {
     if !metadata.is_dir() {
         return Err(Failure::permanent(ROOT_UNUSABLE));
     }
-    if writable_by_others(&metadata) {
+    if open_to_others(&metadata) {
         return Err(Failure::permanent(ROOT_INSECURE));
     }
     std::fs::canonicalize(path).map_err(|_| Failure::permanent(ROOT_UNUSABLE))
@@ -38,13 +40,14 @@ fn create_private(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)
 }
 
+/// Whether group or others have any permission on the directory.
 #[cfg(unix)]
-fn writable_by_others(metadata: &std::fs::Metadata) -> bool {
+pub(crate) fn open_to_others(metadata: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    metadata.permissions().mode() & 0o022 != 0
+    metadata.permissions().mode() & 0o077 != 0
 }
 #[cfg(not(unix))]
-fn writable_by_others(_: &std::fs::Metadata) -> bool {
+pub(crate) fn open_to_others(_: &std::fs::Metadata) -> bool {
     false
 }
 
@@ -68,9 +71,18 @@ mod tests {
     }
 
     #[test]
-    fn group_or_world_writable_roots_are_refused() {
+    fn roots_open_to_group_or_others_are_refused() {
         let dir = tempfile::tempdir().unwrap();
-        for (bits, ok) in [(0o700, true), (0o755, true), (0o770, false), (0o702, false)] {
+        for (bits, ok) in [
+            (0o700, true),
+            (0o500, true),
+            (0o755, false),
+            (0o750, false),
+            (0o710, false),
+            (0o701, false),
+            (0o770, false),
+            (0o702, false),
+        ] {
             let root = dir.path().join(format!("m{bits:o}"));
             std::fs::create_dir(&root).unwrap();
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(bits)).unwrap();

@@ -1018,7 +1018,9 @@ the platform's no-retry rule: operations on content-addressed keys are
 idempotent.
 
 The host creates `media.local.root` with mode 0700 if missing and refuses a
-root writable by group or others. Keys never contain user input. The local
+root that grants group or others any permission (mode `& 0o077`), at startup
+and in readiness. That 0700 root is the access boundary: blob files and the
+subdirectories below it follow the process umask. Keys never contain user input. The local
 driver has no signed URLs, so `serve = "redirect"` with `driver = "local"`
 fails startup with `media_config_invalid`.
 
@@ -1047,14 +1049,20 @@ stays free of `object_store`. `ObjectBlobStore::open` takes a
   10 s (5xx, 408, 429, timeouts and connection failures). An operation that
   never gets an answer fails `blob_unavailable` after at most the timeout
   plus 10 s plus one backoff; a refused connection fails within the
-  timeout. Other 4xx answers fail `blob_backend_rejected` at once. Deletes
+  timeout. Other 4xx and every 3xx (a wrong region or endpoint) fail
+  `blob_backend_rejected` at once, and so does a write to a missing bucket.
+  Deletes
   are single `DELETE` requests, not bulk `POST /?delete`.
 - A ranged read past the end fails `range_not_satisfiable` on both drivers;
   an end past the size is clamped and `BlobRead::range` reports what was
   served.
 - `ObjectBlobStore::ready(deadline)` is the readiness probe below. On S3 it
   needs `s3:ListBucket`: without it a missing key answers 403, which reads as
-  not ready.
+  not ready. Locally it also fails when the root is gone or its mode no
+  longer refuses group and others (object_store recreates a deleted root
+  with the umask's mode on the next put).
+- `ObjectBlobStore::with_max_bytes` lowers the 5 GiB cap, for declared
+  lengths and for streams of unknown length alike.
 
 ### Keys
 
@@ -1278,7 +1286,10 @@ Queue settings for the `content` queue live under `[jobs.queues.content]`, not
 here (R1). Unknown keys and invalid combinations fail startup with every error
 at once, as the platform requires. The blob store contributes to readiness with a
 `head` of the fixed key `content/readiness/probe`; found or not found both
-count as ready.
+count as ready, provided the bucket exists: on S3 a one-key list of
+`content/readiness/` must also succeed, so a missing bucket (whose `head`
+also answers 404) is not ready. Locally the root must be a directory with
+mode `& 0o077` clear.
 
 ### Telemetry
 
@@ -1320,7 +1331,7 @@ and tested on 1.98.0 in their slice.
 | `tokio-postgres` | 0.7.18 | 1.85 | MIT OR Apache-2.0 | Through `merezha-postgres`; features `with-serde_json-1`, `with-uuid-1`, `with-jiff-0_2`. |
 | `deadpool-postgres` | 0.14.2 | 1.85 | MIT OR Apache-2.0 | Through `merezha-postgres`. |
 | `postgres-types` | 0.2.14 | 1.85 | MIT OR Apache-2.0 | `jsonb` and `uuid` mapping. |
-| `object_store` | 0.14.2 | 1.85 | MIT/Apache-2.0 | Blob drivers in `merezha-blob`; `default-features = false`, features `fs` and `aws`. It depends on `chrono` 0.4.45 unconditionally; no `chrono` type appears in `merezha-blob`'s API (R14). |
+| `object_store` | 0.14.2 | 1.85 | MIT/Apache-2.0 | Blob drivers in `merezha-blob`; `default-features = false`, features `fs` and `aws`. It depends on `chrono` 0.4.45 unconditionally, as R14 allows; no `chrono` type appears in `merezha-blob`'s API. |
 | `http` | 1.5.0 | 1.57.0 | MIT OR Apache-2.0 | `merezha-blob`: the `Method` that `object_store`'s signer takes; already locked through reqwest and axum. |
 | `uuid` | 1.29.0 | 1.89.0 | Apache-2.0 OR MIT | UUIDv7 ids; workspace pin with `v4`, `v5`, `v7`, `serde`. |
 | `jiff` | 0.2.38 | 1.70 | Unlicense OR MIT | The workspace's one time crate (R14), pinned with `default-features = false` and `std`, `serde`, `tz-system`, `tzdb-bundle-always`: strict RFC 3339 parsing, UTC normalization. |

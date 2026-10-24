@@ -110,6 +110,13 @@ impl MockS3 {
     pub fn open(&self) -> ObjectBlobStore {
         ObjectBlobStore::open(&DriverConfig::S3(self.config())).unwrap()
     }
+    /// Requests seen with this method and no query.
+    pub fn plain_requests(&self, method: Method) -> usize {
+        self.seen()
+            .iter()
+            .filter(|r| r.method == method && r.query.is_empty())
+            .count()
+    }
     pub fn fail_next(&self, statuses: &[u16]) {
         self.faults.lock().unwrap().extend(statuses);
     }
@@ -158,7 +165,7 @@ async fn handle(State(mock): State<Arc<MockS3>>, request: Request) -> Response {
     let fault = mock.faults.lock().unwrap().pop_front();
     if let Some(status) = fault {
         let status = StatusCode::from_u16(status).unwrap();
-        return s3_error(
+        let mut response = s3_error(
             status,
             if status.is_server_error() {
                 "InternalError"
@@ -166,6 +173,14 @@ async fn handle(State(mock): State<Arc<MockS3>>, request: Request) -> Response {
                 "Refused"
             },
         );
+        // A 300 with `Location`, which the HTTP client does not follow,
+        // reaches object_store as a rendered status.
+        if status == StatusCode::MULTIPLE_CHOICES {
+            response
+                .headers_mut()
+                .insert(header::LOCATION, "http://127.0.0.1:9/".parse().unwrap());
+        }
+        return response;
     }
     let query = parse_query(&raw_query);
     let presigned = query.iter().any(|(k, _)| k == "X-Amz-Signature");
@@ -176,6 +191,12 @@ async fn handle(State(mock): State<Arc<MockS3>>, request: Request) -> Response {
     };
     if let Err(code) = auth {
         return s3_error(StatusCode::FORBIDDEN, code);
+    }
+    if parts.method == Method::GET
+        && (path == format!("/{BUCKET}") || path == format!("/{BUCKET}/"))
+        && query.iter().any(|(k, v)| k == "list-type" && v == "2")
+    {
+        return list(&mock, &query);
     }
     let Some(rest) = path.strip_prefix(&format!("/{BUCKET}/")) else {
         return s3_error(StatusCode::NOT_FOUND, "NoSuchBucket");
@@ -308,6 +329,48 @@ async fn handle(State(mock): State<Arc<MockS3>>, request: Request) -> Response {
         }
         _ => s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed"),
     }
+}
+
+/// ListObjectsV2: keys under `prefix`, at most `max-keys`.
+fn list(mock: &MockS3, query: &[(String, String)]) -> Response {
+    let param = |name: &str| {
+        query
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    };
+    let prefix = param("prefix").unwrap_or_default();
+    let max: usize = param("max-keys")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    let store = mock.store.lock().unwrap();
+    let matching: Vec<_> = store
+        .objects
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .collect();
+    let contents: String = matching
+        .iter()
+        .take(max)
+        .map(|(key, object)| {
+            format!(
+                "<Contents><Key>{key}</Key><LastModified>2026-10-24T12:00:00.000Z</LastModified><ETag>{}</ETag><Size>{}</Size></Contents>",
+                object.etag.replace('"', "&quot;"),
+                object.size
+            )
+        })
+        .collect();
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><Name>{BUCKET}</Name><Prefix>{prefix}</Prefix><KeyCount>{}</KeyCount><MaxKeys>{max}</MaxKeys><IsTruncated>{}</IsTruncated>{contents}</ListBucketResult>",
+        matching.len().min(max),
+        matching.len() > max
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/xml")],
+        xml,
+    )
+        .into_response()
 }
 
 fn attribute_headers(headers: &HeaderMap) -> BTreeMap<String, String> {

@@ -3,8 +3,9 @@
 use crate::{
     config::{DriverConfig, LocalConfig, S3Config, normalized_prefix},
     errors::{
-        BACKEND_UNAVAILABLE, BODY_UNREADABLE, CONFIG_INVALID, Cause, INVALID_ATTRIBUTES,
-        INVALID_RANGE, INVALID_TTL, LENGTH_MISMATCH, RANGE_NOT_SATISFIABLE, TOO_LARGE, classify,
+        BACKEND_REJECTED, BACKEND_UNAVAILABLE, BODY_UNREADABLE, CONFIG_INVALID, Cause,
+        INVALID_ATTRIBUTES, INVALID_RANGE, INVALID_TTL, LENGTH_MISMATCH, RANGE_NOT_SATISFIABLE,
+        TOO_LARGE, classify,
     },
     fs::ensure_private_dir,
 };
@@ -23,6 +24,7 @@ use object_store::{
     ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutPayloadMut,
     RetryConfig,
     aws::{AmazonS3, AmazonS3Builder},
+    list::{PaginatedListOptions, PaginatedListStore},
     local::LocalFileSystem,
     path::Path as ObjectPath,
     signer::Signer,
@@ -95,6 +97,8 @@ enum Backend {
 /// is idempotent on a content-addressed key.
 pub struct ObjectBlobStore {
     backend: Backend,
+    /// Largest body a put accepts, at most [`MAX_BLOB_BYTES`].
+    max_bytes: u64,
 }
 impl std::fmt::Debug for ObjectBlobStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -126,6 +130,7 @@ impl ObjectBlobStore {
             .with_fsync(true);
         Ok(Self {
             backend: Backend::Local { store, root },
+            max_bytes: MAX_BLOB_BYTES,
         })
     }
 
@@ -171,7 +176,17 @@ impl ObjectBlobStore {
             .map_err(|_| Failure::permanent(CONFIG_INVALID))?;
         Ok(Self {
             backend: Backend::S3 { store, prefix },
+            max_bytes: MAX_BLOB_BYTES,
         })
+    }
+
+    /// Lower the largest body a put accepts (default and ceiling
+    /// [`MAX_BLOB_BYTES`]), for a declared length and for the bytes of a
+    /// stream of unknown length alike. Over it a put fails `blob_too_large`
+    /// and stores nothing.
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = max_bytes.min(MAX_BLOB_BYTES);
+        self
     }
 
     pub fn driver(&self) -> Driver {
@@ -182,19 +197,34 @@ impl ObjectBlobStore {
     }
 
     /// The readiness probe (CT §9): a `head` of [`READINESS_KEY`] within
-    /// `deadline`. Found and not found are both ready; the local driver
-    /// also needs its root to still be a directory. Anything else, or the
-    /// deadline passing, is the failure.
+    /// `deadline`, where found and not found are both ready. On S3 the
+    /// bucket must also exist: a one-key list of the probe prefix fails on
+    /// a missing bucket (`blob_backend_rejected`). Locally the root must
+    /// still be a directory with no group or other permissions. Anything
+    /// else, or the deadline passing, is the failure.
     pub async fn ready(&self, deadline: Duration) -> Result<(), BlobError> {
         let unavailable = BlobError::Unavailable(BACKEND_UNAVAILABLE);
         let probe = async {
-            if let Backend::Local { root, .. } = &self.backend {
-                let metadata = tokio::fs::metadata(root).await.map_err(|_| unavailable)?;
-                if !metadata.is_dir() {
-                    return Err(unavailable);
+            let key = BlobKey::new(READINESS_KEY)?;
+            match &self.backend {
+                Backend::Local { root, .. } => {
+                    let metadata = tokio::fs::metadata(root).await.map_err(|_| unavailable)?;
+                    if !metadata.is_dir() || crate::fs::open_to_others(&metadata) {
+                        return Err(unavailable);
+                    }
+                }
+                Backend::S3 { store, prefix } => {
+                    let options = PaginatedListOptions {
+                        max_keys: Some(1),
+                        ..PaginatedListOptions::default()
+                    };
+                    let probe_prefix = format!("{prefix}{}/", parent(READINESS_KEY));
+                    store
+                        .list_paginated(Some(&probe_prefix), options)
+                        .await
+                        .map_err(|e| backend_refused(&e))?;
                 }
             }
-            let key = BlobKey::new(READINESS_KEY)?;
             match self.head(&key).await {
                 Ok(_) | Err(BlobError::NotFound) => Ok(()),
                 Err(error) => Err(error),
@@ -264,7 +294,7 @@ impl ObjectBlobStore {
     ) -> Result<BlobStat, BlobError> {
         let path = self.path(key)?;
         let attributes = self.attributes(attrs)?;
-        let mut source = Source::open(body).await?;
+        let mut source = Source::open(body, self.max_bytes).await?;
         let (first, eof) = source.fill(PART_BYTES).await?;
         if eof {
             source.finish()?;
@@ -276,7 +306,7 @@ impl ObjectBlobStore {
                 .store()
                 .put_opts(&path, first.freeze(), opts)
                 .await
-                .map_err(|e| classify(&e).0)?;
+                .map_err(|e| backend_refused(&e))?;
             return Ok(BlobStat {
                 size: source.read,
                 etag: result.e_tag,
@@ -290,7 +320,7 @@ impl ObjectBlobStore {
             .store()
             .put_multipart_opts(&path, opts)
             .await
-            .map_err(|e| classify(&e).0)?;
+            .map_err(|e| backend_refused(&e))?;
         let written = async {
             let (mut part, mut eof) = (first, false);
             loop {
@@ -298,7 +328,7 @@ impl ObjectBlobStore {
                     upload
                         .put_part(PutPayload::from(part))
                         .await
-                        .map_err(|e| classify(&e).0)?;
+                        .map_err(|e| backend_refused(&e))?;
                 }
                 if eof {
                     break;
@@ -306,7 +336,7 @@ impl ObjectBlobStore {
                 (part, eof) = source.fill(PART_BYTES).await?;
             }
             source.finish()?;
-            upload.complete().await.map_err(|e| classify(&e).0)
+            upload.complete().await.map_err(|e| backend_refused(&e))
         }
         .await;
         match written {
@@ -397,10 +427,25 @@ impl ObjectBlobStore {
     }
 }
 
+/// A failure of a write or of the bucket probe: there a not-found means
+/// the bucket is missing, a backend refusal, not a missing object.
+fn backend_refused(error: &object_store::Error) -> BlobError {
+    match classify(error).0 {
+        BlobError::NotFound => BlobError::Rejected(BACKEND_REJECTED),
+        other => other,
+    }
+}
+
+/// `a/b/c` without its last segment.
+fn parent(key: &str) -> &str {
+    key.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
 /// One body read as chunks, counting bytes against its declared length and
-/// [`MAX_BLOB_BYTES`].
+/// the store's size cap.
 struct Source {
     kind: SourceKind,
+    max_bytes: u64,
     expected: Option<u64>,
     read: u64,
     /// A chunk split at a part boundary, read again first.
@@ -414,13 +459,13 @@ enum SourceKind {
     Stream(BoxStream<'static, io::Result<Bytes>>),
 }
 impl Source {
-    async fn open(body: BlobBody) -> Result<Self, BlobError> {
+    async fn open(body: BlobBody, max_bytes: u64) -> Result<Self, BlobError> {
         let declared = match &body {
             BlobBody::Bytes(bytes) => Some(bytes.len() as u64),
             BlobBody::File { len, .. } => Some(*len),
             BlobBody::Stream { len, .. } => *len,
         };
-        if declared.is_some_and(|len| len > MAX_BLOB_BYTES) {
+        if declared.is_some_and(|len| len > max_bytes) {
             return Err(BlobError::Invalid(TOO_LARGE));
         }
         let (kind, expected) = match body {
@@ -438,6 +483,7 @@ impl Source {
         };
         Ok(Self {
             kind,
+            max_bytes,
             expected,
             read: 0,
             carry: None,
@@ -474,7 +520,7 @@ impl Source {
         if self.expected.is_some_and(|len| self.read > len) {
             return Err(BlobError::Invalid(LENGTH_MISMATCH));
         }
-        if self.read > MAX_BLOB_BYTES {
+        if self.read > self.max_bytes {
             return Err(BlobError::Invalid(TOO_LARGE));
         }
         Ok(Some(chunk))

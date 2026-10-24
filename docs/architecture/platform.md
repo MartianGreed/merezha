@@ -17,7 +17,10 @@ beside them: the PostgreSQL outbox, the jobs port and the relay (see
 
 `merezha-blob` (`crates/blob`, CT-C6) holds the `BlobStore` drivers, local
 filesystem and S3-compatible through `object_store`, so the kernel never
-depends on `object_store`. The content block installs one (CT §6).
+depends on `object_store`. The content block installs one (CT §6). The
+local root must be mode 0700 (no group or other bits, checked at startup and
+by readiness); it is the access boundary, and blob files and subdirectories
+below it follow the process umask.
 
 `merezha run --config merezha.toml` (`crates/cli/src/run.rs`) puts them
 together with the existing runtime and application layer. `merezha serve`

@@ -29,8 +29,44 @@ fn a_group_writable_root_is_refused() {
     assert_eq!(open(&root).unwrap_err().code, "blob_root_insecure");
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o757)).unwrap();
     assert_eq!(open(&root).unwrap_err().code, "blob_root_insecure");
+    for mode in [0o755, 0o750, 0o701] {
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            open(&root).unwrap_err().code,
+            "blob_root_insecure",
+            "{mode:o}"
+        );
+    }
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(open(&root).is_ok());
+}
+
+#[tokio::test]
+async fn readiness_fails_when_the_root_mode_drifts() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("media");
+    let store = open(&root).unwrap();
+    store.ready(Duration::from_secs(1)).await.unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        store.ready(Duration::from_secs(1)).await.unwrap_err(),
+        BlobError::Unavailable("blob_unavailable")
+    );
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    store.ready(Duration::from_secs(1)).await.unwrap();
+
+    // object_store recreates a deleted root on the next put with the
+    // umask's mode; readiness refuses it.
+    std::fs::remove_dir_all(&root).unwrap();
+    let key = BlobKey::new("content/app/sha256/ab/cd/abcd").unwrap();
+    let _ = store
+        .put(&key, BlobBody::Bytes(Bytes::from_static(b"x")), &attrs())
+        .await;
+    if root.exists() {
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_ne!(mode & 0o077, 0, "recreated with the umask, {mode:o}");
+    }
+    assert!(store.ready(Duration::from_secs(1)).await.is_err());
 }
 
 #[test]

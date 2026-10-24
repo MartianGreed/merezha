@@ -164,6 +164,14 @@ async fn every_status_class_maps_to_its_failure() {
         let requests = mock.request_count();
         assert!(requests <= 2, "{status}: no retries ({requests})");
     }
+    // Redirects mean a wrong region or endpoint: permanent, not retried.
+    // S3's 301 PermanentRedirect carries no Location; the 300 does.
+    for status in [300, 301, 307] {
+        mock.requests.store(0, Ordering::SeqCst);
+        mock.fail_next(&[status]);
+        assert_eq!(store.head(&key()).await.unwrap_err(), REJECTED, "{status}");
+        assert_eq!(mock.request_count(), 1, "{status}: no retries");
+    }
     for status in [408, 429, 500, 502, 503] {
         mock.fail_next(&[status; 1 + MAX_RETRIES]);
         assert_eq!(
@@ -239,8 +247,10 @@ async fn invalid_input_never_reaches_the_backend() {
     let mut config = mock.config();
     config.key_prefix = "p".repeat(200);
     let store = ObjectBlobStore::open(&DriverConfig::S3(config)).unwrap();
-    // Valid on its own, over 1024 bytes once prefixed.
-    let long = BlobKey::new(format!("content/{}", "k".repeat(900))).unwrap();
+    // Valid on its own; `p…p/` (201 bytes) plus 824 bytes is 1025 once
+    // prefixed, one byte over.
+    let long = BlobKey::new(format!("content/{}", "k".repeat(816))).unwrap();
+    assert_eq!(long.as_str().len(), 824);
     let invalid_key = BlobError::Invalid("invalid_blob_key");
     assert_eq!(
         store.put(&long, bytes(b"x"), &attrs()).await.unwrap_err(),
@@ -357,4 +367,116 @@ async fn startup_refuses_invalid_settings() {
             .code,
         "blob_config_invalid"
     );
+}
+
+#[tokio::test]
+async fn a_prefixed_key_of_exactly_1024_bytes_is_accepted() {
+    let mock = support::MockS3::start().await;
+    let mut config = mock.config();
+    config.key_prefix = "p".repeat(200);
+    let store = ObjectBlobStore::open(&DriverConfig::S3(config)).unwrap();
+    let key = BlobKey::new(format!("content/{}", "k".repeat(815))).unwrap();
+    store.put(&key, bytes(b"edge"), &attrs()).await.unwrap();
+    let stored = format!("{}/{}", "p".repeat(200), key.as_str());
+    assert_eq!(stored.len(), 1024);
+    assert!(mock.object(&stored).is_some());
+}
+
+#[tokio::test]
+async fn a_missing_bucket_is_not_ready_and_refuses_writes() {
+    let mock = support::MockS3::start().await;
+    let mut config = mock.config();
+    config.bucket = "no-such-bucket".into();
+    let store = ObjectBlobStore::open(&DriverConfig::S3(config)).unwrap();
+    assert_eq!(
+        store.ready(Duration::from_secs(2)).await.unwrap_err(),
+        REJECTED,
+        "a head alone would answer 404 and read as ready"
+    );
+    assert_eq!(
+        store.put(&key(), bytes(b"x"), &attrs()).await.unwrap_err(),
+        REJECTED
+    );
+    let large = BlobBody::Bytes(Bytes::from(vec![1u8; merezha_blob::PART_BYTES + 1]));
+    assert_eq!(
+        store.put(&key(), large, &attrs()).await.unwrap_err(),
+        REJECTED,
+        "the multipart path too"
+    );
+    // The same server's real bucket is ready.
+    mock.open().ready(Duration::from_secs(2)).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_body_of_exactly_one_part_is_one_request() {
+    let mock = support::MockS3::start().await;
+    let store = mock.open();
+    let data = vec![9u8; merezha_blob::PART_BYTES];
+    let chunks: Vec<std::io::Result<Bytes>> = data
+        .chunks(64 * 1024)
+        .map(|c| Ok(Bytes::copy_from_slice(c)))
+        .collect();
+    let body = BlobBody::Stream {
+        body: Box::pin(futures_util::stream::iter(chunks)),
+        len: None,
+    };
+    store.put(&key(), body, &attrs()).await.unwrap();
+    assert_eq!(mock.request_count(), 1);
+    assert_eq!(mock.plain_requests(axum::http::Method::PUT), 1);
+    // One byte more is a multipart upload: create, two parts, complete.
+    let body = BlobBody::Bytes(Bytes::from(vec![9u8; merezha_blob::PART_BYTES + 1]));
+    store.put(&key(), body, &attrs()).await.unwrap();
+    assert_eq!(mock.request_count(), 1 + 4);
+}
+
+#[tokio::test]
+async fn the_size_cap_applies_to_streams_of_unknown_length() {
+    let mock = support::MockS3::start().await;
+    let cap = 3 * 1024 * 1024;
+    let store = mock.open().with_max_bytes(cap);
+    let stream = |len: usize| BlobBody::Stream {
+        body: Box::pin(futures_util::stream::iter(
+            vec![1u8; len]
+                .chunks(64 * 1024)
+                .map(|c| Ok(Bytes::copy_from_slice(c)))
+                .collect::<Vec<std::io::Result<Bytes>>>(),
+        )),
+        len: None,
+    };
+    let at_cap = store
+        .put(&key(), stream(cap as usize), &attrs())
+        .await
+        .unwrap();
+    assert_eq!(at_cap.size, cap);
+    store.delete(&key()).await.unwrap();
+    assert_eq!(
+        store
+            .put(&key(), stream(cap as usize + 1), &attrs())
+            .await
+            .unwrap_err(),
+        BlobError::Invalid("blob_too_large")
+    );
+    assert_eq!(store.head(&key()).await.unwrap_err(), BlobError::NotFound);
+    // A declared length over the cap fails before any request.
+    let requests = mock.request_count();
+    let declared = BlobBody::Stream {
+        body: Box::pin(futures_util::stream::empty()),
+        len: Some(cap + 1),
+    };
+    assert_eq!(
+        store.put(&key(), declared, &attrs()).await.unwrap_err(),
+        BlobError::Invalid("blob_too_large")
+    );
+    assert_eq!(mock.request_count(), requests);
+    // The cap never rises above the 5 GiB ceiling.
+    let raised = mock.open().with_max_bytes(u64::MAX);
+    let declared = BlobBody::Stream {
+        body: Box::pin(futures_util::stream::empty()),
+        len: Some(merezha_blob::MAX_BLOB_BYTES + 1),
+    };
+    assert_eq!(
+        raised.put(&key(), declared, &attrs()).await.unwrap_err(),
+        BlobError::Invalid("blob_too_large")
+    );
+    assert_eq!(merezha_blob::MAX_BLOB_BYTES, 5 * 1024 * 1024 * 1024);
 }

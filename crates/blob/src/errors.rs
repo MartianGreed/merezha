@@ -67,7 +67,7 @@ pub(crate) enum Cause {
 ///
 /// Typed variants map directly. A generic failure is classified by walking
 /// its source chain: a transport error is transient, an I/O error by kind,
-/// and an HTTP status by class (4xx permanent except 408 and 429). `object_store` keeps its status error type
+/// and an HTTP status by class (3xx and 4xx permanent except 408 and 429). `object_store` keeps its status error type
 /// private, so the status is read from the `non-2xx status code: NNN` text
 /// it renders; `tests/s3.rs` pins that rendering for every class.
 pub(crate) fn classify(error: &object_store::Error) -> (BlobError, Cause) {
@@ -105,9 +105,15 @@ fn classify_chain(error: &(dyn std::error::Error + 'static)) -> (BlobError, Caus
                 _ => unavailable(Cause::Unreachable),
             };
         }
-        if let Some(status) = rendered_status(&error.to_string()) {
+        let text = error.to_string();
+        // A redirect is a wrong region or endpoint, never transient. S3's
+        // `PermanentRedirect` carries no `Location`.
+        if text.contains(BARE_REDIRECT) {
+            return (BlobError::Rejected(BACKEND_REJECTED), Cause::Refused);
+        }
+        if let Some(status) = rendered_status(&text) {
             // 408 and 429 are the backend asking for time, like a 5xx.
-            return if (400..500).contains(&status) && status != 408 && status != 429 {
+            return if (300..500).contains(&status) && status != 408 && status != 429 {
                 (BlobError::Rejected(BACKEND_REJECTED), Cause::Refused)
             } else {
                 unavailable(Cause::Unreachable)
@@ -121,6 +127,9 @@ fn classify_chain(error: &(dyn std::error::Error + 'static)) -> (BlobError, Caus
 fn unavailable(cause: Cause) -> (BlobError, Cause) {
     (BlobError::Unavailable(BACKEND_UNAVAILABLE), cause)
 }
+
+/// `object_store`'s rendering of a 3xx without `Location`.
+const BARE_REDIRECT: &str = "Received redirect without LOCATION";
 
 /// The status in `object_store`'s `Server returned non-2xx status code:
 /// 416 Range Not Satisfiable: ...` rendering.

@@ -90,10 +90,11 @@ async fn a_twenty_mebibyte_streamed_put_keeps_memory_near_one_part() {
     }
 
     // One 5 MiB part buffered, plus the chunk in hand and the HTTP and
-    // file layers' own buffers: 8 MiB, well under the 20 MiB body. Fixed,
-    // so a larger part size fails here too.
+    // file layers' own buffers; the S3 figure also counts the in-process
+    // server receiving the part. 10 MiB, half the 20 MiB body. Fixed, so a
+    // larger part size fails here too.
     assert_eq!(PART_BYTES, 5 * 1024 * 1024);
-    let limit = 8 * 1024 * 1024;
+    let limit = 10 * 1024 * 1024;
     let local_peak = peak_during_put(&local).await;
     let s3_peak = peak_during_put(&s3).await;
     eprintln!(
