@@ -70,6 +70,7 @@ pub(super) struct ApplicationExtensions {
     pub reactors: ApplicationReactors,
     pub background: ApplicationBackground,
     pub append: ApplicationAppend,
+    pub max_concurrent_origin: Origin,
 }
 pub(super) fn application_extensions(
     layers: &mut Layers,
@@ -107,6 +108,7 @@ pub(super) fn application_extensions(
     };
     r.finish();
     let (mut r, _) = reader(layers, "application.background", issues);
+    let max_concurrent_origin = r.origin_of("max_concurrent").unwrap_or(Origin::Default);
     let background = ApplicationBackground {
         max_concurrent: r.integer("max_concurrent", 2, 1, 16) as u32,
     };
@@ -121,6 +123,7 @@ pub(super) fn application_extensions(
         reactors,
         background,
         append,
+        max_concurrent_origin,
     }
 }
 

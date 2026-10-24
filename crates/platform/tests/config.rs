@@ -618,7 +618,11 @@ fn application_extensions_validate_with_the_section() {
     assert_eq!(application.append.lock_timeout_max, Duration::from_secs(5));
     let config = load(
         "[application]\npath = \"a.toml\"\n[application.projections]\ncatch_up = \"manual\"\nrun_timeout_ms = \"1m\"\n[application.background]\nmax_concurrent = 16\n",
-        &[("MEREZHA_APPLICATION__APPEND__LOCK_TIMEOUT_MAX_MS", "250")],
+        &[
+            ("MEREZHA_APPLICATION__APPEND__LOCK_TIMEOUT_MAX_MS", "250"),
+            // 16 background runs need 17 detached sessions.
+            ("MEREZHA_DATABASE__MAX_DETACHED", "17"),
+        ],
         &[],
     )
     .unwrap();
@@ -660,6 +664,43 @@ fn application_extensions_validate_with_the_section() {
             ),
         ]
     );
+}
+
+#[test]
+fn background_runs_leave_one_detached_session_free() {
+    // Defaults: 2 background runs, 8 detached sessions.
+    assert!(load("[application]\npath = \"a.toml\"\n", &[], &[]).is_ok());
+    let fits = "[application]\npath = \"a.toml\"\n[application.background]\nmax_concurrent = 7\n";
+    assert!(load(fits, &[], &[]).is_ok());
+    let errors = load(
+        "[application]\npath = \"a.toml\"\n[application.background]\nmax_concurrent = 8\n",
+        &[],
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(
+        codes(&errors),
+        vec![
+            (
+                "application.background.max_concurrent".into(),
+                "detached_sessions_exhausted"
+            ),
+            (
+                "database.max_detached".into(),
+                "detached_sessions_exhausted"
+            ),
+        ]
+    );
+    assert_eq!(errors.0[0].origin, Origin::File);
+    assert_eq!(errors.0[1].origin, Origin::Default);
+    let errors = load(fits, &[("MEREZHA_DATABASE__MAX_DETACHED", "4")], &[]).unwrap_err();
+    assert_eq!(
+        errors.0[1].origin,
+        Origin::Env("MEREZHA_DATABASE__MAX_DETACHED".into())
+    );
+    assert!(load(fits, &[], &[("database.max_detached", "16")]).is_ok());
+    // Without an application there are no background runs to fit.
+    assert!(load("", &[("MEREZHA_DATABASE__MAX_DETACHED", "1")], &[]).is_ok());
 }
 
 #[test]

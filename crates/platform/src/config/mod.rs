@@ -1061,6 +1061,7 @@ fn build(
         defaults.statement_timeout,
         merezha_postgres::limits::STATEMENT_TIMEOUT,
     );
+    let max_detached_origin = r.origin_of("max_detached").unwrap_or(Origin::Default);
     let max_detached = r.integer(
         "max_detached",
         defaults.max_detached as u64,
@@ -1116,6 +1117,20 @@ fn build(
     };
     r.finish();
     let extensions = jobs::application_extensions(layers, issues);
+    // Every background run holds a detached session; one slot stays free
+    // for migrations and explicit catch-ups.
+    if path.is_some() && extensions.background.max_concurrent as usize + 1 > max_detached {
+        issues.push(ConfigIssue::new(
+            "application.background.max_concurrent",
+            "detached_sessions_exhausted",
+            extensions.max_concurrent_origin.clone(),
+        ));
+        issues.push(ConfigIssue::new(
+            "database.max_detached",
+            "detached_sessions_exhausted",
+            max_detached_origin.clone(),
+        ));
+    }
     let application = path.map(|path| ApplicationConfig {
         path,
         projections: extensions.projections,
