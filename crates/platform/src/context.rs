@@ -2,8 +2,9 @@
 use crate::{
     edge::TraceContext,
     ports::{
-        Authenticator, Authorizer, BlobStore, CaptureNotifier, Notifier, Outbox,
-        UnavailableBlobStore, UnavailableOutbox,
+        Authenticator, Authorizer, BlobStore, CaptureNotifications, Directory, EmptyDirectory,
+        Notifier, NotifierFactory, Outbox, Source, SourceOutbox, UnavailableBlobStore,
+        UnavailableOutbox,
     },
 };
 use merezha_domain::Failure;
@@ -158,7 +159,8 @@ struct Inner {
     outbox: Arc<dyn Outbox>,
     authenticator: Option<Arc<dyn Authenticator>>,
     authorizer: Arc<dyn Authorizer>,
-    notifier: Arc<dyn Notifier>,
+    notifications: Arc<dyn NotifierFactory>,
+    directory: Arc<dyn Directory>,
     blobs: Arc<dyn BlobStore>,
 }
 impl std::fmt::Debug for AppContext {
@@ -171,7 +173,8 @@ impl std::fmt::Debug for AppContext {
 }
 impl AppContext {
     /// Start from the disabled-block fallbacks: no authenticator, the given
-    /// policy, a capture notifier, a refusing outbox and blob store.
+    /// policy, capture notifications, an empty directory, a refusing outbox
+    /// and blob store.
     pub fn builder(
         app_id: &str,
         database: Database,
@@ -186,7 +189,8 @@ impl AppContext {
             outbox: Arc::new(UnavailableOutbox),
             authenticator: None,
             authorizer,
-            notifier: Arc::new(CaptureNotifier::default()),
+            notifications: Arc::new(CaptureNotifications::default()),
+            directory: Arc::new(EmptyDirectory),
             blobs: Arc::new(UnavailableBlobStore),
         }
     }
@@ -205,8 +209,14 @@ impl AppContext {
     pub fn http(&self) -> &OutboundHttp {
         &self.inner.http
     }
-    pub fn outbox(&self) -> &Arc<dyn Outbox> {
-        &self.inner.outbox
+    /// The outbox bound to `source`, the caller's module name (or `api`,
+    /// `application`). It validates every append before the implementation
+    /// sees it. Fails permanent `invalid_source`.
+    pub fn outbox(&self, source: &str) -> Result<SourceOutbox, Failure> {
+        Ok(SourceOutbox::new(
+            Source::new(source)?,
+            self.inner.outbox.clone(),
+        ))
     }
     pub fn authenticator(&self) -> Option<&Arc<dyn Authenticator>> {
         self.inner.authenticator.as_ref()
@@ -214,8 +224,17 @@ impl AppContext {
     pub fn authorizer(&self) -> &Arc<dyn Authorizer> {
         &self.inner.authorizer
     }
-    pub fn notifier(&self) -> &Arc<dyn Notifier> {
-        &self.inner.notifier
+    /// The notifier bound to `source`. Fails permanent `invalid_source`.
+    pub fn notifier(&self, source: &str) -> Result<Arc<dyn Notifier>, Failure> {
+        Ok(self.inner.notifications.bind(&Source::new(source)?))
+    }
+    /// `false` while notifications are only captured: blocks that must not
+    /// lose security mail refuse to start on that.
+    pub fn notifications_deliver(&self) -> bool {
+        self.inner.notifications.delivers()
+    }
+    pub fn directory(&self) -> &Arc<dyn Directory> {
+        &self.inner.directory
     }
     pub fn blobs(&self) -> &Arc<dyn BlobStore> {
         &self.inner.blobs
@@ -231,7 +250,8 @@ pub struct AppContextBuilder {
     outbox: Arc<dyn Outbox>,
     authenticator: Option<Arc<dyn Authenticator>>,
     authorizer: Arc<dyn Authorizer>,
-    notifier: Arc<dyn Notifier>,
+    notifications: Arc<dyn NotifierFactory>,
+    directory: Arc<dyn Directory>,
     blobs: Arc<dyn BlobStore>,
 }
 impl AppContextBuilder {
@@ -255,8 +275,12 @@ impl AppContextBuilder {
         self.authenticator = Some(authenticator);
         self
     }
-    pub fn notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
-        self.notifier = notifier;
+    pub fn notifications(mut self, notifications: Arc<dyn NotifierFactory>) -> Self {
+        self.notifications = notifications;
+        self
+    }
+    pub fn directory(mut self, directory: Arc<dyn Directory>) -> Self {
+        self.directory = directory;
         self
     }
     pub fn blobs(mut self, blobs: Arc<dyn BlobStore>) -> Self {
@@ -278,7 +302,8 @@ impl AppContextBuilder {
                 outbox: self.outbox,
                 authenticator: self.authenticator,
                 authorizer: self.authorizer,
-                notifier: self.notifier,
+                notifications: self.notifications,
+                directory: self.directory,
                 blobs: self.blobs,
             }),
         })

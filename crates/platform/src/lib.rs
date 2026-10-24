@@ -15,6 +15,6 @@ pub use config::{ConfigErrors, ConfigInput, ConfigIssue, ModuleSection, ProjectC
 pub use context::{AppContext, Clock, OsRandom, OutboundHttp, Random, SystemClock};
 pub use edge::error_response;
 pub use host::{Host, HostParts, StartupError, Timeouts};
-pub use merezha_postgres::{BoxFuture, Database, Migration, Secret};
+pub use merezha_postgres::{BoxFuture, Database, Migration, MigrationKind, Secret, Tx};
 pub use module::{Module, ModuleEvents};
-pub use ports::Principal;
+pub use ports::{Principal, ResourceScope, Source};

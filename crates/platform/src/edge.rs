@@ -76,7 +76,7 @@ pub struct ClientInfo {
 /// The authenticated principal, inserted by the edge when an
 /// [`Authenticator`] is configured. `None` is an anonymous request.
 #[derive(Clone, Debug)]
-pub struct Authenticated(pub Option<Principal>);
+pub struct Authenticated(pub Option<Arc<Principal>>);
 
 /// W3C trace context for one server span.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

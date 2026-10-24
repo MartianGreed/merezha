@@ -83,8 +83,11 @@ async fn dispatch(state: Routes, request: Request, action: Action) -> Response {
         } else {
             "application.projections.catch_up"
         };
-        let checked = Identity::new(permission)
-            .and_then(|permission| policy.check(None, &permission, &ResourceScope::Global));
+        let checked = Identity::new(permission).and_then(|permission| {
+            policy
+                .check(None, &permission, &ResourceScope::Application)
+                .map_err(Failure::from)
+        });
         if let Err(failure) = checked {
             return failure_response(failure);
         }
