@@ -37,20 +37,86 @@ const DAY: u64 = 86_400;
 pub struct HostFacts {
     /// Directory of `merezha.toml`; `templates.dir` resolves against it.
     pub base_dir: PathBuf,
-    /// `http.public`, when the kernel sections loaded.
+    /// `http.public`; `None` when the setting itself is malformed, which
+    /// the kernel reports.
     pub http_public: Option<bool>,
-    /// `app.name`, the default of `templates.app_name`.
+    /// `app.name` (default `app.id`), the default of `templates.app_name`.
     pub app_name: Option<String>,
-    /// `[jobs]`, when the kernel sections loaded.
+    /// `[jobs]`; `None` when that section itself does not validate, which
+    /// the kernel reports.
     pub jobs: Option<JobsConfig>,
+    /// Origins of the queue settings the block checks, by issue key such as
+    /// `jobs.queues."notify.email".lease_ms`. Absent keys are defaults.
+    pub jobs_origins: BTreeMap<String, Origin>,
     /// `MEREZHA_NOTIFY_NO_EGRESS=1`.
     pub no_egress: bool,
 }
+
+/// The queue settings the cross checks read.
+const CHECKED_QUEUE_KEYS: [(&str, &str); 4] = [
+    ("notify.email", "lease_ms"),
+    ("notify.sms", "lease_ms"),
+    ("notify.webhook", "lease_ms"),
+    ("notify.webhook", "backoff_max_ms"),
+];
+/// Stands in for the database URL while `[jobs]` is validated alone.
+const FACTS_URL_ENV: &str = "NOTIFY_FACTS_PLACEHOLDER_URL";
+
+/// The raw layers of the configuration input, read with the kernel's
+/// precedence: flag, then `MEREZHA_<SECTION>__<KEY>`, then the file.
+struct RawLayers<'a> {
+    file: toml::Table,
+    input: &'a merezha_platform::ConfigInput,
+}
+impl RawLayers<'_> {
+    /// The value of `section.key` and its origin. `section` has no dotted
+    /// segments (`http`, `app`, `jobs.defaults` as two segments).
+    fn get(&self, section: &[&str], key: &str) -> Option<(toml::Value, Origin)> {
+        let dotted = format!("{}.{key}", section.join("."));
+        if let Some((_, value)) = self
+            .input
+            .overrides
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == dotted)
+        {
+            return Some((toml::Value::String(value.clone()), Origin::Flag));
+        }
+        let wanted: Vec<String> = section
+            .iter()
+            .chain(std::iter::once(&key))
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        let env = self.input.env.iter().rev().find(|(name, _)| {
+            name.strip_prefix(merezha_platform::config::ENV_PREFIX)
+                .is_some_and(|rest| {
+                    rest.split("__")
+                        .map(str::to_ascii_lowercase)
+                        .eq(wanted.iter().cloned())
+                })
+        });
+        if let Some((name, value)) = env {
+            return Some((
+                toml::Value::String(value.clone()),
+                Origin::Env(name.clone()),
+            ));
+        }
+        let mut table = &self.file;
+        for segment in section {
+            table = table.get(*segment)?.as_table()?;
+        }
+        table.get(key).map(|v| (v.clone(), Origin::File))
+    }
+}
+
 impl HostFacts {
-    /// Gather the facts from the same input the host loads. When the kernel
-    /// sections do not load, the checks that need them are skipped: the
-    /// host reports the kernel problems and refuses to start anyway.
+    /// Gather the facts from the same input the host loads, with the
+    /// kernel's precedence, whether or not the rest of the configuration
+    /// validates: `http.public`, `app.name` and `[jobs]` are read from the
+    /// layers directly, so the block's checks run in the same pass as the
+    /// kernel's and every problem is reported at once.
     pub fn load(input: &merezha_platform::ConfigInput) -> Self {
+        use std::io::Read;
         let base_dir = input
             .path
             .canonicalize()
@@ -61,15 +127,116 @@ impl HostFacts {
             .env
             .iter()
             .any(|(name, value)| name == NO_EGRESS_ENV && value == "1");
-        match ProjectConfig::load(input) {
-            Ok(config) => Self::from_config(&config, no_egress),
-            Err(_) => Self {
-                base_dir,
-                no_egress,
-                ..Self::default()
-            },
+        let mut text = String::new();
+        let readable = std::fs::File::open(&input.path)
+            .and_then(|f| {
+                f.take(merezha_platform::config::MAX_CONFIG_BYTES + 1)
+                    .read_to_string(&mut text)
+            })
+            .is_ok()
+            && text.len() as u64 <= merezha_platform::config::MAX_CONFIG_BYTES;
+        let file: toml::Table = if readable {
+            toml::from_str(&text).unwrap_or_default()
+        } else {
+            toml::Table::new()
+        };
+        let layers = RawLayers { file, input };
+        let http_public = match layers.get(&["http"], "public") {
+            None => Some(false),
+            Some((toml::Value::Boolean(b), _)) => Some(b),
+            Some((toml::Value::String(text), Origin::Env(_) | Origin::Flag)) => {
+                match text.as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                }
+            }
+            Some(_) => None,
+        };
+        let app_name = [("name"), ("id")]
+            .iter()
+            .find_map(|key| match layers.get(&["app"], key) {
+                Some((toml::Value::String(name), _)) if !name.is_empty() => Some(name),
+                _ => None,
+            });
+        let jobs = Self::jobs_alone(&layers, &base_dir);
+        let mut jobs_origins = BTreeMap::new();
+        for (queue, key) in CHECKED_QUEUE_KEYS {
+            let flag = format!("jobs.queues.\"{queue}\".{key}");
+            let origin = if input.overrides.iter().any(|(k, _)| *k == flag) {
+                Some(Origin::Flag)
+            } else if layers
+                .file
+                .get("jobs")
+                .and_then(|j| j.get("queues"))
+                .and_then(|q| q.get(queue))
+                .and_then(|q| q.get(key))
+                .is_some()
+            {
+                Some(Origin::File)
+            } else {
+                layers.get(&["jobs", "defaults"], key).map(|(_, o)| o)
+            };
+            if let Some(origin) = origin {
+                jobs_origins.insert(flag, origin);
+            }
+        }
+        Self {
+            base_dir,
+            http_public,
+            app_name,
+            jobs,
+            jobs_origins,
+            no_egress,
         }
     }
+
+    /// `[jobs]` validated by the kernel on its own: the file's section and
+    /// its environment and flag layers, with placeholder kernel sections.
+    fn jobs_alone(layers: &RawLayers<'_>, base_dir: &Path) -> Option<JobsConfig> {
+        let mut document = toml::Table::new();
+        let table = |pairs: &[(&str, toml::Value)]| {
+            toml::Value::Table(
+                pairs
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                    .collect(),
+            )
+        };
+        document.insert("app".into(), table(&[("id", "facts".into())]));
+        let url = table(&[("env", FACTS_URL_ENV.into())]);
+        document.insert("database".into(), table(&[("url", url)]));
+        document.insert(
+            "runtime".into(),
+            table(&[("manifest", "runtime.toml".into())]),
+        );
+        if let Some(jobs) = layers.file.get("jobs") {
+            document.insert("jobs".into(), jobs.clone());
+        }
+        let text = toml::to_string(&document).ok()?;
+        let mut env: Vec<(String, String)> = layers
+            .input
+            .env
+            .iter()
+            .filter(|(name, _)| name.to_ascii_uppercase().starts_with("MEREZHA_JOBS__"))
+            .cloned()
+            .collect();
+        env.push((
+            FACTS_URL_ENV.into(),
+            "postgres://facts@127.0.0.1:1/facts".into(),
+        ));
+        let overrides: Vec<(String, String)> = layers
+            .input
+            .overrides
+            .iter()
+            .filter(|(key, _)| key.starts_with("jobs."))
+            .cloned()
+            .collect();
+        ProjectConfig::parse(&text, base_dir.to_path_buf(), &env, &overrides)
+            .ok()
+            .map(|config| config.jobs)
+    }
+
     /// The facts of a loaded project.
     pub fn from_config(config: &ProjectConfig, no_egress: bool) -> Self {
         Self {
@@ -77,6 +244,7 @@ impl HostFacts {
             http_public: Some(config.http.public),
             app_name: Some(config.app.name.clone()),
             jobs: Some(config.jobs.clone()),
+            jobs_origins: BTreeMap::new(),
             no_egress,
         }
     }
@@ -1211,7 +1379,7 @@ fn parse_into(
         webhooks,
         topics,
     };
-    cross_checks(&settings, facts, issues);
+    cross_checks(section, &settings, facts, issues);
     settings
 }
 
@@ -1273,10 +1441,21 @@ fn queue_settings(jobs: &JobsConfig, queue: &str) -> (JobDefaults, bool) {
 }
 
 /// Checks across sections and against the host (NT §7.2).
-fn cross_checks(settings: &Settings, facts: &HostFacts, issues: &mut Vec<ConfigIssue>) {
-    let key = |k: &str| format!("modules.notifications.{k}");
-    let mut push =
-        |k: String, code: &'static str| issues.push(ConfigIssue::new(k, code, Origin::File));
+fn cross_checks(
+    section: &ModuleSection,
+    settings: &Settings,
+    facts: &HostFacts,
+    issues: &mut Vec<ConfigIssue>,
+) {
+    // Issues name the module key with the layer that set it, or `default`.
+    let at = |path: &[&str], code: &'static str| {
+        let dotted: Vec<String> = path.iter().map(|p| segment(p)).collect();
+        ConfigIssue::new(
+            section.key(&dotted.join(".")),
+            code,
+            module_origin(section, path),
+        )
+    };
 
     // Topic channels need a driver and a section.
     for (name, topic) in &settings.topics {
@@ -1285,10 +1464,7 @@ fn cross_checks(settings: &Settings, facts: &HostFacts, issues: &mut Vec<ConfigI
         }
         for channel in &topic.channels {
             if !settings.channel_available(*channel) {
-                push(
-                    key(&format!("topics.{}.channels", segment(name))),
-                    "channel_unavailable",
-                );
+                issues.push(at(&["topics", name, "channels"], "channel_unavailable"));
                 break;
             }
         }
@@ -1297,29 +1473,35 @@ fn cross_checks(settings: &Settings, facts: &HostFacts, issues: &mut Vec<ConfigI
     // `http.public` refuses development conveniences.
     if facts.http_public == Some(true) {
         if settings.email.driver == Driver::Capture {
-            push(key("email.driver"), "refused_when_public");
+            issues.push(at(&["email", "driver"], "refused_when_public"));
         }
         if settings.sms.driver == Driver::Capture {
-            push(key("sms.driver"), "refused_when_public");
+            issues.push(at(&["sms", "driver"], "refused_when_public"));
         }
         if settings.egress.allow_private_networks {
-            push(key("egress.allow_private_networks"), "refused_when_public");
+            issues.push(at(
+                &["egress", "allow_private_networks"],
+                "refused_when_public",
+            ));
         }
         if settings.webhooks.as_ref().is_some_and(|w| w.allow_http) {
-            push(key("webhooks.allow_http"), "refused_when_public");
+            issues.push(at(&["webhooks", "allow_http"], "refused_when_public"));
         }
         if settings.templates.allow_http_links {
-            push(key("templates.allow_http_links"), "refused_when_public");
+            issues.push(at(
+                &["templates", "allow_http_links"],
+                "refused_when_public",
+            ));
         }
         if settings
             .brevo
             .as_ref()
             .is_some_and(|b| !b.base_url.starts_with("https://"))
         {
-            push(key("brevo.base_url"), "refused_when_public");
+            issues.push(at(&["brevo", "base_url"], "refused_when_public"));
         }
         if settings.templates.preview && !settings.templates.preview_in_public {
-            push(key("templates.preview"), "refused_when_public");
+            issues.push(at(&["templates", "preview"], "refused_when_public"));
         }
     }
 
@@ -1333,13 +1515,21 @@ fn cross_checks(settings: &Settings, facts: &HostFacts, issues: &mut Vec<ConfigI
     if settings.public_base_url.is_none()
         && (unsubscribe_needed || settings.sms.driver == Driver::Brevo)
     {
-        push(key("public_base_url"), "missing_required");
+        issues.push(at(&["public_base_url"], "missing_required"));
     }
 
     // Queue leases cover three provider deadlines; the webhook ladder needs
     // a 24-hour backoff cap (R1).
     if let Some(jobs) = &facts.jobs {
-        let queue_key = |queue: &str, k: &str| format!("jobs.queues.\"{queue}\".{k}");
+        let queue_issue = |queue: &str, k: &str, code: &'static str| {
+            let key = format!("jobs.queues.\"{queue}\".{k}");
+            let origin = facts
+                .jobs_origins
+                .get(&key)
+                .cloned()
+                .unwrap_or(Origin::Default);
+            ConfigIssue::new(key, code, origin)
+        };
         if let Some(brevo) = &settings.brevo {
             for (queue, driver) in [
                 ("notify.email", settings.email.driver),
@@ -1347,20 +1537,21 @@ fn cross_checks(settings: &Settings, facts: &HostFacts, issues: &mut Vec<ConfigI
             ] {
                 let (effective, _) = queue_settings(jobs, queue);
                 if driver == Driver::Brevo && effective.lease < brevo.timeout * 3 {
-                    push(queue_key(queue, "lease_ms"), "lease_too_short");
+                    issues.push(queue_issue(queue, "lease_ms", "lease_too_short"));
                 }
             }
         }
         if let Some(webhooks) = &settings.webhooks {
             let (effective, _) = queue_settings(jobs, "notify.webhook");
             if effective.lease < webhooks.timeout * 3 {
-                push(queue_key("notify.webhook", "lease_ms"), "lease_too_short");
+                issues.push(queue_issue("notify.webhook", "lease_ms", "lease_too_short"));
             }
             if effective.backoff_max < Duration::from_secs(DAY) {
-                push(
-                    queue_key("notify.webhook", "backoff_max_ms"),
+                issues.push(queue_issue(
+                    "notify.webhook",
+                    "backoff_max_ms",
                     "backoff_max_too_short",
-                );
+                ));
             }
         }
     }
@@ -1374,7 +1565,32 @@ fn cross_checks(settings: &Settings, facts: &HostFacts, issues: &mut Vec<ConfigI
             .and_then(|u| u.host().map(|h| loopback_host(&h)))
             .unwrap_or(false);
         if !loopback {
-            push(key("brevo.base_url"), "egress_not_loopback");
+            issues.push(at(&["brevo", "base_url"], "egress_not_loopback"));
         }
+    }
+}
+
+/// The layer that set `path` in the section: the override's origin for a
+/// top-level key, `file` for a key present in the table, else `default`.
+fn module_origin(section: &ModuleSection, path: &[&str]) -> Origin {
+    if let [key] = path
+        && let Some(origin) = section.overridden.get(*key)
+    {
+        return origin.clone();
+    }
+    let Some((last, parents)) = path.split_last() else {
+        return Origin::Default;
+    };
+    let mut table = &section.table;
+    for parent in parents {
+        match table.get(*parent).and_then(toml::Value::as_table) {
+            Some(child) => table = child,
+            None => return Origin::Default,
+        }
+    }
+    if table.contains_key(*last) {
+        Origin::File
+    } else {
+        Origin::Default
     }
 }

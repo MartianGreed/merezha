@@ -450,3 +450,144 @@ fn a_project_file_replaces_the_embedded_default() {
     assert!(!email.text.contains("x.example/u"));
     assert!(!email.html.unwrap().contains("x.example/u"));
 }
+
+#[test]
+fn inbox_renders_never_see_secret_data_even_through_a_partial() {
+    let checked = Project::new(&project_topic("\"email\", \"inbox\""))
+        .template("_partials/code.txt", "code {{ secret.code }}")
+        .template("tasks.assigned/en/subject.txt", "Your code")
+        .template("tasks.assigned/en/body.txt", "{% include \"_partials/code.txt\" %}")
+        .template(
+            "tasks.assigned/en/inbox.toml",
+            "title = \"Code\"\nbody = \"{% if show %}{% include '_partials/code.txt' %}{% else %}hidden{% endif %}\"\n",
+        )
+        .template(
+            "tasks.assigned/template.toml",
+            "[preview]\nshow = false\n[preview.secret]\ncode = \"123456\"\n",
+        )
+        .configure()
+        .unwrap();
+    let secret = object(json!({"code": "123456"}));
+    let data = object(json!({"show": true}));
+    let context = RenderContext {
+        topic: "tasks.assigned",
+        category: Category::Transactional,
+        notification_id: PREVIEW_NOTIFICATION_ID,
+        data: &data,
+        secret: &secret,
+        recipient_name: None,
+        timezone: None,
+        unsubscribe: None,
+    };
+    // Email renders the secret through the partial.
+    let Ok(Rendered::Email(email)) =
+        checked
+            .registry
+            .render("tasks.assigned", Channel::Email, "en", &context)
+    else {
+        panic!("email renders");
+    };
+    assert_eq!(email.text, "code 123456");
+    // The inbox refuses explicitly, with secret data present.
+    let refused = checked
+        .registry
+        .render("tasks.assigned", Channel::Inbox, "en", &context)
+        .unwrap_err();
+    assert_eq!(refused.code, "inbox_references_secret");
+    // Testing or printing `secret` itself is refused too.
+    for body in [
+        "{{ secret }}",
+        "{% if secret %}x{% endif %}y",
+        "{% for k in secret %}{{ k }}{% endfor %}z",
+    ] {
+        let issues = Project::new(&project_topic("\"inbox\""))
+            .template(
+                "tasks.assigned/en/inbox.toml",
+                "title = \"t\"\nbody = \"{% include '_partials/p.txt' %}\"\n",
+            )
+            .template("_partials/p.txt", body)
+            .issues();
+        assert!(
+            has(
+                &issues,
+                "modules.notifications.templates.\"tasks.assigned\".preview.en.inbox",
+                "inbox_references_secret"
+            ),
+            "{body}: {issues:?}"
+        );
+    }
+}
+
+#[test]
+fn output_is_capped_while_rendering_not_after() {
+    let started = std::time::Instant::now();
+    let issues = Project::new(&project_topic("\"email\""))
+        .template("tasks.assigned/en/subject.txt", "Big")
+        .template(
+            "tasks.assigned/en/body.txt",
+            "{% for i in range(20) %}{{ 'x' * 50000000 }}{% endfor %}",
+        )
+        .issues();
+    assert!(
+        has(
+            &issues,
+            "modules.notifications.templates.\"tasks.assigned\".preview.en.email",
+            "output_too_large"
+        ),
+        "{issues:?}"
+    );
+    // The first 50 MB piece hits the 128 KiB text cap; the other 19 never run.
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // The cap stops the render where it is hit: the undefined variable after
+    // the oversized output is never reached.
+    let issues = Project::new(&project_topic("\"email\""))
+        .template("tasks.assigned/en/subject.txt", "Big")
+        .template(
+            "tasks.assigned/en/body.txt",
+            "{{ 'x' * 200000 }}{{ never_defined }}",
+        )
+        .issues();
+    assert!(
+        has(
+            &issues,
+            "modules.notifications.templates.\"tasks.assigned\".preview.en.email",
+            "output_too_large"
+        ),
+        "{issues:?}"
+    );
+}
+
+#[test]
+fn sms_refuses_every_control_character_but_line_feed() {
+    let checked = Project::new(&project_topic("\"sms\"").replace(
+        "[modules.notifications.topics",
+        "[modules.notifications.sms]\ndriver = \"capture\"\nsender = \"Tasks\"\n\n[modules.notifications.topics",
+    ))
+    .template("tasks.assigned/en/sms.txt", "{{ text }}")
+    .template("tasks.assigned/template.toml", "[preview]\ntext = \"Hi\"\n")
+    .configure()
+    .unwrap();
+    for bad in ["a\tb", "a\u{7}b", "a\rb", "a\u{1b}b", "a\u{85}b"] {
+        assert_eq!(
+            render(
+                &checked,
+                "tasks.assigned",
+                Channel::Sms,
+                "en",
+                &object(json!({"text": bad}))
+            ),
+            Err("control_character"),
+            "{bad:?}"
+        );
+    }
+    assert!(
+        render(
+            &checked,
+            "tasks.assigned",
+            Channel::Sms,
+            "en",
+            &object(json!({"text": "a\nb"}))
+        )
+        .is_ok()
+    );
+}

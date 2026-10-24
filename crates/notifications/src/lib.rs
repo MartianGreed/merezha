@@ -21,7 +21,7 @@ pub mod templates;
 pub mod topics;
 
 pub use config::{HostFacts, Settings};
-pub use routes::{PREVIEW_CSP, PREVIEW_PERMISSION};
+pub use routes::{PREVIEW_CSP, PREVIEW_PERMISSION, loopback_host_header};
 pub use templates::TemplateRegistry;
 
 use merezha_platform::{

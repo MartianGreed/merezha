@@ -576,9 +576,9 @@ locales and the channel drivers, and exit code 0; or `status` `invalid` with
   | Method and path | Access | Answer |
   | --- | --- | --- |
   | `GET templates` | `notifications.templates.preview` at `Application` | `[{name, description, locales, channels}]` |
-  | `POST templates/{name}/preview` | same | `{locale?, data?, channels?}` renders every channel: `{email: {subject, html, text}, sms: {text, encoding, segments}, push: {title, body, url}, inbox: {title, body, link, payload}}`. Without `data`, the template's preview data. `data.secret` is the preview's secret data. 422 `render_failed` with `details: [{path: "/channels/<channel>", code}]`, `reserved_data_key`, `data_too_large`, `channel_not_allowed`, `invalid_locale`; 400 `invalid_input`; 404 for an unknown template |
+  | `POST templates/{name}/preview` | same | `{locale?, data?, channels?}` renders every channel (`Cache-Control: no-store`): `{email: {subject, html, text}, sms: {text, encoding, segments}, push: {title, body, url}, inbox: {title, body, link, payload}}`. Without `data`, the template's preview data. `data.secret` is the preview's secret data. 422 `render_failed` with `details: [{path: "/channels/<channel>", code}]`, `reserved_data_key`, `data_too_large`, `channel_not_allowed`, `invalid_locale`; 400 `invalid_input`; 404 for an unknown template |
   | `GET templates/{name}/preview.html?locale=` | same | the HTML email with `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; sandbox` |
-  | `GET dev/captures?channel=email\|sms&limit=1..100` | a loopback peer (not through a trusted proxy) while a capture driver is active | the newest captured messages, `[{delivery_id, channel, target, rendered, captured_at}]`; 404 otherwise |
+  | `GET dev/captures?channel=email\|sms&limit=1..100` | a loopback peer (not through a trusted proxy) with a loopback `Host` (`localhost`, `127.0.0.1` or `[::1]`, any port, against DNS rebinding) while a capture driver is active | the newest captured messages, `[{delivery_id, channel, target, rendered, captured_at}]`; 404 otherwise |
 
   The three template routes answer 404 when `templates.preview = false`.
   Without the identity block the kernel policy decides: allowed on a private
@@ -586,8 +586,9 @@ locales and the channel drivers, and exit code 0; or `status` `invalid` with
 - The capture drivers (`email.driver = "capture"`, the default, and
   `sms.driver = "capture"`) keep each rendered message in
   `merezha_notify.captures`, the newest `retention.captures` rows, and accept
-  it with provider `capture`. A second capture with the same delivery and
-  idempotency key answers duplicate, as Brevo does. Captures hold rendered
+  it with provider `capture`. A unique index on the delivery and its
+  idempotency key makes a second capture of the same generation answer
+  duplicate, as Brevo does. Captures hold rendered
   secret data, which is why `http.public = true` refuses a capture driver.
 
 ### Templates
@@ -601,7 +602,12 @@ directories must be in `templates.locales`. Every topic needs its template
 in the default locale, so with a default locale other than `en` or `fr` the
 project provides the built-in templates in it too. Rendering uses strict undefined,
 HTML escaping for `.html` files only, `templates.fuel` and the output limits
-of NT §4. The filters are `url` (`https:`, or `http:` to loopback with
+of NT §4. Output is written into a buffer capped at the channel's limit, so
+a render stops with `output_too_large` as soon as it passes the limit; a
+single expression can still build a large value before it is written
+(templates are trusted project code). In the inbox, `secret` is a guard
+holding no data: any use of it, through partials included, refuses the
+render with `inbox_references_secret`. The filters are `url` (`https:`, or `http:` to loopback with
 `templates.allow_http_links`), `datetime(format)` (a jiff `strftime` format,
 default `%Y-%m-%d %H:%M %Z`, in `recipient.timezone`) and `truncate_chars(n)`
 (the first `n` characters).
@@ -646,11 +652,13 @@ Brevo email and a non-security email topic, a `notify.email`,
 non-loopback `brevo.base_url` (`egress_not_loopback`).
 
 `Module::configure` sees only the module's section, so the binary hands
-the block the facts these checks need (`HostFacts::load`: the configuration
-directory, `http.public`, `app.name`, `[jobs]` and
-`MEREZHA_NOTIFY_NO_EGRESS`) when it registers it. When the kernel sections
-do not load, the cross checks that need them are skipped; startup fails on
-the kernel issues anyway.
+the block the facts these checks need when it registers it
+(`HostFacts::load`: the configuration directory, `http.public`, `app.name`,
+`[jobs]` and `MEREZHA_NOTIFY_NO_EGRESS`). They are read from the file,
+environment and flag layers with the kernel's precedence, `[jobs]` validated
+by the kernel on its own, so these checks run even when other kernel
+settings are invalid and every problem is reported in one pass. Each issue
+carries the layer that set its key, or `default`.
 
 ## PostgreSQL
 

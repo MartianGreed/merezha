@@ -208,7 +208,7 @@ async fn preview_renders_given_data_and_reports_failures_as_details() {
     let router = routes_for(&project, Arc::new(Grantsheet));
     let admin = || Some(user(&[PREVIEW_PERMISSION]));
     let path = "/templates/tasks.assigned/preview";
-    let (status, _, body) = call(
+    let (status, headers, body) = call(
         &router,
         "POST",
         path,
@@ -217,6 +217,10 @@ async fn preview_renders_given_data_and_reports_failures_as_details() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        headers["cache-control"], "no-store",
+        "previews may hold secrets"
+    );
     let preview = json_of(&body);
     assert_eq!(preview["email"]["subject"], "Tâche : Rapport");
     // The inbox has no French file: it falls back to English.
@@ -264,6 +268,12 @@ async fn preview_renders_given_data_and_reports_failures_as_details() {
         (json!({"data": {"app": "x"}}), 422, "reserved_data_key"),
         (
             json!({"data": {"title": "x".repeat(40_000)}}),
+            422,
+            "data_too_large",
+        ),
+        // Secret data counts toward the same limit.
+        (
+            json!({"data": {"title": "x", "owner": "y", "secret": {"code": "s".repeat(33_000)}}}),
             422,
             "data_too_large",
         ),
@@ -384,4 +394,65 @@ async fn captures_are_listed_only_on_loopback_with_a_capture_driver() {
         disabled.oneshot(request).await.unwrap().status(),
         StatusCode::NOT_FOUND
     );
+}
+
+fn client(address: &str, via_trusted_proxy: bool) -> ClientInfo {
+    ClientInfo {
+        address: Some(address.parse().unwrap()),
+        forwarded_proto: None,
+        forwarded_host: None,
+        via_trusted_proxy,
+    }
+}
+
+#[tokio::test]
+async fn captures_refuse_proxied_and_rebound_requests() {
+    let router = routes_for(&Project::new(MINIMAL), Arc::new(Grantsheet));
+    for (info, host) in [
+        // A loopback client address relayed by a trusted proxy.
+        (client("127.0.0.1", true), "localhost"),
+        // A loopback peer whose page rebound a foreign name to 127.0.0.1.
+        (client("127.0.0.1", false), "evil.example"),
+        (client("::1", false), "evil.example:8080"),
+        // No Host header at all.
+        (client("127.0.0.1", false), ""),
+    ] {
+        let mut request = Request::builder().uri("/dev/captures");
+        if !host.is_empty() {
+            request = request.header("host", host);
+        }
+        let request = request.extension(info.clone()).body(Body::empty()).unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{info:?} {host}");
+    }
+}
+
+#[test]
+fn loopback_host_headers_are_recognised() {
+    use merezha_notifications::loopback_host_header;
+    for good in [
+        "localhost",
+        "LocalHost:8080",
+        "127.0.0.1",
+        "127.0.0.1:1",
+        "[::1]",
+        "[::1]:65535",
+    ] {
+        assert!(loopback_host_header(good), "{good}");
+    }
+    for bad in [
+        "",
+        "evil.example",
+        "localhost.evil.example",
+        "127.0.0.2",
+        "127.0.0.1:",
+        "127.0.0.1:x",
+        "127.0.0.1:65536",
+        "[::2]",
+        "[::1]x",
+        "[::1]:",
+        "::1",
+    ] {
+        assert!(!loopback_host_header(bad), "{bad}");
+    }
 }

@@ -197,31 +197,17 @@ impl CaptureDriver {
         let rendered = rendered.to_string();
         let target = target.to_owned();
         let keep = i64::from(self.keep);
-        let key = idempotency_key.map(|k| k.to_string());
         let result = self
             .database
             .transaction(deadline, move |tx| {
                 Box::pin(async move {
                     let id = delivery_id.to_string();
-                    if let Some(key) = &key {
-                        let seen = tx
-                            .query_opt(
-                                "SELECT 1 FROM merezha_notify.captures \
-                                 WHERE delivery_id = $1::text::uuid \
-                                 AND rendered->>'idempotency_key' = $2",
-                                &[&id, key],
-                            )
-                            .await
-                            .map_err(|e| classify(&e))?;
-                        if seen.is_some() {
-                            return Ok(None);
-                        }
-                    }
                     let row = tx
-                        .query_one(
+                        .query_opt(
                             "INSERT INTO merezha_notify.captures \
                              (delivery_id, channel, target, rendered, captured_at) \
-                             VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5) RETURNING id",
+                             VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5) \
+                             ON CONFLICT DO NOTHING RETURNING id",
                             &[
                                 &id,
                                 &channel.as_str(),
@@ -232,6 +218,9 @@ impl CaptureDriver {
                         )
                         .await
                         .map_err(|e| classify(&e))?;
+                    let Some(row) = row else {
+                        return Ok(None);
+                    };
                     tx.execute(
                         "DELETE FROM merezha_notify.captures WHERE id <= \
                          (SELECT id FROM merezha_notify.captures ORDER BY id DESC \

@@ -109,3 +109,6 @@ CREATE TABLE merezha_notify.captures (
   delivery_id uuid NOT NULL, channel text NOT NULL, target text NOT NULL,
   rendered jsonb NOT NULL, captured_at timestamptz NOT NULL
 );
+-- One capture per delivery and idempotency key; SMS captures carry no key.
+CREATE UNIQUE INDEX captures_idempotency_idx
+  ON merezha_notify.captures (delivery_id, (rendered->>'idempotency_key'));

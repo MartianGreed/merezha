@@ -405,9 +405,163 @@ fn host_facts_follow_the_kernel_configuration() {
     assert_eq!(facts.app_name.as_deref(), Some("Tasks"));
     assert_eq!(facts.base_dir, project.path().canonicalize().unwrap());
     assert!(!facts.no_egress);
-    // A broken kernel section leaves the host checks to the kernel.
+    // A broken kernel section does not hide the facts the block reads.
     let broken = Project::raw("[app]\n[modules.notifications]\n");
     let facts = HostFacts::load(&broken.input());
-    assert_eq!(facts.http_public, None);
+    assert_eq!(facts.http_public, Some(false));
+    assert!(facts.jobs.is_some());
     assert_eq!(facts.base_dir, broken.path().canonicalize().unwrap());
+}
+
+/// `(key, code, origin)` of every issue.
+fn with_origins(project: &Project) -> Vec<(String, &'static str, String)> {
+    match project.configure() {
+        Ok(_) => Vec::new(),
+        Err(errors) => errors
+            .0
+            .iter()
+            .map(|i| (i.key.clone(), i.code, i.origin.to_string()))
+            .collect(),
+    }
+}
+
+#[test]
+fn host_checks_run_even_when_kernel_sections_are_invalid() {
+    let project = Project::raw(&format!(
+        "{}\n[http]\nlisten = \"0.0.0.0:8080\"\npublic = true\n{MINIMAL}\n[modules.notifications.webhooks]\n",
+        support::KERNEL.replace("manifest = \"runtime.toml\"", "manifest = 3")
+    ));
+    let issues = project.issues();
+    assert!(
+        has(&issues, "runtime.manifest", "expected_string"),
+        "{issues:?}"
+    );
+    assert!(
+        has(&issues, &format!("{N}.email.driver"), "refused_when_public"),
+        "{issues:?}"
+    );
+    assert!(
+        has(
+            &issues,
+            "jobs.queues.\"notify.webhook\".backoff_max_ms",
+            "backoff_max_too_short"
+        ),
+        "{issues:?}"
+    );
+}
+
+#[test]
+fn host_facts_follow_the_kernel_layers() {
+    let project = Project::raw(
+        "[app]\nid = \"tasks\"\n[http]\npublic = true\n[runtime]\nmanifest = 3\n\
+         [jobs.queues.\"notify.email\"]\nlease_ms = 20000\n",
+    );
+    let facts = HostFacts::load(&project.input());
+    assert_eq!(facts.http_public, Some(true), "the file layer");
+    assert_eq!(
+        facts.app_name.as_deref(),
+        Some("tasks"),
+        "app.name defaults to app.id"
+    );
+    let jobs = facts.jobs.as_ref().expect("[jobs] validates alone");
+    assert_eq!(
+        jobs.queues["notify.email"].settings.lease,
+        Duration::from_millis(20_000)
+    );
+    let mut input = project.input();
+    input
+        .env
+        .push(("MEREZHA_HTTP__PUBLIC".into(), "false".into()));
+    input
+        .env
+        .push(("MEREZHA_JOBS__DEFAULTS__LEASE_MS".into(), "45000".into()));
+    let facts = HostFacts::load(&input);
+    assert_eq!(
+        facts.http_public,
+        Some(false),
+        "the environment wins over the file"
+    );
+    assert_eq!(
+        facts.jobs.as_ref().unwrap().defaults.lease,
+        Duration::from_millis(45_000)
+    );
+    assert_eq!(
+        facts.jobs_origins["jobs.queues.\"notify.webhook\".lease_ms"].to_string(),
+        "env MEREZHA_JOBS__DEFAULTS__LEASE_MS"
+    );
+    assert_eq!(
+        facts.jobs_origins["jobs.queues.\"notify.email\".lease_ms"].to_string(),
+        "file"
+    );
+    input.overrides.push(("http.public".into(), "true".into()));
+    assert_eq!(
+        HostFacts::load(&input).http_public,
+        Some(true),
+        "a flag wins"
+    );
+    // A malformed value leaves the decision to the kernel's own issue.
+    let broken = Project::raw("[http]\npublic = \"yes\"\n");
+    assert_eq!(HostFacts::load(&broken.input()).http_public, None);
+}
+
+#[test]
+fn cross_check_issues_carry_the_layer_that_set_the_key() {
+    let public = |extra: &str, jobs: &str| {
+        Project::new(&format!(
+            "[http]\nlisten = \"0.0.0.0:8080\"\npublic = true\n{jobs}\n{MINIMAL}{extra}"
+        ))
+    };
+    let issues = with_origins(&public(
+        "[modules.notifications.sms]\ndriver = \"capture\"\nsender = \"Tasks\"\n\
+         [modules.notifications.templates]\nfuel = 60000\n\
+         [modules.notifications.webhooks]\n",
+        "[jobs.queues.\"notify.webhook\"]\nlease_ms = 1000\n",
+    ));
+    let origin = |key: &str, code: &str| {
+        issues
+            .iter()
+            .find(|(k, c, _)| k == key && *c == code)
+            .map(|(_, _, o)| o.clone())
+            .unwrap_or_else(|| panic!("{key} {code} not in {issues:?}"))
+    };
+    assert_eq!(
+        origin(&format!("{N}.email.driver"), "refused_when_public"),
+        "default"
+    );
+    assert_eq!(
+        origin(&format!("{N}.sms.driver"), "refused_when_public"),
+        "file"
+    );
+    assert_eq!(
+        origin(&format!("{N}.templates.preview"), "refused_when_public"),
+        "default"
+    );
+    // `[templates]` exists but `preview` is not in it: still the default.
+    assert_eq!(
+        origin("jobs.queues.\"notify.webhook\".lease_ms", "lease_too_short"),
+        "file"
+    );
+    assert_eq!(
+        origin(
+            "jobs.queues.\"notify.webhook\".backoff_max_ms",
+            "backoff_max_too_short"
+        ),
+        "default"
+    );
+    let issues = with_origins(
+        &Project::new(&format!(
+            "{MINIMAL}[modules.notifications.sms]\ndriver = \"brevo\"\nsender = \"Tasks\"\n\
+             [modules.notifications.brevo]\napi_key = {{ env = \"K\" }}\n"
+        ))
+        .env("K", "key")
+        .env("MEREZHA_MODULES__NOTIFICATIONS__PUBLIC_BASE_URL", ""),
+    );
+    assert!(
+        issues
+            .iter()
+            .any(|(k, c, o)| k == &format!("{N}.public_base_url")
+                && *c == "missing_required"
+                && o == "env MEREZHA_MODULES__NOTIFICATIONS__PUBLIC_BASE_URL"),
+        "{issues:?}"
+    );
 }

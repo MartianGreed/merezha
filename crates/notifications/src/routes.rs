@@ -10,7 +10,7 @@ use axum::{
     Extension, Json, Router,
     body::Bytes,
     extract::{Path, RawQuery, State},
-    http::{HeaderValue, header},
+    http::{HeaderMap, HeaderValue, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -248,7 +248,14 @@ async fn preview(
         }
     };
     match render_all(&state, &name, &locale, &channels, &data, &secret) {
-        Ok(rendered) => Json(Value::Object(rendered)).into_response(),
+        Ok(rendered) => {
+            // Previews may hold secret data; nothing caches them.
+            let mut response = Json(Value::Object(rendered)).into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
         Err(reply) => reply.into_response(),
     }
 }
@@ -340,9 +347,36 @@ fn escape(text: &str) -> String {
 }
 
 /// Loopback only, and only while a capture driver is active; 404 otherwise.
+/// Whether a `Host` header names this machine: `localhost`, `127.0.0.1`
+/// or `[::1]`, with an optional port. A page on another origin that
+/// rebinds its name to 127.0.0.1 still sends its own name.
+pub fn loopback_host_header(value: &str) -> bool {
+    let host = if let Some(rest) = value.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inner, port))
+                if port.is_empty() || port.strip_prefix(':').is_some_and(valid_port) =>
+            {
+                return inner == "::1";
+            }
+            _ => return false,
+        }
+    } else {
+        match value.rsplit_once(':') {
+            Some((host, port)) if valid_port(port) => host,
+            Some(_) => return false,
+            None => value,
+        }
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1"
+}
+fn valid_port(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) && text.parse::<u16>().is_ok()
+}
+
 async fn captures(
     State(state): State<RouteState>,
     client: Option<Extension<ClientInfo>>,
+    headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
     // The peer itself, not a forwarded address: a trusted proxy may relay
@@ -350,7 +384,11 @@ async fn captures(
     let loopback = client.as_ref().is_some_and(|c| {
         !c.via_trusted_proxy && c.address.is_some_and(|a| a.to_canonical().is_loopback())
     });
-    let Some(driver) = state.captures.as_ref().filter(|_| loopback) else {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(loopback_host_header);
+    let Some(driver) = state.captures.as_ref().filter(|_| loopback && host) else {
         return reply("not_found");
     };
     let mut channel = None;

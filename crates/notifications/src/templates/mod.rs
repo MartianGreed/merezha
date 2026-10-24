@@ -30,6 +30,10 @@ use serde_json::{Map, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use uuid::Uuid;
 
@@ -667,7 +671,13 @@ impl TemplateRegistry {
         })
     }
 
-    fn context(&self, channel: Channel, locale: &str, ctx: &RenderContext<'_>) -> Jinja {
+    fn context(
+        &self,
+        locale: &str,
+        ctx: &RenderContext<'_>,
+        channel: Channel,
+        guard: Option<&Arc<SecretGuard>>,
+    ) -> Jinja {
         let mut values = object(ctx.data);
         values.insert(
             "recipient".into(),
@@ -704,23 +714,45 @@ impl TemplateRegistry {
                 ("topic", Jinja::from(ctx.topic)),
             ]),
         );
-        if channel != Channel::Inbox {
-            values.insert("secret".into(), Jinja::from(object(ctx.secret)));
-        } else {
-            values.remove("secret");
+        match guard {
+            // The inbox never receives secret data (R2): `secret` is a
+            // guard holding nothing, which records any use so the render
+            // is refused, through partials too.
+            Some(guard) => {
+                values.insert("secret".into(), Jinja::from_dyn_object(guard.clone()));
+            }
+            None => {
+                values.insert("secret".into(), Jinja::from(object(ctx.secret)));
+            }
         }
         Jinja::from(values)
     }
 
-    fn run(&self, engine: &str, context: &Jinja, channel: Channel) -> Result<String, RenderError> {
-        let fail = |code| RenderError { channel, code };
+    /// Render one engine template into a buffer capped at `cap` bytes, so
+    /// output stops growing at the channel limit instead of after fuel.
+    fn run(&self, engine: &str, scope: &Scope<'_>, cap: usize) -> Result<String, RenderError> {
+        let fail = |code| RenderError {
+            channel: scope.channel,
+            code,
+        };
         let template = self
             .env
             .get_template(engine)
             .map_err(|_| fail("template_missing"))?;
-        template
-            .render(context)
-            .map_err(|error| fail(render_code(&error)))
+        let mut out = Capped {
+            buffer: Vec::new(),
+            cap,
+            exceeded: false,
+        };
+        let result = template.render_captured_to(scope.context, &mut out);
+        if scope.guard.is_some_and(|g| g.used()) {
+            return Err(fail("inbox_references_secret"));
+        }
+        match result {
+            Ok(_) => String::from_utf8(out.buffer).map_err(|_| fail("render_error")),
+            Err(_) if out.exceeded => Err(fail("output_too_large")),
+            Err(error) => Err(fail(render_code(&error))),
+        }
     }
 
     /// Render `template` for `channel` in the resolved `locale`, with the
@@ -741,16 +773,23 @@ impl TemplateRegistry {
         let files = self
             .file_locale(info, locale, channel)
             .ok_or(fail("template_missing"))?;
-        let context = self.context(channel, locale, ctx);
+        let guard = (channel == Channel::Inbox).then(|| Arc::new(SecretGuard::default()));
+        let context = self.context(locale, ctx, channel, guard.as_ref());
+        let scope = Scope {
+            context: &context,
+            channel,
+            guard: guard.as_deref(),
+        };
         let name = |file, field| engine_name(template, &files, file, field);
         match channel {
             Channel::Email => {
-                let subject = self.run(&name(File::Subject, None), &context, channel)?;
+                let subject =
+                    self.run(&name(File::Subject, None), &scope, MAX_SUBJECT_CHARS * 4)?;
                 single_line(&subject, MAX_SUBJECT_CHARS).map_err(fail)?;
-                let text = self.run(&name(File::BodyText, None), &context, channel)?;
+                let text = self.run(&name(File::BodyText, None), &scope, MAX_TEXT_BYTES)?;
                 bounded(&text, MAX_TEXT_BYTES).map_err(fail)?;
                 let html = if info.files[&files].contains(&File::BodyHtml) {
-                    let html = self.run(&name(File::BodyHtml, None), &context, channel)?;
+                    let html = self.run(&name(File::BodyHtml, None), &scope, MAX_HTML_BYTES)?;
                     bounded(&html, MAX_HTML_BYTES).map_err(fail)?;
                     Some(html)
                 } else {
@@ -763,7 +802,7 @@ impl TemplateRegistry {
                 }))
             }
             Channel::Sms => {
-                let text = self.run(&name(File::Sms, None), &context, channel)?;
+                let text = self.run(&name(File::Sms, None), &scope, MAX_TEXT_BYTES)?;
                 bounded(&text, MAX_TEXT_BYTES).map_err(fail)?;
                 if text.chars().any(|c| c.is_control() && c != '\n') {
                     return Err(fail("control_character"));
@@ -783,11 +822,15 @@ impl TemplateRegistry {
                 }))
             }
             Channel::Push => {
-                let title = self.run(&name(File::Push, Some("title")), &context, channel)?;
+                let title = self.run(
+                    &name(File::Push, Some("title")),
+                    &scope,
+                    MAX_INBOX_TITLE_CHARS * 4,
+                )?;
                 single_line(&title, MAX_INBOX_TITLE_CHARS).map_err(fail)?;
-                let body = self.run(&name(File::Push, Some("body")), &context, channel)?;
+                let body = self.run(&name(File::Push, Some("body")), &scope, MAX_TEXT_BYTES)?;
                 bounded(&body, MAX_TEXT_BYTES).map_err(fail)?;
-                let url = self.optional_field(&name(File::Push, Some("url")), &context, channel)?;
+                let url = self.optional_field(&name(File::Push, Some("url")), &scope)?;
                 let skeleton = serde_json::json!({
                     "id": Uuid::nil().to_string(), "notification_id": Uuid::nil().to_string(),
                     "topic": ctx.topic, "title": title, "body": "", "url": url,
@@ -799,19 +842,26 @@ impl TemplateRegistry {
                 Ok(Rendered::Push(RenderedPush { title, body, url }))
             }
             Channel::Inbox => {
-                let title = self.run(&name(File::Inbox, Some("title")), &context, channel)?;
+                let title = self.run(
+                    &name(File::Inbox, Some("title")),
+                    &scope,
+                    MAX_INBOX_TITLE_CHARS * 4,
+                )?;
                 single_line(&title, MAX_INBOX_TITLE_CHARS).map_err(fail)?;
-                let body = self.run(&name(File::Inbox, Some("body")), &context, channel)?;
+                let body = self.run(
+                    &name(File::Inbox, Some("body")),
+                    &scope,
+                    MAX_INBOX_BODY_CHARS * 4,
+                )?;
                 if body.chars().count() > MAX_INBOX_BODY_CHARS {
                     return Err(fail("output_too_large"));
                 }
-                let link =
-                    self.optional_field(&name(File::Inbox, Some("link")), &context, channel)?;
+                let link = self.optional_field(&name(File::Inbox, Some("link")), &scope)?;
                 let mut payload = Map::new();
                 for key in info.payload_keys.get(&files).into_iter().flatten() {
                     let field = format!("payload.{key}");
                     let engine = engine_name(template, &files, File::Inbox, Some(&field));
-                    let value = self.run(&engine, &context, channel)?;
+                    let value = self.run(&engine, &scope, MAX_INBOX_PAYLOAD_BYTES)?;
                     payload.insert(key.clone(), Value::String(value));
                 }
                 if Value::Object(payload.clone()).to_string().len() > MAX_INBOX_PAYLOAD_BYTES {
@@ -832,13 +882,12 @@ impl TemplateRegistry {
     fn optional_field(
         &self,
         engine: &str,
-        context: &Jinja,
-        channel: Channel,
+        scope: &Scope<'_>,
     ) -> Result<Option<String>, RenderError> {
         if self.env.get_template(engine).is_err() {
             return Ok(None);
         }
-        let value = self.run(engine, context, channel)?;
+        let value = self.run(engine, scope, MAX_LINK_BYTES * 2)?;
         let value = value.trim();
         if value.is_empty() {
             return Ok(None);
@@ -847,11 +896,71 @@ impl TemplateRegistry {
             || !filters::link_allowed(value, self.rendering.allow_http_links)
         {
             return Err(RenderError {
-                channel,
+                channel: scope.channel,
                 code: "invalid_url",
             });
         }
         Ok(Some(value.to_owned()))
+    }
+}
+
+/// One render's context, channel and inbox secret guard.
+struct Scope<'a> {
+    context: &'a Jinja,
+    channel: Channel,
+    guard: Option<&'a SecretGuard>,
+}
+
+/// The inbox's `secret`: holds no data and records every use.
+#[derive(Debug, Default)]
+struct SecretGuard(AtomicBool);
+impl SecretGuard {
+    fn used(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+    fn touch(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+impl minijinja::value::Object for SecretGuard {
+    fn get_value(self: &Arc<Self>, _: &Jinja) -> Option<Jinja> {
+        self.touch();
+        None
+    }
+    fn enumerate(self: &Arc<Self>) -> minijinja::value::Enumerator {
+        self.touch();
+        minijinja::value::Enumerator::NonEnumerable
+    }
+    fn is_true(self: &Arc<Self>) -> bool {
+        self.touch();
+        false
+    }
+    fn render(self: &Arc<Self>, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
+    where
+        Self: Sized + 'static,
+    {
+        self.touch();
+        Err(std::fmt::Error)
+    }
+}
+
+/// A writer that refuses to grow past `cap` bytes.
+struct Capped {
+    buffer: Vec<u8>,
+    cap: usize,
+    exceeded: bool,
+}
+impl std::io::Write for Capped {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.buffer.len() + bytes.len() > self.cap {
+            self.exceeded = true;
+            return Err(std::io::Error::other("output limit"));
+        }
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

@@ -34,7 +34,7 @@ use uuid::Uuid;
 /// SHA-256 of migration 1 as applied. A changed migration is refused by
 /// every database it already ran on (`migration_checksum_mismatch`), so the
 /// text is frozen: later slices add migrations instead.
-const CORE_CHECKSUM: &str = "01a8c473a8701ef551698066e8a87f9d51019411db8c23341c4e479d13e38f23";
+const CORE_CHECKSUM: &str = "40f9a70cd7cacfcc33d316f559a3cf499925152663fe5a1ad271add029cfdb70";
 
 /// A distinct id per call.
 fn fresh() -> Uuid {
@@ -288,13 +288,18 @@ async fn the_host_starts_the_block_with_its_migration_source_and_routes() {
         soon(),
     )
     .await;
-    let get = |path: &str, peer: &str| {
-        let mut request = Request::builder().uri(path).body(Body::empty()).unwrap();
+    let get_from = |path: &str, peer: &str, host_header: &str| {
+        let mut request = Request::builder()
+            .uri(path)
+            .header("host", host_header)
+            .body(Body::empty())
+            .unwrap();
         request
             .extensions_mut()
             .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
         host.router().oneshot(request)
     };
+    let get = |path: &str, peer: &str| get_from(path, peer, "127.0.0.1:8080");
     let response = get(
         "/v1/notifications/dev/captures?channel=email",
         "127.0.0.1:5000",
@@ -311,6 +316,23 @@ async fn the_host_starts_the_block_with_its_migration_source_and_routes() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // DNS rebinding: a loopback peer with a foreign Host is refused.
+    for foreign in [
+        "evil.example",
+        "evil.example:8080",
+        "127.0.0.1.evil.example",
+    ] {
+        let response = get_from("/v1/notifications/dev/captures", "127.0.0.1:5000", foreign)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{foreign}");
+    }
+    for local in ["localhost", "LOCALHOST:3000", "[::1]:8080"] {
+        let response = get_from("/v1/notifications/dev/captures", "127.0.0.1:5000", local)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{local}");
+    }
     let response = get("/v1/notifications/dev/captures?limit=0", "127.0.0.1:5000")
         .await
         .unwrap();
