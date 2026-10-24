@@ -463,11 +463,11 @@ async fn schedule_action(
 ) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
-        if !matches!(action.as_str(), "pause" | "resume" | "trigger") {
-            return Err(failure(Failure::permanent("not_found")));
-        }
+        // The permission first: an unknown action or name tells a caller
+        // without it nothing.
         let principal = admin.allow(&parts, &[WRITE])?;
-        if !valid_schedule_name(&name) {
+        if !matches!(action.as_str(), "pause" | "resume" | "trigger") || !valid_schedule_name(&name)
+        {
             return Err(failure(Failure::permanent("not_found")));
         }
         let principal = principal.as_deref();
@@ -486,13 +486,26 @@ async fn schedule_action(
                     .await
                     .map_err(failure)?
             )),
-            _ => ok(json!(
-                admin
-                    .jobs
-                    .trigger_schedule(&name, principal)
-                    .await
-                    .map_err(failure)?
-            )),
+            _ => {
+                // An optional `Idempotency-Key`: a retry returns the job the
+                // first call enqueued.
+                let key = match parts.headers.get("idempotency-key") {
+                    None => None,
+                    Some(value) => match value.to_str() {
+                        Ok(key) if crate::valid_trigger_key(key) => Some(key.to_owned()),
+                        _ => {
+                            return Err(invalid(vec![field_error("", "invalid_idempotency_key")]));
+                        }
+                    },
+                };
+                ok(json!(
+                    admin
+                        .jobs
+                        .trigger_schedule(&name, key.as_deref(), principal)
+                        .await
+                        .map_err(failure)?
+                ))
+            }
         }
     };
     respond(run.await)

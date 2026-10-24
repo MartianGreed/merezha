@@ -747,6 +747,7 @@ Block events (AP's former `jobs.*` events are `job.*`):
 | `job.worker_failed` (a worker statement failing: `lease`, `settle`, `heartbeat`, `reaper`, `retention`, `lag`, `release`, or the cron tick `scheduler`; once per failure streak, except a due schedule this version cannot parse, logged per tick with `schedule`) | warn | `task`, `code`, `classification`, `schedule` |
 | `job.schedule_sync_failed` (declaring the instance's schedules, at start and on each heartbeat; once per failure streak) | warn | `code`, `classification` |
 | `job.schedule_fired` (one occurrence enqueued its job) | debug | `schedule`, `job_id`, `scheduled_for` |
+| `job.schedule_conflict` (this instance declares another definition for a schedule whose stored definition has precedence: a newer `app.version`, or declarers still alive; once per streak) | warn | `schedule`, `version` |
 | `job.queue_unconfigured` (a registered kind's queue missing from `[jobs.queues]`, at worker start) | warn | `queue` |
 | `job.reissue_claim_lost` (a reissue hook returned after the reaper reverted its claim; its settle wrote nothing) | warn | `job_id`, `hook` (`succeeded`, `failed`) |
 | `identity.login_failed` | debug (the metric and the audit log carry the signal) | `method`, `outcome` |

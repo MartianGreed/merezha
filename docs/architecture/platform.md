@@ -564,7 +564,7 @@ as before, and runs no OTLP pipeline.
 
 | Method | Contract |
 | --- | --- |
-| `name()` | `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not `application`, `api`, `services`, `pipelines`, `reload`, `health`, `jobs` (the jobs runtime), `outbox` or `cron` (job key prefixes the relay and the scheduler mint). Names the section, route prefix and migration ledger key; never changes. |
+| `name()` | `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not `application`, `api`, `services`, `pipelines`, `reload`, `health`, `jobs` (the jobs runtime), `outbox` or `cron` (job key prefixes the relay and the scheduler mint), or `config` (the source of configured schedules). Names the section, route prefix and migration ledger key; never changes. |
 | `configure(&ModuleSection)` | validate and keep `[modules.<name>]`; return every issue at once. Default: only an empty section. |
 | `migrations()` | ordered forward-only `Migration::new(version, name, sql)` or `Migration::non_transactional(..)` for its own schema |
 | `errors()` | `ErrorCode { code, status }` it returns, registered at startup; default none |
@@ -1178,7 +1178,8 @@ state, and the R10 trace columns.
   uses (`schedule_already_declared`), at most 256 per instance
   (`too_many_schedules`), validated like config (`invalid_schedule_name`,
   `invalid_cron`, `invalid_timezone`, `unknown_timezone`) and refused
-  after start (`jobs_started`). Schedules follow the subscriptions'
+  after start (`jobs_started`). Module name `config` is reserved for the
+  configured schedules' source. Schedules follow the subscriptions'
   rolling-deploy rule: at start and every `jobs.subscriptions.heartbeat`,
   each instance upserts the schedules it declares (`last_declared_at`,
   reactivating a retired one) and retires those nobody declared for
@@ -1186,11 +1187,16 @@ state, and the R10 trace columns.
   fired), all in one transaction under
   `pg_advisory_xact_lock(MZJB, hashtext('schedules'))`. A schedule only a
   newer version declares therefore survives older instances restarting.
-  A changed definition (expression, zone, queue, kind or payload, digested
-  in `definition`) or a reactivation recomputes `next_run_at` from now;
-  an unchanged one keeps a due run. While two versions declare one name
-  with different definitions, the last declaring instance wins at each
-  heartbeat. Every instance ticks every `jobs.scheduler.interval_ms` and
+  When two versions declare one name with different definitions
+  (expression, zone, queue, kind or payload, digested in `definition`),
+  the other definition replaces the stored one only if its `app.version`
+  is strictly greater (dotted numbers; otherwise no precedence), if
+  nobody re-declared the stored definition for `2 x heartbeat`, or if
+  the row is retired; otherwise the stored one stands and the instance
+  logs `job.schedule_conflict` once per streak. A replacement keeps a due
+  run (it fires once, with the new definition) and otherwise recomputes
+  `next_run_at` from now; a reactivation recomputes it from now.
+  `merezha run` passes `app.version`. Every instance ticks every `jobs.scheduler.interval_ms` and
   once at start, `workers = false` included: under
   `pg_try_advisory_xact_lock(MZJB, hashtext('scheduler'))` (taken: skip
   this tick), it locks up to 32 due rows at a time with
@@ -1200,7 +1206,9 @@ state, and the R10 trace columns.
   `max_attempts`, correlation id = the key) and moves `next_run_at` to the
   first occurrence strictly after `max(occurrence, now)`: a downtime
   spanning several occurrences runs one job, then the normal cadence.
-  Times come from the database clock. Daylight saving time follows
+  Times come from the database clock. A due row this version cannot
+  parse stays due for an instance that can, is kept out of the tick's
+  later batches and is logged once per streak. Daylight saving time follows
   croner (OCPS): in a spring-forward gap a fixed-time schedule (`30 2 * *
   *`) runs at the first minute after the gap and an interval schedule
   (`*/30 * * * *`) skips the missing occurrences; in a fall-back overlap
@@ -1260,10 +1268,14 @@ state, and the R10 trace columns.
   sets `enabled = false` (a paused schedule never fires), `/resume`
   re-enables a paused one with `next_run_at` recomputed from now (the
   occurrences it missed never run), and `/trigger` enqueues one job now
-  keyed `cron:{name}:manual:{unix_ms}` without moving the cadence
-  (`{"name","job_id","idempotency_key"}`); pause and resume answer the
+  keyed `cron:{name}:manual:{key}`, with `key` from an optional
+  `Idempotency-Key` header (1 to 120 bytes of `[A-Za-z0-9._:-]`, else
+  `422`; a retry returns the same job with `"inserted":false`) or the
+  time in milliseconds, without moving the cadence
+  (`{"name","job_id","idempotency_key","inserted"}`; `409
+  schedule_retired` for a retired schedule); pause and resume answer the
   schedule's listing entry, an unknown name or action is `404
-  not_found`, and each writes an `admin_actions` row (`schedule_pause`,
+  not_found` (after the permission check), and each writes an `admin_actions` row (`schedule_pause`,
   `schedule_resume`, `schedule_trigger`). Bad bodies and query
   strings fail `invalid_input` (400) or `validation_failed` (422) with
   `details` that never echo input.
@@ -1272,15 +1284,15 @@ Error codes it registers: `invalid_topic`, `invalid_queue`,
 `invalid_run_at`, `invalid_event_envelope`, `invalid_record_data`, `job_payload_limit`,
 `kind_already_registered`, `kind_not_registered`, `too_many_kinds` and
 `jobs_started`, `invalid_schedule_name`, `schedule_already_declared` and
-`too_many_schedules` (422), `not_quarantined`, `not_dead`, `not_cancellable` and
-`reissue_claim_lost` (409), `jobs_not_ready` (503); the kernel registers
+`too_many_schedules` (422), `not_quarantined`, `not_dead`, `not_cancellable`,
+`reissue_claim_lost` and `schedule_retired` (409), `jobs_not_ready` (503); the kernel registers
 `invalid_cron`, `invalid_timezone` and `unknown_timezone` (422), which
 `merezha_platform::cron` returns. Migration 0002 adds the `outbox_quarantined`
 index the admin listing, the outbox count and retention read, the
 `jobs_due` index the readiness lag reads, and the `reissue_claimed_at`
 claim column (only on `cancelled` rows) with its index. Migration 0003
-adds `schedules.last_declared_at` and `retired_at` and the
-`schedules_due` index the tick reads.
+adds `schedules.last_declared_at`, `retired_at`, `declared_version` and
+`definition_declared_at` and the `schedules_due` index the tick reads.
 
 Process tests hold the relay with `MEREZHA_JOBS_TEST_RELAY=off` (or
 `interval`, no `LISTEN`), and `MEREZHA_JOBS_TEST_HANDLER=<ms>` registers a

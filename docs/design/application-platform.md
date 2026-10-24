@@ -860,8 +860,9 @@ readiness lag (one row, `ORDER BY run_at LIMIT 1`); and the reissue claim column
 `reissue_claimed_at timestamptz NULL CHECK (reissue_claimed_at IS NULL OR state = 'cancelled')` with
 a partial index (D.1).
 
-Migration 0003 (AP-B3) adds `schedules.last_declared_at timestamptz NOT NULL DEFAULT now()` and
-`retired_at timestamptz NULL` (B.7) and `CREATE INDEX schedules_due ON merezha_jobs.schedules
+Migration 0003 (AP-B3) adds `schedules.last_declared_at timestamptz NOT NULL DEFAULT now()`,
+`retired_at timestamptz NULL`, `declared_version text NULL` and `definition_declared_at timestamptz
+NOT NULL DEFAULT now()` (B.7) and `CREATE INDEX schedules_due ON merezha_jobs.schedules
 (next_run_at) WHERE enabled AND retired_at IS NULL`. `enabled` stays the admin pause flag.
 
 Dead letters stay in `jobs` with `state = 'dead'`, rather than moving to a separate table as in
@@ -1228,8 +1229,19 @@ start and every `jobs.subscriptions.heartbeat` (`last_declared_at = now()`, `ret
 a schedule nobody declared for `jobs.subscriptions.retire_after` gets `retired_at` (kept, never
 fired), in one transaction under `pg_advisory_xact_lock(MZJB, hashtext('schedules'))`. No instance
 disables a schedule because its own config lacks it, so a schedule a newer version declares survives
-older instances restarting. A changed `definition` digest (cron, zone, queue, kind, payload) or a
-reactivation recomputes `next_run_at` from now. At most 256 schedules per instance. Config
+older instances restarting. At most 256 schedules per instance.
+
+When two versions declare one name with different definitions (digest over cron, zone, queue,
+kind and payload), the stored row also keeps `declared_version` (the declarer's `app.version`,
+nullable) and `definition_declared_at` (the last declaration of the stored definition). A differing
+declaration replaces the stored definition only when its `app.version` is strictly greater (both
+dotted numbers, missing parts 0; otherwise no precedence), when nobody re-declared the stored
+definition for more than `2 x jobs.subscriptions.heartbeat` (its declarers are gone), or when the row
+is retired. Otherwise the stored definition stands, the name still counts as declared, and the
+instance logs `job.schedule_conflict` once per streak. So a rolling deploy switches a definition at
+most once and never back, instead of flipping on every heartbeat. On a replacement a due
+`next_run_at` (`<= now()`) is kept, so the due run fires once with the definition current at tick
+time; otherwise, and on a reactivation, `next_run_at` is recomputed from now. Config
 validation parses every expression and zone, listing every problem (`invalid_cron`,
 `invalid_timezone`, `unknown_timezone`).
 
@@ -1250,7 +1262,10 @@ COMMIT;
 
 Missed runs follow Structure's policy. One job runs for the due occurrence, and the next occurrence
 is computed strictly after `max(scheduled, now)`, so downtime never causes a burst. `now` is the
-database clock. The job's correlation id is its key.
+database clock. The job's correlation id is its key. A due row this version cannot parse (another
+version's definition) stays due for an instance that can; it is excluded from the tick's later
+batches, so it never starves the others, and logged once per streak (`job.worker_failed`, task
+`scheduler`). A tick runs at most 8 batches.
 
 ## B.8 Graceful drain
 
@@ -1757,7 +1772,7 @@ permissions (decided in the AP-A3 review); every other write needs `application.
 | `GET outbox` | `{"pending","oldest_age_s","unrouted","quarantined":[{"id","source","record_kind","quarantine_code","quarantined_at"}]}` (`unrouted`: this instance's count since start; at most 100 quarantined rows, oldest first) |
 | `POST outbox/{id}/requeue` | a quarantined record back to pending once the cause is fixed; `{"id"}`. `409 secret_purged` for a flagged record quarantined as `unroutable`, whose payload is gone (R4a): the owning module issues it again. |
 | `GET schedules?limit=&after=` | `{"schedules":[{"name","source","cron","timezone","queue","kind","enabled","retired_at","next_run_at","last_run_at","last_job_id"}],"next":cursor?}`, by name; no payload |
-| `POST schedules/{name}/pause`, `/resume`, `/trigger` | pause and resume answer the listing entry; `resume` recomputes `next_run_at` from now for a paused schedule. `trigger` enqueues a job keyed `cron:{name}:manual:{unix_ms}` without moving the cadence: `{"name","job_id","idempotency_key"}` |
+| `POST schedules/{name}/pause`, `/resume`, `/trigger` | pause and resume answer the listing entry; `resume` recomputes `next_run_at` from now for a paused schedule. `trigger` enqueues a job keyed `cron:{name}:manual:{key}` (`key` from an optional `Idempotency-Key` header, 1 to 120 bytes of `[A-Za-z0-9._:-]`, else `{unix_ms}`) without moving the cadence: `{"name","job_id","idempotency_key","inserted"}`, `inserted: false` for a retry; `409 schedule_retired` for a retired schedule. The permission is checked before the name and action |
 
 Every write appends to `merezha_jobs.admin_actions` and emits the log event `job.admin_action`.
 Replay starts a new trace that links to the stored context (TE §2.3).

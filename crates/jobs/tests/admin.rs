@@ -681,6 +681,39 @@ async fn schedule_routes_check_their_permissions_at_application_scope() {
     assert_eq!(status, StatusCode::OK);
     let job = triggered["job_id"].as_i64().unwrap();
     assert_eq!(state(&db, job).await, "available");
+    // The permission comes first: a reader learns nothing about names or
+    // actions.
+    let (status, _) = post(&reader, "/v1/jobs/admin/schedules/tasks.none/delete", "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // An Idempotency-Key makes the trigger retry-safe; a bad one is 422.
+    let keyed = |key: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/jobs/admin/schedules/tasks.daily/trigger")
+            .header("idempotency-key", key)
+            .extension(Authenticated(Some(Arc::new(
+                Principal::system("ops", GrantSnapshot::empty()).unwrap(),
+            ))))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let mut answers = Vec::new();
+    for key in ["retry-1", "retry-1", "bad key"] {
+        let response = writer.clone().oneshot(keyed(key)).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 16).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        answers.push((status, body));
+    }
+    assert_eq!(answers[0].0, StatusCode::OK);
+    assert_eq!(answers[0].1["inserted"], json!(true));
+    assert_eq!(answers[1].1["job_id"], answers[0].1["job_id"]);
+    assert_eq!(answers[1].1["inserted"], json!(false));
+    assert_eq!(
+        (answers[2].0, code(&answers[2].1)),
+        (StatusCode::UNPROCESSABLE_ENTITY, "validation_failed")
+    );
+    assert!(!answers[2].1.to_string().contains("bad key"));
     for missing in [
         "/v1/jobs/admin/schedules/tasks.none/pause",
         "/v1/jobs/admin/schedules/Tasks/trigger",

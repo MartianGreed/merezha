@@ -529,14 +529,23 @@ async fn drain_releases_in_flight_jobs_with_the_attempt_refunded() {
     let first = workers(&db, &config, "first", vec![("tasks.long", handler.clone())]).await;
     let id = insert_job(&db, "tasks.long", "tasks:long", r#"{"n":1}"#, false).await;
     wait_state(&db, id, "running", PATIENCE).await;
+    // The handler runs (a lease landing as the drain began is parked, never
+    // run: another test).
+    let entered = Instant::now();
+    while calls.load(Ordering::SeqCst) == 0 {
+        assert!(entered.elapsed() < PATIENCE, "the handler never ran");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let leased_at = Instant::now();
+    // A 60 s shutdown budget: a drain that ignored `drain_timeout_ms` and
+    // its grace would run to the budget, far past the bound below.
     first
-        .shutdown(Instant::now() + Duration::from_secs(10))
+        .shutdown(Instant::now() + Duration::from_secs(60))
         .await;
     let took = leased_at.elapsed();
     assert!(
-        took >= Duration::from_millis(2900) && took < PATIENCE,
-        "drain timeout plus the 2 s grace: {took:?}"
+        took >= Duration::from_millis(2900) && took < Duration::from_secs(1 + 2 + 5),
+        "drain timeout (1 s) plus the 2 s grace, with 5 s of margin: {took:?}"
     );
     assert!(first.ready().await.is_err());
     assert_eq!(state(&db, id).await, "available");
@@ -1349,7 +1358,8 @@ async fn a_failure_after_the_drain_cutoff_is_released_not_retried() {
         "[jobs]\npoll_interval_ms = 100\ndrain_timeout_ms = 200",
     );
     let returned = Arc::new(AtomicUsize::new(0));
-    let failed = returned.clone();
+    let entered = Arc::new(AtomicUsize::new(0));
+    let (failed, running) = (returned.clone(), entered.clone());
     let jobs = workers(
         &db,
         &config,
@@ -1357,8 +1367,9 @@ async fn a_failure_after_the_drain_cutoff_is_released_not_retried() {
         vec![(
             "tasks.cut",
             func(move |ctx, _| {
-                let failed = failed.clone();
+                let (failed, running) = (failed.clone(), running.clone());
                 Box::pin(async move {
+                    running.fetch_add(1, Ordering::SeqCst);
                     let mut cancel = ctx.cancel.clone();
                     let _ = cancel.wait_for(|c| *c).await;
                     failed.fetch_add(1, Ordering::SeqCst);
@@ -1370,6 +1381,13 @@ async fn a_failure_after_the_drain_cutoff_is_released_not_retried() {
     .await;
     let id = insert_job(&db, "tasks.cut", "tasks:cut", "{}", false).await;
     wait_state(&db, id, "running", PATIENCE).await;
+    // The handler runs: a lease landing as the drain began would be parked
+    // and never run, which is another test.
+    let started = Instant::now();
+    while entered.load(Ordering::SeqCst) == 0 {
+        assert!(started.elapsed() < PATIENCE, "the handler never ran");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     jobs.shutdown(Instant::now() + PATIENCE).await;
     assert_eq!(
         returned.load(Ordering::SeqCst),

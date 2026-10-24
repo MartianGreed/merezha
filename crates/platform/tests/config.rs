@@ -968,7 +968,7 @@ impl Module for Named {
 
 #[test]
 fn modules_named_after_reserved_prefixes_are_refused_at_startup() {
-    for name in ["jobs", "outbox", "cron", "api", "application"] {
+    for name in ["jobs", "outbox", "cron", "config", "api", "application"] {
         let project = Project::new(&format!("{MINIMAL}\n[modules.{name}]\n"));
         let errors = configure(&project.input(&[URL], &[]), vec![Box::new(Named(name))])
             .err()

@@ -299,7 +299,9 @@ async fn start(
         routes,
         authorizer,
         timeouts,
-        jobs: Some(Arc::new(merezha_jobs::PgJobs::new(&config.jobs))),
+        jobs: Some(Arc::new(
+            merezha_jobs::PgJobs::new(&config.jobs).with_app_version(config.app.version.clone()),
+        )),
     };
     let host = match Host::start(config, modules, parts).await {
         Ok(host) => host,

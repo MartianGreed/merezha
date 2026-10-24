@@ -15,8 +15,9 @@ use std::{sync::Arc, time::Instant};
 /// `api` and `application` are also the kernel-only outbox and notifier
 /// sources; `jobs` is the [`JobsRuntime`]; `outbox` and `cron` prefix the
 /// job keys the relay and the scheduler mint, so no module may write or
-/// cancel under them.
-pub const RESERVED_NAMES: [&str; 9] = [
+/// cancel under them; `config` is the source of `[[jobs.schedules]]` rows,
+/// so no module can pass its schedules off as configured ones.
+pub const RESERVED_NAMES: [&str; 10] = [
     "application",
     "api",
     "services",
@@ -26,6 +27,7 @@ pub const RESERVED_NAMES: [&str; 9] = [
     "jobs",
     "outbox",
     "cron",
+    "config",
 ];
 
 /// Integration events a module publishes and consumes through the outbox.

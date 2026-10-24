@@ -153,12 +153,17 @@ CREATE INDEX jobs_reissuing ON merezha_jobs.jobs (reissue_claimed_at)
 /// declaring instance refreshes `last_declared_at`, and a schedule nobody
 /// declared for `jobs.subscriptions.retire_after` gets `retired_at` (kept,
 /// never fired) instead of being disabled by one instance's config.
-/// `enabled` stays the admin pause flag. The tick reads due rows through
+/// `enabled` stays the admin pause flag. `declared_version` (the
+/// declarer's `app.version`) and `definition_declared_at` (the last
+/// declaration of the stored definition) decide between two versions'
+/// definitions of one name. The tick reads due rows through
 /// `schedules_due`.
 const CRON: &str = "
 ALTER TABLE merezha_jobs.schedules
     ADD COLUMN last_declared_at timestamptz NOT NULL DEFAULT now(),
-    ADD COLUMN retired_at timestamptz NULL;
+    ADD COLUMN retired_at timestamptz NULL,
+    ADD COLUMN declared_version text NULL CHECK (octet_length(declared_version) <= 128),
+    ADD COLUMN definition_declared_at timestamptz NOT NULL DEFAULT now();
 CREATE INDEX schedules_due ON merezha_jobs.schedules (next_run_at)
     WHERE enabled AND retired_at IS NULL;
 ";

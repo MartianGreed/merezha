@@ -1131,7 +1131,13 @@ pub const EVENTS: &[Event] = &[
     ev(
         "job.admin_action",
         INFO,
-        &[JOB_ID, local("count"), QUEUE, local("action")],
+        &[
+            JOB_ID,
+            local("count"),
+            QUEUE,
+            local("action"),
+            f("schedule", "job.schedule"),
+        ],
     ),
     ev(
         "job.drain_abandoned",
@@ -1149,9 +1155,32 @@ pub const EVENTS: &[Event] = &[
             local("task"),
             CODE,
             f("classification", "job.classification"),
+            f("schedule", "job.schedule"),
         ],
     ),
     ev("job.reissue_claim_lost", WARN, &[JOB_ID, local("hook")]),
+    // AP-B3: cron. A fired occurrence, a failing schedule declaration (once
+    // per failure streak), and a declaration whose definition another one
+    // with precedence keeps (once per streak).
+    ev(
+        "job.schedule_fired",
+        DEBUG,
+        &[
+            f("schedule", "job.schedule"),
+            JOB_ID,
+            local("scheduled_for"),
+        ],
+    ),
+    ev(
+        "job.schedule_sync_failed",
+        WARN,
+        &[CODE, f("classification", "job.classification")],
+    ),
+    ev(
+        "job.schedule_conflict",
+        WARN,
+        &[f("schedule", "job.schedule"), local("version")],
+    ),
     ev(
         "outbox.relayed",
         DEBUG,

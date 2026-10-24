@@ -28,7 +28,7 @@ pub use relay::{JOBS_CHANNEL, RelayReport};
 pub use retention::{RETENTION_INTERVAL, RetentionReport};
 pub use scheduler::{
     CONFIG_SOURCE, MAX_SCHEDULES, MAX_SCHEDULES_LISTED, SchedulePage, ScheduleSummary, TickReport,
-    Triggered,
+    Triggered, valid_trigger_key,
 };
 
 use merezha_domain::{Failure, Identity};
@@ -68,6 +68,7 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("not_dead", 409),
     ErrorCode::new("not_cancellable", 409),
     ErrorCode::new("reissue_claim_lost", 409),
+    ErrorCode::new("schedule_retired", 409),
     ErrorCode::new("jobs_not_ready", 503),
 ];
 /// Per-instance slots of a queue a registered kind names but `[jobs.queues]`
@@ -135,6 +136,14 @@ struct Inner {
     stop: tokio::sync::watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     scheduler: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// `app.version`, which decides between definitions two versions
+    /// declare for one schedule name.
+    app_version: Option<String>,
+    /// Names whose stored definition another declaration kept, for
+    /// `job.schedule_conflict` once per streak.
+    conflicts: Mutex<std::collections::BTreeSet<String>>,
+    /// Due names the last tick could not schedule, logged once per streak.
+    unschedulable: Mutex<std::collections::BTreeSet<String>>,
     /// A `[[jobs.schedules]]` entry that failed to parse, returned by
     /// `start`; config validation makes this unreachable from a file.
     schedule_error: Option<Failure>,
@@ -245,9 +254,21 @@ impl PgJobs {
                 stop: tokio::sync::watch::channel(false).0,
                 task: Mutex::new(None),
                 scheduler: Mutex::new(None),
+                app_version: None,
+                conflicts: Mutex::default(),
+                unschedulable: Mutex::default(),
                 schedule_error,
             }),
         }
+    }
+    /// The application's `app.version`: a schedule definition declared by a
+    /// strictly newer dotted-numeric version replaces another version's
+    /// (AP §B.7). Call before sharing the runtime.
+    pub fn with_app_version(mut self, version: Option<String>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.app_version = version;
+        }
+        self
     }
     /// Probe an idle `LISTEN` session every `interval` instead of
     /// [`LISTEN_CHECK_INTERVAL`]; call before sharing the runtime.
@@ -449,7 +470,12 @@ impl PgJobs {
     /// one job. The background scheduler runs the same tick every
     /// `jobs.scheduler.interval_ms`.
     pub async fn schedule_now(&self) -> Result<TickReport, Failure> {
-        scheduler::tick(self.database()?, &self.inner.settings).await
+        scheduler::tick(
+            self.database()?,
+            &self.inner.settings,
+            &self.inner.unschedulable,
+        )
+        .await
     }
     /// Schedules by name after `after` (D.1 `GET schedules`).
     pub async fn list_schedules(
@@ -478,14 +504,17 @@ impl PgJobs {
         scheduler::resume(self.database()?, name, principal).await
     }
     /// Enqueue one job of a schedule now (D.1 `POST
-    /// schedules/{name}/trigger`), keyed `cron:{name}:manual:{unix_ms}`,
-    /// audited. Fails `not_found`.
+    /// schedules/{name}/trigger`), keyed `cron:{name}:manual:{key}` with the
+    /// caller's `key` (see [`valid_trigger_key`]) or `unix_ms`,
+    /// audited. Fails `not_found`, `validation_failed` for a bad key, or
+    /// conflict `schedule_retired`.
     pub async fn trigger_schedule(
         &self,
         name: &str,
+        key: Option<&str>,
         principal: Option<&str>,
     ) -> Result<Triggered, Failure> {
-        scheduler::trigger(self.database()?, &self.inner.settings, name, principal).await
+        scheduler::trigger(self.database()?, &self.inner.settings, name, key, principal).await
     }
     /// Return a quarantined record to pending once its cause is fixed
     /// (D.1 `POST outbox/{id}/requeue`), with an `admin_actions` row for
@@ -578,7 +607,32 @@ impl PgJobs {
     async fn sync_schedules(&self, database: &Database) -> Result<(), Failure> {
         let declared: Vec<scheduler::Declared> =
             self.registry().schedules.values().cloned().collect();
-        scheduler::sync(database, declared, self.inner.subscriptions.retire_after).await
+        let report = scheduler::sync(
+            database,
+            declared,
+            self.inner.app_version.clone(),
+            self.inner.subscriptions.heartbeat,
+            self.inner.subscriptions.retire_after,
+        )
+        .await?;
+        let mut streak = self
+            .inner
+            .conflicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for name in report
+            .conflicts
+            .iter()
+            .filter(|name| !streak.contains(*name))
+        {
+            tracing::warn!(
+                event = "job.schedule_conflict",
+                schedule = name.as_str(),
+                version = self.inner.app_version.as_deref().unwrap_or("")
+            );
+        }
+        *streak = report.conflicts.into_iter().collect();
+        Ok(())
     }
     async fn sync_subscriptions(&self, database: &Database) -> Result<(), Failure> {
         let (topics, kinds, queues, sources) = {
@@ -694,7 +748,7 @@ async fn schedule_loop(
         if *stop.borrow() {
             return;
         }
-        match scheduler::tick(&database, &jobs.inner.settings).await {
+        match scheduler::tick(&database, &jobs.inner.settings, &jobs.inner.unschedulable).await {
             Ok(_) => failing = false,
             Err(failure) => {
                 if !failing {

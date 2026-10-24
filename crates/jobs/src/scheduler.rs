@@ -54,8 +54,9 @@ fn timestamp(micros: i64) -> jiff::Timestamp {
     jiff::Timestamp::from_microsecond(micros).unwrap_or(jiff::Timestamp::UNIX_EPOCH)
 }
 
-/// One declared schedule, parsed and ready to sync.
-#[derive(Clone, Debug)]
+/// One declared schedule, parsed and ready to sync. `Debug` never prints
+/// the payload.
+#[derive(Clone)]
 pub(crate) struct Declared {
     pub name: String,
     pub source: String,
@@ -64,6 +65,17 @@ pub(crate) struct Declared {
     pub kind: String,
     /// The payload as stored, compact JSON.
     pub payload: String,
+}
+impl std::fmt::Debug for Declared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Declared")
+            .field("name", &self.name)
+            .field("source", &self.source)
+            .field("schedule", &self.schedule)
+            .field("queue", &self.queue)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
 }
 impl Declared {
     /// What the digest covers: everything that decides which jobs run.
@@ -154,14 +166,63 @@ fn from_parts(
     })
 }
 
-/// Declare `declared` and retire what nobody declared for `retire_after`,
-/// in one transaction under the schedules advisory lock.
+/// Whether `a` is a strictly greater version than `b`: both dotted
+/// numbers (`2`, `1.10.3`; missing parts count as 0), else no precedence.
+pub(crate) fn newer(a: Option<&str>, b: Option<&str>) -> bool {
+    fn parts(version: &str) -> Option<Vec<u64>> {
+        version.split('.').map(|part| part.parse().ok()).collect()
+    }
+    let (Some(a), Some(b)) = (a.and_then(parts), b.and_then(parts)) else {
+        return false;
+    };
+    let len = a.len().max(b.len());
+    let at = |v: &[u64], i: usize| v.get(i).copied().unwrap_or(0);
+    (0..len)
+        .map(|i| at(&a, i).cmp(&at(&b, i)))
+        .find(|order| order.is_ne())
+        .is_some_and(|order| order.is_gt())
+}
+
+/// How one sync went: the names whose stored definition another
+/// declaration kept (logged once per streak by the caller).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SyncReport {
+    pub conflicts: Vec<String>,
+}
+
+/// The stored side of one declared name, read under the sync lock.
+struct Stored {
+    same: bool,
+    version: Option<String>,
+    /// Seconds since anyone declared the stored definition.
+    definition_age: f64,
+    retired: bool,
+}
+
+/// Declare `declared` for an instance of `version` and retire what nobody
+/// declared for `retire_after`, in one transaction under the schedules
+/// advisory lock. Per name:
+///
+/// - new: inserted, next run from now;
+/// - same definition: refreshed (`last_declared_at`,
+///   `definition_declared_at`), the version raised when newer, a retired
+///   one reactivated from now;
+/// - another definition: it replaces the stored one only when its version
+///   is strictly newer, when nobody re-declared the stored one for
+///   `2 x heartbeat` (its declarers are gone), or when the row was
+///   retired. A due run is kept (it fires once, with the definition current
+///   at tick time); otherwise the next run is recomputed from now. Without
+///   precedence the stored definition stands, the name stays declared, and
+///   it is reported as a conflict.
 pub(crate) async fn sync(
     database: &Database,
     declared: Vec<Declared>,
+    version: Option<String>,
+    heartbeat: Duration,
     retire_after: Duration,
-) -> Result<(), Failure> {
+) -> Result<SyncReport, Failure> {
     let retire_after = retire_after.as_secs_f64();
+    let grace = (heartbeat * 2).as_secs_f64();
     database
         .transaction(deadline(), move |tx| {
             Box::pin(async move {
@@ -177,50 +238,133 @@ pub(crate) async fn sync(
                     .map_err(|e| classify(&e))?
                     .get(0);
                 let now = timestamp(now);
-                let mut columns: [Vec<String>; 9] = Default::default();
-                for schedule in &declared {
-                    let next = schedule.schedule.next_after(now)?;
-                    for (column, value) in columns.iter_mut().zip([
-                        schedule.name.clone(),
-                        schedule.source.clone(),
-                        schedule.schedule.expression().to_owned(),
-                        schedule.schedule.timezone().to_owned(),
-                        schedule.queue.clone(),
-                        schedule.kind.clone(),
-                        schedule.payload.clone(),
-                        next.to_string(),
-                        schedule.definition(),
-                    ]) {
-                        column.push(value);
+                let names: Vec<String> = declared.iter().map(|d| d.name.clone()).collect();
+                let definitions: Vec<String> = declared.iter().map(Declared::definition).collect();
+                let rows = tx
+                    .query(
+                        "SELECT d.name, s.definition = sha256(convert_to(d.definition, 'UTF8')),
+                                s.declared_version,
+                                extract(epoch FROM now() - s.definition_declared_at)::float8,
+                                s.retired_at IS NOT NULL
+                           FROM unnest($1::text[], $2::text[]) AS d(name, definition)
+                           JOIN merezha_jobs.schedules s ON s.name = d.name",
+                        &[&names, &definitions],
+                    )
+                    .await
+                    .map_err(|e| classify(&e))?;
+                let stored: std::collections::BTreeMap<String, Stored> = rows
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.get::<_, String>(0),
+                            Stored {
+                                same: row.get(1),
+                                version: row.get(2),
+                                definition_age: row.get(3),
+                                retired: row.get(4),
+                            },
+                        )
+                    })
+                    .collect();
+                let mut report = SyncReport::default();
+                for (schedule, definition) in declared.iter().zip(&definitions) {
+                    let next = schedule.schedule.next_after(now)?.to_string();
+                    let row = stored.get(&schedule.name);
+                    let replace = match row {
+                        None => {
+                            tx.execute(
+                                "INSERT INTO merezha_jobs.schedules
+                                     (name, source, cron, timezone, queue, kind, payload, next_run_at,
+                                      definition, declared_version)
+                                 VALUES ($1, $2, $3, $4, $5, $6, $7::text::json, $8::text::timestamptz,
+                                         sha256(convert_to($9::text, 'UTF8')), $10)
+                                 ON CONFLICT (name) DO NOTHING",
+                                &[
+                                    &schedule.name,
+                                    &schedule.source,
+                                    &schedule.schedule.expression(),
+                                    &schedule.schedule.timezone(),
+                                    &schedule.queue,
+                                    &schedule.kind,
+                                    &schedule.payload,
+                                    &next,
+                                    definition,
+                                    &version,
+                                ],
+                            )
+                            .await
+                            .map_err(|e| classify(&e))?;
+                            continue;
+                        }
+                        Some(row) if row.same => {
+                            let raised = if row.version.is_none()
+                                || newer(version.as_deref(), row.version.as_deref())
+                            {
+                                version.clone()
+                            } else {
+                                row.version.clone()
+                            };
+                            tx.execute(
+                                "UPDATE merezha_jobs.schedules
+                                    SET source = $2, declared_version = $3,
+                                        last_declared_at = now(), definition_declared_at = now(),
+                                        next_run_at = CASE WHEN retired_at IS NOT NULL
+                                                           THEN $4::text::timestamptz ELSE next_run_at END,
+                                        updated_at = CASE WHEN retired_at IS NOT NULL
+                                                          THEN now() ELSE updated_at END,
+                                        retired_at = NULL
+                                  WHERE name = $1",
+                                &[&schedule.name, &schedule.source, &raised, &next],
+                            )
+                            .await
+                            .map_err(|e| classify(&e))?;
+                            continue;
+                        }
+                        Some(row) => {
+                            row.retired
+                                || newer(version.as_deref(), row.version.as_deref())
+                                || row.definition_age > grace
+                        }
+                    };
+                    if replace {
+                        tx.execute(
+                            "UPDATE merezha_jobs.schedules
+                                SET source = $2, cron = $3, timezone = $4, queue = $5, kind = $6,
+                                    payload = $7::text::json,
+                                    definition = sha256(convert_to($9::text, 'UTF8')),
+                                    declared_version = $10,
+                                    next_run_at = CASE WHEN retired_at IS NULL AND next_run_at <= now()
+                                                       THEN next_run_at ELSE $8::text::timestamptz END,
+                                    last_declared_at = now(), definition_declared_at = now(),
+                                    retired_at = NULL, updated_at = now()
+                              WHERE name = $1",
+                            &[
+                                &schedule.name,
+                                &schedule.source,
+                                &schedule.schedule.expression(),
+                                &schedule.schedule.timezone(),
+                                &schedule.queue,
+                                &schedule.kind,
+                                &schedule.payload,
+                                &next,
+                                definition,
+                                &version,
+                            ],
+                        )
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    } else {
+                        // Still declared, so never retired; the stored
+                        // definition stands.
+                        tx.execute(
+                            "UPDATE merezha_jobs.schedules SET last_declared_at = now() WHERE name = $1",
+                            &[&schedule.name],
+                        )
+                        .await
+                        .map_err(|e| classify(&e))?;
+                        report.conflicts.push(schedule.name.clone());
                     }
                 }
-                let [names, sources, crons, zones, queues, kinds, payloads, nexts, definitions] =
-                    &columns;
-                tx.execute(
-                    "INSERT INTO merezha_jobs.schedules
-                         (name, source, cron, timezone, queue, kind, payload, next_run_at, definition)
-                     SELECT d.name, d.source, d.cron, d.timezone, d.queue, d.kind, d.payload::json,
-                            d.next::timestamptz, sha256(convert_to(d.definition, 'UTF8'))
-                       FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
-                                   $6::text[], $7::text[], $8::text[], $9::text[])
-                            AS d(name, source, cron, timezone, queue, kind, payload, next, definition)
-                     ON CONFLICT (name) DO UPDATE SET
-                         source = excluded.source, cron = excluded.cron, timezone = excluded.timezone,
-                         queue = excluded.queue, kind = excluded.kind, payload = excluded.payload,
-                         next_run_at = CASE
-                             WHEN schedules.definition <> excluded.definition
-                               OR schedules.retired_at IS NOT NULL
-                             THEN excluded.next_run_at ELSE schedules.next_run_at END,
-                         updated_at = CASE
-                             WHEN schedules.definition <> excluded.definition
-                               OR schedules.retired_at IS NOT NULL
-                             THEN now() ELSE schedules.updated_at END,
-                         definition = excluded.definition,
-                         last_declared_at = now(), retired_at = NULL",
-                    &[names, sources, crons, zones, queues, kinds, payloads, nexts, definitions],
-                )
-                .await
-                .map_err(|e| classify(&e))?;
                 tx.execute(
                     "UPDATE merezha_jobs.schedules SET retired_at = now(), updated_at = now()
                       WHERE retired_at IS NULL
@@ -229,7 +373,7 @@ pub(crate) async fn sync(
                 )
                 .await
                 .map_err(|e| classify(&e))?;
-                Ok(())
+                Ok(report)
             })
         })
         .await
@@ -255,26 +399,49 @@ impl TickReport {
 }
 
 /// Enqueue every due occurrence: batches of [`TICK_BATCH`] rows, at most
-/// [`MAX_TICK_BATCHES`] of them.
+/// [`MAX_TICK_BATCHES`] of them. A due row this version cannot schedule
+/// (a definition another version wrote, or one that never fires again) is
+/// left due, kept out of this tick's later batches so it cannot starve the
+/// rest, and logged once per streak: `unschedulable` holds the names
+/// skipped by the previous tick.
 pub(crate) async fn tick(
     database: &Database,
     settings: &RelaySettings,
+    unschedulable: &std::sync::Mutex<std::collections::BTreeSet<String>>,
 ) -> Result<TickReport, Failure> {
     let mut report = TickReport::default();
+    let mut skipped: Vec<String> = Vec::new();
     for _ in 0..MAX_TICK_BATCHES {
-        let (batch, taken) = tick_batch(database, settings).await?;
+        let (batch, taken, names) = tick_batch(database, settings, skipped.clone()).await?;
         report.add(batch);
-        if taken < TICK_BATCH as usize || batch.fired + batch.duplicates == 0 {
+        skipped.extend(names);
+        // A full batch may hide more due rows behind it; skipped ones are
+        // excluded from the next, so every batch makes progress.
+        if taken < TICK_BATCH as usize {
             break;
         }
     }
+    let mut previous = unschedulable
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for name in skipped.iter().filter(|name| !previous.contains(*name)) {
+        tracing::warn!(
+            event = "job.worker_failed",
+            task = "scheduler",
+            code = "invalid_cron",
+            classification = "permanent",
+            schedule = name.as_str()
+        );
+    }
+    *previous = skipped.into_iter().collect();
     Ok(report)
 }
 
 async fn tick_batch(
     database: &Database,
     settings: &RelaySettings,
-) -> Result<(TickReport, usize), Failure> {
+    excluded: Vec<String>,
+) -> Result<(TickReport, usize, Vec<String>), Failure> {
     let settings = settings.clone();
     database
         .transaction(deadline(), move |tx| {
@@ -291,7 +458,7 @@ async fn tick_batch(
                     .map_err(|e| classify(&e))?
                     .get(0);
                 if !ours {
-                    return Ok((TickReport::default(), 0));
+                    return Ok((TickReport::default(), 0, Vec::new()));
                 }
                 let rows = tx
                     .query(
@@ -300,15 +467,17 @@ async fn tick_batch(
                                 (extract(epoch FROM now()) * 1000000)::bigint
                            FROM merezha_jobs.schedules
                           WHERE enabled AND retired_at IS NULL AND next_run_at <= now()
+                            AND NOT (name = ANY($2::text[]))
                           ORDER BY next_run_at
                           LIMIT $1
                           FOR UPDATE SKIP LOCKED",
-                        &[&TICK_BATCH],
+                        &[&TICK_BATCH, &excluded],
                     )
                     .await
                     .map_err(|e| classify(&e))?;
                 let mut report = TickReport::default();
                 let mut woken: Vec<String> = Vec::new();
+                let mut skipped = Vec::new();
                 for row in &rows {
                     let name: String = row.get(0);
                     let queue: String = row.get(3);
@@ -321,13 +490,7 @@ async fn tick_batch(
                         .and_then(|schedule| schedule.next_after(scheduled.max(now)));
                     let Ok(next) = next else {
                         report.skipped += 1;
-                        tracing::warn!(
-                            event = "job.worker_failed",
-                            task = "scheduler",
-                            code = "invalid_cron",
-                            classification = "permanent",
-                            schedule = name.as_str()
-                        );
+                        skipped.push(name);
                         continue;
                     };
                     let key = format!("cron:{name}:{}", scheduled.as_second());
@@ -371,7 +534,7 @@ async fn tick_batch(
                         .await
                         .map_err(|e| classify(&e))?;
                 }
-                Ok((report, rows.len()))
+                Ok((report, rows.len(), skipped))
             })
         })
         .await
@@ -593,19 +756,37 @@ pub(crate) async fn resume(
 pub struct Triggered {
     pub name: String,
     pub job_id: i64,
-    /// `cron:{name}:manual:{unix_ms}`.
+    /// `cron:{name}:manual:{key}`, the key the caller gave or `unix_ms`.
     pub idempotency_key: String,
+    /// `false`: a job with this key existed and was returned instead.
+    pub inserted: bool,
+}
+
+/// A caller's trigger key (the `Idempotency-Key` header): 1 to 120 bytes
+/// of `[A-Za-z0-9._:-]`, so the job key stays within 200 bytes.
+pub fn valid_trigger_key(key: &str) -> bool {
+    (1..=120).contains(&key.len())
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
 }
 
 /// `POST schedules/{name}/trigger`: one job now, keyed
-/// `cron:{name}:manual:{unix_ms}`, whether the schedule is paused or
-/// retired or not; `next_run_at` is unchanged. Audited.
+/// `cron:{name}:manual:{key}` with the caller's key (a retry returns the
+/// same job, `inserted = false`) or `unix_ms` without one. A paused
+/// schedule can be triggered; a retired one fails conflict
+/// `schedule_retired`. `next_run_at` is unchanged. Audited.
 pub(crate) async fn trigger(
     database: &Database,
     settings: &RelaySettings,
     name: &str,
+    key: Option<&str>,
     principal: Option<&str>,
 ) -> Result<Triggered, Failure> {
+    if key.is_some_and(|key| !valid_trigger_key(key)) {
+        return Err(Failure::permanent("validation_failed"));
+    }
+    let given = key.map(str::to_owned);
     let name = name.to_owned();
     let principal = principal.map(str::to_owned);
     let settings = settings.clone();
@@ -615,7 +796,7 @@ pub(crate) async fn trigger(
                 let row = tx
                     .query_opt(
                         "SELECT queue, kind, payload::text,
-                                (extract(epoch FROM now()) * 1000000)::bigint
+                                (extract(epoch FROM now()) * 1000000)::bigint, retired_at IS NOT NULL
                            FROM merezha_jobs.schedules WHERE name = $1",
                         &[&name],
                     )
@@ -626,7 +807,13 @@ pub(crate) async fn trigger(
                 let kind: String = row.get(1);
                 let payload: String = row.get(2);
                 let now = timestamp(row.get(3));
-                let key = format!("cron:{name}:manual:{}", now.as_millisecond());
+                if row.get::<_, bool>(4) {
+                    return Err(Failure::conflict("schedule_retired"));
+                }
+                let key = match &given {
+                    Some(given) => format!("cron:{name}:manual:{given}"),
+                    None => format!("cron:{name}:manual:{}", now.as_millisecond()),
+                };
                 let (job_id, inserted) = insert_job(
                     tx,
                     &queue,
@@ -648,10 +835,41 @@ pub(crate) async fn trigger(
                     name,
                     job_id,
                     idempotency_key: key,
+                    inserted,
                 })
             })
         })
         .await?;
     logged("schedule_trigger", &triggered.name);
     Ok(triggered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::newer;
+
+    #[test]
+    fn versions_take_precedence_only_when_both_are_dotted_numbers() {
+        for (a, b) in [
+            ("2", "1"),
+            ("1.10", "1.9"),
+            ("1.2.1", "1.2"),
+            ("10.0.0", "9.99.99"),
+        ] {
+            assert!(newer(Some(a), Some(b)), "{a} > {b}");
+            assert!(!newer(Some(b), Some(a)), "{b} < {a}");
+        }
+        for (a, b) in [
+            ("1.2", "1.2.0"),
+            ("1.2.0", "1.2"),
+            ("2.0.0-rc1", "1.0"),
+            ("2", "v1"),
+            ("", "1"),
+        ] {
+            assert!(!newer(Some(a), Some(b)), "no precedence: {a} vs {b}");
+        }
+        assert!(!newer(Some("2"), None));
+        assert!(!newer(None, Some("1")));
+        assert!(!newer(None, None));
+    }
 }
