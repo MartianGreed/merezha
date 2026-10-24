@@ -9,7 +9,8 @@
 //! denies them.
 //!
 //! Publishing, deletion, the trash and batches (C4) mount beside them from
-//! [`crate::manage`]; delivery is C5's and assets C7's.
+//! [`crate::manage`]; the delivery routes and the model endpoints (C5)
+//! from [`crate::delivery`]; assets are C7's.
 use crate::{
     json::{body_object, optional, string, write_fields},
     manage,
@@ -134,7 +135,12 @@ pub(crate) fn router(store: Store, policy: Arc<dyn Authorizer>) -> Router {
             "/manage/batch/unpublish",
             axum::routing::post(manage::batch_unpublish),
         )
-        .with_state(Manage { store, policy })
+        .route("/manage/model", get(crate::delivery::manage_model))
+        .with_state(Manage {
+            store: store.clone(),
+            policy: policy.clone(),
+        })
+        .merge(crate::delivery::router(store, policy))
 }
 
 pub(crate) type Params = Path<HashMap<String, String>>;
@@ -396,7 +402,18 @@ pub(crate) fn variant_json(
     selection: Option<&[String]>,
     warnings: Option<&[FieldError]>,
 ) -> String {
-    let mut out = String::with_capacity(256);
+    let mut fields = String::new();
+    write_fields(content_type, &view.fields, selection, &mut fields);
+    variant_document(view, &fields, warnings)
+}
+
+/// The variant document with its `fields` already written.
+pub(crate) fn variant_document(
+    view: &VariantView,
+    fields: &str,
+    warnings: Option<&[FieldError]>,
+) -> String {
+    let mut out = String::with_capacity(256 + fields.len());
     let _ = write!(
         out,
         "{{\"sys\":{{\"id\":{},\"type\":{},\"locale\":{},\"status\":{},\"draft_revision\":{},\
@@ -418,7 +435,7 @@ pub(crate) fn variant_json(
         optional(view.published_at.as_deref()),
         optional(view.first_published_at.as_deref()),
     );
-    write_fields(content_type, &view.fields, selection, &mut out);
+    out.push_str(fields);
     if let Some(warnings) = warnings {
         out.push_str(",\"warnings\":");
         out.push_str(&serde_json::to_string(warnings).unwrap_or_else(|_| "[]".to_owned()));
@@ -656,17 +673,46 @@ async fn read_variant(
         let (parts, _) = request.into_parts();
         let (target, content_type, id, locale) =
             manage.locate(&parts, ENTRIES_READ, &params).await?;
-        let query = selection(&content_type, parts.uri.query(), &["fields"])?;
+        let query = selection(&content_type, parts.uri.query(), &["fields", "populate"])?;
+        let fields = field_list(&query);
+        let paths = match query.get("populate") {
+            None => None,
+            Some(text) => Some(
+                crate::populate::parse_paths(
+                    manage.store.model(),
+                    &content_type,
+                    text,
+                    manage.store.state().settings().limits.max_populate_depth,
+                    fields.as_deref(),
+                )
+                .map_err(|details| Rejection {
+                    failure: Failure::permanent("invalid_query"),
+                    details,
+                })?,
+            ),
+        };
         let id = id.ok_or_else(Rejection::not_found)?;
         let view = manage.store.variant(&target, id, &locale).await?;
-        Ok(variant_response(
-            StatusCode::OK,
-            &content_type,
-            &view,
-            field_list(&query).as_deref(),
-            None,
-            None,
-        ))
+        let Some(paths) = paths else {
+            return Ok(variant_response(
+                StatusCode::OK,
+                &content_type,
+                &view,
+                fields.as_deref(),
+                None,
+                None,
+            ));
+        };
+        // Drafts of the referenced entries the caller reads.
+        let expanded =
+            crate::delivery::populate_draft(&manage, &parts, &target, &view, paths).await?;
+        let mut rendered = String::new();
+        expanded.write_fields(0, &content_type, fields.as_deref(), &mut rendered);
+        let mut response = json(StatusCode::OK, variant_document(&view, &rendered, None));
+        if let Ok(value) = HeaderValue::from_str(&etag(view.draft_revision)) {
+            response.headers_mut().insert(header::ETAG, value);
+        }
+        Ok(response)
     };
     respond(run.await)
 }

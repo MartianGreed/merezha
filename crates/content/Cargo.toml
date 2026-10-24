@@ -26,5 +26,6 @@ uuid.workspace = true
 [dev-dependencies]
 merezha-application = { path = "../application" }
 merezha-jobs = { path = "../jobs" }
+merezha-telemetry = { path = "../telemetry", features = ["testing"] }
 tempfile.workspace = true
 tower.workspace = true

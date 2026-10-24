@@ -233,6 +233,86 @@ fn limits_revision_retention_and_trash_are_validated_with_every_problem_at_once(
 }
 
 #[test]
+fn population_limits_and_delivery_cache_headers_are_validated_with_every_problem_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    project(
+        dir.path(),
+        false,
+        "[modules.content]\n\
+         limits = { max_populate_depth = 4, max_populated_entries = 0, max_response_bytes = 1024 }\n\
+         delivery = { cache_control_public = \"public\\nx\", cache_control_private = 3, \
+                      public_base_url = \"https://example.com\" }\n",
+        &[("content.toml", V1)],
+    );
+    let mut issues = configure_issues(dir.path()).unwrap_err();
+    issues.sort();
+    let issues: Vec<(&str, &str)> = issues
+        .iter()
+        .map(|(k, c)| (k.as_str(), c.as_str()))
+        .collect();
+    assert_eq!(
+        issues,
+        [
+            (
+                "modules.content.delivery.cache_control_private",
+                "expected_string"
+            ),
+            (
+                "modules.content.delivery.cache_control_public",
+                "invalid_value"
+            ),
+            // Asset URLs arrive with C7.
+            ("modules.content.delivery.public_base_url", "unknown_key"),
+            ("modules.content.limits.max_populate_depth", "out_of_range"),
+            (
+                "modules.content.limits.max_populated_entries",
+                "out_of_range"
+            ),
+            ("modules.content.limits.max_response_bytes", "out_of_range"),
+        ]
+    );
+    for long in [" public", &"x".repeat(257)] {
+        project(
+            dir.path(),
+            false,
+            &format!("[modules.content]\ndelivery = {{ cache_control_public = \"{long}\" }}\n"),
+            &[("content.toml", V1)],
+        );
+        assert!(configure_issues(dir.path()).is_err(), "{long}");
+    }
+    project(
+        dir.path(),
+        false,
+        "[modules.content]\nlimits = { max_populate_depth = 0, max_populated_entries = 2000 }\n\
+         delivery = { cache_control_public = \"public, max-age=5\", \
+                      cache_control_private = \"private, max-age=0\" }\n",
+        &[("content.toml", V1)],
+    );
+    let settings = configure_issues(dir.path())
+        .unwrap()
+        .state()
+        .unwrap()
+        .settings()
+        .clone();
+    assert_eq!(settings.limits.max_populate_depth, 0);
+    assert_eq!(settings.limits.max_populated_entries, 2000);
+    assert_eq!(settings.delivery.cache_control_public, "public, max-age=5");
+    assert_eq!(
+        settings.delivery.cache_control_private,
+        "private, max-age=0"
+    );
+    let defaults = merezha_content::ContentSettings::default();
+    assert_eq!(defaults.limits.max_populate_depth, 2);
+    assert_eq!(defaults.limits.max_populated_entries, 500);
+    assert_eq!(defaults.limits.max_response_bytes, 16_777_216);
+    assert_eq!(
+        defaults.delivery.cache_control_public,
+        "public, max-age=60, stale-while-revalidate=300"
+    );
+    assert_eq!(defaults.delivery.cache_control_private, "private, no-cache");
+}
+
+#[test]
 fn content_errors_register_with_the_kernel_codes() {
     let mut registry = ErrorRegistry::kernel();
     registry.register("content", ERRORS).unwrap();
@@ -253,6 +333,9 @@ fn content_errors_register_with_the_kernel_codes() {
         ("content_model_breaking", 422),
         ("index_build_failed", 422),
         ("validation_failed", 422),
+        ("populate_limit", 400),
+        ("response_too_large", 400),
+        ("content_type_not_found", 404),
     ] {
         assert_eq!(
             registry.status_of(code).map(|s| s.as_u16()),

@@ -560,7 +560,8 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS variants_by_update ON merezha_content.va
 remain without a matching index: `sys.created_at` (an `entries` column),
 and every sort of two or more keys, which reads the first key's index
 order and sorts the rest. Delivery lists over `published` (C5) choose
-their tie-breaker the same way.
+their tie-breaker the same way, except after `sys.published_at`, whose
+tie-breaker follows `published_list` (`published_at DESC, entry_id`).
 
 Migration 3 (C4) adds `rebuilds (version integer PRIMARY KEY REFERENCES
 models, after_entry uuid, state text CHECK (state IN ('pending', 'done')),
@@ -1022,6 +1023,70 @@ fallback is resolved per query (`DISTINCT ON` over the chain), so preview
 lists are slower than delivery lists. Preview responses are
 `private, no-store` without ETag. Delivery never distinguishes unpublished
 from absent: both are `entry_not_found`.
+
+C5 ships these routes, preview, population, the ETags and the model
+endpoints (`GET /v1/content/model` and the management `GET /model`). As
+built:
+
+- Access is checked before anything is read, an unknown id answering
+  like a known one. A type the model lacks is `content_type_not_found`,
+  while a restricted one answers 401 or 403, as the acceptance criteria
+  require; delivery does not hide which restricted type names exist (the
+  restricted model endpoint does).
+- Preview needs the type's `access` as well as `content.preview`; a
+  preview grant never lifts a type's own rule. Population in preview
+  needs both for every target type.
+- `populate` segments name top-level fields of the types the previous
+  segment reached. A segment expands every entry reference inside the
+  field's value: a `reference`, references inside components, component
+  lists and `blocks`, and a rich text field's `entry_link` annotations and
+  embedded components. With `fields`, a path's first segment must be
+  selected (`not_selected`). Populated entries are counted per reference
+  (a target reached twice counts twice) against
+  `limits.max_populated_entries`; depth is checked when the query is
+  parsed (`invalid_query`, `/populate` `too_deep`).
+- Every entry reference of a delivery response is checked: one whose
+  target is unpublished, deleted, of a type the caller cannot read, in
+  another scope, or of another type than the reference names becomes
+  `missing`. Management draft reads mark only the references on populated
+  paths, and populate the drafts of the types the caller holds
+  `content.entries.read` on.
+- The default delivery sort `-sys.published_at` takes `entry_id` against
+  its direction, the order of the static `published_list` index, so
+  either direction of `sys.published_at` is one index scan without a new
+  migration; field sorts keep C3's rule.
+- In preview, `sys.published_at` filters and sorts on the variant's own
+  `published_at`, null (sorted last) for a draft never published.
+- A by-slug lookup orders candidates by their source locale's place in
+  the chain, which starts with the locale itself, so an own slug wins.
+- The ETag hashes the route, the type, the scope, the sorted query pairs
+  and an access class: whether a principal asked, and the set of types
+  the caller reads on that path (anonymous callers too, since a policy
+  may grant them a permission type). On an organization's path a type
+  that can reference entries also carries the application generation,
+  populated or not, because the `missing` checks read application rows.
+  The generations are read first in the read's transaction, so the
+  content is never older than its tag. No other scope's generation
+  enters a tag.
+- `delivery.cache_control_public` applies only without a principal, to a
+  `public` type whose reachable reference targets the caller reads are
+  all `public`; it is decided before reading, so a 304 and a 200 agree.
+- `limits.max_response_bytes` (16 MiB by default, 64 KiB to 256 MiB)
+  bounds a delivery body and a populated management read; past it the
+  request fails `response_too_large` (400). Without it the bound would be
+  `max_page_size` × `max_entry_bytes` plus `max_populated_entries` ×
+  `max_entry_bytes`, gigabytes at the ceilings.
+- The delivery model endpoint keeps the types the caller reads (on an
+  organization's path its organization types and the application types),
+  the components they embed and only reference targets among them; the
+  management one needs `content.model.read` in the principal's tenant,
+  or at `Application` without one.
+- Asset metadata expansion, asset serving and `delivery.public_base_url`
+  arrive with C7; until then asset fields are delivered as stored.
+- Delivery's statements are registered with the TE-T4 registry
+  (`merezha_content::STATEMENTS`); its lists run through the registry's
+  `Database::query_text`, which C5 adds for text built per request with
+  parameters.
 
 ### Filters
 

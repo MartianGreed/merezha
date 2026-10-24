@@ -76,6 +76,13 @@ pub(crate) fn chain<'m>(
     if !content_type.localized {
         return vec![default];
     }
+    locale_chain(model, locale)
+}
+
+/// The chain of a localized type in `locale`: itself first, then its
+/// fallbacks, the default locale last.
+pub(crate) fn locale_chain<'m>(model: &'m ContentModel, locale: &'m str) -> Vec<&'m str> {
+    let default = model.default_locale().code.as_str();
     let mut out: Vec<&str> = Vec::new();
     let mut next = Some(locale);
     while let Some(code) = next {

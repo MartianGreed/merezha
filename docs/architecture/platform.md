@@ -1166,13 +1166,19 @@ db.execute(tx, &INSERT_NOTE, &[&id, &body]).await.map_err(|e| classify(&e))?;
 
 `query`, `query_one`, `query_opt`, `execute` and `batch` run `statement.sql`;
 `batch_text` runs text built at run time (DDL naming a derived index, a
-computed `SET`) under a registered name. The kernel's own statements are
+computed `SET`) under a registered name, and `query_text` a query whose
+text varies per call (a list's filters, sort keys and cursor condition)
+with its values as parameters, returning rows; `statement.sql` documents
+the shape and the text is never recorded. The kernel's own statements are
 `merezha_postgres::KERNEL_STATEMENTS` (`kernel.*`); a block lists its own
 and checks them against the kernel's with `check_registry` in a test: the
 application store's are `merezha_application::postgres::STATEMENTS`
 (`app.*`; the append is `app.events.append`, summary
 `INSERT merezha_app.events`, run prepared through `query_one_prepared`), the
-capture driver's `merezha_notifications::drivers::STATEMENTS`. SQL
+capture driver's `merezha_notifications::drivers::STATEMENTS`, content
+delivery's `merezha_content::STATEMENTS` (`content.delivery.*`,
+`content.preview.*`, `content.populate.*`; content's C2 to C4 statements
+are issue #41). SQL
 sent through the driver directly is not observed at all, so each crate
 scans its own sources in a test: `statement::scan_sources(dir, skip)`
 walks every `.rs` file and reports each call of a driver method
@@ -1788,12 +1794,13 @@ such as `cargo build --release -p merezha-cli` or `cargo build
 
 ## Content
 
-`merezha-content` (`crates/content`, CT-C1 to CT-C4) is the content block,
+`merezha-content` (`crates/content`, CT-C1 to CT-C5) is the content block,
 a `Module` named `content` with schema `merezha_content` (ledger key
 `content`). C2 ships its schema, model activation and readiness; C3 the
 management routes for drafts and revisions; C4 publishing, the
-`published` rows, deletion, the trash and its purge job. Delivery (C5)
-and assets (C7) come later. The design is
+`published` rows, deletion, the trash and its purge job; C5 the delivery
+API, preview, population and the model endpoints. Assets (C7) come
+later. The design is
 [content.md](../design/content.md).
 
 ```toml
@@ -1801,9 +1808,13 @@ and assets (C7) come later. The design is
 model = "content.toml"     # the default
 limits = { max_request_bytes = 1048576, max_entry_bytes = 262144,
            default_page_size = 25, max_page_size = 100, max_filters = 10,
-           max_sort_keys = 2, max_batch = 100, query_timeout = "5s" }   # the defaults
+           max_sort_keys = 2, max_batch = 100, query_timeout = "5s",
+           max_populate_depth = 2, max_populated_entries = 500,
+           max_response_bytes = 16777216 }   # the defaults
 revisions = { retain = 100 }                           # the default
 trash = { retention = "30d", purge_cron = "23 3 * * *" }   # the defaults
+delivery = { cache_control_public = "public, max-age=60, stale-while-revalidate=300",
+             cache_control_private = "private, no-cache" }      # the defaults
 ```
 
 | Key | Default | Range | Meaning |
@@ -1819,14 +1830,19 @@ trash = { retention = "30d", purge_cron = "23 3 * * *" }   # the defaults
 | `revisions.retain` | 100 | 2 to 10000 | Revisions kept per variant; the published one is kept besides them. |
 | `trash.retention` | `"30d"` | 1 day to 3650 days | How long a trashed entry stays before the purge job hard-deletes it. |
 | `trash.purge_cron` | `"23 3 * * *"` | AP's cron parser, five fields | When `content.trash_purge` runs, in UTC (`invalid_cron`). |
+| `limits.max_populate_depth` | 2 | 0 to 3 | Segments of one `populate` path (`invalid_query`, detail `/populate` `too_deep`); 0 turns population off. |
+| `limits.max_populated_entries` | 500 | 1 to 2000 | Populated references in one response; past it the request fails `populate_limit` (400) rather than truncating. |
+| `limits.max_response_bytes` | 16777216 | 65536 to 268435456 | Largest delivery body, and largest populated management read; past it the request fails `response_too_large` (400): ask for a smaller `limit`, fewer `fields` or less `populate`. |
+| `delivery.cache_control_public` | `"public, max-age=60, stale-while-revalidate=300"` | visible ASCII, 1 to 256 bytes, no edge spaces | `Cache-Control` of a published read of an `access = "public"` type without a principal (`invalid_value`). |
+| `delivery.cache_control_private` | `"private, no-cache"` | as above | `Cache-Control` of every other published read. |
 
-The tables take only these keys in C4. `max_populate_depth`,
-`max_populated_entries`, `delivery` and `media` stay `unknown_key` until
-their slices. Problems are reported with the configuration, every one at
-once (`out_of_range`, `expected_integer`, `expected_duration`,
-`expected_string`, `invalid_cron`, `expected_table`, `unknown_key`),
-keyed `modules.content.limits.<key>`, `modules.content.revisions.retain`
-or `modules.content.trash.<key>`.
+The tables take only these keys in C5. `delivery.public_base_url` and
+`media` stay `unknown_key` until C7. Problems are reported with the
+configuration, every one at once (`out_of_range`, `expected_integer`,
+`expected_duration`, `expected_string`, `invalid_cron`, `invalid_value`,
+`expected_table`, `unknown_key`), keyed `modules.content.limits.<key>`,
+`modules.content.revisions.retain`, `modules.content.trash.<key>` or
+`modules.content.delivery.<key>`.
 
 `model` follows the runtime manifest's path rules: relative to
 `merezha.toml`, no `..` or absolute paths, and it must resolve (symlinks
@@ -1970,7 +1986,7 @@ All under `/v1/content/manage`, answered `private, no-store`:
 | `GET /entries/{type}` (list: `locale`, `status`, `filter[<field>][<op>]`, `sort`, `limit`, `cursor`, `fields`) | `content.entries.read` |
 | `POST /entries/{type}` (`{id?, locale?, fields}`, 201 with `ETag` and `Location`) | `content.entries.write` |
 | `GET /entries/{type}/{id}`, `GET /entries/{type}/{id}/referrers` (`stage`, `limit`, `cursor`) | `content.entries.read` |
-| `GET /entries/{type}/{id}/{locale}` (`fields`), `.../revisions` (`limit`, `cursor`), `.../revisions/{n}` | `content.entries.read` |
+| `GET /entries/{type}/{id}/{locale}` (`fields`, and `populate` since C5), `.../revisions` (`limit`, `cursor`), `.../revisions/{n}` | `content.entries.read` |
 | `PUT` and `PATCH /entries/{type}/{id}/{locale}`, `POST .../revisions/{n}/restore` | `content.entries.write` |
 | the same under `/singletons/{type}/{locale}` (no entry id; the first `PUT` with `If-None-Match: *` creates the entry) | as above |
 | `POST /entries/{type}/{id}/{locale}/publish` (`{revision?}`, `If-Match`), `.../unpublish` (`If-Match`), and the same under `/singletons/{type}/{locale}` | `content.entries.publish` |
@@ -1978,6 +1994,7 @@ All under `/v1/content/manage`, answered `private, no-store`:
 | `DELETE /entries/{type}/{id}/{locale}` (`If-Match`, a non-default variant, 204) | `content.entries.write` |
 | `DELETE /entries/{type}/{id}` (`if_unreferenced`, `purge`, 204), `POST /entries/{type}/{id}/undelete` (200 entry summary) | `content.entries.delete`, plus `content.entries.purge` with `purge=true` |
 | `GET /trash` (`type`, `limit`, `cursor`) | `content.entries.read`: the given type, or every type the caller reads |
+| `GET /model` (C5: the full model, `{version, fingerprint, locales, components, types}`) | `content.model.read`, in the principal's tenant when it has one, else at `Application` |
 
 Each route checks its permission through the host's `Authorizer` before
 anything else, at `ResourceScope::Resource { tenant, kind: "content_type",
@@ -2056,6 +2073,87 @@ numeric text); anything else, and any value PostgreSQL then refuses
 `merezha_content` is a declared non-transactional step building
 `variants_by_update` (`draft_updated_at DESC, entry_id DESC`), the index
 of the default `-sys.updated_at` list and its reverse.
+
+`populate` on a management variant read (C5) expands the drafts of the
+referenced entries, through the variant's locale chain, for the types the
+caller holds `content.entries.read` on (each in its resource scope); any
+other reference on a populated path is `{"id", "type", "missing": true}`.
+
+### Content delivery routes
+
+C5 serves published entries under `/v1/content` and organization types
+under `/v1/content/o/{organization}` (organization types load from C9 on;
+an application type under an organization's path, and the reverse, is
+`content_type_not_found`):
+
+| Route | Query |
+| --- | --- |
+| `GET /model` | none: the model restricted to the types the caller reads, reference targets (`to`, `entry_link_to`) among them, and only the components they embed |
+| `GET /{type}` (collection) | `locale`, `fallback`, `filter[<field>][<op>]`, `sort`, `limit`, `cursor`, `fields`, `populate`, `stage` |
+| `GET /{type}` (singleton), `GET /{type}/{id}`, `GET /{type}/by-slug/{slug}` | `locale`, `fallback`, `fields`, `populate`, `stage` |
+
+Access is each type's `access`, checked before anything is read:
+`public` serves anyone; `authenticated` any principal (an organization
+type only one whose tenant is the path's organization, else 403
+`unauthorized`); a permission is checked through the host's `Authorizer`
+at `Resource { tenant, kind: "content_type", id: <type> }`, so an
+`Application` grant or a grant on that type serves it and a grant on
+another type does not. Without a principal a non-public type answers 401
+`unauthenticated`. Delivery never consults the policy for `public`
+types, so they are served on a public listener without identity too.
+Unpublished and absent entries are both 404 `entry_not_found`.
+
+`stage=draft` (preview) also needs `content.preview` at `Application`
+scope (`Tenant(org)` for organization types) besides the type's
+`access`; it reads the live drafts through the locale chain (each
+entry's first variant in the chain, `DISTINCT ON`), with the same
+filters, population and slugs, and answers `private, no-store` without
+an ETag. In preview `sys.published_at` is the variant's own, null (sorted
+last) for a draft never published.
+
+- `locale` is any configured locale (default: the default locale); a
+  non-localized type serves its default variant in every locale.
+  `fallback=false` serves only the locale's own variant of a localized
+  type. `sys.source_locale` names the variant served.
+- Delivery filters take `sys.id` and `sys.published_at`; the default sort
+  is `-sys.published_at`, whose tie-breaker `entry_id` runs against it so
+  either direction is one scan of `published_list`. Cursors are bound to
+  the type, scope, stage, locale, fallback, filters and sort.
+- `by-slug` reads the slug in the locale's own variant first, then the
+  fallback rows in chain order, then the entry id.
+- `populate=author,body.author` expands entry references along dotted
+  paths of field names, at most `limits.max_populate_depth` segments each,
+  one batched query per level in the request's stage and locale chain. A
+  segment expands every entry reference inside the field's value
+  (references, components, component lists and `blocks`, and a rich text
+  field's `entry_link` annotations). Only targets of types the caller
+  reads (by their own `access`, and `content.preview` for drafts), in the
+  request's scope or the application scope, are expanded, as `entry`
+  (`sys` with id, type, locale, source locale and revision, and every
+  field). Every reference in a delivery response whose target is not
+  visible is `{"id", "type", "missing": true}`. A path's first segment
+  must be among `fields` when `fields` is given (`not_selected`).
+
+Published responses carry `ETag: W/"<8 hex of the model fingerprint>-<the
+scope's generation>-<16 hex of SHA-256 of the route, the sorted query and
+the caller's access class>"` (an organization response that populates
+on an organization's path also carries the application generation
+whenever the type can reference entries, since population and the
+`missing` checks read application rows). The access class is whether a
+principal asked plus the set of types the caller reads there. A matching
+`If-None-Match` answers 304 after reading only
+`merezha_content.generations`; otherwise the generations are read first
+and the entries after, in the same transaction. `Cache-Control` is
+`delivery.cache_control_public` only when there is no principal, the
+type is `public`, and every type reachable through its references that
+the caller reads is `public` too (a policy may let anonymous callers read
+a permission type); `delivery.cache_control_private` otherwise; every delivery
+response, errors included, has `Vary: Authorization, Cookie`, and errors
+are `private, no-store`.
+
+Codes added by C5: `populate_limit`, `response_too_large` (400). Delivery's statements are
+registered (`merezha_content::STATEMENTS`: `content.delivery.*`,
+`content.preview.*`, `content.populate.*`).
 
 ## Dependencies
 

@@ -1,8 +1,9 @@
 //! The `[modules.content]` settings that entries need (section 9):
 //! `limits.*` for request, entry, page, filter, sort, batch and query
 //! bounds, `revisions.retain`, and the trash's `retention` and
-//! `purge_cron` (C4). Keys of later slices stay `unknown_key` until the
-//! slice that gives them behaviour.
+//! `purge_cron` (C4), and population bounds and delivery cache headers
+//! (C5). Keys of later slices stay `unknown_key` until the slice that
+//! gives them behaviour.
 use merezha_platform::{
     ModuleSection,
     config::{ConfigIssue, parse_duration},
@@ -28,6 +29,14 @@ pub struct Limits {
     pub max_batch: u32,
     /// Bound on every statement of a request, 100 ms to 30 s.
     pub query_timeout: Duration,
+    /// Most segments of one `populate` path, 0 (population off) to 3.
+    pub max_populate_depth: u32,
+    /// Most populated references in one response, 1 to 2000; past it the
+    /// request fails `populate_limit`.
+    pub max_populated_entries: u32,
+    /// Largest delivery or populated management response body, 65536 to
+    /// 268435456 bytes; past it the request fails `response_too_large`.
+    pub max_response_bytes: usize,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -40,6 +49,9 @@ impl Default for Limits {
             max_sort_keys: 2,
             max_batch: 100,
             query_timeout: Duration::from_secs(5),
+            max_populate_depth: 2,
+            max_populated_entries: 500,
+            max_response_bytes: 16_777_216,
         }
     }
 }
@@ -67,6 +79,33 @@ impl Default for Trash {
     }
 }
 
+/// `Cache-Control` of published delivery responses read anonymously from
+/// an `access = "public"` type, when the key is absent.
+pub const DEFAULT_CACHE_CONTROL_PUBLIC: &str = "public, max-age=60, stale-while-revalidate=300";
+/// `Cache-Control` of every other published delivery response, when the
+/// key is absent.
+pub const DEFAULT_CACHE_CONTROL_PRIVATE: &str = "private, no-cache";
+/// Longest accepted `delivery.cache_control_*` value, in bytes.
+pub const MAX_CACHE_CONTROL: usize = 256;
+
+/// `[modules.content.delivery]`: the `Cache-Control` values of published
+/// delivery responses (section 5, caching).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delivery {
+    /// For `access = "public"` types read without a principal.
+    pub cache_control_public: String,
+    /// For every other published response.
+    pub cache_control_private: String,
+}
+impl Default for Delivery {
+    fn default() -> Self {
+        Self {
+            cache_control_public: DEFAULT_CACHE_CONTROL_PUBLIC.to_owned(),
+            cache_control_private: DEFAULT_CACHE_CONTROL_PRIVATE.to_owned(),
+        }
+    }
+}
+
 /// The settings of the content block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContentSettings {
@@ -74,6 +113,7 @@ pub struct ContentSettings {
     /// Revisions kept per variant besides the published one, 2 to 10000.
     pub revisions_retain: u32,
     pub trash: Trash,
+    pub delivery: Delivery,
 }
 impl Default for ContentSettings {
     fn default() -> Self {
@@ -81,14 +121,16 @@ impl Default for ContentSettings {
             limits: Limits::default(),
             revisions_retain: 100,
             trash: Trash::default(),
+            delivery: Delivery::default(),
         }
     }
 }
 
 /// The top-level keys `[modules.content]` accepts.
-pub(crate) const KEYS: [&str; 4] = ["model", "limits", "revisions", "trash"];
+pub(crate) const KEYS: [&str; 5] = ["model", "limits", "revisions", "trash", "delivery"];
 const TRASH_KEYS: [&str; 2] = ["retention", "purge_cron"];
-const LIMIT_KEYS: [&str; 8] = [
+const DELIVERY_KEYS: [&str; 2] = ["cache_control_public", "cache_control_private"];
+const LIMIT_KEYS: [&str; 11] = [
     "max_request_bytes",
     "max_entry_bytes",
     "default_page_size",
@@ -97,6 +139,9 @@ const LIMIT_KEYS: [&str; 8] = [
     "max_sort_keys",
     "max_batch",
     "query_timeout",
+    "max_populate_depth",
+    "max_populated_entries",
+    "max_response_bytes",
 ];
 const REVISION_KEYS: [&str; 1] = ["retain"];
 
@@ -143,6 +188,24 @@ impl ContentSettings {
             limits.max_filters = int("max_filters", defaults.max_filters.into(), 1, 32) as u32;
             limits.max_sort_keys = int("max_sort_keys", defaults.max_sort_keys.into(), 1, 4) as u32;
             limits.max_batch = int("max_batch", defaults.max_batch.into(), 1, 500) as u32;
+            limits.max_populate_depth = int(
+                "max_populate_depth",
+                defaults.max_populate_depth.into(),
+                0,
+                3,
+            ) as u32;
+            limits.max_populated_entries = int(
+                "max_populated_entries",
+                defaults.max_populated_entries.into(),
+                1,
+                2000,
+            ) as u32;
+            limits.max_response_bytes = int(
+                "max_response_bytes",
+                defaults.max_response_bytes as u64,
+                65_536,
+                268_435_456,
+            ) as usize;
             if let Some(value) = table.get("query_timeout") {
                 let key = format!("{}.query_timeout", section.key("limits"));
                 match value.as_str().and_then(parse_duration) {
@@ -197,12 +260,44 @@ impl ContentSettings {
                 }
             }
         }
+        if let Some(table) = subtable(section, "delivery", &DELIVERY_KEYS, &mut issues) {
+            let origin = section.origin("delivery");
+            for key in DELIVERY_KEYS {
+                let Some(value) = table.get(key) else {
+                    continue;
+                };
+                let dotted = format!("{}.{key}", section.key("delivery"));
+                let slot = if key == "cache_control_public" {
+                    &mut settings.delivery.cache_control_public
+                } else {
+                    &mut settings.delivery.cache_control_private
+                };
+                match value.as_str() {
+                    Some(text) if header_safe(text) => text.clone_into(slot),
+                    Some(_) => {
+                        issues.push(ConfigIssue::new(dotted, "invalid_value", origin.clone()))
+                    }
+                    None => {
+                        issues.push(ConfigIssue::new(dotted, "expected_string", origin.clone()))
+                    }
+                }
+            }
+        }
         if issues.is_empty() {
             Ok(settings)
         } else {
             Err(issues)
         }
     }
+}
+
+/// A header value of visible ASCII and spaces, trimmed, 1 to
+/// [`MAX_CACHE_CONTROL`] bytes.
+fn header_safe(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= MAX_CACHE_CONTROL
+        && text.trim() == text
+        && text.bytes().all(|b| (0x20..0x7f).contains(&b))
 }
 
 /// The time zone of the `content.trash_purge` schedule.

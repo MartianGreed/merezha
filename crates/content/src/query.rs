@@ -178,6 +178,52 @@ impl Op {
     }
 }
 
+/// What a listing reads: the management list over `variants`, delivery
+/// over `published`, and preview over the variants a locale chain
+/// resolves (exposed as `v` with the variant columns).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    Manage,
+    Published,
+    Preview,
+}
+impl Source {
+    /// The JSON column of the entry's fields.
+    pub(crate) fn data(self) -> &'static str {
+        match self {
+            Self::Published => "p.data",
+            Self::Manage | Self::Preview => "v.draft_data",
+        }
+    }
+    /// The entry id column, the final sort key.
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::Published => "p.entry_id",
+            Self::Manage | Self::Preview => "v.entry_id",
+        }
+    }
+    /// The column of the system timestamp `sys.<name>` and whether it may
+    /// be null: `updated_at` and `created_at` in management,
+    /// `published_at` in delivery. Preview reads the variant's
+    /// `published_at`, null for a draft never published.
+    fn timestamp(self, name: &str) -> Option<(&'static str, bool)> {
+        match (self, name) {
+            (Self::Manage, "updated_at") => Some(("v.draft_updated_at", false)),
+            (Self::Manage, "created_at") => Some(("e.created_at", false)),
+            (Self::Published, "published_at") => Some(("p.published_at", false)),
+            (Self::Preview, "published_at") => Some(("v.published_at", true)),
+            _ => None,
+        }
+    }
+    /// The sort of a listing that names none.
+    fn default_sort(self) -> &'static str {
+        match self {
+            Self::Manage => "-sys.updated_at",
+            Self::Published | Self::Preview => "-sys.published_at",
+        }
+    }
+}
+
 /// The cast a sortable field's text takes in SQL, as in its derived index.
 fn cast(kind: &FieldKind) -> &'static str {
     match kind {
@@ -189,14 +235,15 @@ fn cast(kind: &FieldKind) -> &'static str {
 }
 /// The typed SQL expression of a top-level field, matching the derived
 /// sort index.
-fn field_expression(name: &str, kind: &FieldKind) -> String {
+fn field_expression(source: Source, name: &str, kind: &FieldKind) -> String {
+    let data = source.data();
     match cast(kind) {
-        "text" => format!("(v.draft_data->>'{name}')"),
-        cast => format!("((v.draft_data->>'{name}'))::{cast}"),
+        "text" => format!("({data}->>'{name}')"),
+        cast => format!("(({data}->>'{name}'))::{cast}"),
     }
 }
-fn null_expression(name: &str) -> String {
-    format!("((v.draft_data->'{name}') IS NULL)")
+fn null_expression(source: Source, name: &str) -> String {
+    format!("(({}->'{name}') IS NULL)", source.data())
 }
 
 /// A filter value parsed with the field's type: the stored JSON form, as
@@ -271,40 +318,55 @@ struct SortKey {
     text: String,
     /// The cast a cursor value takes back.
     cast: &'static str,
+    /// As the last key, `entry_id` runs against its direction: the static
+    /// `published_list` index orders `published_at DESC, entry_id`, so
+    /// `sys.published_at` in either direction is one scan of it.
+    reverse_tie: bool,
+}
+impl SortKey {
+    /// The direction of the `entry_id` tie-breaker after this key.
+    fn tie_desc(&self) -> bool {
+        self.desc != self.reverse_tie
+    }
 }
 
-fn sort_key(content_type: &ContentType, spelled: &str) -> Result<SortKey, &'static str> {
+fn sort_key(
+    source: Source,
+    content_type: &ContentType,
+    spelled: &str,
+) -> Result<SortKey, &'static str> {
     let (desc, name) = match spelled.strip_prefix('-') {
         Some(name) => (true, name),
         None => (false, spelled),
     };
-    let system = |column: &str| SortKey {
+    if let Some(system) = name.strip_prefix("sys.") {
+        let (column, nullable) = source.timestamp(system).ok_or("unknown_field")?;
+        return Ok(SortKey {
+            spelled: spelled.to_owned(),
+            desc,
+            null: nullable.then(|| format!("({column} IS NULL)")),
+            value: column.to_owned(),
+            text: format!(
+                "to_char({column} AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
+            ),
+            cast: "timestamptz",
+            reverse_tie: source == Source::Published,
+        });
+    }
+    let field = content_type.field(name).ok_or("unknown_field")?;
+    if !field.sortable {
+        return Err("not_sortable");
+    }
+    let value = field_expression(source, &field.name, &field.kind);
+    Ok(SortKey {
         spelled: spelled.to_owned(),
         desc,
-        null: None,
-        value: column.to_owned(),
-        text: format!("to_char({column} AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"),
-        cast: "timestamptz",
-    };
-    match name {
-        "sys.updated_at" => Ok(system("v.draft_updated_at")),
-        "sys.created_at" => Ok(system("e.created_at")),
-        _ => {
-            let field = content_type.field(name).ok_or("unknown_field")?;
-            if !field.sortable {
-                return Err("not_sortable");
-            }
-            let value = field_expression(&field.name, &field.kind);
-            Ok(SortKey {
-                spelled: spelled.to_owned(),
-                desc,
-                null: Some(null_expression(&field.name)),
-                text: format!("({value})::text"),
-                value,
-                cast: cast(&field.kind),
-            })
-        }
-    }
+        null: Some(null_expression(source, &field.name)),
+        text: format!("({value})::text"),
+        value,
+        cast: cast(&field.kind),
+        reverse_tie: false,
+    })
 }
 
 /// A parsed management list request, ready to run.
@@ -320,9 +382,10 @@ pub(crate) struct ListQuery {
 }
 
 /// Collects SQL parameters, numbering them.
-struct Params(Vec<Box<dyn ToSql + Sync + Send>>);
+#[derive(Debug, Default)]
+pub(crate) struct Params(pub(crate) Vec<Box<dyn ToSql + Sync + Send>>);
 impl Params {
-    fn push(&mut self, value: impl ToSql + Sync + Send + 'static) -> String {
+    pub(crate) fn push(&mut self, value: impl ToSql + Sync + Send + 'static) -> String {
         self.0.push(Box::new(value));
         format!("${}", self.0.len())
     }
@@ -452,7 +515,7 @@ pub(crate) fn castable(cast: &str, text: &str) -> bool {
     }
 }
 
-fn hex16(text: &str) -> String {
+pub(crate) fn hex16(text: &str) -> String {
     let digest = Sha256::digest(text.as_bytes());
     let mut out = String::with_capacity(16);
     for byte in &digest[..8] {
@@ -461,26 +524,34 @@ fn hex16(text: &str) -> String {
     out
 }
 
-/// Parse a management list query string for `content_type` in `scope`.
-pub(crate) fn parse_list(
-    model: &ContentModel,
+/// A listing's query string split into its parts: the parameters every
+/// listing takes (`filter[..]`, `sort`, `limit`, `cursor`, `fields`), the
+/// extra ones its route allows, and the problems found so far, which the
+/// caller completes before refusing with `invalid_query`.
+#[derive(Debug, Default)]
+pub(crate) struct Split {
+    pub extra: std::collections::HashMap<String, String>,
+    clauses: Vec<((String, Op), Vec<String>)>,
+    filter_problems: Vec<FieldError>,
+    sort: Option<String>,
+    cursor: Option<String>,
+    pub limit: u32,
+    pub fields: Option<Vec<String>>,
+    pub problems: Vec<FieldError>,
+}
+
+/// Split `query` for a listing of `content_type` whose route also takes
+/// the parameters `extra`.
+pub(crate) fn split(
     content_type: &ContentType,
-    scope: &str,
     query: Option<&str>,
     limits: &Limits,
-) -> Result<ListQuery, Rejection> {
-    let pairs = pairs(query)?;
-    let mut locale = None;
-    let mut status = None;
-    let mut sort = None;
+    extra: &[&str],
+) -> Result<Split, Rejection> {
+    let mut out = Split::default();
     let mut limit = None;
-    let mut cursor = None;
     let mut fields = None;
-    // (field, op) -> raw values, in first-seen order.
-    let mut clauses: Vec<((String, Op), Vec<String>)> = Vec::new();
-    let mut unknown = Vec::new();
-    let mut filter_problems = Vec::new();
-    for (key, value) in pairs {
+    for (key, value) in pairs(query)? {
         if let Some(rest) = key.strip_prefix("filter[") {
             let parsed = rest
                 .strip_suffix(']')
@@ -489,94 +560,118 @@ pub(crate) fn parse_list(
                     !f.is_empty() && !o.contains(['[', ']']) && !f.contains(['[', ']'])
                 });
             let Some((field, op)) = parsed else {
-                filter_problems.push(detail("/filter", "invalid_key"));
+                out.filter_problems.push(detail("/filter", "invalid_key"));
                 continue;
             };
             let Some(op) = Op::parse(op) else {
-                filter_problems.push(detail("/filter", "unknown_operator"));
+                out.filter_problems
+                    .push(detail("/filter", "unknown_operator"));
                 continue;
             };
             let key = (field.to_owned(), op);
-            match clauses.iter_mut().find(|(k, _)| *k == key) {
+            match out.clauses.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, values)) if op.repeatable() => values.push(value),
-                Some(_) => filter_problems.push(detail("/filter", "duplicate_key")),
-                None => clauses.push((key, vec![value])),
+                Some(_) => out.filter_problems.push(detail("/filter", "duplicate_key")),
+                None => out.clauses.push((key, vec![value])),
             }
             continue;
         }
         let slot = match key.as_str() {
-            "locale" => &mut locale,
-            "status" => &mut status,
-            "sort" => &mut sort,
+            "sort" => &mut out.sort,
             "limit" => &mut limit,
-            "cursor" => &mut cursor,
+            "cursor" => &mut out.cursor,
             "fields" => &mut fields,
+            other if extra.contains(&other) => {
+                if out.extra.contains_key(other) {
+                    out.problems
+                        .push(detail(&format!("/{key}"), "duplicate_parameter"));
+                } else {
+                    out.extra.insert(key, value);
+                }
+                continue;
+            }
             _ => {
-                unknown.push(detail("", "unknown_parameter"));
+                out.problems.push(detail("", "unknown_parameter"));
                 continue;
             }
         };
         if slot.is_some() {
-            unknown.push(detail(&format!("/{key}"), "duplicate_parameter"));
+            out.problems
+                .push(detail(&format!("/{key}"), "duplicate_parameter"));
         } else {
             *slot = Some(value);
         }
     }
-    let status = match status.as_deref() {
-        None => StatusFilter::Any,
-        Some(text) => match StatusFilter::parse(text) {
-            Some(status) => status,
-            None => {
-                unknown.push(detail("/status", "invalid_value"));
-                StatusFilter::Any
-            }
-        },
-    };
-    let limit = match limit.as_deref() {
+    out.limit = match limit.as_deref() {
         None => limits.default_page_size,
         Some(text) => match text.parse::<u32>() {
             Ok(n) if (1..=limits.max_page_size).contains(&n) => n,
             _ => {
-                unknown.push(detail("/limit", "invalid_value"));
+                out.problems.push(detail("/limit", "invalid_value"));
                 limits.default_page_size
             }
         },
     };
-    let fields = match fields.as_deref() {
-        None => None,
-        Some(text) => {
-            let names: Vec<String> = text.split(',').map(str::to_owned).collect();
-            if names.iter().any(|n| content_type.field(n).is_none()) {
-                unknown.push(detail("/fields", "unknown_field"));
-            }
-            Some(names)
+    out.fields = fields.as_deref().map(|text| {
+        let names: Vec<String> = text.split(',').map(str::to_owned).collect();
+        if names.iter().any(|n| content_type.field(n).is_none()) {
+            out.problems.push(detail("/fields", "unknown_field"));
         }
-    };
-    if !unknown.is_empty() {
-        return Err(rejection("invalid_query", unknown));
+        names
+    });
+    Ok(out)
+}
+impl Split {
+    /// The problems found so far as `invalid_query`, if any.
+    pub(crate) fn check(&mut self) -> Result<(), Rejection> {
+        if self.problems.is_empty() {
+            Ok(())
+        } else {
+            Err(rejection(
+                "invalid_query",
+                std::mem::take(&mut self.problems),
+            ))
+        }
     }
-    let locale = match locale {
-        None => model.default_locale().code.clone(),
-        Some(code) => code,
-    };
-    if !locale_allowed(model, content_type, &locale) {
-        return Err(Failure::permanent("locale_unknown").into());
-    }
+}
 
-    let mut params = Params(Vec::new());
-    let scope_param = params.push(scope.to_owned());
-    // A literal, not a parameter: the derived indexes are partial on
-    // `content_type = '<type>'`, which a generic plan could not prove from
-    // a parameter. Type names are `[a-z][a-z0-9_]*`.
-    let type_literal = format!("'{}'", content_type.name.replace('\'', "''"));
-    let locale_param = params.push(locale.clone());
+/// The clauses of a listing as SQL over its [`Source`], ready to join a
+/// `FROM` and the scope predicates of the caller.
+#[derive(Debug)]
+pub(crate) struct Built {
+    /// ` AND ...` per filter clause.
+    pub conditions: String,
+    /// ` AND (...)`, the keyset condition after the cursor, or empty.
+    pub after: String,
+    /// The `ORDER BY` list, `entry_id` last.
+    pub order: String,
+    /// `, <text of each sort key>`, selected after the row's columns.
+    pub texts: String,
+    pub keys: usize,
+    /// The 16 hex characters cursors of this query carry.
+    pub fingerprint: String,
+}
+
+/// Build the filters, sort and cursor of `split` over `source`, numbering
+/// parameters after those already in `params`. `context` names the
+/// listing (scope, stage, locale and the like) in the cursor fingerprint
+/// beside the type, the filters and the sort.
+pub(crate) fn build(
+    split: &mut Split,
+    content_type: &ContentType,
+    limits: &Limits,
+    source: Source,
+    context: &str,
+    params: &mut Params,
+) -> Result<Built, Rejection> {
     let mut conditions = String::new();
     let mut canonical: Vec<String> = Vec::new();
-    if clauses.len() > limits.max_filters as usize {
+    let mut filter_problems = std::mem::take(&mut split.filter_problems);
+    if split.clauses.len() > limits.max_filters as usize {
         filter_problems.push(detail("/filter", "too_many_filters"));
     }
-    for ((name, op), values) in &clauses {
-        match filter(content_type, name, *op, values, &mut params) {
+    for ((name, op), values) in &split.clauses {
+        match filter(source, content_type, name, *op, values, params) {
             Ok((sql, normalized)) => {
                 conditions.push_str(" AND ");
                 conditions.push_str(&sql);
@@ -594,8 +689,8 @@ pub(crate) fn parse_list(
     }
     canonical.sort();
 
-    let spelled: Vec<String> = match sort.as_deref() {
-        None => vec!["-sys.updated_at".to_owned()],
+    let spelled: Vec<String> = match split.sort.as_deref() {
+        None => vec![source.default_sort().to_owned()],
         Some(text) => text.split(',').map(str::to_owned).collect(),
     };
     let mut sort_problems = Vec::new();
@@ -612,7 +707,7 @@ pub(crate) fn parse_list(
             sort_problems.push(detail("/sort", "duplicate_key"));
             continue;
         }
-        match sort_key(content_type, spelled) {
+        match sort_key(source, content_type, spelled) {
             Ok(key) => keys.push(key),
             Err(code) => sort_problems.push(detail("/sort", code)),
         }
@@ -621,15 +716,14 @@ pub(crate) fn parse_list(
         return Err(rejection("invalid_sort", sort_problems));
     }
     let fingerprint = hex16(&format!(
-        "{}\n{scope}\ndraft\n{locale}\n{}\n{}\n{}",
+        "{}\n{context}\n{}\n{}",
         content_type.name,
-        status.as_str(),
         canonical.join("\n"),
         spelled.join(",")
     ));
 
     let mut after = String::new();
-    if let Some(text) = cursor {
+    if let Some(text) = split.cursor.take() {
         let cursor = decode_cursor(&text, &fingerprint, keys.len())?;
         let valid = uuid_value(&cursor.id).is_ok()
             && keys
@@ -642,7 +736,7 @@ pub(crate) fn parse_list(
         if !valid {
             return Err(problem("invalid_cursor", "/cursor", "invalid_value"));
         }
-        after = after_condition(&keys, &cursor, &mut params);
+        after = after_condition(source, &keys, &cursor, params);
     }
 
     let mut order = String::new();
@@ -660,31 +754,95 @@ pub(crate) fn parse_list(
         let _ = write!(texts, ", {}", key.text);
     }
     // `entry_id` follows the last key's direction, as in the derived
-    // indexes and `variants_by_update`, so either direction is one scan.
-    let tie_desc = keys.last().is_some_and(|k| k.desc);
-    order.push_str(if tie_desc {
-        "v.entry_id DESC"
-    } else {
-        "v.entry_id ASC"
-    });
-    let fetch = params.push(i64::from(limit) + 1);
-    let statement = format!(
-        "SELECT {}{texts} FROM {VARIANT_FROM} \
-          WHERE v.scope = {scope_param} AND v.content_type = {type_literal} \
-            AND v.locale = {locale_param} AND NOT v.deleted AND e.deleted_at IS NULL\
-            {}{conditions}{after} \
-          ORDER BY {order} LIMIT {fetch}",
-        variant_columns(),
-        status.sql(),
+    // indexes and `variants_by_update`, so either direction is one scan
+    // (against it after `sys.published_at`, as `published_list` orders).
+    let tie_desc = keys.last().is_some_and(SortKey::tie_desc);
+    let _ = write!(
+        order,
+        "{} {}",
+        source.id(),
+        if tie_desc { "DESC" } else { "ASC" }
     );
-    Ok(ListQuery {
-        limit,
-        fields,
-        statement,
-        params: params.0,
+    Ok(Built {
+        conditions,
+        after,
+        order,
+        texts,
         keys: keys.len(),
         fingerprint,
     })
+}
+
+/// Parse a management list query string for `content_type` in `scope`.
+pub(crate) fn parse_list(
+    model: &ContentModel,
+    content_type: &ContentType,
+    scope: &str,
+    query: Option<&str>,
+    limits: &Limits,
+) -> Result<ListQuery, Rejection> {
+    let mut split = split(content_type, query, limits, &["locale", "status"])?;
+    let status = match split.extra.get("status").map(String::as_str) {
+        None => StatusFilter::Any,
+        Some(text) => match StatusFilter::parse(text) {
+            Some(status) => status,
+            None => {
+                split.problems.push(detail("/status", "invalid_value"));
+                StatusFilter::Any
+            }
+        },
+    };
+    split.check()?;
+    let locale = match split.extra.get("locale") {
+        None => model.default_locale().code.clone(),
+        Some(code) => code.clone(),
+    };
+    if !locale_allowed(model, content_type, &locale) {
+        return Err(Failure::permanent("locale_unknown").into());
+    }
+
+    let mut params = Params(Vec::new());
+    let scope_param = params.push(scope.to_owned());
+    let type_literal = type_literal(content_type);
+    let locale_param = params.push(locale.clone());
+    let built = build(
+        &mut split,
+        content_type,
+        limits,
+        Source::Manage,
+        &format!("{scope}\ndraft\n{locale}\n{}", status.as_str()),
+        &mut params,
+    )?;
+    let limit = split.limit;
+    let fetch = params.push(i64::from(limit) + 1);
+    let statement = format!(
+        "SELECT {}{} FROM {VARIANT_FROM} \
+          WHERE v.scope = {scope_param} AND v.content_type = {type_literal} \
+            AND v.locale = {locale_param} AND NOT v.deleted AND e.deleted_at IS NULL\
+            {}{}{} \
+          ORDER BY {} LIMIT {fetch}",
+        variant_columns(),
+        built.texts,
+        status.sql(),
+        built.conditions,
+        built.after,
+        built.order,
+    );
+    Ok(ListQuery {
+        limit,
+        fields: split.fields.take(),
+        statement,
+        params: params.0,
+        keys: built.keys,
+        fingerprint: built.fingerprint,
+    })
+}
+
+/// The type as an SQL literal, not a parameter: the derived indexes are
+/// partial on `content_type = '<type>'`, which a generic plan could not
+/// prove from a parameter. Type names are `[a-z][a-z0-9_]*`.
+pub(crate) fn type_literal(content_type: &ContentType) -> String {
+    format!("'{}'", content_type.name.replace('\'', "''"))
 }
 
 /// Whether `locale` addresses a variant of `content_type`: a configured
@@ -703,7 +861,12 @@ pub(crate) fn locale_allowed(
 
 /// The keyset condition "after `cursor`" for `keys` then `entry_id`:
 /// lexicographic over `(is null, value)` per key, nulls last.
-fn after_condition(keys: &[SortKey], cursor: &Cursor, params: &mut Params) -> String {
+fn after_condition(
+    source: Source,
+    keys: &[SortKey],
+    cursor: &Cursor,
+    params: &mut Params,
+) -> String {
     let mut terms: Vec<String> = Vec::new();
     let mut prefix: Vec<String> = Vec::new();
     let joined = |prefix: &[String], last: String| {
@@ -733,12 +896,15 @@ fn after_condition(keys: &[SortKey], cursor: &Cursor, params: &mut Params) -> St
         }
     }
     let id = params.push(cursor.id.clone());
-    let op = if keys.last().is_some_and(|k| k.desc) {
+    let op = if keys.last().is_some_and(SortKey::tie_desc) {
         "<"
     } else {
         ">"
     };
-    terms.push(joined(&prefix, format!("v.entry_id {op} {id}::text::uuid")));
+    terms.push(joined(
+        &prefix,
+        format!("{} {op} {id}::text::uuid", source.id()),
+    ));
     format!(
         " AND ({})",
         terms
@@ -753,6 +919,7 @@ type FilterError = (String, &'static str);
 
 /// One filter clause as SQL plus its normalized values.
 fn filter(
+    source: Source,
     content_type: &ContentType,
     name: &str,
     op: Op,
@@ -763,7 +930,7 @@ fn filter(
         return Err(("/filter".into(), "too_many_values"));
     }
     if let Some(system) = name.strip_prefix("sys.") {
-        return system_filter(system, op, values, params);
+        return system_filter(source, system, op, values, params);
     }
     let Some(field) = content_type.field(name) else {
         return Err(("/filter".into(), "unknown_field"));
@@ -781,7 +948,7 @@ fn filter(
                 _ => return Err((path, "invalid_value")),
             };
             let param = params.push(field.name.clone());
-            let sql = format!("v.draft_data ? {param}");
+            let sql = format!("{} ? {param}", source.data());
             Ok((
                 if present { sql } else { format!("NOT ({sql})") },
                 vec![present.to_string()],
@@ -804,7 +971,7 @@ fn filter(
                     _ => return Err((path, "not_supported")),
                 };
                 normalized.push(stored.to_string());
-                terms.push(containment(field, stored, params));
+                terms.push(containment(source, field, stored, params));
             }
             normalized.sort();
             normalized.dedup();
@@ -837,7 +1004,10 @@ fn filter(
             let mut normalized: Vec<String> = items.iter().map(Value::to_string).collect();
             normalized.sort();
             normalized.dedup();
-            Ok((containment(field, Value::Array(items), params), normalized))
+            Ok((
+                containment(source, field, Value::Array(items), params),
+                normalized,
+            ))
         }
         Op::Lt | Op::Lte | Op::Gt | Op::Gte => {
             if !field.sortable {
@@ -852,7 +1022,7 @@ fn filter(
             Ok((
                 format!(
                     "{} {comparison} {param}::text::{}",
-                    field_expression(&field.name, &field.kind),
+                    field_expression(source, &field.name, &field.kind),
                     cast(&field.kind)
                 ),
                 vec![text],
@@ -861,66 +1031,61 @@ fn filter(
     }
 }
 
-fn containment(field: &Field, value: Value, params: &mut Params) -> String {
+fn containment(source: Source, field: &Field, value: Value, params: &mut Params) -> String {
     let mut object = Map::new();
     object.insert(field.name.clone(), value);
     let param = params.push(Value::Object(object).to_string());
-    format!("v.draft_data @> {param}::text::jsonb")
+    format!("{} @> {param}::text::jsonb", source.data())
 }
 
 fn system_filter(
+    source: Source,
     name: &str,
     op: Op,
     values: &[String],
     params: &mut Params,
 ) -> Result<(String, Vec<String>), FilterError> {
     let path = || format!("/filter/sys.{name}/{}", op.as_str());
-    match name {
-        "id" => {
-            let ids = values
-                .iter()
-                .map(|v| uuid_value(v))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|c| (path(), c))?;
-            match op {
-                Op::Eq | Op::Ne if ids.len() == 1 => {
-                    let param = params.push(ids[0].clone());
-                    let cmp = if op == Op::Eq { "=" } else { "<>" };
-                    Ok((format!("v.entry_id {cmp} {param}::text::uuid"), ids))
-                }
-                Op::In => {
-                    let mut sorted = ids.clone();
-                    sorted.sort();
-                    sorted.dedup();
-                    let param = params.push(ids);
-                    Ok((format!("v.entry_id = ANY({param}::text[]::uuid[])"), sorted))
-                }
-                Op::Eq | Op::Ne => Err((path(), "invalid_value")),
-                _ => Err((path(), "unknown_operator")),
+    if name == "id" {
+        let ids = values
+            .iter()
+            .map(|v| uuid_value(v))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|c| (path(), c))?;
+        let column = source.id();
+        return match op {
+            Op::Eq | Op::Ne if ids.len() == 1 => {
+                let param = params.push(ids[0].clone());
+                let cmp = if op == Op::Eq { "=" } else { "<>" };
+                Ok((format!("{column} {cmp} {param}::text::uuid"), ids))
             }
-        }
-        "created_at" | "updated_at" => {
-            let column = if name == "created_at" {
-                "e.created_at"
-            } else {
-                "v.draft_updated_at"
-            };
-            let comparison = match op {
-                Op::Eq => "=",
-                other => other.comparison().ok_or((path(), "unknown_operator"))?,
-            };
-            let [value] = values else {
-                return Err((path(), "invalid_value"));
-            };
-            let value = scalar::datetime(value).map_err(|_| (path(), "invalid_value"))?;
-            let param = params.push(value.clone());
-            Ok((
-                format!("{column} {comparison} {param}::text::timestamptz"),
-                vec![value],
-            ))
-        }
-        _ => Err(("/filter".into(), "unknown_field")),
+            Op::In => {
+                let mut sorted = ids.clone();
+                sorted.sort();
+                sorted.dedup();
+                let param = params.push(ids);
+                Ok((format!("{column} = ANY({param}::text[]::uuid[])"), sorted))
+            }
+            Op::Eq | Op::Ne => Err((path(), "invalid_value")),
+            _ => Err((path(), "unknown_operator")),
+        };
     }
+    let Some((column, _)) = source.timestamp(name) else {
+        return Err(("/filter".into(), "unknown_field"));
+    };
+    let comparison = match op {
+        Op::Eq => "=",
+        other => other.comparison().ok_or((path(), "unknown_operator"))?,
+    };
+    let [value] = values else {
+        return Err((path(), "invalid_value"));
+    };
+    let value = scalar::datetime(value).map_err(|_| (path(), "invalid_value"))?;
+    let param = params.push(value.clone());
+    Ok((
+        format!("{column} {comparison} {param}::text::timestamptz"),
+        vec![value],
+    ))
 }
 
 impl crate::module::ContentState {
