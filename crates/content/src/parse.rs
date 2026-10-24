@@ -13,9 +13,9 @@ use toml::{Table, Value as Toml};
 /// Largest accepted model file.
 pub const MAX_MODEL_BYTES: usize = 1_048_576;
 /// Longest accepted `pattern` source.
-pub const MAX_PATTERN_BYTES: usize = 4096;
-/// Compiled size limit of a `pattern`.
-pub const PATTERN_SIZE_LIMIT: usize = 65_536;
+pub const MAX_PATTERN_BYTES: usize = 1024;
+/// Compiled size limit of a `pattern`, for the program and the lazy DFA.
+pub const PATTERN_SIZE_LIMIT: usize = 1_048_576;
 /// Longest `description`, in Unicode scalar values.
 pub const MAX_DESCRIPTION: usize = 500;
 
@@ -693,7 +693,7 @@ fn parse_type(
     let title_field = reader.string("title_field", issues).map(str::to_owned);
     let title_path = reader.at("title_field");
     let description = reader.description(issues);
-    let fields = parse_fields(
+    let mut fields = parse_fields(
         reader.take("fields"),
         path,
         Site::Top {
@@ -706,7 +706,16 @@ fn parse_type(
         let is_string = fields
             .iter()
             .any(|(_, f)| &f.name == title && matches!(f.kind, FieldKind::String(_)));
-        if !is_string {
+        if is_string {
+            // A top-level slug without `from` is generated from the title.
+            for (_, field) in &mut fields {
+                if let FieldKind::Slug(rules) = &mut field.kind
+                    && rules.from.is_none()
+                {
+                    rules.from = Some(title.clone());
+                }
+            }
+        } else {
             issues.push(
                 title_path,
                 "invalid_title_field",
@@ -904,7 +913,13 @@ fn parse_field(table: &Table, path: &str, site: Site, issues: &mut Issues) -> Op
         }
         Site::Component => {
             flags.required = reader.boolean("required", issues);
-            flags.default = reader.take("default");
+            if reader.take("default").is_some() {
+                issues.push(
+                    reader.at("default"),
+                    "not_allowed",
+                    "is only allowed on top-level fields of a content type",
+                );
+            }
             if reader.take("localized").is_some() {
                 issues.push(
                     reader.at("localized"),
@@ -925,6 +940,15 @@ fn parse_field(table: &Table, path: &str, site: Site, issues: &mut Issues) -> Op
         Site::Item => {}
     }
     let kind = parse_kind(type_name?, &mut reader, path, issues)?;
+    if site == Site::Item
+        && let FieldKind::Slug(SlugRules { from: Some(_), .. }) = &kind
+    {
+        issues.push(
+            join(path, "from"),
+            "not_allowed",
+            "is not allowed on list items: an item has no sibling field",
+        );
+    }
     let what = if site == Site::Item {
         "for list items".to_owned()
     } else {
@@ -1071,7 +1095,12 @@ fn items(reader: &mut Reader<'_>, issues: &mut Issues, allowed: bool) -> (Option
     }
     let min = reader.count("min_items", 0, 1000, issues);
     let max = reader.count("max_items", 1, 1000, issues);
-    order(reader, ("min_items", min), ("max_items", max), issues);
+    order(
+        reader,
+        ("min_items", min),
+        ("max_items", max.or(Some(100))),
+        issues,
+    );
     (min, max.unwrap_or(100))
 }
 
@@ -1158,6 +1187,8 @@ fn time_bound(
 
 fn float_bound(reader: &mut Reader<'_>, key: &str, issues: &mut Issues) -> Option<f64> {
     match reader.take(key)? {
+        // `-0.0` and `0.0` are one bound, so they fingerprint the same.
+        Toml::Float(f) if *f == 0.0 => Some(0.0),
         Toml::Float(f) if f.is_finite() => Some(*f),
         // Integers in the safe range are exact as binary64.
         Toml::Integer(n) if n.unsigned_abs() <= MAX_SAFE_INTEGER as u64 => Some(*n as f64),
@@ -1186,6 +1217,7 @@ fn pattern(reader: &mut Reader<'_>, issues: &mut Issues) -> Option<Pattern> {
     let build = |text: &str| {
         regex::RegexBuilder::new(text)
             .size_limit(PATTERN_SIZE_LIMIT)
+            .dfa_size_limit(PATTERN_SIZE_LIMIT)
             .build()
     };
     // The bare pattern must compile on its own, so `a)|(b` cannot escape
@@ -1220,7 +1252,12 @@ fn parse_kind(
         "string" => {
             let min = reader.count("min_length", 0, 4096, issues);
             let max = reader.count("max_length", 1, 4096, issues);
-            order(reader, ("min_length", min), ("max_length", max), issues);
+            order(
+                reader,
+                ("min_length", min),
+                ("max_length", max.or(Some(255))),
+                issues,
+            );
             FieldKind::String(StringRules {
                 min_length: min,
                 max_length: max.unwrap_or(255),
@@ -1230,7 +1267,12 @@ fn parse_kind(
         "text" => {
             let min = reader.count("min_length", 0, 100_000, issues);
             let max = reader.count("max_length", 1, 100_000, issues);
-            order(reader, ("min_length", min), ("max_length", max), issues);
+            order(
+                reader,
+                ("min_length", min),
+                ("max_length", max.or(Some(10_000))),
+                issues,
+            );
             FieldKind::Text(TextRules {
                 min_length: min,
                 max_length: max.unwrap_or(10_000),

@@ -85,8 +85,17 @@ fn integer(rules: &IntegerRules, value: &Value) -> Result<Value, &'static str> {
     } else if number.is_u64() {
         return Err("max");
     } else {
-        // `1.0` and every other binary64 value.
-        return Err("type_mismatch");
+        // A binary64 value: JSON `-0` (which parses as -0.0) is 0, integral
+        // values beyond the safe range are out of range, and anything else,
+        // `1.0` included, is not an integer.
+        let f = number.as_f64().unwrap_or(f64::NAN);
+        if f == 0.0 && f.is_sign_negative() {
+            0
+        } else if f.fract() == 0.0 && f.abs() > MAX_SAFE_INTEGER as f64 {
+            return Err(if f > 0.0 { "max" } else { "min" });
+        } else {
+            return Err("type_mismatch");
+        }
     };
     if n < -MAX_SAFE_INTEGER || rules.min.is_some_and(|min| n < min) {
         return Err("min");
@@ -94,16 +103,19 @@ fn integer(rules: &IntegerRules, value: &Value) -> Result<Value, &'static str> {
     if n > MAX_SAFE_INTEGER || rules.max.is_some_and(|max| n > max) {
         return Err("max");
     }
-    Ok(value.clone())
+    Ok(Value::from(n))
 }
 
 fn float(rules: &FloatRules, value: &Value) -> Result<Value, &'static str> {
-    let Value::Number(_) = value else {
+    let Value::Number(number) = value else {
         return Err("type_mismatch");
     };
-    // The application JSON policy: integral values stay in the safe range.
-    merezha_domain::compatible_json(value).map_err(|_| "type_mismatch")?;
-    let n = value.as_f64().ok_or("type_mismatch")?;
+    let n = number.as_f64().ok_or("type_mismatch")?;
+    // The application JSON policy keeps integral values in the safe range;
+    // beyond it a number is out of range rather than of the wrong type.
+    if n.fract() == 0.0 && n.abs() > MAX_SAFE_INTEGER as f64 {
+        return Err(if n > 0.0 { "max" } else { "min" });
+    }
     if rules.min.is_some_and(|min| n < min) {
         return Err("min");
     }

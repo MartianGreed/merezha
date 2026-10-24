@@ -87,8 +87,9 @@ fn integer_rules_and_the_safe_range() {
     );
     bad(&plain, json!(u64::MAX), "/fields/a", "max");
     // Beyond u64 JSON parses as binary64, which is not an integer here.
+    // Beyond u64 JSON parses as binary64: still an integral number, so out of range.
     let huge: Value = serde_json::from_str("123456789012345678901234567890").unwrap();
-    bad(&plain, huge, "/fields/a", "type_mismatch");
+    bad(&plain, huge, "/fields/a", "max");
 }
 
 #[test]
@@ -101,12 +102,7 @@ fn float_rules() {
     bad(&m, json!("0.5"), "/fields/a", "type_mismatch");
     let plain = model("{ name = \"a\", type = \"float\" }");
     same(&plain, json!(9_007_199_254_740_991_i64));
-    bad(
-        &plain,
-        json!(9_007_199_254_740_992_i64),
-        "/fields/a",
-        "type_mismatch",
-    );
+    bad(&plain, json!(9_007_199_254_740_992_i64), "/fields/a", "max");
 }
 
 #[test]
@@ -695,4 +691,131 @@ fn key_generation_failures_are_reported_as_failures() {
     assert_eq!(key.len(), 12);
     assert!(key.bytes().all(|b| b.is_ascii_alphanumeric()));
     let _ = Stage::Draft;
+}
+
+#[test]
+fn items_with_generated_keys_are_addressed_by_index() {
+    let m = model(
+        "{ name = \"a\", type = \"list\", of = { type = \"component\", component = \"quote\" } },\n{ name = \"r\", type = \"rich_text\", embeds = [\"asset\"] }",
+    );
+    let errors = validate(
+        &m,
+        &json!({ "a": [{ "_key": "mine", "text": 1 }, { "text": 2 }] }),
+        &DRAFT,
+    )
+    .unwrap_err();
+    assert_eq!(
+        errors,
+        pairs(&[
+            ("/fields/a/mine/text", "type_mismatch"),
+            ("/fields/a/1/text", "type_mismatch")
+        ]),
+        "a key the client sent is kept; a generated one never appears"
+    );
+    let valid = m
+        .validate_fields(
+            "t",
+            &json!({ "r": [
+                { "_type": "asset", "_key": "sent", "id": UUID },
+                { "_type": "asset", "id": UUID },
+                { "_type": "block", "style": "normal", "markDefs": [],
+                  "children": [{ "_type": "span", "text": "x\u{0}" }] },
+            ] }),
+            &DRAFT,
+            &mut Counter(0),
+        )
+        .unwrap_err();
+    assert_eq!(
+        valid
+            .details()
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        ["/fields/r/2/children/0/text"]
+    );
+    let valid = m
+        .validate_fields(
+            "t",
+            &json!({ "r": [{ "_type": "asset", "_key": "sent", "id": UUID }, { "_type": "asset", "id": UUID }] }),
+            &DRAFT,
+            &mut Counter(0),
+        )
+        .unwrap();
+    let paths: Vec<_> = valid.references.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(paths, ["/fields/r/sent", "/fields/r/1"]);
+}
+
+#[test]
+fn generated_keys_never_collide_with_keys_later_in_the_array() {
+    let m = model(
+        "{ name = \"a\", type = \"list\", of = { type = \"component\", component = \"quote\" } }",
+    );
+    // Counter yields g1 first, which a later item already carries.
+    let fields = validate(
+        &m,
+        &json!({ "a": [{ "text": "one" }, { "_key": "g1", "text": "two" }, { "text": "three" }] }),
+        &DRAFT,
+    )
+    .unwrap();
+    let keys: Vec<_> = fields["a"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["g2", "g1", "g3"]);
+}
+
+#[test]
+fn rich_text_without_text_or_embeds_is_absent_for_required() {
+    let m = model("{ name = \"a\", type = \"rich_text\", required = true, embeds = [\"asset\"] }");
+    let empty_block = json!({ "_type": "block", "_key": "b", "style": "normal", "markDefs": [],
+        "children": [{ "_type": "span", "_key": "s", "text": "", "marks": [] }] });
+    assert_eq!(
+        validate(&m, &json!({ "a": [empty_block.clone(), { "_type": "block", "_key": "c", "style": "normal", "markDefs": [], "children": [] }] }), &PUBLISH).unwrap_err(),
+        pairs(&[("/fields/a", "required")])
+    );
+    let mut text = empty_block.clone();
+    text["children"][0]["text"] = json!("Hello");
+    assert!(validate(&m, &json!({ "a": [text] }), &PUBLISH).is_ok());
+    assert!(
+        validate(
+            &m,
+            &json!({ "a": [empty_block, { "_type": "asset", "_key": "x", "id": UUID }] }),
+            &PUBLISH
+        )
+        .is_ok(),
+        "an embed is content"
+    );
+}
+
+#[test]
+fn numbers_of_the_right_kind_beyond_range_are_min_or_max() {
+    let int = model("{ name = \"a\", type = \"integer\" }");
+    for (text, code) in [
+        ("1e20", "max"),
+        ("-1e20", "min"),
+        ("123456789012345678901234567890", "max"),
+        ("-123456789012345678901234567890", "min"),
+        ("1.0", "type_mismatch"),
+        ("2.5", "type_mismatch"),
+    ] {
+        bad(&int, serde_json::from_str(text).unwrap(), "/fields/a", code);
+    }
+    ok(&int, serde_json::from_str("-0").unwrap(), json!(0));
+    let float = model("{ name = \"a\", type = \"float\" }");
+    bad(&float, json!(9_007_199_254_740_992_i64), "/fields/a", "max");
+    bad(
+        &float,
+        json!(-9_007_199_254_740_992_i64),
+        "/fields/a",
+        "min",
+    );
+    bad(
+        &float,
+        serde_json::from_str("1e300").unwrap(),
+        "/fields/a",
+        "max",
+    );
+    same(&float, json!(1.5e300_f64.recip()));
 }

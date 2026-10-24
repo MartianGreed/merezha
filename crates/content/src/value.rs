@@ -264,7 +264,11 @@ impl Ctx<'_, '_> {
         if !self.seen.insert((path.to_owned(), code)) {
             return;
         }
-        if let Ok(detail) = FieldError::new(path, code) {
+        // A path the platform refuses still refuses the input, at the root.
+        let detail = FieldError::new(path, code)
+            .or_else(|_| FieldError::new("", code))
+            .or_else(|_| FieldError::new("", "validation_failed"));
+        if let Ok(detail) = detail {
             self.details.push(detail);
         }
     }
@@ -323,7 +327,7 @@ impl Ctx<'_, '_> {
                 continue;
             };
             if let Some(stored) = self.value(field, &value, &at) {
-                if self.publishing() && field.required && empty(&stored) {
+                if self.publishing() && field.required && empty(&field.kind, &stored) {
                     self.violation(&at, "required");
                 }
                 out.insert(field.name.clone(), stored);
@@ -388,8 +392,9 @@ impl Ctx<'_, '_> {
         Some(items)
     }
 
-    /// Items identified by `_key`: missing keys are generated, malformed or
-    /// repeated ones are violations and the item is addressed by index.
+    /// Items identified by `_key`: missing keys are generated (distinct from
+    /// every key the array carries) and the item is addressed by index, as
+    /// are items with a malformed or repeated key, which are violations.
     /// `each` validates one item object (with `_key` still in it) at its
     /// path and returns its stored form without `_key`.
     pub(crate) fn keyed(
@@ -412,11 +417,10 @@ impl Ctx<'_, '_> {
                 continue;
             };
             let (key, item_path) = match object.get("_key") {
+                // The client did not send this key, so paths use the index
+                // it can find in its request.
                 None => match self.fresh_key(&taken, &used) {
-                    Some(key) => {
-                        let at = child(path, &key);
-                        (Some(key), at)
-                    }
+                    Some(key) => (Some(key), index_path),
                     None => return out,
                 },
                 Some(Value::String(key)) if valid_key(key) => {
@@ -720,10 +724,70 @@ fn contains_nul(value: &Value) -> bool {
 }
 
 /// Empty strings, lists and rich text count as absent for `required`.
-fn empty(value: &Value) -> bool {
+/// Rich text is empty when no span has text and nothing is embedded.
+fn empty(kind: &FieldKind, value: &Value) -> bool {
+    if let (FieldKind::RichText(_), Value::Array(blocks)) = (kind, value) {
+        return blocks.iter().all(|block| {
+            block.get("_type").and_then(Value::as_str) == Some("block")
+                && block
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .is_none_or(|spans| {
+                        spans.iter().all(|span| {
+                            span.get("text")
+                                .and_then(Value::as_str)
+                                .is_none_or(str::is_empty)
+                        })
+                    })
+        });
+    }
     match value {
         Value::String(s) => s.is_empty(),
         Value::Array(items) => items.is_empty(),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoKeys;
+    impl KeySource for NoKeys {
+        fn next_key(&mut self) -> Result<String, Failure> {
+            Err(Failure::transient("random_unavailable"))
+        }
+    }
+
+    #[test]
+    fn a_path_the_platform_refuses_still_refuses_the_input() {
+        let model = ContentModel::parse(
+            "version = 1\nlocales = [{ code = \"en\", default = true }]\n[types.t]\naccess = \"public\"\nfields = [{ name = \"a\", type = \"string\" }]\n",
+            &crate::ModelOptions {
+                permissions: &["x.y"],
+                media: false,
+                organizations: false,
+            },
+        )
+        .unwrap();
+        let mut keys = NoKeys;
+        let mut ctx = Ctx {
+            model: &model,
+            stage: Stage::Draft,
+            keys: &mut keys,
+            details: Vec::new(),
+            seen: HashSet::new(),
+            references: Vec::new(),
+            failed: None,
+        };
+        // Not printable ASCII, so `FieldError::new` refuses the path.
+        ctx.violation("/fields/é", "max_length");
+        ctx.violation("/fields/a b", "Not A Code");
+        let details: Vec<_> = ctx
+            .details
+            .iter()
+            .map(|d| (d.path.as_str(), d.code.as_str()))
+            .collect();
+        assert_eq!(details, [("", "max_length"), ("", "validation_failed")]);
     }
 }

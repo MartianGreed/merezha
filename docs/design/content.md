@@ -202,7 +202,7 @@ content type. Fields inside components cannot be filtered in v1.
 | `datetime` | string | `min`, `max` | RFC 3339 with an offset. At most 3 fractional digits. Stored as UTC `YYYY-MM-DDTHH:MM:SS.sssZ`, so the stored strings sort in time order. |
 | `date` | string | `min`, `max` | `YYYY-MM-DD`, a calendar date with no zone. |
 | `enum` | string | `values` (1 to 200 identifiers matching `^[a-z0-9][a-z0-9_-]{0,63}$`) | |
-| `slug` | string | `from` (a `string` field), `max_length` (default 96, max 200) | Matches `^[a-z0-9]+(?:-[a-z0-9]+)*$`. When a save leaves it absent and `from` is set, the host transliterates the source field with `deunicode`, lowercases it, replaces runs of other characters with `-` and truncates at a word boundary. The host never changes an existing slug. |
+| `slug` | string | `from` (a sibling `string` field; defaults to the type's `title_field` for top-level slugs), `max_length` (default 96, max 200) | Matches `^[a-z0-9]+(?:-[a-z0-9]+)*$`. When a save leaves it absent and `from` is set, the host transliterates the source field with `deunicode`, lowercases it, replaces runs of other characters with `-` and truncates at a word boundary. The host never changes an existing slug. |
 | `reference` | `{"id": "<uuid>", "type": "<type>"}` or an array of them | `to` (1 to 16 types), `cardinality` (`one`, `many`), `min_items`, `max_items` (default 100, max 1000), `require_published` (default `false`) | Writes may omit `type`; the host fills it. The target must exist, not be in the trash, be one of the `to` types, and be in the same scope or in the application scope. With `require_published`, publishing fails while a target has no published variant in the same locale chain. |
 | `asset` | `{"id": "<uuid>", "alt": "..."}` or an array of them | `accept` (MIME types or `image/*` patterns), `cardinality`, `min_items`, `max_items` | `alt` is optional, at most 500 chars. Alt text belongs to the field value, so each entry and locale can describe the same image differently. |
 | `component` | object | `component` | Validated against the component's fields. |
@@ -210,8 +210,10 @@ content type. Fields inside components cannot be filtered in v1.
 | `blocks` | array of `{"_type": "<component>", "_key": "...", ...fields}` | `components` (1 to 32), `min_items`, `max_items` | A tagged union of components, the "dynamic zone" for page builders. |
 | `json` | any JSON | `max_bytes` (default 16384, max 262144) | Opaque. Not filterable. Integers outside the safe range are rejected, as everywhere. |
 
-`pattern` uses the linear-time `regex` crate, anchored as `^(?:...)$` and
-compiled at startup with a 64 KiB size limit. Any string containing U+0000 is
+`pattern` uses the linear-time `regex` crate, at most 1024 bytes of source,
+anchored as `^(?:...)$` and compiled at startup with a 1 MiB size limit on
+the program and on the lazy DFA, so ordinary patterns such as `.{1,255}` or
+`\w{5}` fit. Any string containing U+0000 is
 rejected, `json` fields included, because `jsonb` cannot store it. `_key`
 values match `^[A-Za-z0-9_-]{1,32}$`, are unique within their array, and are
 assigned randomly (12 characters) when a write omits them. They identify list

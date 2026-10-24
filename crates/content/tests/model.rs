@@ -817,17 +817,26 @@ fn field_type_keys() {
         "types.t.fields[0].pattern",
         "invalid_pattern",
     );
-    // The 64 KiB compiled size limit.
-    rule(
-        "{ name = \"a\", type = \"string\", pattern = '\\w+' }",
-        "{ name = \"a\", type = \"string\", pattern = '\\w{5}' }",
-        ".pattern",
+    // The 1 MiB compiled size limit admits ordinary patterns.
+    for ordinary in [".{1,255}", "\\w{5}", "\\w{50}", "[a-z]{1,1000}"] {
+        accepts(&with_fields(&format!(
+            "{{ name = \"a\", type = \"string\", pattern = '{ordinary}' }}"
+        )));
+    }
+    rejects(
+        &with_fields("{ name = \"a\", type = \"string\", pattern = '\\w{100}' }"),
+        "types.t.fields[0].pattern",
         "pattern_too_large",
     );
+    // At most 1024 bytes of source.
+    accepts(&with_fields(&format!(
+        "{{ name = \"a\", type = \"string\", pattern = \"{}\" }}",
+        "a".repeat(1024)
+    )));
     rejects(
         &with_fields(&format!(
             "{{ name = \"a\", type = \"string\", pattern = \"{}\" }}",
-            "a".repeat(4097)
+            "a".repeat(1025)
         )),
         "types.t.fields[0].pattern",
         "out_of_range",
@@ -1255,4 +1264,107 @@ fn defaults_are_filled_into_the_canonical_form() {
     );
     assert_eq!(fields[6]["max_bytes"], 16_384);
     assert_eq!(canonical["locales"][1]["fallback"], "en");
+}
+
+#[test]
+fn component_fields_take_no_default() {
+    rejects(
+        &document("[components.c]\nfields = [{ name = \"a\", type = \"integer\", default = 1 }]\n"),
+        "components.c.fields[0].default",
+        "not_allowed",
+    );
+}
+
+#[test]
+fn a_slug_without_from_is_generated_from_the_title_field() {
+    let source = document(
+        "[types.t]\naccess = \"public\"\ntitle_field = \"title\"\nfields = [{ name = \"title\", type = \"string\" }, { name = \"slug\", type = \"slug\" }]\n",
+    );
+    let model = parse(&source).unwrap();
+    let canonical: serde_json::Value = serde_json::from_str(model.canonical_json()).unwrap();
+    assert_eq!(canonical["types"]["t"]["fields"][1]["from"], "title");
+    let explicit = source.replace(
+        "{ name = \"slug\", type = \"slug\" }",
+        "{ name = \"slug\", type = \"slug\", from = \"title\" }",
+    );
+    assert_eq!(fingerprint(&explicit), model.fingerprint());
+    let fields = validate(
+        &model,
+        &serde_json::json!({ "title": "Hello World" }),
+        &DRAFT,
+    )
+    .unwrap();
+    assert_eq!(fields["slug"], "hello-world");
+    // Without a title field nothing is generated.
+    let untitled = parse(&with_fields("{ name = \"slug\", type = \"slug\" }")).unwrap();
+    let canonical: serde_json::Value = serde_json::from_str(untitled.canonical_json()).unwrap();
+    assert!(canonical["types"]["t"]["fields"][0].get("from").is_none());
+}
+
+#[test]
+fn bounds_are_compared_with_effective_defaults() {
+    for (field, key) in [
+        (
+            "{ name = \"a\", type = \"string\", min_length = 256 }",
+            ".min_length",
+        ),
+        (
+            "{ name = \"a\", type = \"text\", min_length = 10001 }",
+            ".min_length",
+        ),
+        (
+            "{ name = \"a\", type = \"list\", of = { type = \"string\" }, min_items = 101 }",
+            ".min_items",
+        ),
+        (
+            "{ name = \"a\", type = \"blocks\", components = [\"quote\"], min_items = 101 }",
+            ".min_items",
+        ),
+        (
+            "{ name = \"a\", type = \"reference\", to = [\"other\"], cardinality = \"many\", min_items = 101 }",
+            ".min_items",
+        ),
+        (
+            "{ name = \"a\", type = \"asset\", cardinality = \"many\", min_items = 101 }",
+            ".min_items",
+        ),
+    ] {
+        rejects(
+            &with_fields(field),
+            &format!("types.t.fields[0]{key}"),
+            "out_of_range",
+        );
+    }
+    accepts(&with_fields(
+        "{ name = \"a\", type = \"string\", min_length = 255 }",
+    ));
+    accepts(&with_fields(
+        "{ name = \"a\", type = \"list\", of = { type = \"string\" }, min_items = 100 }",
+    ));
+}
+
+#[test]
+fn list_items_take_no_slug_source() {
+    accepts(&with_fields(
+        "{ name = \"a\", type = \"list\", of = { type = \"slug\" } }",
+    ));
+    rejects(
+        &with_fields(
+            "{ name = \"title\", type = \"string\" },\n{ name = \"a\", type = \"list\", of = { type = \"slug\", from = \"title\" } }",
+        ),
+        "types.t.fields[1].of.from",
+        "not_allowed",
+    );
+}
+
+#[test]
+fn negative_zero_float_bounds_fingerprint_like_zero() {
+    let with = |bound: &str| {
+        fingerprint(&with_fields(&format!(
+            "{{ name = \"a\", type = \"float\", min = {bound} }}"
+        )))
+    };
+    assert_eq!(with("-0.0"), with("0.0"));
+    assert_eq!(with("0"), with("0.0"));
+    assert_ne!(with("0.5"), with("0.0"));
 }
