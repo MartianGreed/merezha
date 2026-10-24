@@ -3,11 +3,13 @@
 //! modules reach it through [`crate::AppContext::jobs`], bound to their
 //! name like the outbox.
 //!
-//! Later slices add `schedule` (module-declared cron, AP-B3) and
-//! `queue_status` (AP-B2) here.
+//! [`Jobs::queue_status`] is the read behind the jobs admin API's
+//! `GET queues` and `GET outbox` and TE's status and gauges (R10). AP-B3
+//! adds `schedule` (module-declared cron) here.
 use super::{DedupeKey, JobFailure, MessageContext, Source};
 use crate::BoxFuture;
 use merezha_domain::{Failure, Identity};
+use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -63,7 +65,8 @@ pub struct JobContext {
     /// is at least once.
     pub idempotency_key: String,
     pub deadline: tokio::time::Instant,
-    /// Turns `true` on lease loss or at the drain cutoff.
+    /// Turns `true` on lease loss, at the drain cutoff and at `deadline`
+    /// (the queue's `timeout_ms`), where the handler is also aborted.
     pub cancel: tokio::sync::watch::Receiver<bool>,
     pub correlation_id: Identity,
     pub causation_id: Option<Identity>,
@@ -130,6 +133,61 @@ impl std::fmt::Debug for JobRegistration {
     }
 }
 
+/// One queue in [`QueueStatus`], with TE's state names: `ready` and
+/// `delayed` are `available` jobs whose `run_at` is past or future,
+/// `leased` is `running`, `dead` is `dead`; terminal rows are not counted.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct QueueSummary {
+    pub name: String,
+    pub ready: u64,
+    pub delayed: u64,
+    pub leased: u64,
+    pub dead: u64,
+    /// Age in seconds of the oldest due `available` job, 0 when none
+    /// (TE's `merezha.job.lag`).
+    pub oldest_ready_age_s: f64,
+    /// This instance's per-queue slots.
+    pub concurrency: u32,
+    /// Cluster-wide cap; 0 is unlimited.
+    pub global_concurrency: u32,
+}
+/// A quarantined outbox record, as `GET outbox` lists it. No payload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct QuarantinedRecord {
+    pub id: i64,
+    pub source: String,
+    pub record_kind: String,
+    pub quarantine_code: String,
+    pub quarantined_at: jiff::Timestamp,
+}
+/// The outbox in [`QueueStatus`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct OutboxSummary {
+    /// Records not relayed yet, quarantined ones included.
+    pub pending: u64,
+    /// Age in seconds of the oldest of them, 0 when none.
+    pub oldest_age_s: f64,
+    /// Event records this instance relayed without a subscription since it
+    /// started.
+    pub unrouted: u64,
+    /// At most [`MAX_QUARANTINED_LISTED`], oldest first.
+    pub quarantined: Vec<QuarantinedRecord>,
+}
+/// Most quarantined records [`OutboxSummary`] lists.
+pub const MAX_QUARANTINED_LISTED: usize = 100;
+/// Most queues [`QueueStatus`] lists.
+pub const MAX_QUEUES_LISTED: usize = 256;
+/// Queue and outbox state from the database (AP §D.1 `GET queues` and
+/// `GET outbox`), read by TE's status endpoint and gauges (R10). Every
+/// field is a count, a configured name, a code or a timestamp.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct QueueStatus {
+    /// Configured queues, queues of registered kinds and queues holding
+    /// jobs, by name, at most [`MAX_QUEUES_LISTED`].
+    pub queues: Vec<QueueSummary>,
+    pub outbox: OutboxSummary,
+}
+
 /// The jobs runtime as modules use it. Registration and subscriptions are
 /// declared before the runtime starts, from [`crate::Module::start`];
 /// later calls fail.
@@ -153,6 +211,8 @@ pub trait Jobs: Send + Sync {
     /// Fan event records on `topic` out to jobs of `kind`, which `source`
     /// registered; stored in `merezha_jobs.subscriptions` at start.
     fn subscribe(&self, source: &Source, topic: &Identity, kind: &Identity) -> Result<(), Failure>;
+    /// Queue and outbox state, read in one bounded pass.
+    fn queue_status(&self) -> BoxFuture<'_, Result<QueueStatus, Failure>>;
 }
 
 /// The jobs port bound to one source, as [`crate::AppContext::jobs`] hands
@@ -209,6 +269,10 @@ impl JobsHandle {
         self.inner
             .subscribe(&self.source, &Identity::new(topic)?, &Identity::new(kind)?)
     }
+    /// See [`Jobs::queue_status`].
+    pub async fn queue_status(&self) -> Result<QueueStatus, Failure> {
+        self.inner.queue_status().await
+    }
 }
 
 /// Fallback without the jobs runtime: every call fails permanent
@@ -227,5 +291,8 @@ impl Jobs for UnavailableJobs {
     }
     fn subscribe(&self, _: &Source, _: &Identity, _: &Identity) -> Result<(), Failure> {
         Err(Failure::permanent("jobs_unavailable"))
+    }
+    fn queue_status(&self) -> BoxFuture<'_, Result<QueueStatus, Failure>> {
+        Box::pin(async { Err(Failure::permanent("jobs_unavailable")) })
     }
 }

@@ -732,6 +732,8 @@ Block events (AP's former `jobs.*` events are `job.*`):
 | `outbox.quarantined` | warn | `outbox_id`, `source`, `code` |
 | `outbox.relay_failed` (a systemic relay failure, once per failure streak; nothing is quarantined) | error | `code`, `classification` |
 | `job.subscription_sync_failed` (the start-up subscription sync, once per failure streak) | warn | `code`, `classification` |
+| `job.worker_failed` (a worker statement failing: `lease`, `settle`, `heartbeat`, `reaper`, `retention`, `lag` or `release`; once per failure streak) | warn | `task`, `code`, `classification` |
+| `job.queue_unconfigured` (a registered kind's queue missing from `[jobs.queues]`, at worker start) | warn | `queue` |
 | `identity.login_failed` | debug (the metric and the audit log carry the signal) | `method`, `outcome` |
 | `identity.grants_truncated` (grants past `max_resource_assignments`) / `identity.audit_write_failed` | warn / error | `count` / `code` |
 | `identity.dev_link` | info, stderr only, never bridged to OTLP | `purpose`, `link`; emitted only with `dev_print_links = true` on loopback, the one catalog event that carries a secret |

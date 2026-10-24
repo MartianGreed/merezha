@@ -11,8 +11,9 @@ kernel every block builds on:
   the `Module` trait, `AppContext`, the cross-module ports, the HTTP edge,
   health endpoints, structured logging and the host lifecycle.
 
-`merezha-jobs` (`crates/jobs`, AP-B1) is the jobs runtime the host installs
-beside them: the PostgreSQL outbox, the jobs port and the relay (see
+`merezha-jobs` (`crates/jobs`, AP-B1 and AP-B2) is the jobs runtime the host
+installs beside them: the PostgreSQL outbox, the jobs port, the relay, the
+workers that lease and run jobs, retention and the jobs admin API (see
 [Jobs and the outbox](#jobs-and-the-outbox)).
 
 `merezha-blob` (`crates/blob`, CT-C6) holds the `BlobStore` drivers, local
@@ -91,6 +92,7 @@ the process exits 0. A serving failure exits 1.
 | `GET /health/ready` | kernel | always |
 | `/v1/<module>/...` | each enabled module | its `[modules.<module>]` section exists |
 | `/v1/application/...` | application layer (the `application` module on PostgreSQL) | `[application]` is set |
+| `/v1/jobs/admin/...` | jobs runtime (AP §D.1) | always; each route is a permission check |
 | `/health`, `/v1/services/...`, `/v1/pipelines/...`, `/v1/reload` | raw runtime | the listener is private |
 
 Without the identity block there is no authentication. A listener is private
@@ -237,8 +239,12 @@ applies to a PostgreSQL application; the others are *reserved* until AP-A3:
 Always present: jobs run whenever the database is configured, and there is
 no `enabled` key (R12). AP-B1 gives `[jobs.relay]`, `[jobs.subscriptions]` and `max_attempts`
 (`[jobs.defaults]` and per queue) their behaviour: the relay and
-`enqueue` stamp each job with its queue's `max_attempts`. The other keys
-are *reserved* until leasing and dispatch (AP-B2) and cron (AP-B3) ship.
+`enqueue` stamp each job with its queue's `max_attempts`. AP-B2 gives the
+workers theirs: `workers`, `poll_interval_ms`, `reaper_interval_ms`,
+`drain_timeout_ms`, every `[jobs.defaults]` and `[jobs.queues.<name>]`
+key, `[jobs.retention]` and `[jobs.readiness] max_lag_ms` (see "Jobs and
+the outbox"). `[jobs.scheduler]` and `[[jobs.schedules]]` stay *reserved*
+until cron (AP-B3) ships.
 
 | Table | Key | Type | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -447,7 +453,11 @@ dot, `<area>.<noun>_<verb>`.
 `http.request.completed`, `health.ready`, `health.not_ready`,
 `notification.captured`, and from the jobs runtime `outbox.relayed`,
 `outbox.quarantined`, `outbox.relay_failed`, `job.admin_action`,
-`job.subscription_sync_failed`, `db.listener_lost`,
+`job.subscription_sync_failed`, `job.leased`, `job.completed`,
+`job.retry_scheduled`, `job.dead_lettered`, `job.lease_lost`,
+`job.drain_abandoned`, `job.worker_failed` (a lease, settle, heartbeat,
+reaper, retention, lag or release statement failing, once per failure
+streak), `job.queue_unconfigured`, `db.listener_lost`,
 `db.listener_restored`.
 
 K2 renamed `database.connected`, `database.unavailable`,
@@ -542,7 +552,7 @@ pass what they learned in (`NotificationRequest::members`).
 | `ResourceScope` | `Application`, `Tenant(id)`, `Resource { tenant: Option<id>, kind, id }`; a resource without a tenant is application-level (R5). A tenant grant never satisfies an application check | |
 | `Authorizer` | extends the application `Authorizer` with `check(Option<&Principal>, permission, scope) -> Result<Allowed, AccessDenied>`; synchronous and I/O-free. Without a principal it denies `Unauthenticated` (401), otherwise `unauthorized` (403) | `LoopbackAllowAll` on a private listener (constructible only for loopback addresses), `DenyAll` otherwise (401 anonymous, 403 with a principal) |
 | `Outbox` | `append(tx, source, &[OutboxRecord], OnDuplicate) -> Appended` (AP §B.3); records carry a `DedupeKey` (at most 160 bytes, R4a; `DedupeKey::api(subject, key)` namespaces HTTP keys), an `OutboxTarget` (`Event { topic }` or `Job { queue, kind }`), a JSON payload of at most 64 KiB, `contains_secret`, `run_at`, `priority` and a `MessageContext`; at most 256 records per call. `OutboxRecord::event(source, topic, NewEvent)` (or `SourceOutbox::event`) builds an event record whose payload is the `IntegrationEvent` envelope (R11). `JobFailure` carries the code, classification and `retry_after` job handlers report | `UnavailableOutbox`: fails `outbox_unavailable`, so the caller's transaction rolls back. `merezha_jobs::PgOutbox` is the PostgreSQL implementation |
-| `Jobs` | through `JobsHandle`: `enqueue(NewJob) -> Enqueued` in its own transaction, idempotent on the queue and `{source}:{key}`; `cancel(id)`; `register(kind, queue, Arc<dyn JobHandler>, KindOptions)` and `subscribe(topic, kind)` before the jobs runtime starts. `JobHandler`, `JobContext`, `KindOptions` and `Reissue` are AP §B.3's; `NewJob` hides its payload from `Debug` | `UnavailableJobs`: every call fails `jobs_unavailable` |
+| `Jobs` | through `JobsHandle`: `enqueue(NewJob) -> Enqueued` in its own transaction, idempotent on the queue and `{source}:{key}`; `cancel(id)`; `register(kind, queue, Arc<dyn JobHandler>, KindOptions)` and `subscribe(topic, kind)` before the jobs runtime starts; `queue_status() -> QueueStatus` (per queue `ready`, `delayed`, `leased`, `dead`, `oldest_ready_age_s` and slots, plus the outbox backlog and up to 100 quarantined records), the read behind `GET /v1/jobs/admin/queues` and `outbox` and TE's status and gauges (R10). `JobHandler`, `JobContext`, `KindOptions` and `Reissue` are AP §B.3's; `NewJob` hides its payload from `Debug` | `UnavailableJobs`: every call fails `jobs_unavailable` |
 | `Notifier` | `validate(&request)` (pure), `request(tx, NotificationRequest)` and `emit_webhook(tx, WebhookEvent)` (NT §3.1); a webhook's `source_event_id` is an `EventId` of up to 225 bytes, room for `{source}:{dedupe_key}`. Requests carry topic, 1 to 100 recipients (`User`, `Tenant`, `Application { roles }`, `Address`), channels, template, `data`, `secret_data`, locale, dedupe key, tenant, `members`, `not_before`, `expires_at`, collapse key and correlation. For sources `application` and `api` with a tenant every user recipient must be in `members` (`recipient_not_in_tenant`). `Debug` never shows data, secret data or addresses. `NotifierFactory::bind(source)` hands out bound notifiers | `CaptureNotifications`: validates structurally, logs a redacted `notification.captured` warning, keeps the last 64 redacted records (never `data`, `secret_data` or addresses) and delivers nothing |
 | `Directory` | `users(ids)` (at most 100) to verified `Contact`s, `tenant_members(tenant, roles?, PageRequest)` and `application_members(roles?, PageRequest)` (pages of at most 500, keyset by user id), `is_member(user, tenant)` (R7) | `EmptyDirectory`: resolves nothing; nobody is a member |
 | `BlobStore` | `put(key, BlobBody, attrs) -> BlobStat` streaming, `get(key, range?) -> BlobRead` streaming, `head`, idempotent `delete`, `signed_get_url(key, ttl) -> Option<String>` (CT §6); `BlobKey` is 1 to 1024 bytes of `[A-Za-z0-9._-]` segments; `BlobError` maps to classified failures | `UnavailableBlobStore`: fails permanent `blob_store_unavailable`. `merezha_blob::ObjectBlobStore` is the local and S3 implementation |
@@ -880,7 +890,7 @@ runs the same checks, and its PostgreSQL tests print the skip message.
 
 ## Jobs and the outbox
 
-`merezha-jobs` implements AP §B for AP-B1. Its migration 0001 (ledger key
+`merezha-jobs` implements AP §B for AP-B1 and AP-B2 (cron is AP-B3). Its migration 0001 (ledger key
 `jobs`) creates schema `merezha_jobs`: `outbox`, `subscriptions`, `jobs`,
 `attempts`, `schedules` and `admin_actions`, with AP §B.2's constraints,
 including the R3 rule that a flagged (`contains_secret`) record has no
@@ -946,17 +956,91 @@ state, and the R10 trace columns.
 - **Requeue.** `PgJobs::requeue_outbox(id, principal)` returns a
   quarantined record to pending with an `admin_actions` row; a flagged one
   quarantined as `unroutable` fails `409 secret_purged` (R4a), others
-  `not_quarantined` or `not_found`.
-  The HTTP route arrives with the jobs admin API (AP-B2).
+  `not_quarantined` or `not_found`. Its HTTP route is
+  `POST /v1/jobs/admin/outbox/{id}/requeue`.
+- **Workers** (AP-B2; off with `jobs.workers = false`, an API-only role
+  that still enqueues and relays). They start once the first subscription
+  sync succeeded. Each queue a registered kind names or `[jobs.queues]`
+  configures gets one dispatcher with `concurrency` slots; a registered
+  queue missing from `[jobs.queues]` runs on the defaults with 2 slots and
+  logs `job.queue_unconfigured`. A dispatcher leases only while it has
+  free slots, only kinds this instance registered, `priority DESC, run_at,
+  id`, with `FOR UPDATE SKIP LOCKED`; it wakes on `LISTEN merezha_jobs`
+  (the payload names the queue), on a freed slot and every
+  `jobs.poll_interval_ms`. `global_concurrency > 0` caps running jobs of
+  the queue across instances under a transaction advisory lock. Each lease
+  gets a fresh `lease_token`, an attempts row and `lease_owner =
+  app.instance_id`, and every later write is fenced on the token, so a
+  handler whose lease was lost can never settle the job.
+- **Retry.** A handler runs in its own task with a `JobContext` (attempt,
+  idempotency key, deadline, `cancel`) and the queue's `timeout_ms`.
+  Success is `succeeded`; `permanent` is `dead` at once; `transient` and
+  `conflict` retry until `max_attempts`, then `dead`; a panic is `dead`
+  with `handler_panic`; a payload `serde_json` cannot read back is `dead`
+  with `invalid_job_payload`; a timeout fires `cancel`, aborts the handler
+  and is a transient `timeout`. The delay is equal jitter over
+  `min(backoff_max, backoff_base * 2^(attempt - 1))` from the OS CSPRNG,
+  at least the handler's `retry_after` (capped at `backoff_max`). Logs:
+  `job.leased`, `job.completed` (debug), `job.retry_scheduled` (warn),
+  `job.dead_lettered` (error), never with payloads.
+- **Heartbeat and reaper.** Every third of the shortest `lease_ms`, one
+  statement extends every lease the instance holds; a token missing from
+  the result lost its lease, so its `cancel` fires and its result is
+  discarded (`job.lease_lost`). Every `jobs.reaper_interval_ms`, any
+  instance reclaims expired leases (100 per statement, `SKIP LOCKED`): the
+  attempt counts, the job goes back to `available` after an unjittered
+  backoff or `dead` at `max_attempts`, code `lease_expired`.
+- **Drain.** `shutdown` stops the dispatchers, reaper and retention, keeps
+  heartbeating, waits up to `jobs.drain_timeout_ms`, fires `cancel`, gives
+  2 s, then releases what is left in one fenced statement: `available`
+  now with the attempt refunded, the attempts row `released`, logged as
+  `job.drain_abandoned` with the ids. A handler that fails after the
+  cutoff is released, not retried; one that succeeds is settled. `merezha
+  run` sets the module shutdown budget to at least `drain_timeout_ms` plus
+  5 s.
+- **Secrets (R3).** A flagged job's payload is nulled by the same
+  statement that makes it terminal: success, dead letter (handler or
+  reaper), cancel. The admin API never returns a flagged payload.
+- **Retention.** At start and hourly, any instance purges in batches of
+  1000 under `pg_try_advisory_xact_lock(MZJB, hashtext('retention'))`:
+  succeeded and cancelled jobs after `jobs.retention.succeeded`, dead jobs
+  after `jobs.retention.dead` (with an `admin_actions` row
+  `retention_purge`), relayed outbox rows after `jobs.retention.outbox`,
+  quarantined ones after `jobs.retention.dead`, admin actions after
+  `jobs.retention.audit`. `PgJobs::purge_expired` runs one pass.
+- **Readiness.** Ready once the subscriptions synced and the workers
+  started. With `jobs.readiness.max_lag_ms`, the reaper loop also measures
+  the age of the oldest due `available` job and readiness fails while it is
+  older; unset, backlog is no readiness input (R10).
+- **Admin API** under `/v1/jobs/admin/` (AP §D.1), each route checked at
+  `ResourceScope::Application` through the host's policy before anything
+  else: `jobs.admin.read` for reads, `jobs.admin.write` for writes, and
+  `jobs.admin.payload` as well for `?payload=true`. Without the identity
+  block, a loopback listener allows them and a public one answers 401.
+  `GET queues` and `GET outbox` serve `JobsHandle::queue_status()`;
+  `GET jobs?queue=&state=&kind=&limit=&after=` lists by id (limit 1 to
+  200, default 50, `next` cursor), without payloads; `GET jobs/{id}` adds
+  `attempt_history`; `POST jobs/{id}/replay`, `POST dead/replay` (at most
+  1000), `POST dead/purge`, `POST jobs/{id}/cancel` and `POST
+  outbox/{id}/requeue` write an `admin_actions` row with the principal and
+  log `job.admin_action`. Replaying a flagged dead job calls its kind's
+  `reissue` hook (`"state":"reissued"`, the dead row closed as `cancelled`
+  with `replays + 1`) or fails `409 secret_purged`. Bad bodies and query
+  strings fail `invalid_input` (400) or `validation_failed` (422) with
+  `details` that never echo input.
 
 Error codes it registers: `invalid_topic`, `invalid_queue`,
 `invalid_run_at`, `invalid_event_envelope`, `invalid_record_data`, `job_payload_limit`,
 `kind_already_registered`, `kind_not_registered`, `too_many_kinds` and
-`jobs_started` (422), `not_quarantined` (409), `jobs_not_ready` (503).
+`jobs_started` (422), `not_quarantined`, `not_dead` and `not_cancellable`
+(409), `jobs_not_ready` (503). Migration 0002 adds the `outbox_quarantined`
+index the admin listing and retention read.
 
 Process tests hold the relay with `MEREZHA_JOBS_TEST_RELAY=off` (or
-`interval`, no `LISTEN`). Only builds with the `test-hooks` feature read
-it. `merezha-cli`'s dev-dependency enables it, and Cargo unifies that into
+`interval`, no `LISTEN`), and `MEREZHA_JOBS_TEST_HANDLER=<ms>` registers a
+`test.sleep` kind on queue `default` whose handler sleeps that long,
+ignoring `cancel`. Only builds with the `test-hooks` feature read
+them. `merezha-cli`'s dev-dependency enables it, and Cargo unifies that into
 every build that compiles the dev-dependencies: the `merezha` binary built
 by `cargo test` or `--all-targets` reads the variable. Builds without them,
 such as `cargo build --release -p merezha-cli` or `cargo build
@@ -995,7 +1079,8 @@ itself.
 - Modules start even when migrations are pending in verify mode; readiness
   stays false. A module that needs its tables at start should check them.
 - `Timeouts` (migrate 300 s, module start 10 s, drain 30 s, module shutdown
-  10 s) are code defaults, not configuration yet.
+  10 s) are code defaults, not configuration yet; `merezha run` raises the
+  module shutdown budget to cover `jobs.drain_timeout_ms` plus 5 s.
 - There is no request deadline at the edge yet; handlers bound their own
   work.
 - `Host::start` installs no `Authenticator` yet, so the edge never
@@ -1003,8 +1088,9 @@ itself.
 - The events, outbox and jobs `trace_parent`/`trace_state` columns exist
   but stay empty until the telemetry block fills them from the current span
   (TE-T3 for events, TE-T5 for the outbox and jobs).
-- Jobs are created but not leased or run: dispatch, retry, drain,
-  retention and the jobs admin API are AP-B2, cron is AP-B3.
+- Cron (`[[jobs.schedules]]`, `JobsHandle::schedule`, the scheduler and
+  the schedule admin routes) is AP-B3. Job attempts open no `process`
+  span and the `merezha.job.*` instruments do not exist yet (TE-T5).
 - PostgreSQL application storage (AP-A2) has no background projection
   runners, warm-up readiness or application admin API yet (AP-A3); catch-up
   and rebuild run in the request.

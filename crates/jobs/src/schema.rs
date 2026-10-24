@@ -133,4 +133,14 @@ CREATE TABLE merezha_jobs.admin_actions (
     count integer NOT NULL);
 "#;
 
-pub(crate) const MIGRATIONS: [Migration; 1] = [Migration::new(1, "initial", INITIAL)];
+/// AP-B2: quarantined outbox rows are listed oldest first by the admin
+/// API and purged by retention, outside the pending index.
+const QUARANTINED_INDEX: &str = "
+CREATE INDEX outbox_quarantined ON merezha_jobs.outbox (quarantined_at, id)
+    WHERE quarantined_at IS NOT NULL;
+";
+
+pub(crate) const MIGRATIONS: [Migration; 2] = [
+    Migration::new(1, "initial", INITIAL),
+    Migration::new(2, "quarantined_index", QUARANTINED_INDEX),
+];

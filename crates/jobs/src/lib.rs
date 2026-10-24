@@ -3,26 +3,35 @@
 //! [`PgJobs`] is the jobs runtime the host installs
 //! ([`merezha_platform::JobsRuntime`]): the PostgreSQL [`PgOutbox`] behind
 //! the kernel `Outbox` port, the `Jobs` port behind every module's
-//! `JobsHandle` (enqueue, cancel, register, subscribe), and the relay that
-//! turns committed outbox records into jobs.
+//! `JobsHandle` (enqueue, cancel, register, subscribe, queue status), the
+//! relay that turns committed outbox records into jobs, the workers that
+//! lease and run them (dispatch, heartbeat, reaper, retry, drain), retention
+//! and the admin API under `/v1/jobs/admin/`.
 //!
-//! Seams for later slices: leasing, dispatch, retry, drain, retention and
-//! the admin API (AP-B2) read the registrations kept here
-//! ([`PgJobs::registrations`]) and the tables of migration 0001; cron
-//! (AP-B3) adds `JobsHandle::schedule` and the scheduler tick.
+//! Seam for AP-B3: cron adds `JobsHandle::schedule`, the scheduler tick and
+//! the schedule admin routes beside [`PgJobs::admin_router`]'s.
+pub mod admin;
 mod outbox;
 mod relay;
+mod retention;
+mod retry;
+mod routes;
 mod schema;
 mod validate;
+mod worker;
 
+pub use admin::{
+    AttemptRecord, BulkReplay, DeadFilter, JobDetail, JobFilter, JobPage, JobSummary, Replay,
+};
 pub use outbox::{OUTBOX_CHANNEL, PgOutbox};
 pub use relay::{JOBS_CHANNEL, RelayReport};
+pub use retention::{RETENTION_INTERVAL, RetentionReport};
 
 use merezha_domain::{Failure, Identity};
 use merezha_platform::{
     AppContext, BoxFuture, Database, ErrorCode, JobsPorts, JobsRuntime, Migration, Module,
     config::{JobsConfig, SubscriptionsConfig},
-    ports::{Enqueued, JobRegistration, Jobs, NewJob, Source},
+    ports::{Enqueued, JobRegistration, Jobs, NewJob, QueueStatus, Source},
 };
 use merezha_postgres::{Listener, classify};
 use relay::RelaySettings;
@@ -34,6 +43,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use worker::{QueuePlan, Worker, WorkerConfig};
 
 /// Codes this runtime returns, registered at startup (R8).
 pub const ERRORS: &[ErrorCode] = &[
@@ -48,8 +58,13 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("too_many_kinds", 422),
     ErrorCode::new("jobs_started", 422),
     ErrorCode::new("not_quarantined", 409),
+    ErrorCode::new("not_dead", 409),
+    ErrorCode::new("not_cancellable", 409),
     ErrorCode::new("jobs_not_ready", 503),
 ];
+/// Per-instance slots of a queue a registered kind names but `[jobs.queues]`
+/// does not configure (AP §D.2).
+pub const UNCONFIGURED_CONCURRENCY: u32 = 2;
 /// Most registered kinds and subscriptions each.
 pub const MAX_KINDS: usize = 1024;
 /// Most batches one wake-up relays before it checks for shutdown.
@@ -63,6 +78,10 @@ const LISTEN_DEADLINE: Duration = Duration::from_secs(5);
 /// The process-test hook (feature `test-hooks`): `off` keeps the relay
 /// stopped, `interval` relays on the interval only.
 pub const TEST_RELAY_ENV: &str = "MEREZHA_JOBS_TEST_RELAY";
+/// The process-test hook (feature `test-hooks`): a number of milliseconds
+/// registers kind `test.sleep` on queue `default` (source `jobs`), whose
+/// handler sleeps that long, ignoring `cancel`, and succeeds.
+pub const TEST_HANDLER_ENV: &str = "MEREZHA_JOBS_TEST_HANDLER";
 
 /// How the relay is woken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,11 +107,15 @@ struct Registry {
 }
 
 struct Inner {
+    config: JobsConfig,
     settings: RelaySettings,
     subscriptions: SubscriptionsConfig,
     listen_check: Duration,
+    heartbeat: bool,
     mode: RelayMode,
     database: OnceLock<Database>,
+    ctx: OnceLock<AppContext>,
+    worker: OnceLock<Arc<Worker>>,
     registry: Mutex<Registry>,
     started: AtomicBool,
     ready: AtomicBool,
@@ -114,6 +137,46 @@ impl std::fmt::Debug for PgJobs {
     }
 }
 
+/// The `test.sleep` handler of [`TEST_HANDLER_ENV`].
+#[cfg(feature = "test-hooks")]
+struct Sleep(Duration);
+#[cfg(feature = "test-hooks")]
+impl merezha_platform::ports::JobHandler for Sleep {
+    fn handle<'a>(
+        &'a self,
+        _: merezha_platform::ports::JobContext,
+        _: serde_json::Value,
+    ) -> BoxFuture<'a, Result<(), merezha_platform::ports::JobFailure>> {
+        Box::pin(async move {
+            tokio::time::sleep(self.0).await;
+            Ok(())
+        })
+    }
+}
+fn test_handler(jobs: &PgJobs) {
+    #[cfg(feature = "test-hooks")]
+    if let Some(ms) = std::env::var(TEST_HANDLER_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        && let (Ok(source), Ok(kind), Ok(queue)) = (
+            Source::new("jobs"),
+            Identity::new("test.sleep"),
+            Identity::new("default"),
+        )
+    {
+        let _ = jobs.register(
+            &source,
+            JobRegistration {
+                kind,
+                queue,
+                handler: Arc::new(Sleep(Duration::from_millis(ms))),
+                options: Default::default(),
+            },
+        );
+    }
+    let _ = jobs;
+}
+
 fn test_mode() -> Option<RelayMode> {
     #[cfg(feature = "test-hooks")]
     match std::env::var(TEST_RELAY_ENV).as_deref() {
@@ -127,16 +190,24 @@ fn test_mode() -> Option<RelayMode> {
 impl PgJobs {
     /// The runtime for `[jobs]`, relaying in [`RelayMode::Listen`].
     pub fn new(config: &JobsConfig) -> Self {
-        Self::with_mode(config, test_mode().unwrap_or(RelayMode::Listen))
+        let jobs = Self::with_mode(config, test_mode().unwrap_or(RelayMode::Listen));
+        test_handler(&jobs);
+        jobs
     }
+    /// The runtime in `mode`. Workers listen on `merezha_jobs` only in
+    /// [`RelayMode::Listen`]; otherwise they poll.
     pub fn with_mode(config: &JobsConfig, mode: RelayMode) -> Self {
         Self {
             inner: Arc::new(Inner {
+                config: config.clone(),
                 settings: RelaySettings::new(config),
                 subscriptions: config.subscriptions.clone(),
                 listen_check: LISTEN_CHECK_INTERVAL,
+                heartbeat: true,
                 mode,
                 database: OnceLock::new(),
+                ctx: OnceLock::new(),
+                worker: OnceLock::new(),
                 registry: Mutex::new(Registry::default()),
                 started: AtomicBool::new(false),
                 ready: AtomicBool::new(false),
@@ -154,7 +225,15 @@ impl PgJobs {
         }
         self
     }
-    /// Migration 0001 of `merezha_jobs`, under ledger key `jobs`.
+    /// Never extend leases: a test hook for duplicate delivery (AP-B2
+    /// test 1). Call before sharing the runtime.
+    pub fn without_heartbeat(mut self) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.heartbeat = false;
+        }
+        self
+    }
+    /// Migrations 0001 and 0002 of `merezha_jobs`, under ledger key `jobs`.
     pub fn migrations() -> &'static [Migration] {
         &schema::MIGRATIONS
     }
@@ -176,6 +255,101 @@ impl PgJobs {
             .values()
             .map(|kind| kind.registration.clone())
             .collect()
+    }
+    /// How this instance runs `queue`: its `[jobs.queues.<name>]`, else
+    /// the defaults with [`UNCONFIGURED_CONCURRENCY`] slots.
+    fn plan(&self, queue: &str) -> QueuePlan {
+        let config = &self.inner.config;
+        match config.queues.get(queue) {
+            Some(q) => QueuePlan {
+                name: queue.to_owned(),
+                concurrency: q.concurrency,
+                global_concurrency: q.global_concurrency,
+                settings: q.settings.clone(),
+            },
+            None => QueuePlan {
+                name: queue.to_owned(),
+                concurrency: UNCONFIGURED_CONCURRENCY,
+                global_concurrency: 0,
+                settings: config.defaults.clone(),
+            },
+        }
+    }
+    /// Configured queues and the queues of registered kinds.
+    fn plans(&self) -> Vec<QueuePlan> {
+        let mut names: std::collections::BTreeSet<String> =
+            self.inner.config.queues.keys().cloned().collect();
+        names.extend(
+            self.registry()
+                .kinds
+                .values()
+                .map(|kind| kind.registration.queue.as_str().to_owned()),
+        );
+        names.iter().map(|name| self.plan(name)).collect()
+    }
+    /// One retention pass now (AP §B.9); the workers run one at start and
+    /// then every [`RETENTION_INTERVAL`].
+    pub async fn purge_expired(&self) -> Result<RetentionReport, Failure> {
+        retention::purge(self.database()?, &self.inner.config.retention).await
+    }
+    /// The jobs admin API (AP §D.1), as [`Module::routes`] mounts it under
+    /// `/v1/jobs`, checked by `policy`.
+    pub fn admin_router(
+        &self,
+        policy: Arc<dyn merezha_platform::ports::Authorizer>,
+    ) -> axum::Router {
+        routes::router(self.clone(), policy)
+    }
+    /// Build and start the workers once the tables answered.
+    fn start_workers(&self, database: &Database) {
+        let Some(ctx) = self.inner.ctx.get().cloned() else {
+            return;
+        };
+        let config = &self.inner.config;
+        let registered: Vec<(String, Arc<dyn merezha_platform::ports::JobHandler>, String)> = self
+            .registry()
+            .kinds
+            .iter()
+            .map(|(name, kind)| {
+                (
+                    name.clone(),
+                    kind.registration.handler.clone(),
+                    kind.registration.queue.as_str().to_owned(),
+                )
+            })
+            .collect();
+        for queue in registered
+            .iter()
+            .map(|(_, _, queue)| queue)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            if !config.queues.contains_key(queue) {
+                tracing::warn!(event = "job.queue_unconfigured", queue = queue.as_str());
+            }
+        }
+        let worker = Worker::new(
+            database.clone(),
+            ctx,
+            WorkerConfig {
+                plans: self.plans(),
+                defaults: config.defaults.clone(),
+                handlers: registered
+                    .into_iter()
+                    .map(|(name, handler, _)| (name, handler))
+                    .collect(),
+                poll_interval: config.poll_interval,
+                reaper_interval: config.reaper_interval,
+                drain_timeout: config.drain_timeout,
+                retention: config.retention.clone(),
+                heartbeat: self.inner.heartbeat,
+                listen: self.inner.mode == RelayMode::Listen,
+                listen_check: self.inner.listen_check,
+                max_lag: config.readiness_max_lag,
+            },
+        );
+        if self.inner.worker.set(worker.clone()).is_ok() {
+            worker.start();
+        }
     }
     fn registry(&self) -> std::sync::MutexGuard<'_, Registry> {
         self.inner
@@ -251,8 +425,10 @@ impl PgJobs {
         );
         Ok(())
     }
-    fn launch(&self, database: Database) -> Result<(), Failure> {
+    fn launch(&self, ctx: AppContext) -> Result<(), Failure> {
+        let database = ctx.database().clone();
         let _ = self.inner.database.set(database.clone());
+        let _ = self.inner.ctx.set(ctx);
         if self.inner.started.swap(true, Ordering::SeqCst) {
             return Err(Failure::permanent("jobs_started"));
         }
@@ -386,6 +562,9 @@ async fn background(
             return;
         }
     }
+    if jobs.inner.config.workers {
+        jobs.start_workers(&database);
+    }
     jobs.inner.ready.store(true, Ordering::SeqCst);
     let mut next_heartbeat = tokio::time::Instant::now() + heartbeat;
     if jobs.inner.mode == RelayMode::Off {
@@ -508,12 +687,24 @@ impl Module for PgJobs {
     /// Starts after every other module: subscriptions are synced, then the
     /// relay runs in the background.
     fn start(&self, ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
-        let result = self.launch(ctx.database().clone());
+        let result = self.launch(ctx);
         Box::pin(async move { result })
     }
-    /// Ready once subscriptions are synced and until shutdown.
+    /// The jobs admin API under `/v1/jobs/admin/` (AP §D.1).
+    fn routes(&self, ctx: &AppContext) -> axum::Router {
+        self.admin_router(ctx.authorizer().clone())
+    }
+    /// Ready once subscriptions are synced and the workers started
+    /// (`jobs.workers = true`), until shutdown; with
+    /// `jobs.readiness.max_lag_ms`, not while the backlog is older.
     fn ready(&self) -> BoxFuture<'_, Result<(), Failure>> {
-        let ready = self.inner.ready.load(Ordering::SeqCst) && !*self.inner.stop.borrow();
+        let worker = self.inner.worker.get();
+        let workers = !self.inner.config.workers || worker.is_some();
+        let lagging = worker.is_some_and(|w| w.lagging());
+        let ready = self.inner.ready.load(Ordering::SeqCst)
+            && workers
+            && !lagging
+            && !*self.inner.stop.borrow();
         Box::pin(async move {
             if ready {
                 Ok(())
@@ -522,11 +713,17 @@ impl Module for PgJobs {
             }
         })
     }
-    /// Stops the relay. A batch in progress finishes or, past `deadline`,
-    /// is abandoned and rolls back.
+    /// Stops the relay and drains the workers (AP §B.8): no new leases,
+    /// in-flight jobs get `jobs.drain_timeout_ms` (within `deadline`), then
+    /// `cancel` and a 2 s grace, then the rest is released with the attempt
+    /// refunded. A relay batch in progress finishes or, past `deadline`, is
+    /// abandoned and rolls back.
     fn shutdown(&self, deadline: Instant) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.inner.stop.send_replace(true);
+            if let Some(worker) = self.inner.worker.get() {
+                worker.drain(deadline).await;
+            }
             let task = self
                 .inner
                 .task
@@ -686,6 +883,9 @@ impl Jobs for PgJobs {
             },
         );
         Ok(())
+    }
+    fn queue_status(&self) -> BoxFuture<'_, Result<QueueStatus, Failure>> {
+        Box::pin(self.status())
     }
     fn subscribe(&self, source: &Source, topic: &Identity, kind: &Identity) -> Result<(), Failure> {
         validate::topic(topic.as_str())?;

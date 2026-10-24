@@ -163,3 +163,134 @@ impl JobHandler for Noop {
 pub fn handle(jobs: &PgJobs, source: &str) -> JobsHandle {
     JobsHandle::new(Source::new(source).unwrap(), Arc::new(jobs.clone()))
 }
+
+/// A handler from a closure returning a `'static` future.
+pub struct Func<F>(pub F);
+impl<F> JobHandler for Func<F>
+where
+    F: Fn(JobContext, Value) -> BoxFuture<'static, Result<(), JobFailure>> + Send + Sync,
+{
+    fn handle<'a>(
+        &'a self,
+        ctx: JobContext,
+        payload: Value,
+    ) -> BoxFuture<'a, Result<(), JobFailure>> {
+        (self.0)(ctx, payload)
+    }
+}
+pub fn func<F>(f: F) -> Arc<dyn JobHandler>
+where
+    F: Fn(JobContext, Value) -> BoxFuture<'static, Result<(), JobFailure>> + Send + Sync + 'static,
+{
+    Arc::new(Func(f))
+}
+/// A context for the instance `instance`.
+pub fn instance_context(db: &Database, instance: &str) -> AppContext {
+    let policy = Arc::new(LoopbackAllowAll::new("127.0.0.1:1".parse().unwrap()).unwrap());
+    AppContext::builder("tasks", db.clone(), policy)
+        .instance_id(instance)
+        .build()
+        .unwrap()
+}
+/// A runtime polling (no `LISTEN`) whose `tasks` module registered
+/// `kinds` on queue `default`, started as `instance`.
+pub async fn workers(
+    db: &Database,
+    config: &JobsConfig,
+    instance: &str,
+    kinds: Vec<(&str, Arc<dyn JobHandler>)>,
+) -> PgJobs {
+    workers_with(
+        PgJobs::with_mode(config, RelayMode::Interval),
+        db,
+        instance,
+        kinds,
+    )
+    .await
+}
+pub async fn workers_with(
+    jobs: PgJobs,
+    db: &Database,
+    instance: &str,
+    kinds: Vec<(&str, Arc<dyn JobHandler>)>,
+) -> PgJobs {
+    jobs.ports(db);
+    let tasks = handle(&jobs, "tasks");
+    for (kind, handler) in kinds {
+        tasks
+            .register(kind, "default", handler, Default::default())
+            .unwrap();
+    }
+    jobs.start(instance_context(db, instance)).await.unwrap();
+    wait_ready(&jobs).await;
+    jobs
+}
+/// Insert one job straight into the table; returns its id.
+pub async fn insert_job(db: &Database, kind: &str, key: &str, payload: &str, secret: bool) -> i64 {
+    insert_job_on(db, "default", kind, key, payload, secret, 10).await
+}
+pub async fn insert_job_on(
+    db: &Database,
+    queue: &str,
+    kind: &str,
+    key: &str,
+    payload: &str,
+    secret: bool,
+    max_attempts: i32,
+) -> i64 {
+    let client = db.acquire(soon()).await.unwrap();
+    client
+        .query_one(
+            "INSERT INTO merezha_jobs.jobs (queue, kind, idempotency_key, payload, payload_digest,
+                 contains_secret, max_attempts, correlation_id)
+             VALUES ($1, $2, $3, $4::text::json, sha256(convert_to($4::text, 'UTF8')), $5, $6, 'corr-1')
+             RETURNING id",
+            &[&queue, &kind, &key, &payload, &secret, &max_attempts],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+/// `state` of job `id`.
+pub async fn state(db: &Database, id: i64) -> String {
+    let client = db.acquire(soon()).await.unwrap();
+    client
+        .query_one("SELECT state FROM merezha_jobs.jobs WHERE id = $1", &[&id])
+        .await
+        .unwrap()
+        .get(0)
+}
+/// Wait until job `id` is in `expected`.
+pub async fn wait_state(db: &Database, id: i64, expected: &str, within: Duration) {
+    let started = Instant::now();
+    loop {
+        let now = state(db, id).await;
+        if now == expected {
+            return;
+        }
+        assert!(
+            started.elapsed() < within,
+            "job {id} stayed {now}, never {expected} within {within:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+/// `(attempt, outcome, error_code, lease_owner)` of every lease of job
+/// `id`, oldest first.
+pub async fn attempts(
+    db: &Database,
+    id: i64,
+) -> Vec<(i32, Option<String>, Option<String>, String)> {
+    let client = db.acquire(soon()).await.unwrap();
+    client
+        .query(
+            "SELECT attempt, outcome, error_code, lease_owner FROM merezha_jobs.attempts
+              WHERE job_id = $1 ORDER BY started_at",
+            &[&id],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+        .collect()
+}
