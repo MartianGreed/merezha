@@ -256,6 +256,17 @@ fn run_serves_health_runtime_and_application_behind_the_edge_and_stops_gracefull
     let receipt = request(address, "POST", "/v1/application/commands", COMMAND);
     assert_eq!(receipt.status, 200, "{}", receipt.body);
     assert_eq!(receipt.body["position"], 1);
+    // A private listener keeps projection administration open.
+    let caught_up = request(
+        address,
+        "POST",
+        "/v1/application/projections/total/catch-up",
+        "",
+    );
+    assert_eq!(
+        (caught_up.status, caught_up.body),
+        (200, json!({"state":1,"checkpoint":1}))
+    );
 
     // One error shape for kernel, runtime and application failures.
     for (method, path, body, status, code) in [
@@ -316,26 +327,42 @@ fn a_public_listener_without_identity_denies_application_and_hides_the_raw_runti
     let Some(test) = TestDatabase::create() else {
         return;
     };
-    let dir = tempfile::tempdir().unwrap();
-    // Public, but still bound to loopback so the test exposes nothing.
-    let config = project(dir.path(), "");
-    let mut host = Host::spawn(
-        &config,
-        &[(DATABASE_ENV, test.url()), ("MEREZHA_HTTP__PUBLIC", "true")],
-        "public",
-    );
-    let address = host.ready();
-    let raw = request(address, "POST", "/v1/services/echo/invoke", "opaque");
-    assert_eq!(raw.status, 404, "{}", raw.body);
-    let denied = request(address, "POST", "/v1/application/commands", COMMAND);
-    assert_eq!(
-        (denied.status, denied.body),
-        (
-            403,
-            json!({"error":{"code":"unauthorized","classification":"permanent"}})
-        )
-    );
-    host.stop();
+    const QUERY: &str =
+        r#"{"tag":"Total","payload":{},"metadata":{"message_id":"q1","correlation_id":"c1"}}"#;
+    // Both stay bound to loopback so the test exposes nothing. A trusted
+    // proxy makes a loopback listener reachable from elsewhere, so it is
+    // public too.
+    for (name, setting) in [
+        ("public", ("MEREZHA_HTTP__PUBLIC", "true")),
+        ("proxied", ("MEREZHA_HTTP__TRUSTED_PROXIES", "127.0.0.1")),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = project(dir.path(), "");
+        let mut host = Host::spawn(&config, &[(DATABASE_ENV, test.url()), setting], name);
+        let address = host.ready();
+        for path in ["/v1/services/echo/invoke", "/v1/reload", "/health"] {
+            let method = if path == "/health" { "GET" } else { "POST" };
+            let raw = request(address, method, path, "");
+            assert_eq!(raw.status, 404, "{name} {path}: {}", raw.body);
+        }
+        for (path, body) in [
+            ("/v1/application/commands", COMMAND),
+            ("/v1/application/queries", QUERY),
+            ("/v1/application/projections/total/catch-up", ""),
+            ("/v1/application/projections/total/rebuild", ""),
+        ] {
+            let denied = request(address, "POST", path, body);
+            assert_eq!(
+                (denied.status, denied.body),
+                (
+                    403,
+                    json!({"error":{"code":"unauthorized","classification":"permanent"}})
+                ),
+                "{name} {path}"
+            );
+        }
+        host.stop();
+    }
 }
 
 #[test]

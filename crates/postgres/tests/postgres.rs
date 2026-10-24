@@ -387,3 +387,72 @@ async fn unreachable_database_is_a_transient_failure() {
     }
     assert!(recovered, "pool did not recover after connections resumed");
 }
+
+#[tokio::test]
+async fn verify_reuses_a_pooled_session_without_changing_it() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let mut config = test.config();
+    config.pool_size = 1;
+    let db = Database::connect(&config).unwrap();
+    run_migrations(&db, &module(&[CREATE]), MigrationMode::Apply, soon())
+        .await
+        .unwrap();
+    let pid = |db: Database| async move {
+        let client = db.acquire(soon()).await.unwrap();
+        client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get::<_, i32>(0)
+    };
+    let before = pid(db.clone()).await;
+    // Readiness polls like this while migrations are pending.
+    for _ in 0..5 {
+        let report = run_migrations(
+            &db,
+            &module(&[CREATE, INDEX]),
+            MigrationMode::Verify,
+            Instant::now() + Duration::from_millis(1500),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.pending.len(), 1);
+    }
+    assert_eq!(pid(db.clone()).await, before, "verify opened new sessions");
+    let client = db.acquire(soon()).await.unwrap();
+    let timeout: String = client
+        .query_one("SHOW statement_timeout", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(timeout, "5s", "the verify bound leaked into the session");
+}
+
+#[tokio::test]
+async fn url_options_are_kept_beside_the_statement_timeout() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let separator = if test.url().contains('?') { '&' } else { '?' };
+    let mut config = test.config();
+    config.url = merezha_postgres::Secret::new(format!(
+        "{}{separator}options=-c%20search_path%3Dcustom_schema",
+        test.url()
+    ));
+    let db = Database::connect(&config).unwrap();
+    let client = db.acquire(soon()).await.unwrap();
+    let path: String = client
+        .query_one("SHOW search_path", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(path, "custom_schema");
+    let timeout: String = client
+        .query_one("SHOW statement_timeout", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(timeout, "5s");
+}

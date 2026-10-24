@@ -7,11 +7,21 @@ use axum::{
     routing::post,
 };
 use merezha_application::Application;
-use merezha_domain::{Classification, Failure};
+use merezha_domain::{Classification, Failure, Identity};
+use merezha_platform::ports::{Authorizer, ResourceScope};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-pub fn router(application: Application) -> Router {
+#[derive(Clone)]
+struct Routes {
+    application: Application,
+    policy: Option<Arc<dyn Authorizer>>,
+}
+/// Application routes. Projection catch-up and rebuild are administrative:
+/// with a `policy`, each needs `application.projections.catch_up` or
+/// `application.projections.rebuild` at global scope. `serve` passes no
+/// policy and keeps them open on its loopback listener.
+pub fn router(application: Application, policy: Option<Arc<dyn Authorizer>>) -> Router {
     Router::new()
         .route("/v1/application/commands", post(command))
         .route("/v1/application/queries", post(query))
@@ -20,21 +30,24 @@ pub fn router(application: Application) -> Router {
             post(catch_up),
         )
         .route("/v1/application/projections/{name}/rebuild", post(rebuild))
-        .with_state(application)
+        .with_state(Routes {
+            application,
+            policy,
+        })
 }
 enum Action {
     Command,
     Query,
     Project { name: String, rebuild: bool },
 }
-async fn command(State(app): State<Application>, request: Request) -> Response {
+async fn command(State(app): State<Routes>, request: Request) -> Response {
     dispatch(app, request, Action::Command).await
 }
-async fn query(State(app): State<Application>, request: Request) -> Response {
+async fn query(State(app): State<Routes>, request: Request) -> Response {
     dispatch(app, request, Action::Query).await
 }
 async fn catch_up(
-    State(app): State<Application>,
+    State(app): State<Routes>,
     Path(name): Path<String>,
     request: Request,
 ) -> Response {
@@ -49,7 +62,7 @@ async fn catch_up(
     .await
 }
 async fn rebuild(
-    State(app): State<Application>,
+    State(app): State<Routes>,
     Path(name): Path<String>,
     request: Request,
 ) -> Response {
@@ -63,10 +76,23 @@ async fn rebuild(
     )
     .await
 }
-async fn dispatch(app: Application, request: Request, action: Action) -> Response {
+async fn dispatch(state: Routes, request: Request, action: Action) -> Response {
+    if let (Action::Project { rebuild, .. }, Some(policy)) = (&action, &state.policy) {
+        let permission = if *rebuild {
+            "application.projections.rebuild"
+        } else {
+            "application.projections.catch_up"
+        };
+        let checked = Identity::new(permission)
+            .and_then(|permission| policy.check(None, &permission, &ResourceScope::Global));
+        if let Err(failure) = checked {
+            return failure_response(failure);
+        }
+    }
+    let app = state.application;
     let admission = match app.admit() {
         Ok(a) => a,
-        Err(e) => return failure(e),
+        Err(e) => return failure_response(e),
     };
     let maximum = if matches!(action, Action::Project { .. }) {
         0
@@ -84,8 +110,8 @@ async fn dispatch(app: Application, request: Request, action: Action) -> Respons
     .await
     {
         Ok(Ok(bytes)) => bytes,
-        Ok(Err(_)) => return failure(Failure::permanent("input_limit")),
-        Err(_) => return failure(Failure::transient("timeout")),
+        Ok(Err(_)) => return failure_response(Failure::permanent("input_limit")),
+        Err(_) => return failure_response(Failure::transient("timeout")),
     };
     let result = tokio::task::spawn_blocking(move || -> Result<Value, Failure> {
         let input = std::str::from_utf8(&bytes).map_err(|_| Failure::permanent("invalid_input"))?;
@@ -103,11 +129,11 @@ async fn dispatch(app: Application, request: Request, action: Action) -> Respons
     .await;
     match result {
         Ok(Ok(value)) => Json(value).into_response(),
-        Ok(Err(error)) => failure(error),
-        Err(_) => failure(Failure::transient("internal")),
+        Ok(Err(error)) => failure_response(error),
+        Err(_) => failure_response(Failure::transient("internal")),
     }
 }
-fn failure(error: Failure) -> Response {
+fn failure_response(error: Failure) -> Response {
     let status = match error.code.as_str() {
         "unauthorized" => StatusCode::FORBIDDEN,
         "handler_not_found" | "projection_not_found" => StatusCode::NOT_FOUND,

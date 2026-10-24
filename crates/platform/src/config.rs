@@ -815,6 +815,12 @@ fn build(
 
     // [database]
     let (mut r, _) = reader(layers, "database", issues);
+    // Cross-field issues found by `DatabaseConfig::validate` name the layer
+    // that supplied the offending setting.
+    let origins: BTreeMap<&str, Origin> = ["url", "tls", "tls_ca_file"]
+        .into_iter()
+        .filter_map(|key| Some((key, r.entries.get(key)?.origin.clone())))
+        .collect();
     let url = r.secret("url", resolver);
     let defaults = DatabaseConfig::new(Secret::new(String::new()));
     let pool_size = r.integer(
@@ -859,7 +865,8 @@ fn build(
         for (key, code) in database.validate() {
             // Range issues were already reported by the typed reads.
             if code != "out_of_range" {
-                r.issue(key, code, Origin::File);
+                let origin = origins.get(key).cloned().unwrap_or(Origin::Default);
+                r.issue(key, code, origin);
             }
         }
     }

@@ -338,3 +338,48 @@ fn modules_validate_their_sections_and_unknown_modules_fail_with_kernel_errors()
         );
     }
 }
+
+#[test]
+fn database_issues_name_the_layer_that_supplied_the_setting() {
+    let project = Project::new(MINIMAL);
+    let errors = merezha_platform::ProjectConfig::load(&project.input(
+        &[URL, ("MEREZHA_DATABASE__URL", "postgres://db:notaport/app")],
+        &[],
+    ))
+    .unwrap_err();
+    assert_eq!(
+        errors.0,
+        vec![ConfigIssue::new(
+            "database.url",
+            "invalid_database_url",
+            Origin::Env("MEREZHA_DATABASE__URL".into())
+        )]
+    );
+    // A URL demanding TLS while `tls` stays disabled would be downgraded.
+    let errors = merezha_platform::ProjectConfig::load(&project.input(
+        &[(
+            "APP_DATABASE_URL",
+            "postgres://app:hunter2@db/app?sslmode=require",
+        )],
+        &[],
+    ))
+    .unwrap_err();
+    assert_eq!(
+        errors.0,
+        vec![ConfigIssue::new(
+            "database.url",
+            "sslmode_requires_tls",
+            Origin::File
+        )]
+    );
+    assert!(!errors.to_string().contains("hunter2"));
+    let config = merezha_platform::ProjectConfig::load(&project.input(
+        &[(
+            "APP_DATABASE_URL",
+            "postgres://app:hunter2@db/app?sslmode=require",
+        )],
+        &[("database.tls", "require")],
+    ))
+    .unwrap();
+    assert_eq!(config.database.tls, TlsMode::Require);
+}

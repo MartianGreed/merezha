@@ -131,6 +131,14 @@ impl Module for Notes {
 }
 
 fn config(test: &TestDatabase, migrate: bool, extra: &str) -> ProjectConfig {
+    config_with(test, migrate, extra, &[])
+}
+fn config_with(
+    test: &TestDatabase,
+    migrate: bool,
+    extra: &str,
+    overrides: &[(String, String)],
+) -> ProjectConfig {
     let text = format!(
         "[app]\nid = \"notes-app\"\n[database]\nurl = {{ env = \"NOTES_DATABASE_URL\" }}\nmigrate = {migrate}\npool_size = 4\nconnect_timeout_ms = 2000\nacquire_timeout_ms = 1000\n[runtime]\nmanifest = \"runtime.toml\"\n[http]\nbody_limit = 1024\ntrusted_proxies = [\"10.0.0.0/8\"]\n{extra}"
     );
@@ -138,7 +146,7 @@ fn config(test: &TestDatabase, migrate: bool, extra: &str) -> ProjectConfig {
         &text,
         std::env::temp_dir(),
         &[("NOTES_DATABASE_URL".into(), test.url().into())],
-        &[],
+        overrides,
     )
     .unwrap()
 }
@@ -259,6 +267,43 @@ async fn startup_applies_migrations_and_mounts_modules_behind_the_edge() {
     .await
     .unwrap();
     assert!(again.migrations().applied.is_empty() && again.migrations().is_current());
+}
+
+#[tokio::test]
+async fn body_limits_above_the_extractor_default_reach_handlers() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    // 4 MiB is above the 2 MiB default of axum's body extractors.
+    let config = config_with(
+        &test,
+        true,
+        "",
+        &[("http.body_limit".into(), (4 << 20).to_string())],
+    );
+    let host = Host::start(config, vec![Box::new(Notes::default())], parts())
+        .await
+        .unwrap();
+    let router = host.router();
+    let echo = |size: usize| {
+        Request::post("/v1/notes/echo")
+            .body(Body::from(vec![b'x'; size]))
+            .unwrap()
+    };
+    let response = router.clone().oneshot(echo(3 << 20)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 8 << 20)
+        .await
+        .unwrap();
+    assert_eq!(bytes.len(), 3 << 20);
+    let (status, body, _) = call(&router, echo((4 << 20) + 1)).await;
+    assert_eq!(
+        (status, body),
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            json!({"error":{"code":"body_limit","classification":"permanent"}})
+        )
+    );
 }
 
 #[tokio::test]

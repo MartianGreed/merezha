@@ -3,8 +3,8 @@
 //! Apply mode takes a session advisory lock on a connection removed from the
 //! pool, so concurrent hosts serialize and the lock is released when that
 //! connection closes, even if the caller is cancelled. Each pending migration
-//! runs with its ledger row in one transaction. Verify mode is read-only and
-//! takes no lock.
+//! runs with its ledger row in one transaction. Verify mode takes no lock and
+//! reads in one read-only transaction on a pooled session.
 use crate::{Database, classify};
 use merezha_domain::Failure;
 use sha2::{Digest, Sha256};
@@ -254,72 +254,48 @@ async fn run(
     mode: MigrationMode,
     deadline: Instant,
 ) -> Result<MigrationReport, MigrationError> {
-    let pooled = db.acquire(deadline).await.map_err(MigrationError::new)?;
+    let mut pooled = db.acquire(deadline).await.map_err(MigrationError::new)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let budget = remaining.as_millis().clamp(1, i32::MAX as u128);
+    if mode == MigrationMode::Verify {
+        // Readiness verifies repeatedly, so stay on a pooled session: the
+        // bound is `SET LOCAL` and ends with this read-only transaction.
+        let transaction = pooled.transaction().await.map_err(|e| database(&e))?;
+        transaction
+            .batch_execute(&format!(
+                "SET LOCAL statement_timeout = {budget}; SET TRANSACTION READ ONLY"
+            ))
+            .await
+            .map_err(|e| database(&e))?;
+        let applied = read_ledger(&*transaction, modules).await?;
+        transaction.commit().await.map_err(|e| database(&e))?;
+        return Ok(MigrationReport {
+            applied: Vec::new(),
+            pending: report(modules, plan(modules, &applied.unwrap_or_default())?),
+        });
+    }
     // Detach from the pool: session settings and the advisory lock die with
     // this connection instead of leaking into later borrowers.
     let mut client = deadpool_postgres::Object::take(pooled);
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let budget = remaining.as_millis().clamp(1, i32::MAX as u128);
     client
         .batch_execute(&format!("SET statement_timeout = {budget}"))
         .await
         .map_err(|e| database(&e))?;
-    if mode == MigrationMode::Apply {
-        client
-            .execute("SELECT pg_advisory_lock($1)", &[&MIGRATIONS_LOCK])
-            .await
-            .map_err(|e| match classify(&e).code.as_str() {
-                "database_timeout" => {
-                    MigrationError::new(Failure::transient("migration_lock_timeout"))
-                }
-                _ => database(&e),
-            })?;
-        let transaction = client.transaction().await.map_err(|e| database(&e))?;
-        transaction
-            .batch_execute(LEDGER)
-            .await
-            .map_err(|e| database(&e))?;
-        transaction.commit().await.map_err(|e| database(&e))?;
-    } else {
-        let exists: bool = client
-            .query_one("SELECT to_regclass('merezha.migrations') IS NOT NULL", &[])
-            .await
-            .map_err(|e| database(&e))?
-            .get(0);
-        if !exists {
-            let applied = BTreeMap::new();
-            return Ok(MigrationReport {
-                applied: Vec::new(),
-                pending: report(modules, plan(modules, &applied)?),
-            });
-        }
-    }
-    let names: Vec<&str> = modules.iter().map(|m| m.module).collect();
-    let rows = client
-        .query(
-            "SELECT module, version, name, checksum FROM merezha.migrations WHERE module = ANY($1)",
-            &[&names],
-        )
+    client
+        .execute("SELECT pg_advisory_lock($1)", &[&MIGRATIONS_LOCK])
+        .await
+        .map_err(|e| match classify(&e).code.as_str() {
+            "database_timeout" => MigrationError::new(Failure::transient("migration_lock_timeout")),
+            _ => database(&e),
+        })?;
+    let transaction = client.transaction().await.map_err(|e| database(&e))?;
+    transaction
+        .batch_execute(LEDGER)
         .await
         .map_err(|e| database(&e))?;
-    let mut applied = BTreeMap::new();
-    for row in rows {
-        let version: i32 = row.get(1);
-        applied.insert(
-            (row.get::<_, String>(0), version.max(0) as u32),
-            Applied {
-                name: row.get(2),
-                checksum: row.get(3),
-            },
-        );
-    }
+    transaction.commit().await.map_err(|e| database(&e))?;
+    let applied = read_ledger(&*client, modules).await?.unwrap_or_default();
     let pending = plan(modules, &applied)?;
-    if mode == MigrationMode::Verify {
-        return Ok(MigrationReport {
-            applied: Vec::new(),
-            pending: report(modules, pending),
-        });
-    }
     let mut done = Vec::new();
     for (index, migration) in pending {
         let module = modules[index].module;
@@ -378,6 +354,41 @@ async fn run(
         applied: done,
         pending: Vec::new(),
     })
+}
+
+/// Applied rows for `modules`, or `None` when the ledger does not exist.
+async fn read_ledger(
+    client: &impl tokio_postgres::GenericClient,
+    modules: &[ModuleMigrations<'_>],
+) -> Result<Option<BTreeMap<(String, u32), Applied>>, MigrationError> {
+    let exists: bool = client
+        .query_one("SELECT to_regclass('merezha.migrations') IS NOT NULL", &[])
+        .await
+        .map_err(|e| database(&e))?
+        .get(0);
+    if !exists {
+        return Ok(None);
+    }
+    let names: Vec<&str> = modules.iter().map(|m| m.module).collect();
+    let rows = client
+        .query(
+            "SELECT module, version, name, checksum FROM merezha.migrations WHERE module = ANY($1)",
+            &[&names],
+        )
+        .await
+        .map_err(|e| database(&e))?;
+    let mut applied = BTreeMap::new();
+    for row in rows {
+        let version: i32 = row.get(1);
+        applied.insert(
+            (row.get::<_, String>(0), version.max(0) as u32),
+            Applied {
+                name: row.get(2),
+                checksum: row.get(3),
+            },
+        );
+    }
+    Ok(Some(applied))
 }
 
 fn report(

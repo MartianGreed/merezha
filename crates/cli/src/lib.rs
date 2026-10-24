@@ -52,7 +52,7 @@ pub fn app_with_application(
     runtime: Runtime,
     application: merezha_application::Application,
 ) -> Router {
-    app(runtime).merge(application_http::router(application))
+    app(runtime).merge(application_http::router(application, None))
 }
 mod application_http;
 pub mod run;

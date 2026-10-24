@@ -195,6 +195,9 @@ pub fn apply(
         })
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(middleware::from_fn_with_state(state.clone(), limit_body))
+        // Extractors such as `Bytes` and `Json` carry their own 2 MiB default;
+        // `http.body_limit` replaces it in both directions.
+        .layer(axum::extract::DefaultBodyLimit::max(http.body_limit))
         .layer(middleware::from_fn(normalize_errors));
     let router = match cors(&http.cors) {
         Some(layer) => router.layer(layer),
@@ -240,14 +243,57 @@ fn cors(config: &CorsConfig) -> Option<tower_http::cors::CorsLayer> {
     )
 }
 
+/// Bound on the joined `X-Forwarded-For` value; a longer chain is ignored
+/// and the trusted peer itself is the client.
+const MAX_FORWARDED_BYTES: usize = 4096;
+
+/// The client behind a trusted `peer`: walk every `X-Forwarded-For` line,
+/// joined in order, from the right. Trusted hops are skipped and the first
+/// untrusted one is the client. An unparseable hop ends the trusted chain,
+/// so the last trusted hop seen is the client. When every hop is trusted,
+/// the leftmost one read is.
+fn forwarded_client(
+    headers: &axum::http::HeaderMap,
+    peer: Option<IpAddr>,
+    trusted: &[Cidr],
+) -> Option<IpAddr> {
+    let mut lines = Vec::new();
+    for value in headers.get_all(&FORWARDED_FOR) {
+        let Ok(line) = value.to_str() else {
+            return peer;
+        };
+        lines.push(line);
+    }
+    let chain = lines.join(",");
+    if chain.len() > MAX_FORWARDED_BYTES {
+        return peer;
+    }
+    let mut client = peer;
+    for hop in chain.rsplit(',').take(MAX_FORWARDED_HOPS) {
+        let Ok(ip) = hop.trim().parse::<IpAddr>() else {
+            break;
+        };
+        let ip = ip.to_canonical();
+        client = Some(ip);
+        if !trusted.iter().any(|c| c.contains(ip)) {
+            break;
+        }
+    }
+    client
+}
+/// The last comma-separated element of the last line of `name`.
+fn last_value(headers: &axum::http::HeaderMap, name: &HeaderName) -> Option<String> {
+    let line = headers.get_all(name).iter().next_back()?.to_str().ok()?;
+    line.rsplit(',').next().map(|v| v.trim().to_owned())
+}
+
 async fn context(State(state): State<EdgeState>, mut request: Request, next: Next) -> Response {
     let started = Instant::now();
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip().to_canonical());
-    let trusted = |ip: IpAddr| state.trusted.iter().any(|c| c.contains(ip));
-    let via_trusted_proxy = peer.is_some_and(trusted);
+    let via_trusted_proxy = peer.is_some_and(|ip| state.trusted.iter().any(|c| c.contains(ip)));
     let headers = request.headers();
     let text = |name: &HeaderName| {
         headers
@@ -263,26 +309,14 @@ async fn context(State(state): State<EdgeState>, mut request: Request, next: Nex
     };
     let mut request_id = None;
     if via_trusted_proxy {
-        if let Some(chain) = text(&FORWARDED_FOR).filter(|c| c.len() <= 4096) {
-            let hops: Vec<IpAddr> = chain
-                .rsplit(',')
-                .take(MAX_FORWARDED_HOPS)
-                .filter_map(|hop| hop.trim().parse::<IpAddr>().ok())
-                .map(|ip| ip.to_canonical())
-                .collect();
-            // The rightmost hop not added by a trusted proxy is the client.
-            info.address = hops
-                .iter()
-                .copied()
-                .find(|ip| !trusted(*ip))
-                .or_else(|| hops.last().copied())
-                .or(peer);
-        }
-        info.forwarded_proto = text(&FORWARDED_PROTO)
-            .map(|p| p.trim().to_ascii_lowercase())
+        info.address = forwarded_client(headers, peer, &state.trusted);
+        // Proxies append: the last value is the one the nearest trusted
+        // proxy wrote.
+        info.forwarded_proto = last_value(headers, &FORWARDED_PROTO)
+            .map(|p| p.to_ascii_lowercase())
             .filter(|p| p == "https" || p == "http");
-        info.forwarded_host = text(&FORWARDED_HOST)
-            .map(|h| h.trim().to_ascii_lowercase())
+        info.forwarded_host = last_value(headers, &FORWARDED_HOST)
+            .map(|h| h.to_ascii_lowercase())
             .filter(|h| {
                 (1..=253).contains(&h.len())
                     && h.bytes()
@@ -472,6 +506,44 @@ mod tests {
         ] {
             assert!(TraceContext::parse(bad).is_none(), "{bad}");
         }
+    }
+    #[test]
+    fn forwarded_for_uses_every_header_line_and_stops_at_garbage() {
+        let trusted: Vec<Cidr> = vec!["10.0.0.0/8".parse().unwrap()];
+        let peer = Some("10.0.0.2".parse().unwrap());
+        let headers = |lines: &[&str]| {
+            let mut map = axum::http::HeaderMap::new();
+            for line in lines {
+                map.append(FORWARDED_FOR, HeaderValue::from_str(line).unwrap());
+            }
+            map
+        };
+        let client = |lines: &[&str]| {
+            forwarded_client(&headers(lines), peer, &trusted).map(|ip| ip.to_string())
+        };
+        // The client's own line comes first; the trusted proxy appends.
+        assert_eq!(
+            client(&["6.6.6.6", "203.0.113.7"]).as_deref(),
+            Some("203.0.113.7")
+        );
+        assert_eq!(
+            client(&["6.6.6.6, 203.0.113.7, 10.1.1.1"]).as_deref(),
+            Some("203.0.113.7")
+        );
+        // Garbage ends the trusted chain instead of being skipped.
+        assert_eq!(
+            client(&["6.6.6.6, garbage, 10.1.1.1"]).as_deref(),
+            Some("10.1.1.1")
+        );
+        assert_eq!(client(&["garbage"]).as_deref(), Some("10.0.0.2"));
+        assert_eq!(client(&[]).as_deref(), Some("10.0.0.2"));
+        assert_eq!(client(&["10.3.3.3, 10.1.1.1"]).as_deref(), Some("10.3.3.3"));
+        let long = vec!["203.0.113.7"; 400].join(",");
+        assert_eq!(client(&[&long]).as_deref(), Some("10.0.0.2"));
+        let mut map = headers(&[]);
+        map.append(FORWARDED_PROTO, HeaderValue::from_static("http"));
+        map.append(FORWARDED_PROTO, HeaderValue::from_static("http, https"));
+        assert_eq!(last_value(&map, &FORWARDED_PROTO).as_deref(), Some("https"));
     }
     #[test]
     fn statuses_follow_codes_then_classification() {

@@ -124,9 +124,13 @@ pub async fn run(
         };
     // Without the identity block, only a private loopback listener keeps the
     // explicit allow-all policy and the unauthenticated raw runtime
-    // endpoints. A public listener denies application messages and does not
-    // mount the raw runtime at all.
-    let private = !config.http.public && config.http.listen.ip().is_loopback();
+    // endpoints. A public listener denies application messages and
+    // projection administration and does not mount the raw runtime at all.
+    // A trusted proxy means requests arrive from elsewhere even on a
+    // loopback listener, so it counts as public too.
+    let private = !config.http.public
+        && config.http.listen.ip().is_loopback()
+        && config.http.trusted_proxies.is_empty();
     let authorizer: Arc<dyn Authorizer> = match LoopbackAllowAll::new(config.http.listen) {
         Ok(allow) if private => Arc::new(allow),
         _ => Arc::new(DenyAll),
@@ -148,9 +152,14 @@ pub async fn run(
         None => None,
     };
     let routes = match (private, application) {
-        (true, Some(application)) => crate::app_with_application(runtime, application),
+        (true, Some(application)) => crate::app(runtime).merge(crate::application_http::router(
+            application,
+            Some(authorizer.clone()),
+        )),
         (true, None) => crate::app(runtime),
-        (false, Some(application)) => crate::application_http::router(application),
+        (false, Some(application)) => {
+            crate::application_http::router(application, Some(authorizer.clone()))
+        }
         (false, None) => axum::Router::new(),
     };
     tracing::info!(

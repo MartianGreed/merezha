@@ -71,11 +71,16 @@ the process exits 0. A serving failure exits 1.
 | `/health`, `/v1/services/...`, `/v1/pipelines/...`, `/v1/reload` | raw runtime | the listener is private |
 
 Without the identity block there is no authentication. A listener is private
-when `http.public` is false and `http.listen` is a loopback address. A private
-listener keeps the explicit allow-all policy and the raw runtime endpoints, as
-`serve` does. A public listener gets the deny-all policy, so every application
-command and query fails `403 unauthorized`, and the raw runtime endpoints are
-not mounted. A deployment exposes nothing unauthenticated by accident.
+when `http.public` is false, `http.listen` is a loopback address and
+`http.trusted_proxies` is empty; a trusted proxy means requests arrive from
+elsewhere even on loopback. A private listener keeps the explicit allow-all
+policy and the raw runtime endpoints, as `serve` does. Any other listener gets
+the deny-all policy, and the raw runtime endpoints are not mounted. Every
+application command, query, projection catch-up and rebuild then fails
+`403 unauthorized`. Catch-up and rebuild are checked through the policy as
+the permissions `application.projections.catch_up` and
+`application.projections.rebuild` at global scope. A deployment exposes
+nothing unauthenticated by accident.
 
 ## Configuration reference
 
@@ -142,11 +147,15 @@ headers are `content-type`, `authorization`, `x-request-id` and
 | `acquire_timeout_ms` | integer | `2000` | no | 10 to 60000; wait for a pooled connection |
 | `statement_timeout_ms` | integer | `5000` | no | 10 to 300000; session default and ceiling for transactions |
 | `migrate` | boolean | `false` | no | apply pending migrations at startup instead of verifying |
-| `tls` | `disable` or `require` | `disable` | no | `require` verifies the chain and host name |
+| `tls` | `disable` or `require` | `disable` | no | `require` verifies the chain and host name; decides over the URL's `sslmode` |
 | `tls_ca_file` | path | none | no | extra PEM roots, at most 1 MiB; only with `tls = "require"` |
 
 With TLS the platform trust store is used through `rustls-platform-verifier`,
-plus `tls_ca_file` when set. There is no mode that skips verification.
+plus `tls_ca_file` when set. There is no mode that skips verification. A URL
+`sslmode=require` with `tls = "disable"` fails `sslmode_requires_tls` rather
+than connecting in plaintext, and `sslmode=disable` with `tls = "require"`
+fails `sslmode_conflicts_with_tls`. `sslmode=prefer` follows `tls`. The URL's
+`options` are kept; the kernel appends its `statement_timeout` to them.
 
 ### `[runtime]`
 
@@ -186,7 +195,7 @@ secrets with the kernel rules.
 `invalid_path`, `missing_required`, `invalid_app_id`, `invalid_name`,
 `invalid_address`, `public_listen_not_enabled`, `invalid_cidr`,
 `invalid_origin`, `invalid_wildcard_origin`, `invalid_database_url`,
-`tls_ca_without_tls`, `secret_literal`, `secret_on_command_line`,
+`sslmode_requires_tls`, `sslmode_conflicts_with_tls`, `tls_ca_without_tls`, `secret_literal`, `secret_on_command_line`,
 `secret_unavailable`, `secret_too_large`, `invalid_secret_reference`,
 `invalid_module_name`, `unknown_module`, `invalid_module_registration`.
 
@@ -195,9 +204,12 @@ secrets with the kernel rules.
 `edge::apply` wraps the composed router. For every request it:
 
 - takes the client address from the socket, or from `X-Forwarded-For` when
-  the peer is in `http.trusted_proxies` (the rightmost hop that is not a
-  trusted proxy). `X-Forwarded-Proto` and `X-Forwarded-Host` are honoured
-  only from trusted peers. All `X-Forwarded-*` and `Forwarded` headers are
+  the peer is in `http.trusted_proxies`. Every header line is read, joined in
+  order, and walked from the right: trusted hops are skipped and the first
+  untrusted hop is the client. An unparseable hop ends the walk at the last
+  trusted hop, and a chain over 4 KiB is ignored. `X-Forwarded-Proto` and
+  `X-Forwarded-Host` are honoured only from trusted peers, using the last
+  value. All `X-Forwarded-*` and `Forwarded` headers are
   removed before handlers run; handlers read `ClientInfo`.
 - accepts `X-Request-Id` only from a trusted proxy (1 to 128 bytes of
   `[A-Za-z0-9._:/-]`), otherwise generates 128 random bits, and returns it in
@@ -205,7 +217,8 @@ secrets with the kernel rules.
 - continues a valid W3C `traceparent` with a new span id or starts a new
   trace. Handlers read `TraceContext`; `OutboundHttp::send` propagates it.
 - refuses bodies over `http.body_limit`: a larger `Content-Length` fails at
-  once and an undeclared body fails while it is read.
+  once and an undeclared body fails while it is read. The same limit replaces
+  the 2 MiB default of axum's `Bytes` and `Json` extractors.
 - applies CORS and the optional `Authenticator`.
 - logs one `http.request` event with method, matched route, status, duration,
   request id and trace id. It never logs paths, query strings, headers or
@@ -342,7 +355,9 @@ first failed use.
   serialize and the lock dies with the session. The wait is bounded by the
   deadline (`migration_lock_timeout`, `migration_timeout`);
 - creates `merezha.migrations (module, version, name, checksum, applied_at)`
-  when missing. Verify mode never creates it;
+  when missing. Verify mode never creates it and reads in one read-only
+  transaction on a pooled session, so repeated readiness probes open no new
+  connections;
 - refuses before applying anything when an applied version is not declared
   (`unknown_applied_migration`), its SHA-256 checksum or name differs
   (`migration_checksum_mismatch`, `migration_name_mismatch`), or a pending
@@ -385,15 +400,18 @@ keeps its data.
 
 ### Throwaway server
 
-With the Homebrew PostgreSQL 17 binaries and no Contremaitre:
+With the Homebrew PostgreSQL 17 binaries and no Contremaitre. The
+`postgresql@17` formula is keg-only, so its binaries are not on `PATH`; with
+another installation set `pg` to the directory holding `initdb` and `pg_ctl`.
 
 ```sh
+pg=$(brew --prefix postgresql@17)/bin
 dir=$(mktemp -d)
-LC_ALL=C initdb -D "$dir/data" -U postgres -A trust --no-locale -E UTF8 >/dev/null
-LC_ALL=C pg_ctl -D "$dir/data" -l "$dir/log" -o "-p 54329 -k $dir -c listen_addresses=127.0.0.1" -w start
+LC_ALL=C "$pg/initdb" -D "$dir/data" -U postgres -A trust --no-locale -E UTF8 >/dev/null
+LC_ALL=C "$pg/pg_ctl" -D "$dir/data" -l "$dir/log" -o "-p 54329 -k $dir -c listen_addresses=127.0.0.1" -w start
 export MEREZHA_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:54329/postgres
 cargo test --locked --workspace
-pg_ctl -D "$dir/data" -m fast stop && rm -rf "$dir"
+"$pg/pg_ctl" -D "$dir/data" -m fast stop && rm -rf "$dir"
 ```
 
 Trust authentication is acceptable only for a disposable loopback server.

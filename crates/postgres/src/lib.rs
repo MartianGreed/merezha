@@ -107,8 +107,20 @@ impl DatabaseConfig {
     /// Every violated rule as `(setting, code)`, empty when valid.
     pub fn validate(&self) -> Vec<(&'static str, &'static str)> {
         let mut issues = Vec::new();
-        if tokio_postgres::Config::from_str(self.url.expose()).is_err() {
-            issues.push(("url", "invalid_database_url"));
+        match tokio_postgres::Config::from_str(self.url.expose()) {
+            Err(_) => issues.push(("url", "invalid_database_url")),
+            // `tls` decides transport security. A URL asking for more than
+            // `tls` grants would otherwise be silently downgraded to
+            // plaintext, and one refusing TLS contradicts `tls = "require"`.
+            Ok(url) => match (self.tls, url.get_ssl_mode()) {
+                (TlsMode::Disable, tokio_postgres::config::SslMode::Require) => {
+                    issues.push(("url", "sslmode_requires_tls"));
+                }
+                (TlsMode::Require, tokio_postgres::config::SslMode::Disable) => {
+                    issues.push(("url", "sslmode_conflicts_with_tls"));
+                }
+                _ => {}
+            },
         }
         let (min, max) = limits::POOL_SIZE;
         if !(min..=max).contains(&self.pool_size) {
@@ -177,12 +189,19 @@ impl Database {
         }
         let mut pg = tokio_postgres::Config::from_str(config.url.expose())
             .map_err(|_| Failure::permanent("invalid_database_config"))?;
+        // Append to the URL's own `options` (search_path and the like); the
+        // later setting wins, so the configured statement timeout applies.
+        let timeout = format!(
+            "-c statement_timeout={}",
+            config.statement_timeout.as_millis()
+        );
+        let options = match pg.get_options() {
+            Some(existing) if !existing.trim().is_empty() => format!("{existing} {timeout}"),
+            _ => timeout,
+        };
         pg.connect_timeout(config.connect_timeout)
             .application_name("merezha")
-            .options(format!(
-                "-c statement_timeout={}",
-                config.statement_timeout.as_millis()
-            ))
+            .options(options)
             .keepalives(true);
         let manager_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
@@ -388,6 +407,27 @@ mod tests {
             Database::connect(&config).unwrap_err().code,
             "invalid_database_config"
         );
+    }
+    #[test]
+    fn url_sslmode_must_agree_with_tls() {
+        let mut config = DatabaseConfig::new(Secret::new("postgres://db/app?sslmode=require"));
+        assert_eq!(config.validate(), vec![("url", "sslmode_requires_tls")]);
+        assert_eq!(
+            Database::connect(&config).unwrap_err().code,
+            "invalid_database_config"
+        );
+        config.tls = TlsMode::Require;
+        assert!(config.validate().is_empty());
+        config.url = Secret::new("postgres://db/app?sslmode=disable");
+        assert_eq!(
+            config.validate(),
+            vec![("url", "sslmode_conflicts_with_tls")]
+        );
+        config.tls = TlsMode::Disable;
+        assert!(config.validate().is_empty());
+        // `prefer`, libpq's default, follows `tls`.
+        config.url = Secret::new("postgres://db/app?sslmode=prefer");
+        assert!(config.validate().is_empty());
     }
     #[test]
     fn statement_budget_is_capped_and_refuses_expired_deadlines() {
