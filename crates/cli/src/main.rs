@@ -42,6 +42,9 @@ fn arguments() -> anyhow::Result<(PathBuf, Option<PathBuf>, SocketAddr)> {
 }
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("run") {
+        return merezha_cli::run::main(std::env::args().skip(2)).await;
+    }
     let (manifest, application, address) = match arguments() {
         Ok(args) => args,
         Err(_) => {
@@ -62,35 +65,10 @@ async fn main() -> std::process::ExitCode {
         };
     let router = if let Some(path) = application {
         let guest = runtime.clone();
-        match tokio::task::spawn_blocking(move || -> Result<_, merezha_domain::Failure> {
-            use std::io::Read;
-            if !std::fs::metadata(&path)
-                .map_err(|_| merezha_domain::Failure::permanent("invalid_application_config"))?
-                .is_file()
-            {
-                return Err(merezha_domain::Failure::permanent(
-                    "invalid_application_config",
-                ));
-            }
-            let file = std::fs::File::open(path)
-                .map_err(|_| merezha_domain::Failure::permanent("invalid_application_config"))?;
-            if !file
-                .metadata()
-                .map_err(|_| merezha_domain::Failure::permanent("invalid_application_config"))?
-                .is_file()
-            {
-                return Err(merezha_domain::Failure::permanent(
-                    "invalid_application_config",
-                ));
-            }
-            let mut text = String::new();
-            file.take(65_537)
-                .read_to_string(&mut text)
-                .map_err(|_| merezha_domain::Failure::permanent("invalid_application_config"))?;
-            let config = merezha_application::config::Config::parse(&text)?;
-            merezha_application::Application::open(
-                config,
-                std::sync::Arc::new(guest),
+        match tokio::task::spawn_blocking(move || {
+            merezha_cli::open_application(
+                &path,
+                guest,
                 std::sync::Arc::new(merezha_application::AllowAll),
             )
         })

@@ -40,9 +40,10 @@ budgets. Replace artifact files and manifests atomically before requesting reloa
 
 The listener is restricted to loopback for trusted local use. Local processes
 can invoke services and reload the catalog. Guest limits do not cap native
-compiler memory or provide an OS sandbox. PostgreSQL and developer tools remain
-external. See [runtime decisions and limitations](docs/architecture/runtime.md)
-and [research coverage](docs/architecture/research-coverage.md).
+compiler memory or provide an OS sandbox. `serve` uses no PostgreSQL; see
+[Platform host](#platform-host) for `run`. See
+[runtime decisions and limitations](docs/architecture/runtime.md) and
+[research coverage](docs/architecture/research-coverage.md).
 
 Required host checks:
 
@@ -71,6 +72,26 @@ on `127.0.0.1:8787`; the [task board guide](docs/services/README.md#local-task-b
 shows the `task-board` client commands. See the
 [Structure parity map](docs/architecture/structure-parity.md)
 for the bounded subset and deferred capabilities.
+
+## Platform host
+
+`merezha run --config merezha.toml` is the PostgreSQL-backed host for
+framework projects. One file declares the app, HTTP edge, database, runtime
+manifest, optional application and modules. It opens a bounded pool,
+applies or verifies module migrations, serves `/health/live` and
+`/health/ready`, and mounts the runtime and application routes behind an edge
+that handles request ids, trace context, trusted proxies, CORS, body limits
+and one error shape. It stops gracefully on SIGINT or SIGTERM.
+
+```sh
+cargo run --locked -p merezha-cli -- run --config merezha.toml
+```
+
+PostgreSQL tests run when `MEREZHA_TEST_DATABASE_URL` points to a server
+where the role can create databases; otherwise they print a skip message.
+`.contremaitre.yaml` provides a local PostgreSQL 17. The
+[platform guide](docs/architecture/platform.md) has the full configuration
+reference, the module and port contracts, and both local database setups.
 
 ## License
 

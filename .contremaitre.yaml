@@ -1,0 +1,9 @@
+# Local development stack for Merezha: a managed PostgreSQL 17 server for
+# `merezha run` and the PostgreSQL test suites. The host itself runs on the
+# developer's machine with cargo; see docs/architecture/platform.md.
+version: 1
+project: merezha
+services:
+  postgres:
+    kind: postgres
+    memory: 512M

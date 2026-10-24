@@ -7,11 +7,40 @@ on:
 permissions:
   contents: read
 jobs:
-  cargo:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  # Linux runs every test, including the PostgreSQL suites, against a service
+  # container. MEREZHA_TEST_REQUIRE_DATABASE turns a missing database into a
+  # failure instead of a skip.
+  linux:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      MEREZHA_TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+      MEREZHA_TEST_REQUIRE_DATABASE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install Rust 1.98.0
+        run: rustup toolchain install 1.98.0 --profile minimal --component clippy --component rustfmt
+      - run: cargo +1.98.0 fmt --all --check
+      - run: cargo +1.98.0 check --locked --workspace
+      - run: cargo +1.98.0 clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo +1.98.0 test --locked --workspace
+      - run: cargo +1.98.0 test --locked --workspace --doc
+      - run: cargo +1.98.0 doc --locked --workspace --no-deps
+      - run: cargo +1.98.0 build --locked --workspace
+  # GitHub's macOS runners cannot start service containers. The PostgreSQL
+  # tests print their skip message here; Linux covers them.
+  macos:
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust 1.98.0
