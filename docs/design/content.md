@@ -1060,10 +1060,22 @@ built:
 - A by-slug lookup orders candidates by their source locale's place in
   the chain, which starts with the locale itself, so an own slug wins.
 - The ETag hashes the route, the type, the scope, the sorted query pairs
-  and an access class: `anonymous`, or the set of types the principal
-  reads on that path. The generations are read first in the read's
-  transaction, so the content is never older than its tag. Another
-  scope's generation never enters a tag.
+  and an access class: whether a principal asked, and the set of types
+  the caller reads on that path (anonymous callers too, since a policy
+  may grant them a permission type). On an organization's path a type
+  that can reference entries also carries the application generation,
+  populated or not, because the `missing` checks read application rows.
+  The generations are read first in the read's transaction, so the
+  content is never older than its tag. No other scope's generation
+  enters a tag.
+- `delivery.cache_control_public` applies only without a principal, to a
+  `public` type whose reachable reference targets the caller reads are
+  all `public`; it is decided before reading, so a 304 and a 200 agree.
+- `limits.max_response_bytes` (16 MiB by default, 64 KiB to 256 MiB)
+  bounds a delivery body and a populated management read; past it the
+  request fails `response_too_large` (400). Without it the bound would be
+  `max_page_size` × `max_entry_bytes` plus `max_populated_entries` ×
+  `max_entry_bytes`, gigabytes at the ceilings.
 - The delivery model endpoint keeps the types the caller reads (on an
   organization's path its organization types and the application types),
   the components they embed and only reference targets among them; the

@@ -807,10 +807,14 @@ async fn a_publish_changes_the_etag_and_an_unchanged_scope_answers_304_from_gene
         .await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.body["items"].as_array().unwrap().len(), 2);
-    // The caller's access class is part of the tag.
+    // The caller's access class is part of the tag: being a principal,
+    // and the set of types it reads.
     let anonymous = read(&fx, &uri, None).await.etag();
     let principal = read(&fx, &uri, Some("nobody")).await.etag();
+    let reader = read(&fx, &uri, Some("delivery_reader")).await.etag();
     assert_ne!(anonymous, principal);
+    assert_ne!(principal, reader);
+    assert_eq!(read(&fx, &uri, Some("editor")).await.etag(), principal);
 }
 
 #[tokio::test]
@@ -1264,4 +1268,156 @@ async fn management_draft_reads_populate_drafts_of_the_types_the_caller_reads() 
         .await;
         assert_eq!(reply.code(), "invalid_query", "{query}");
     }
+}
+
+#[tokio::test]
+async fn by_slug_and_singleton_reads_never_serve_another_scopes_row() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let fx = start(&test, "", DELIVERY_MODEL).await;
+    let article = seed_row(
+        &fx.db,
+        "org:acme",
+        "article",
+        r#"{"title": "Org", "slug": "org-only"}"#,
+    )
+    .await;
+    let settings = seed_row(
+        &fx.db,
+        "org:acme",
+        "settings",
+        r#"{"site_name": "Org site"}"#,
+    )
+    .await;
+    execute(
+        &fx.db,
+        &format!(
+            "UPDATE merezha_content.entries SET singleton = true WHERE id = '{settings}';
+             UPDATE merezha_content.variants SET draft_slug = 'org-only' WHERE entry_id = '{article}';
+             INSERT INTO merezha_content.published
+               (entry_id, locale, source_locale, scope, content_type, revision, slug, data,
+                published_at, first_published_at)
+             VALUES ('{article}', 'en', 'en', 'org:acme', 'article', 1, 'org-only',
+                     '{{\"title\": \"Org\", \"slug\": \"org-only\"}}', now(), now()),
+                    ('{settings}', 'en', 'en', 'org:acme', 'settings', 1, NULL,
+                     '{{\"site_name\": \"Org site\"}}', now(), now())"
+        ),
+    )
+    .await;
+    for uri in [
+        "/v1/content/article/by-slug/org-only",
+        "/v1/content/article/by-slug/org-only?stage=draft",
+        "/v1/content/settings",
+        "/v1/content/settings?stage=draft",
+    ] {
+        let reply = read(&fx, uri, Some("previewer")).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::NOT_FOUND,
+            "{uri}: {:?}",
+            reply.body
+        );
+        assert_eq!(reply.code(), "entry_not_found", "{uri}");
+        assert!(!reply.text.contains("Org"), "{uri}");
+    }
+    let list = read(&fx, "/v1/content/article?stage=draft", Some("previewer")).await;
+    assert_eq!(list.body["items"], json!([]));
+}
+
+#[tokio::test]
+async fn trashed_targets_are_missing_in_both_stages() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let fx = start(&test, "", DELIVERY_MODEL).await;
+    // Trashed through the API, then two halves of "live" set by hand: an
+    // entry trashed with a live variant, a deleted variant of a live entry.
+    let trashed = published(&fx, "author", json!({"name": "Trashed"})).await;
+    let entry_only = published(&fx, "author", json!({"name": "EntryOnly"})).await;
+    let variant_only = published(&fx, "author", json!({"name": "VariantOnly"})).await;
+    let mut articles = Vec::new();
+    for (n, author) in [&trashed, &entry_only, &variant_only]
+        .into_iter()
+        .enumerate()
+    {
+        articles.push(
+            published(
+                &fx,
+                "article",
+                json!({"title": format!("By {n}"), "author": author_ref(author)}),
+            )
+            .await,
+        );
+    }
+    let reply = fx
+        .call(
+            axum::http::Method::DELETE,
+            &format!("/v1/content/manage/entries/author/{trashed}"),
+        )
+        .by(Some("admin"))
+        .send()
+        .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT, "{:?}", reply.body);
+    execute(
+        &fx.db,
+        &format!(
+            "UPDATE merezha_content.entries SET deleted_at = now(), deleted_by = 'sys_test'
+              WHERE id = '{entry_only}';
+             UPDATE merezha_content.variants SET deleted = true WHERE entry_id = '{variant_only}'"
+        ),
+    )
+    .await;
+    for (index, article) in articles.iter().enumerate() {
+        for (query, who, stages) in [
+            ("populate=author", None, "published"),
+            ("", None, "published"),
+            ("populate=author&stage=draft", Some("previewer"), "draft"),
+            ("stage=draft", Some("previewer"), "draft"),
+        ] {
+            // The published rows of the hand-edited authors are still in
+            // place: only the trashed one is gone from delivery.
+            if stages == "published" && index > 0 {
+                continue;
+            }
+            let reply = read(&fx, &format!("/v1/content/article/{article}?{query}"), who).await;
+            assert_eq!(reply.status, StatusCode::OK, "{index} {query}");
+            let author = &reply.body["fields"]["author"];
+            assert_eq!(author["missing"], true, "{index} {query}: {author}");
+            assert!(author.get("entry").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_response_past_its_byte_bound_fails_rather_than_grows() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let fx = start(
+        &test,
+        "limits = { max_response_bytes = 65536 }",
+        DELIVERY_MODEL,
+    )
+    .await;
+    let text = "x".repeat(4000);
+    for n in 0..20 {
+        published(
+            &fx,
+            "article",
+            json!({"title": format!("Long {n}"), "body": [{
+                "_type": "block", "_key": "b1", "style": "normal", "markDefs": [],
+                "children": [{"_type": "span", "_key": "s1", "text": text, "marks": []}]
+            }]}),
+        )
+        .await;
+    }
+    let reply = read(&fx, "/v1/content/article?limit=20", None).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.code(), "response_too_large");
+    let reply = read(&fx, "/v1/content/article?limit=5", None).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["items"].as_array().unwrap().len(), 5);
+    let reply = read(&fx, "/v1/content/article?limit=20&fields=title", None).await;
+    assert_eq!(reply.status, StatusCode::OK);
 }

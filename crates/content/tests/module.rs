@@ -239,7 +239,7 @@ fn population_limits_and_delivery_cache_headers_are_validated_with_every_problem
         dir.path(),
         false,
         "[modules.content]\n\
-         limits = { max_populate_depth = 4, max_populated_entries = 0 }\n\
+         limits = { max_populate_depth = 4, max_populated_entries = 0, max_response_bytes = 1024 }\n\
          delivery = { cache_control_public = \"public\\nx\", cache_control_private = 3, \
                       public_base_url = \"https://example.com\" }\n",
         &[("content.toml", V1)],
@@ -268,6 +268,7 @@ fn population_limits_and_delivery_cache_headers_are_validated_with_every_problem
                 "modules.content.limits.max_populated_entries",
                 "out_of_range"
             ),
+            ("modules.content.limits.max_response_bytes", "out_of_range"),
         ]
     );
     for long in [" public", &"x".repeat(257)] {
@@ -303,6 +304,7 @@ fn population_limits_and_delivery_cache_headers_are_validated_with_every_problem
     let defaults = merezha_content::ContentSettings::default();
     assert_eq!(defaults.limits.max_populate_depth, 2);
     assert_eq!(defaults.limits.max_populated_entries, 500);
+    assert_eq!(defaults.limits.max_response_bytes, 16_777_216);
     assert_eq!(
         defaults.delivery.cache_control_public,
         "public, max-age=60, stale-while-revalidate=300"
@@ -332,6 +334,7 @@ fn content_errors_register_with_the_kernel_codes() {
         ("index_build_failed", 422),
         ("validation_failed", 422),
         ("populate_limit", 400),
+        ("response_too_large", 400),
         ("content_type_not_found", 404),
     ] {
         assert_eq!(

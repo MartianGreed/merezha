@@ -1809,7 +1809,8 @@ model = "content.toml"     # the default
 limits = { max_request_bytes = 1048576, max_entry_bytes = 262144,
            default_page_size = 25, max_page_size = 100, max_filters = 10,
            max_sort_keys = 2, max_batch = 100, query_timeout = "5s",
-           max_populate_depth = 2, max_populated_entries = 500 }   # the defaults
+           max_populate_depth = 2, max_populated_entries = 500,
+           max_response_bytes = 16777216 }   # the defaults
 revisions = { retain = 100 }                           # the default
 trash = { retention = "30d", purge_cron = "23 3 * * *" }   # the defaults
 delivery = { cache_control_public = "public, max-age=60, stale-while-revalidate=300",
@@ -1831,6 +1832,7 @@ delivery = { cache_control_public = "public, max-age=60, stale-while-revalidate=
 | `trash.purge_cron` | `"23 3 * * *"` | AP's cron parser, five fields | When `content.trash_purge` runs, in UTC (`invalid_cron`). |
 | `limits.max_populate_depth` | 2 | 0 to 3 | Segments of one `populate` path (`invalid_query`, detail `/populate` `too_deep`); 0 turns population off. |
 | `limits.max_populated_entries` | 500 | 1 to 2000 | Populated references in one response; past it the request fails `populate_limit` (400) rather than truncating. |
+| `limits.max_response_bytes` | 16777216 | 65536 to 268435456 | Largest delivery body, and largest populated management read; past it the request fails `response_too_large` (400): ask for a smaller `limit`, fewer `fields` or less `populate`. |
 | `delivery.cache_control_public` | `"public, max-age=60, stale-while-revalidate=300"` | visible ASCII, 1 to 256 bytes, no edge spaces | `Cache-Control` of a published read of an `access = "public"` type without a principal (`invalid_value`). |
 | `delivery.cache_control_private` | `"private, no-cache"` | as above | `Cache-Control` of every other published read. |
 
@@ -2135,17 +2137,21 @@ last) for a draft never published.
 Published responses carry `ETag: W/"<8 hex of the model fingerprint>-<the
 scope's generation>-<16 hex of SHA-256 of the route, the sorted query and
 the caller's access class>"` (an organization response that populates
-also carries the application generation). The access class is
-`anonymous`, or the set of types the principal reads. A matching
+on an organization's path also carries the application generation
+whenever the type can reference entries, since population and the
+`missing` checks read application rows). The access class is whether a
+principal asked plus the set of types the caller reads there. A matching
 `If-None-Match` answers 304 after reading only
 `merezha_content.generations`; otherwise the generations are read first
 and the entries after, in the same transaction. `Cache-Control` is
-`delivery.cache_control_public` for a `public` type read without a
-principal and `delivery.cache_control_private` otherwise; every delivery
+`delivery.cache_control_public` only when there is no principal, the
+type is `public`, and every type reachable through its references that
+the caller reads is `public` too (a policy may let anonymous callers read
+a permission type); `delivery.cache_control_private` otherwise; every delivery
 response, errors included, has `Vary: Authorization, Cookie`, and errors
 are `private, no-store`.
 
-Code added by C5: `populate_limit` (400). Delivery's statements are
+Codes added by C5: `populate_limit`, `response_too_large` (400). Delivery's statements are
 registered (`merezha_content::STATEMENTS`: `content.delivery.*`,
 `content.preview.*`, `content.populate.*`).
 

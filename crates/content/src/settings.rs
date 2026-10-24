@@ -34,6 +34,9 @@ pub struct Limits {
     /// Most populated references in one response, 1 to 2000; past it the
     /// request fails `populate_limit`.
     pub max_populated_entries: u32,
+    /// Largest delivery or populated management response body, 65536 to
+    /// 268435456 bytes; past it the request fails `response_too_large`.
+    pub max_response_bytes: usize,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -48,6 +51,7 @@ impl Default for Limits {
             query_timeout: Duration::from_secs(5),
             max_populate_depth: 2,
             max_populated_entries: 500,
+            max_response_bytes: 16_777_216,
         }
     }
 }
@@ -126,7 +130,7 @@ impl Default for ContentSettings {
 pub(crate) const KEYS: [&str; 5] = ["model", "limits", "revisions", "trash", "delivery"];
 const TRASH_KEYS: [&str; 2] = ["retention", "purge_cron"];
 const DELIVERY_KEYS: [&str; 2] = ["cache_control_public", "cache_control_private"];
-const LIMIT_KEYS: [&str; 10] = [
+const LIMIT_KEYS: [&str; 11] = [
     "max_request_bytes",
     "max_entry_bytes",
     "default_page_size",
@@ -137,6 +141,7 @@ const LIMIT_KEYS: [&str; 10] = [
     "query_timeout",
     "max_populate_depth",
     "max_populated_entries",
+    "max_response_bytes",
 ];
 const REVISION_KEYS: [&str; 1] = ["retain"];
 
@@ -195,6 +200,12 @@ impl ContentSettings {
                 1,
                 2000,
             ) as u32;
+            limits.max_response_bytes = int(
+                "max_response_bytes",
+                defaults.max_response_bytes as u64,
+                65_536,
+                268_435_456,
+            ) as usize;
             if let Some(value) = table.get("query_timeout") {
                 let key = format!("{}.query_timeout", section.key("limits"));
                 match value.as_str().and_then(parse_duration) {

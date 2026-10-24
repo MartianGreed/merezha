@@ -14,7 +14,10 @@ use crate::{
     http::{RESOURCE_KIND, entry_id, error_response, page_json, principal, selection},
     json::{optional, string},
     model::{Access, ContentModel, ContentType, Kind, Scope},
-    populate::{Doc, Expanded, Paths, Population, Read, parse_paths},
+    populate::{
+        Doc, Expanded, Paths, Population, RESPONSE_TOO_LARGE, Read, parse_paths, reachable_types,
+        referenced_types,
+    },
     publish::{chain, locale_chain},
     query::{self, Built, Params, Source, Split, detail, encode_cursor, hex16, type_literal},
     statements,
@@ -240,6 +243,55 @@ fn readable(
         .collect()
 }
 
+/// The access class an ETag hashes: whether a principal asked, and the
+/// types it reads on this path (an anonymous caller included: a policy
+/// may grant anonymous reads of a permission type).
+fn access_class(principal: bool, readable: &BTreeMap<String, String>) -> String {
+    format!(
+        "{}\u{1f}{}",
+        if principal { "principal" } else { "anonymous" },
+        readable.keys().cloned().collect::<Vec<_>>().join(",")
+    )
+}
+
+/// The scopes whose generations a published read of `content_type` in
+/// `scope` depends on: its own, and on an organization's path the
+/// application scope too whenever the type can reference entries, since
+/// populated entries and the `missing` checks read application rows.
+pub(crate) fn tag_scopes(
+    model: &ContentModel,
+    content_type: &ContentType,
+    scope: &str,
+) -> Vec<String> {
+    let mut scopes = vec![scope.to_owned()];
+    if scope != "app" && !referenced_types(model, content_type).is_empty() {
+        scopes.push("app".to_owned());
+    }
+    scopes
+}
+
+/// Whether a published read may carry `delivery.cache_control_public`:
+/// no principal, and every type the response could show (the root and
+/// every type reachable through its references that the caller reads) is
+/// `public`. Decided before reading, so a 304 and a 200 agree.
+pub(crate) fn public_cache(
+    model: &ContentModel,
+    content_type: &ContentType,
+    principal: bool,
+    readable: &BTreeMap<String, String>,
+) -> bool {
+    !principal
+        && content_type.access == Access::Public
+        && reachable_types(model, content_type)
+            .iter()
+            .filter(|t| readable.contains_key(*t))
+            .all(|t| {
+                model
+                    .content_type(t)
+                    .is_some_and(|t| t.access == Access::Public)
+            })
+}
+
 /// The validated options of a delivery read.
 #[derive(Debug)]
 struct Plan {
@@ -344,18 +396,13 @@ impl Delivery {
             fallback: plan.fallback,
             readable: readable.clone(),
             max_entries: limits.max_populated_entries as usize,
+            max_bytes: limits.max_response_bytes,
             mark_all: true,
         };
         // The ETag of a published read, without its generations.
         let mut sorted = pairs.clone();
         sorted.sort();
-        let class = match principal {
-            None => "anonymous".to_owned(),
-            Some(_) => format!(
-                "principal\u{1f}{}",
-                readable.keys().cloned().collect::<Vec<_>>().join(",")
-            ),
-        };
+        let class = access_class(principal.is_some(), &readable);
         let canonical = format!(
             "{}\n{}\n{scope}\n{}\n{}\n{class}",
             content_type.name,
@@ -369,10 +416,7 @@ impl Delivery {
         );
         // An organization response that populates application entries
         // depends on both generations.
-        let mut generations = vec![scope.clone()];
-        if scope != "app" && !plan.paths.is_empty() {
-            generations.push("app".to_owned());
-        }
+        let generations = tag_scopes(&model, &content_type, &scope);
         let tag_base = TagBase {
             fingerprint: model.fingerprint()[..8].to_owned(),
             hash: hex16(&canonical),
@@ -393,7 +437,7 @@ impl Delivery {
             Read::Draft => PREVIEW_CACHE_CONTROL.to_owned(),
             Read::Published => {
                 let delivery = &self.store.state().settings().delivery;
-                if content_type.access == Access::Public && principal.is_none() {
+                if public_cache(&model, &content_type, principal.is_some(), &readable) {
                     delivery.cache_control_public.clone()
                 } else {
                     delivery.cache_control_private.clone()
@@ -420,9 +464,17 @@ impl Delivery {
                 limit,
                 etag,
             } => {
-                let items: Vec<String> = (0..expanded.roots.len())
-                    .map(|i| entry_json(&expanded, i, &content_type, &plan))
-                    .collect();
+                let max = self.store.state().settings().limits.max_response_bytes;
+                let mut items = Vec::with_capacity(expanded.roots.len());
+                let mut bytes = 0usize;
+                for index in 0..expanded.roots.len() {
+                    let item = entry_json(&expanded, index, &content_type, &plan);
+                    bytes = bytes.saturating_add(item.len() + 1);
+                    if bytes > max {
+                        return Err(Failure::permanent(RESPONSE_TOO_LARGE).into());
+                    }
+                    items.push(item);
+                }
                 let body = match limit {
                     Some(limit) => page_json(items, next, limit),
                     None => items.into_iter().next().ok_or_else(Rejection::not_found)?,
@@ -1055,6 +1107,7 @@ pub(crate) async fn populate_draft(
         fallback: true,
         readable,
         max_entries: limits.max_populated_entries as usize,
+        max_bytes: limits.max_response_bytes,
         mark_all: false,
     };
     let root = Doc {
@@ -1158,7 +1211,10 @@ fields = [{ name = "title", type = "string" }]
 [types.handbook]
 scope = "organization"
 access = { permission = "content.delivery.read" }
-fields = [{ name = "title", type = "string" }]
+fields = [{ name = "title", type = "string" }, { name = "page", type = "reference", to = ["page"] }]
+[types.digest]
+access = "public"
+fields = [{ name = "brief", type = "reference", to = ["partner_brief"] }]
 "#;
 
     fn model() -> ContentModel {
@@ -1343,7 +1399,7 @@ fields = [{ name = "title", type = "string" }]
     fn the_restricted_model_names_no_hidden_type() {
         let model = model();
         let anonymous = readable(&Policy, None, &model, None, Read::Published);
-        assert_eq!(anonymous.keys().collect::<Vec<_>>(), ["page"]);
+        assert_eq!(anonymous.keys().collect::<Vec<_>>(), ["digest", "page"]);
         let visible: BTreeSet<String> = ["page".to_owned(), "partner_brief".to_owned()].into();
         let json: Value = serde_json::from_str(&model_json(&model, Some(&visible))).unwrap();
         let types: Vec<&String> = json["types"].as_object().unwrap().keys().collect();
@@ -1353,6 +1409,48 @@ fields = [{ name = "title", type = "string" }]
         let json: Value = serde_json::from_str(&model_json(&model, Some(&only_page))).unwrap();
         assert!(!json.to_string().contains("partner_brief"));
         assert!(!json.to_string().contains("member_note"));
+    }
+
+    #[test]
+    fn organization_tags_carry_the_application_generation_when_entries_can_be_referenced() {
+        let model = model();
+        let tag =
+            |name: &str, scope: &str| tag_scopes(&model, model.content_type(name).unwrap(), scope);
+        // No reference field: the organization's generation alone.
+        assert_eq!(tag("help", "org:acme"), ["org:acme"]);
+        // A reference field reads application rows (population and the
+        // `missing` checks), with or without `populate`.
+        assert_eq!(tag("handbook", "org:acme"), ["org:acme", "app"]);
+        assert_eq!(tag("partner_brief", "app"), ["app"]);
+    }
+
+    #[test]
+    fn public_cache_control_needs_an_anonymous_caller_and_only_public_types() {
+        let model = model();
+        let page = model.content_type("page").unwrap();
+        let digest = model.content_type("digest").unwrap();
+        let brief = model.content_type("partner_brief").unwrap();
+        let anonymous = readable(&Policy, None, &model, None, Read::Published);
+        assert!(public_cache(&model, page, false, &anonymous));
+        assert!(!public_cache(&model, page, true, &anonymous));
+        assert!(!public_cache(&model, brief, false, &anonymous));
+        // A public type whose references reach a type the caller reads
+        // that is not public (a policy granting anonymous permission
+        // reads, as the loopback one does) is private.
+        assert!(public_cache(&model, digest, false, &anonymous));
+        let mut granted = anonymous.clone();
+        granted.insert("partner_brief".into(), "app".into());
+        assert!(!public_cache(&model, digest, false, &granted));
+    }
+
+    #[test]
+    fn the_access_class_holds_the_readable_types_for_every_caller() {
+        let one: BTreeMap<String, String> = [("page".to_owned(), "app".to_owned())].into();
+        let mut two = one.clone();
+        two.insert("note".into(), "app".into());
+        assert_ne!(access_class(false, &one), access_class(false, &two));
+        assert_ne!(access_class(true, &one), access_class(true, &two));
+        assert_ne!(access_class(false, &one), access_class(true, &one));
     }
 
     #[test]

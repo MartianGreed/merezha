@@ -28,6 +28,8 @@ use uuid::Uuid;
 pub const IDS_PER_STATEMENT: usize = 1000;
 /// The code past `limits.max_populated_entries`.
 pub const POPULATE_LIMIT: &str = "populate_limit";
+/// The code of a response past `limits.max_response_bytes`.
+pub const RESPONSE_TOO_LARGE: &str = "response_too_large";
 /// Deepest component nesting the reference walker follows; the model
 /// bounds nesting at 4.
 const MAX_WALK_DEPTH: usize = 8;
@@ -100,7 +102,11 @@ pub(crate) fn parse_paths(
 
 /// The types the entry references inside a value of `kind` may target,
 /// `None` when it holds none.
-fn ref_targets(model: &ContentModel, kind: &FieldKind, depth: usize) -> Option<BTreeSet<String>> {
+pub(crate) fn ref_targets(
+    model: &ContentModel,
+    kind: &FieldKind,
+    depth: usize,
+) -> Option<BTreeSet<String>> {
     if depth > MAX_WALK_DEPTH {
         return None;
     }
@@ -140,6 +146,40 @@ fn ref_targets(model: &ContentModel, kind: &FieldKind, depth: usize) -> Option<B
         }
         _ => None,
     }
+}
+
+/// The types the fields of `content_type` may reference directly.
+pub(crate) fn referenced_types(
+    model: &ContentModel,
+    content_type: &ContentType,
+) -> BTreeSet<String> {
+    content_type
+        .fields
+        .iter()
+        .filter_map(|f| ref_targets(model, &f.kind, 0))
+        .flatten()
+        .collect()
+}
+
+/// Every type a response rooted at `content_type` may show: the type,
+/// and the types reachable from it through references, transitively.
+pub(crate) fn reachable_types(
+    model: &ContentModel,
+    content_type: &ContentType,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::from([content_type.name.clone()]);
+    let mut pending = vec![content_type.name.clone()];
+    while let Some(name) = pending.pop() {
+        let Some(t) = model.content_type(&name) else {
+            continue;
+        };
+        for target in referenced_types(model, t) {
+            if out.insert(target.clone()) {
+                pending.push(target);
+            }
+        }
+    }
+    out
 }
 
 /// Call `visit` on every entry reference object inside `value`, a stored
@@ -309,6 +349,9 @@ pub(crate) struct Population {
     pub readable: BTreeMap<String, String>,
     /// `limits.max_populated_entries`.
     pub max_entries: usize,
+    /// `limits.max_response_bytes`: the rendered populated entries, and
+    /// the response they go into, fail `response_too_large` past it.
+    pub max_bytes: usize,
     /// Mark every reference whose target is not visible as `missing`
     /// (delivery); otherwise only those on populated paths (management).
     pub mark_all: bool,
@@ -448,6 +491,7 @@ impl Population {
         // Mark and link, children before parents: a child always comes
         // after its parent.
         let mut rendered: Vec<Option<String>> = vec![None; nodes.len()];
+        let mut rendered_bytes = 0usize;
         for index in (0..nodes.len()).rev() {
             let node = &mut nodes[index];
             let Some(content_type) = self.model.content_type(&node.doc.content_type) else {
@@ -476,6 +520,12 @@ impl Population {
             if index >= root_count {
                 let mut out = String::new();
                 write_populated(&node.doc, content_type, &self.locale, &rendered, &mut out);
+                // Each entry counts with the entries rendered inside it, an
+                // upper bound on what the response holds.
+                rendered_bytes = rendered_bytes.saturating_add(out.len());
+                if rendered_bytes > self.max_bytes {
+                    return Err(Failure::permanent(RESPONSE_TOO_LARGE).into());
+                }
                 rendered[index] = Some(out);
             }
         }

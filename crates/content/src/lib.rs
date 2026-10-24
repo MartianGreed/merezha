@@ -91,7 +91,7 @@ pub use parse::{
     CONTENT_PERMISSIONS, MAX_DESCRIPTION, MAX_MODEL_BYTES, MAX_PATTERN_BYTES, ModelOptions,
     PATTERN_SIZE_LIMIT, PermissionCatalog,
 };
-pub use populate::{IDS_PER_STATEMENT, POPULATE_LIMIT};
+pub use populate::{IDS_PER_STATEMENT, POPULATE_LIMIT, RESPONSE_TOO_LARGE};
 pub use publish::{Expect, Item, PUBLISHED, UNPUBLISHED};
 pub use query::{MAX_CURSOR_BYTES, MAX_FILTER_VALUES, MAX_QUERY_BYTES};
 pub use rebuild::{PendingRebuild, REBUILD_BATCH, REBUILD_JOB, pending_rebuild};
@@ -154,6 +154,7 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("entry_referenced", 409),
     ErrorCode::new("default_variant_required", 409),
     ErrorCode::new("populate_limit", 400),
+    ErrorCode::new("response_too_large", 400),
 ];
 
 /// Every detail code field validation reports (section 2).
