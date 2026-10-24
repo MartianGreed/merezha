@@ -337,13 +337,38 @@ session and releases the lock. It builds the indexes the new model adds (section
 one transaction marks the active `models` row `superseded`, inserts the new
 one as `active`, syncs `locales`, bumps the affected generations and appends
 `content.model_activated`. After that it drops the indexes the new model no
-longer needs and rebuilds the `published` fallback rows that a new locale or
-a changed fallback affects, in batches of 500 entries (C4 adds this step
-with materialization; until then nothing writes `published`). Readiness
-stays false until all of it completes. A lost session loses its lock too,
-so the run reopens one (twice at most), retakes the lock and plans again,
-keeping each index's attempt count. With `database.migrate = false`, a pending model
-change fails readiness with `content_model_pending`.
+longer needs; the `published` fallback rows that a new locale or a changed
+fallback affects are rebuilt in the background. Readiness stays false
+until the indexes and the activation are done, not the rebuild. A lost
+session loses its lock too, so the run reopens one (twice at most),
+retakes the lock and plans again, keeping each index's attempt count.
+With `database.migrate = false`, a pending model change fails readiness
+with `content_model_pending`.
+
+Decision (C4 review, 2026-10-24): readiness is not gated on the fallback
+rebuild. The activation transaction records a pending row in
+`merezha_content.rebuilds` (migration 3) when it inserts a locale or
+changes a fallback, or when an older rebuild is still pending (that one
+turns `superseded`: the new one covers every entry), and appends the
+content job `content.published_rebuild`, registered through
+`guard_jobs`. Any current host runs it: batches of 500 live entries with
+a published variant, in id order and share-locked (saves and their
+reference locks pass; publishes and deletes wait), each re-materializing
+its entries, bumping the generations it touched and persisting the
+cursor under the rebuild row's `FOR UPDATE`, so two runs never repeat a
+batch; logged as `content.rebuild_batch` and `content.rebuild_completed`.
+The job's payload names its version: a run of a superseded or finished
+rebuild succeeds without work. A run does at least one batch, and one
+stopped by its deadline or a cancel appends a continuation job keyed by
+its job id (a retried run finds it there and goes on). A host dying
+mid-batch leaves the committed cursor for the retried job, and a module
+start enqueues a pending rebuild of its model again, keyed by the cursor
+(a dead-lettered job, say; a duplicate beside a live one is harmless,
+since runs serialize on the cursor row). Until it is
+done, delivery may serve the previous materialization for the affected
+locales, eventually consistent like the mixed state of a rolling deploy.
+`merezha content diff` reports a pending rebuild as
+`content_rebuild_pending`; readiness does not.
 
 ### Mixed model versions
 
@@ -537,6 +562,11 @@ and every sort of two or more keys, which reads the first key's index
 order and sorts the rest. Delivery lists over `published` (C5) choose
 their tie-breaker the same way.
 
+Migration 3 (C4) adds `rebuilds (version integer PRIMARY KEY REFERENCES
+models, after_entry uuid, state text CHECK (state IN ('pending', 'done')),
+updated_at timestamptz NOT NULL)`, the resume cursor of the fallback
+rebuild (section 2).
+
 ### Derived indexes
 
 The model decides which indexes exist beyond the static ones. For every
@@ -602,6 +632,25 @@ number never reaches it. `refs`, `assets` and `blobs` statements filter on
 `scope`; only the `if_unreferenced` and `asset_in_use` checks count referrers
 in every scope, without returning them. C3 ships these predicates with the
 first write path; C9 adds organization types without changing a statement.
+
+### Lock order
+
+Content transactions take their locks in this order, so they wait on each
+other rather than deadlock:
+
+1. The loaded model's `models` row, `FOR SHARE` (the version check).
+2. Entries: the entry a save or delete addresses (`FOR SHARE` for a save,
+   `FOR UPDATE` for publish, unpublish and deletes), a batch's entries
+   first, in id order. The rebuild takes the rebuild row `FOR UPDATE`,
+   then its batch's entries `FOR SHARE` in id order.
+3. The default variant `FOR SHARE` (a non-default save), then the
+   addressed variant (`FOR UPDATE`, or its compare-and-swap update).
+4. Reference targets, `FOR KEY SHARE` in id order, then
+   `require_published` targets `FOR SHARE` in id order.
+
+Steps 2 and 4 can still cross (a publish of A requiring B while a publish
+of B requires A); PostgreSQL then aborts one transaction, which answers
+`database_conflict` (409, conflict, retryable).
 
 ### Optimistic concurrency
 
@@ -905,6 +954,50 @@ their singleton forms); the rest arrive with C4, C5 and C7. As built:
 - A save of a non-default variant share-locks the default variant while it
   reads the shared values, so a concurrent default save cannot be undone
   by a stale copy.
+
+C4 ships publish, unpublish, the batches, the variant and entry deletes,
+undelete and the trash. As built:
+
+- Every publish, unpublish and delete locks the entry `FOR UPDATE` before
+  its variant, and a batch locks its entries in id order first, so
+  concurrent batches never deadlock. Each re-materializes all of the
+  entry's `published` rows (one per configured locale whose chain reaches
+  a published variant), a superset of the rows the change affects.
+- `require_published` checks that the target has a `published` row in
+  the referrer's locale (the chain resolved), after every item of the
+  transaction is materialized, so one batch can publish a target with its
+  referrers.
+- Batch items are checked in order: a failure names its item in
+  `details` (`/items/<n>` plus the item's own path), and a repeated
+  `(type, id, locale)` is `duplicate_item`. `revision` is required on
+  publish items and refused on unpublish items.
+- Unpublishing a variant that is not published answers 200 without an
+  event or a generation bump. Undeleting a live entry does too.
+- Deleting clears the variants' published pointers (undelete restores
+  drafts only) and removes the entry's refs; undelete records the drafts'
+  refs again. The variant delete of a published variant appends
+  `content.entry_unpublished` with reason `delete`.
+- `purge=true` reaches trashed entries too. Purging a live entry appends
+  what a delete does, then `content.entry_purged`.
+- `GET /trash` without `type` lists the types the caller reads, each
+  checked in its resource scope; organization types need the principal's
+  tenant.
+- The trash purge is the cron schedule `content.trash_purge`, in UTC.
+- The tightening count reads only own `published` rows
+  (`source_locale = locale`); fallback rows repeat their source.
+- Reference resolution locks the target entries `FOR KEY SHARE` until the
+  saving transaction commits, and `require_published` share-locks its
+  target before reading `published`. So a delete, purge, publish or
+  unpublish of a target waits for a save that references it and then
+  sees its refs, a save waits for a delete in flight and then gets
+  `reference_not_found`, and a referrer's publish waits for its target's
+  unpublish and then gets `reference_unpublished`. Two publishes requiring
+  each other may deadlock; PostgreSQL aborts one (`database_conflict`,
+  409, retryable).
+- A purge deletes the refs pointing at the entry too, in every scope, so
+  an id created again inherits no stale referrers.
+- A batch's transaction gets one `limits.query_timeout` per 50 items
+  started; the request bound would be too short for 500 items.
 
 Until identity lands, C3 relies on the host's policy: a private listener
 allows every route, a public one denies every route (`unauthenticated`

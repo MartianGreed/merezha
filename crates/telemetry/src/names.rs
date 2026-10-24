@@ -1511,6 +1511,18 @@ pub const EVENTS: &[Event] = &[
         INFO,
         &[f("type", "content.type"), local("rows")],
     ),
+    // The background `published` rebuild after a locale or fallback
+    // change (CT-C4): one per batch, then one when it is done.
+    ev(
+        "content.rebuild_batch",
+        INFO,
+        &[local("version"), local("entries"), local("done")],
+    ),
+    ev(
+        "content.rebuild_completed",
+        INFO,
+        &[local("version"), local("entries")],
+    ),
     ev(
         "content.index_created",
         INFO,

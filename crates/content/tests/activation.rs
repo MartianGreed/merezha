@@ -44,6 +44,7 @@ async fn migration_1_applies_and_leaves_the_search_path_alone() {
             "locales",
             "models",
             "published",
+            "rebuilds",
             "refs",
             "revisions",
             "variants"
@@ -271,6 +272,35 @@ async fn additive_tightening_access_and_index_changes_activate() {
         )
         .await,
         8
+    );
+    // The new `fr-BE` locale needs the `published` rows rebuilt (C4): the
+    // same transaction records the rebuild and enqueues its job, which a
+    // host's jobs runtime runs in the background.
+    assert!(report.rebuild_enqueued);
+    assert_eq!(
+        strings(
+            &db,
+            "SELECT version || ':' || state FROM merezha_content.rebuilds"
+        )
+        .await,
+        ["2:pending"]
+    );
+    assert_eq!(
+        strings(
+            &db,
+            "SELECT dedupe_key || ':' || queue || ':' || job_kind FROM merezha_jobs.outbox \
+              WHERE record_kind = 'job'"
+        )
+        .await,
+        ["rebuild:2:content:content.published_rebuild"]
+    );
+    assert_eq!(
+        strings(
+            &db,
+            "SELECT locale || ':' || source_locale FROM merezha_content.published ORDER BY locale"
+        )
+        .await,
+        ["en:en"]
     );
     // New indexes built (category sort, isbn unique), the dropped ones gone
     // (reading_minutes sort, legacy_code unique), the slug's kept.
@@ -1165,4 +1195,49 @@ async fn unique_indexes_ignore_fallback_rows_and_shared_copies() {
         .await
     );
     assert!(!accepted(&db, &published(d, "en", "en", r#"{"isbn":"i1"}"#)).await);
+}
+
+#[tokio::test]
+async fn the_rebuild_job_is_enqueued_in_the_activation_transaction() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let (v1, v2) = (model(V1), model(V2));
+    run(&db, &v1).await.unwrap();
+    // A failing commit of the activation leaves neither the rebuild row nor
+    // its job.
+    execute(
+        &db,
+        "CREATE FUNCTION public.fail_activation() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'injected'; END $$;
+         CREATE CONSTRAINT TRIGGER fail_activation AFTER INSERT ON merezha_content.models
+           DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.fail_activation();",
+    )
+    .await;
+    assert!(run(&db, &v2).await.is_err());
+    let jobs = "SELECT count(*) FROM merezha_jobs.outbox WHERE record_kind = 'job'";
+    assert_eq!(scalar_i64(&db, jobs).await, 0);
+    assert_eq!(
+        scalar_i64(&db, "SELECT count(*) FROM merezha_content.rebuilds").await,
+        0
+    );
+    execute(
+        &db,
+        "DROP TRIGGER fail_activation ON merezha_content.models",
+    )
+    .await;
+    let report = run(&db, &v2).await.unwrap();
+    assert!(report.rebuild_enqueued);
+    // One transaction wrote all three: `now()` is its start.
+    assert_eq!(
+        strings(
+            &db,
+            "SELECT (m.activated_at = r.updated_at AND r.updated_at = o.created_at)::text \
+               FROM merezha_content.models m, merezha_content.rebuilds r, merezha_jobs.outbox o \
+              WHERE m.version = 2 AND r.version = 2 AND o.record_kind = 'job'"
+        )
+        .await,
+        ["true"]
+    );
 }

@@ -1657,11 +1657,12 @@ such as `cargo build --release -p merezha-cli` or `cargo build
 
 ## Content
 
-`merezha-content` (`crates/content`, CT-C1 to CT-C3) is the content block,
+`merezha-content` (`crates/content`, CT-C1 to CT-C4) is the content block,
 a `Module` named `content` with schema `merezha_content` (ledger key
 `content`). C2 ships its schema, model activation and readiness; C3 the
-management routes for drafts and revisions. Publishing and deletion (C4),
-delivery (C5) and assets (C7) come later. The design is
+management routes for drafts and revisions; C4 publishing, the
+`published` rows, deletion, the trash and its purge job. Delivery (C5)
+and assets (C7) come later. The design is
 [content.md](../design/content.md).
 
 ```toml
@@ -1669,8 +1670,9 @@ delivery (C5) and assets (C7) come later. The design is
 model = "content.toml"     # the default
 limits = { max_request_bytes = 1048576, max_entry_bytes = 262144,
            default_page_size = 25, max_page_size = 100, max_filters = 10,
-           max_sort_keys = 2, query_timeout = "5s" }   # the defaults
+           max_sort_keys = 2, max_batch = 100, query_timeout = "5s" }   # the defaults
 revisions = { retain = 100 }                           # the default
+trash = { retention = "30d", purge_cron = "23 3 * * *" }   # the defaults
 ```
 
 | Key | Default | Range | Meaning |
@@ -1681,15 +1683,19 @@ revisions = { retain = 100 }                           # the default
 | `limits.max_page_size` | 100 | 1 to 500 | Largest `limit`. |
 | `limits.max_filters` | 10 | 1 to 32 | Filter clauses per list. |
 | `limits.max_sort_keys` | 2 | 1 to 4 | `sort` keys per list. |
+| `limits.max_batch` | 100 | 1 to 500 | Items of one `POST /batch/publish` or `/batch/unpublish` (`validation_failed`, detail `/items` `max_items`). |
 | `limits.query_timeout` | `"5s"` | 100 ms to 30 s | Deadline of each request's transaction, which sets `statement_timeout` (capped by `database.statement_timeout_ms`); an expired one answers `timeout` (504). |
 | `revisions.retain` | 100 | 2 to 10000 | Revisions kept per variant; the published one is kept besides them. |
+| `trash.retention` | `"30d"` | 1 day to 3650 days | How long a trashed entry stays before the purge job hard-deletes it. |
+| `trash.purge_cron` | `"23 3 * * *"` | AP's cron parser, five fields | When `content.trash_purge` runs, in UTC (`invalid_cron`). |
 
-The tables take only these keys in C3. `max_populate_depth`,
-`max_populated_entries`, `max_batch`, `trash`, `delivery` and `media`
-stay `unknown_key` until their slices. Problems are reported with the
-configuration, every one at once (`out_of_range`, `expected_integer`,
-`expected_duration`, `expected_table`, `unknown_key`), keyed
-`modules.content.limits.<key>` or `modules.content.revisions.retain`.
+The tables take only these keys in C4. `max_populate_depth`,
+`max_populated_entries`, `delivery` and `media` stay `unknown_key` until
+their slices. Problems are reported with the configuration, every one at
+once (`out_of_range`, `expected_integer`, `expected_duration`,
+`expected_string`, `invalid_cron`, `expected_table`, `unknown_key`),
+keyed `modules.content.limits.<key>`, `modules.content.revisions.retain`
+or `modules.content.trash.<key>`.
 
 `model` follows the runtime manifest's path rules: relative to
 `merezha.toml`, no `..` or absolute paths, and it must resolve (symlinks
@@ -1738,6 +1744,33 @@ one or none (the loaded model is still pending, as on a new host before a
 migrating one activated it) fails `content_model_pending`, and the host
 stays as it is. Both are 503 with `Retry-After: 1`.
 
+When an activation adds a locale or changes a fallback, or finds an older
+rebuild still pending, its transaction marks any pending rebuild
+`superseded`, records one for its version in `merezha_content.rebuilds`
+(migration 3) and appends the job `content.published_rebuild` (queue
+`content`, key `rebuild:<version>`). Readiness does not wait for it: any
+current host's jobs runtime runs it in the background, re-materializing
+the `published` rows of every live entry with a published variant, 500
+entries per transaction in id order, each with the model version check,
+the rebuild row locked `FOR UPDATE` (two runs never repeat a batch), the
+entries locked `FOR SHARE` (saves are not blocked), a generation bump for
+the scopes it touched and the resume cursor (`content.rebuild_batch`,
+then `content.rebuild_completed`). The job's payload names its version;
+a superseded or finished rebuild's job succeeds without work. Each run
+does at least one batch; one that nears its job deadline or is cancelled
+appends a continuation job (`rebuild:<version>:after:<job id>`, a
+duplicate from a retried run ignored). A host that dies mid-batch leaves
+the cursor at the last commit and the retried job resumes there. A
+module start that did not just enqueue it enqueues a pending rebuild of
+its model again (`rebuild:<version>:resume:<cursor>`, a key the runtime
+already holds ignored), so a dead-lettered rebuild is retried by the next
+deploy. A run alongside a live one waits on the cursor row and never
+repeats a batch; content never reads the jobs runtime's tables. Until it is done, delivery may serve the
+previous materialization for the affected locales, as in a rolling
+deploy. `merezha content diff` prints `content_rebuild_pending version <n>
+after <entry id or start>` while one is pending. A first activation has
+nothing to rebuild. Fallback rows emit no events.
+
 After the activation commits, the index drop pass (each drop bounded by
 30 s) and the tightening count (30 s, on a pooled session after the lock is
 released) are best effort: a failure logs `content.index_failed`
@@ -1785,6 +1818,18 @@ handler meets `content_model_superseded` mid-run, is given back with
 `JobFailure::release()`: available again at once with its attempt
 refunded, for a current host to run.
 
+Content's job kinds (C4): `content.published_rebuild` (above, enqueued by
+activation) and `content.trash_purge`, both on the `content` queue
+(`[jobs.queues.content]` tunes it), declared at start as the cron
+schedule `content.trash_purge` through `JobsHandle::schedule` with
+`trash.purge_cron` in `UTC`. Each run hard-deletes entries trashed longer
+than `trash.retention`, 100 per transaction (`FOR UPDATE SKIP LOCKED`,
+cascading to variants, revisions, `published` rows and refs), appends one
+`content.entry_purged` per entry, and continues until none is left, the
+job is cancelled or its deadline is one `limits.query_timeout` away (the
+next run continues). The admin API's schedule routes can pause, resume or
+trigger it.
+
 ### Content management routes
 
 All under `/v1/content/manage`, answered `private, no-store`:
@@ -1797,6 +1842,11 @@ All under `/v1/content/manage`, answered `private, no-store`:
 | `GET /entries/{type}/{id}/{locale}` (`fields`), `.../revisions` (`limit`, `cursor`), `.../revisions/{n}` | `content.entries.read` |
 | `PUT` and `PATCH /entries/{type}/{id}/{locale}`, `POST .../revisions/{n}/restore` | `content.entries.write` |
 | the same under `/singletons/{type}/{locale}` (no entry id; the first `PUT` with `If-None-Match: *` creates the entry) | as above |
+| `POST /entries/{type}/{id}/{locale}/publish` (`{revision?}`, `If-Match`), `.../unpublish` (`If-Match`), and the same under `/singletons/{type}/{locale}` | `content.entries.publish` |
+| `POST /batch/publish` (`{items: [{type, id, locale, revision}]}`), `POST /batch/unpublish` (`{items: [{type, id, locale}]}`) | `content.entries.publish` on every item |
+| `DELETE /entries/{type}/{id}/{locale}` (`If-Match`, a non-default variant, 204) | `content.entries.write` |
+| `DELETE /entries/{type}/{id}` (`if_unreferenced`, `purge`, 204), `POST /entries/{type}/{id}/undelete` (200 entry summary) | `content.entries.delete`, plus `content.entries.purge` with `purge=true` |
+| `GET /trash` (`type`, `limit`, `cursor`) | `content.entries.read`: the given type, or every type the caller reads |
 
 Each route checks its permission through the host's `Authorizer` before
 anything else, at `ResourceScope::Resource { tenant, kind: "content_type",
@@ -1813,6 +1863,54 @@ longer the draft's, is `revision_conflict` (412) and writes nothing.
 exists). `PATCH` takes `application/merge-patch+json` only
 (`unsupported_media_type`, 415). An id of another type or scope, or one
 that is not a UUID, is `entry_not_found` (404) on every route.
+
+Publishing (C4) runs in one transaction: the model version check, the
+entry locked `FOR UPDATE` and the variant under the route's scope
+predicates, the draft revision compared with `If-Match`, publish-time
+validation of the published revision (`required`, every rule, the
+references, and `require_published`: a target with no `published` row in
+the referrer's locale, `reference_unpublished`), then the variant's
+`published` refs, the entry's `published` rows for every configured locale
+(the first published variant of the locale's fallback chain, with the
+default variant's published shared fields), a bump of the scope's
+generation and `content.entry_published`. `{revision: n}` publishes an
+older revision without touching the draft. A batch is all or none; a
+failing item names itself in `details` (`/items/<n>...`), and its
+`require_published` checks run after every item is materialized. Unpublish
+clears the pointer, refs and rows (locales fall back further) and appends
+`content.entry_unpublished` (reason `unpublish`); an unpublished variant is
+left as it is. A unique value already published by another entry fails the
+publish with a `unique` detail on its field.
+
+Deleting an entry sets `deleted_at`, marks its variants `deleted` with
+their published pointers cleared (freeing their unique values), removes
+its `published` rows and refs, bumps the generation and appends one
+`content.entry_unpublished` (reason `delete`) per published locale and one
+`content.entry_deleted`. `if_unreferenced=true` fails `entry_referenced`
+(409) while a ref in any scope points at it. Undelete returns the drafts
+only, records their refs again and appends `content.entry_undeleted`; a
+unique value or singleton slot taken meanwhile fails it (`unique` detail,
+`singleton_exists`). `purge=true` hard-deletes at once, trashed or not,
+and appends `content.entry_purged`. The variant delete removes a
+non-default variant with its revisions and refs (`default_variant_required`,
+409, for the default one); a published one falls back and appends
+`content.entry_unpublished` with reason `delete`.
+
+Codes added by C4: `entry_referenced`, `default_variant_required` (409).
+
+Concurrency: a save, publish or restore locks the entries its references
+resolve to `FOR KEY SHARE` until it commits, and `require_published`
+share-locks the target too. A delete, purge, publish or unpublish of a
+target (`FOR UPDATE`) therefore waits for such a save and then counts its
+refs (`if_unreferenced`) or removes them with the entry (`purge`); a save
+meeting a delete in flight waits and then reports `reference_not_found`;
+a referrer's publish meeting its target's unpublish in flight waits and
+then reports `reference_unpublished`. Two publishes that each require the
+other can deadlock; PostgreSQL aborts one, answered `database_conflict`
+(409, conflict, retryable). A purge also deletes the refs pointing at the
+entry, in every scope. A batch's transaction gets one
+`limits.query_timeout` per 50 items started (a full 500-item batch, ten);
+each statement stays bounded by `database.statement_timeout_ms`.
 
 Codes added by C3: `entry_not_found`, `revision_not_found` (404),
 `locale_unknown`, `invalid_query`, `invalid_filter`, `invalid_sort`,

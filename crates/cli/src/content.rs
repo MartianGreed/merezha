@@ -106,7 +106,7 @@ pub async fn diff(input: &ConfigInput) -> Result<(String, u8), u8> {
     };
     let database = Database::connect(&config.database).map_err(unavailable)?;
     let deadline = Instant::now() + config.database.connect_timeout + Duration::from_secs(10);
-    let (stored, existing) = {
+    let (stored, existing, rebuild) = {
         let mut client = database.acquire(deadline).await.map_err(unavailable)?;
         let transaction = client
             .transaction()
@@ -122,7 +122,10 @@ pub async fn diff(input: &ConfigInput) -> Result<(String, u8), u8> {
         } else {
             existing_indexes(&*transaction).await.map_err(unavailable)?
         };
-        (stored, existing)
+        let rebuild = merezha_content::pending_rebuild(&*transaction)
+            .await
+            .map_err(unavailable)?;
+        (stored, existing, rebuild)
     };
     database.close();
     let model = state.model();
@@ -165,6 +168,15 @@ pub async fn diff(input: &ConfigInput) -> Result<(String, u8), u8> {
         for name in unneeded_indexes(&expected, &existing) {
             let _ = writeln!(out, "index drop {name}");
         }
+    }
+    // Informational: the background job finishes it; it never fails the diff.
+    if let Some(rebuild) = rebuild {
+        let _ = writeln!(
+            out,
+            "content_rebuild_pending version {} after {}",
+            rebuild.version,
+            rebuild.after_entry.as_deref().unwrap_or("start")
+        );
     }
     let refused = plan.changes.iter().any(|c| c.class == ChangeClass::Refused);
     let code = match plan.status {

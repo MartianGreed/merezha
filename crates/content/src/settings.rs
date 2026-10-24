@@ -1,6 +1,7 @@
 //! The `[modules.content]` settings that entries need (section 9):
-//! `limits.*` for request, entry, page, filter, sort and query bounds, and
-//! `revisions.retain`. Keys of later slices stay `unknown_key` until the
+//! `limits.*` for request, entry, page, filter, sort, batch and query
+//! bounds, `revisions.retain`, and the trash's `retention` and
+//! `purge_cron` (C4). Keys of later slices stay `unknown_key` until the
 //! slice that gives them behaviour.
 use merezha_platform::{
     ModuleSection,
@@ -23,6 +24,8 @@ pub struct Limits {
     pub max_filters: u32,
     /// Most `sort` keys, 1 to 4.
     pub max_sort_keys: u32,
+    /// Most items of one batch publish or unpublish, 1 to 500.
+    pub max_batch: u32,
     /// Bound on every statement of a request, 100 ms to 30 s.
     pub query_timeout: Duration,
 }
@@ -35,36 +38,64 @@ impl Default for Limits {
             max_page_size: 100,
             max_filters: 10,
             max_sort_keys: 2,
+            max_batch: 100,
             query_timeout: Duration::from_secs(5),
         }
     }
 }
 
-/// The settings of the content block that C3 reads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `[modules.content.trash]`: how long trashed entries stay and when the
+/// purge job runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Trash {
+    /// Entries trashed longer than this are purged, 1 day to 3650 days.
+    pub retention: Duration,
+    /// The `content.trash_purge` schedule, five cron fields in UTC
+    /// (`PURGE_TIMEZONE`), declared through `JobsHandle::schedule`.
+    pub purge_cron: String,
+}
+/// `trash.retention` when the key is absent: 30 days.
+pub const DEFAULT_TRASH_RETENTION: Duration = Duration::from_secs(30 * 86_400);
+/// `trash.purge_cron` when the key is absent.
+pub const DEFAULT_PURGE_CRON: &str = "23 3 * * *";
+impl Default for Trash {
+    fn default() -> Self {
+        Self {
+            retention: DEFAULT_TRASH_RETENTION,
+            purge_cron: DEFAULT_PURGE_CRON.to_owned(),
+        }
+    }
+}
+
+/// The settings of the content block.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContentSettings {
     pub limits: Limits,
     /// Revisions kept per variant besides the published one, 2 to 10000.
     pub revisions_retain: u32,
+    pub trash: Trash,
 }
 impl Default for ContentSettings {
     fn default() -> Self {
         Self {
             limits: Limits::default(),
             revisions_retain: 100,
+            trash: Trash::default(),
         }
     }
 }
 
 /// The top-level keys `[modules.content]` accepts.
-pub(crate) const KEYS: [&str; 3] = ["model", "limits", "revisions"];
-const LIMIT_KEYS: [&str; 7] = [
+pub(crate) const KEYS: [&str; 4] = ["model", "limits", "revisions", "trash"];
+const TRASH_KEYS: [&str; 2] = ["retention", "purge_cron"];
+const LIMIT_KEYS: [&str; 8] = [
     "max_request_bytes",
     "max_entry_bytes",
     "default_page_size",
     "max_page_size",
     "max_filters",
     "max_sort_keys",
+    "max_batch",
     "query_timeout",
 ];
 const REVISION_KEYS: [&str; 1] = ["retain"];
@@ -111,6 +142,7 @@ impl ContentSettings {
             ) as u32;
             limits.max_filters = int("max_filters", defaults.max_filters.into(), 1, 32) as u32;
             limits.max_sort_keys = int("max_sort_keys", defaults.max_sort_keys.into(), 1, 4) as u32;
+            limits.max_batch = int("max_batch", defaults.max_batch.into(), 1, 500) as u32;
             if let Some(value) = table.get("query_timeout") {
                 let key = format!("{}.query_timeout", section.key("limits"));
                 match value.as_str().and_then(parse_duration) {
@@ -143,12 +175,43 @@ impl ContentSettings {
                 &mut issues,
             ) as u32;
         }
+        if let Some(table) = subtable(section, "trash", &TRASH_KEYS, &mut issues) {
+            let origin = section.origin("trash");
+            if let Some(value) = table.get("retention") {
+                let key = format!("{}.retention", section.key("trash"));
+                let range = Duration::from_secs(86_400)..=Duration::from_secs(3650 * 86_400);
+                match value.as_str().and_then(parse_duration) {
+                    Some(d) if range.contains(&d) => settings.trash.retention = d,
+                    Some(_) => issues.push(ConfigIssue::new(key, "out_of_range", origin.clone())),
+                    None => issues.push(ConfigIssue::new(key, "expected_duration", origin.clone())),
+                }
+            }
+            if let Some(value) = table.get("purge_cron") {
+                let key = format!("{}.purge_cron", section.key("trash"));
+                match value.as_str() {
+                    Some(cron) if valid_cron(cron) => {
+                        cron.clone_into(&mut settings.trash.purge_cron)
+                    }
+                    Some(_) => issues.push(ConfigIssue::new(key, "invalid_cron", origin)),
+                    None => issues.push(ConfigIssue::new(key, "expected_string", origin)),
+                }
+            }
+        }
         if issues.is_empty() {
             Ok(settings)
         } else {
             Err(issues)
         }
     }
+}
+
+/// The time zone of the `content.trash_purge` schedule.
+pub const PURGE_TIMEZONE: &str = "UTC";
+
+/// A five-field cron expression the jobs scheduler accepts in UTC, by
+/// AP's parser (§B.7).
+fn valid_cron(cron: &str) -> bool {
+    merezha_platform::cron::CronSchedule::parse(cron, PURGE_TIMEZONE).is_ok()
 }
 
 fn subtable(

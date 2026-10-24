@@ -21,8 +21,16 @@
 //! through [`DerivedIndex::field`], reference resolution and referrers
 //! ([`Store`]). Every write transaction starts with
 //! [`ContentState::check_writable`] and every statement carries the
-//! route's scope and content type. Publishing and deletion are C4,
-//! delivery C5 and assets C7.
+//! route's scope and content type.
+//!
+//! CT-C4, publishing and deletion: publish, unpublish, publishing an older
+//! revision, batch publish and unpublish ([`Store::publish`]), the
+//! `published` rows materialized per locale with fallback, generations,
+//! the variant delete, soft delete, undelete, immediate purge, the trash
+//! and the `content.trash_purge` job ([`Store::delete_entry`]), each with
+//! its outbox events in the change's transaction, and the background
+//! fallback rebuild after a locale or fallback change ([`REBUILD_JOB`]). Delivery is
+//! C5 and assets C7.
 mod activation;
 mod canonical;
 mod diff;
@@ -30,10 +38,13 @@ mod http;
 mod indexes;
 mod issues;
 mod json;
+mod manage;
 mod model;
 mod module;
 mod parse;
+mod publish;
 mod query;
+mod rebuild;
 mod refs;
 mod rich_text;
 mod scalar;
@@ -41,6 +52,7 @@ mod schema;
 mod settings;
 mod slug;
 mod store;
+mod trash;
 mod value;
 
 pub use activation::{
@@ -50,7 +62,10 @@ pub use activation::{
     read_active, unneeded_indexes, verify,
 };
 pub use diff::{Change, ChangeClass, change_classes, diff, diff_models};
-pub use http::{ENTRIES_READ, ENTRIES_WRITE, NO_STORE, RESOURCE_KIND};
+pub use http::{
+    ENTRIES_DELETE, ENTRIES_PUBLISH, ENTRIES_PURGE, ENTRIES_READ, ENTRIES_WRITE, NO_STORE,
+    RESOURCE_KIND,
+};
 pub use indexes::{
     DerivedIndex, INDEX_PREFIX, IndexPurpose, IndexTable, SCHEMA, derived_indexes, drop_statement,
     is_derived_name,
@@ -65,14 +80,20 @@ pub use parse::{
     CONTENT_PERMISSIONS, MAX_DESCRIPTION, MAX_MODEL_BYTES, MAX_PATTERN_BYTES, ModelOptions,
     PATTERN_SIZE_LIMIT, PermissionCatalog,
 };
+pub use publish::{Expect, Item, PUBLISHED, UNPUBLISHED};
 pub use query::{MAX_CURSOR_BYTES, MAX_FILTER_VALUES, MAX_QUERY_BYTES};
+pub use rebuild::{PendingRebuild, REBUILD_BATCH, REBUILD_JOB, pending_rebuild};
 pub use rich_text::{MAX_HREF_BYTES, MAX_MARK_DEFS, MAX_SPAN_MARKS, MAX_SPANS};
-pub use schema::{MIGRATION_1, MIGRATION_2, MIGRATIONS};
-pub use settings::{ContentSettings, Limits};
+pub use schema::{MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATIONS};
+pub use settings::{ContentSettings, DEFAULT_PURGE_CRON, DEFAULT_TRASH_RETENTION, Limits, Trash};
 pub use slug::slugify;
 pub use store::{
-    Actor, Content, DRAFT_SAVED, EntrySummary, Page, Referrer, Rejection, RevisionItem,
-    RevisionView, Saved, Store, Target, VariantView, WriteKind,
+    Actor, BATCH_ITEMS_PER_TIMEOUT, Content, DRAFT_SAVED, EntrySummary, Page, Referrer, Rejection,
+    RevisionItem, RevisionView, Saved, Store, Target, VariantView, WriteKind,
+};
+pub use trash::{
+    DELETED, DeleteOptions, PURGE_BATCH, PURGE_SUBJECT, PURGED, QUEUE, TRASH_PURGE, TrashItem,
+    UNDELETED,
 };
 pub use value::{
     GENERATED_KEY_LENGTH, KeySource, MAX_ALT_LENGTH, MAX_DETAIL_PATH, RandomKeys, ReferenceTarget,
@@ -114,6 +135,8 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("precondition_required", 428),
     ErrorCode::new("entry_exists", 409),
     ErrorCode::new("singleton_exists", 409),
+    ErrorCode::new("entry_referenced", 409),
+    ErrorCode::new("default_variant_required", 409),
 ];
 
 /// Every detail code field validation reports (section 2).

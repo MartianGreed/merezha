@@ -14,8 +14,14 @@ pub const MIGRATION_2: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS variants_
      ON merezha_content.variants (scope, content_type, locale, draft_updated_at DESC, entry_id DESC) \
      WHERE NOT deleted";
 
+/// Migration 3 (C4): `merezha_content.rebuilds`, the pending fallback
+/// rebuilds of `published` after a locale or fallback change, with their
+/// resume cursors.
+pub const MIGRATION_3: &str = include_str!("migrations/0003_rebuilds.sql");
+
 /// The content block's migrations, in order.
 pub const MIGRATIONS: &[Migration] = &[
     Migration::new(1, "merezha_content", MIGRATION_1),
     Migration::non_transactional(2, "variants_by_update", MIGRATION_2),
+    Migration::new(3, "rebuilds", MIGRATION_3),
 ];

@@ -1,5 +1,5 @@
-//! CT-C3 and mixed model versions (section 2): a superseded host refuses
-//! every write and drains, a pending one refuses without draining, saves
+//! CT-C3 and C4 with mixed model versions (section 2): a superseded host
+//! refuses every write (saves, publishing, deletion, batches) and drains, a pending one refuses without draining, saves
 //! racing another host's activation commit before it or are refused, and
 //! restore reports what the current model no longer accepts.
 mod http;
@@ -82,6 +82,41 @@ async fn a_superseded_host_refuses_every_write_and_reports_outdated() {
         old.put("/v1/content/manage/singletons/site_settings/en")
             .header("if-none-match", "*")
             .json(&json!({"fields": {"site_name": "S"}}))
+            .send()
+            .await,
+        // C4: publishing, deletion and batches.
+        old.publish("article", &id, "en", 1).await,
+        old.unpublish("article", &id, "en", 1).await,
+        old.call(axum::http::Method::DELETE, &variant("article", &id, "fr"))
+            .if_match(1)
+            .send()
+            .await,
+        old.call(
+            axum::http::Method::DELETE,
+            &format!("/v1/content/manage/entries/article/{id}"),
+        )
+        .by(Some("admin"))
+        .send()
+        .await,
+        old.call(
+            axum::http::Method::DELETE,
+            &format!("/v1/content/manage/entries/article/{id}?purge=true"),
+        )
+        .by(Some("admin"))
+        .send()
+        .await,
+        old.post(&format!("/v1/content/manage/entries/article/{id}/undelete"))
+            .by(Some("admin"))
+            .send()
+            .await,
+        old.post("/v1/content/manage/batch/publish")
+            .by(Some("admin"))
+            .json(&json!({"items": [{"type": "article", "id": id, "locale": "en", "revision": 1}]}))
+            .send()
+            .await,
+        old.post("/v1/content/manage/batch/unpublish")
+            .by(Some("admin"))
+            .json(&json!({"items": [{"type": "article", "id": id, "locale": "en"}]}))
             .send()
             .await,
     ];

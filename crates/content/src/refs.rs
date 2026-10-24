@@ -4,6 +4,12 @@
 //! scope. Lookups filter on those scopes; only a target found nowhere
 //! visible is looked up again, as an existence bit, to tell
 //! `reference_scope` from `reference_not_found`.
+//!
+//! The targets found are locked `FOR KEY SHARE` until the saving
+//! transaction ends (in id order), so a delete, purge, publish or
+//! unpublish of a target (`FOR UPDATE`) waits for the save and then sees
+//! its refs, and a save that meets a delete in flight waits for it and
+//! then finds the target trashed (`reference_not_found`).
 use crate::value::{ReferenceTarget, ValueReference};
 use merezha_domain::Failure;
 use merezha_platform::{FieldError, Tx};
@@ -67,7 +73,8 @@ pub(crate) async fn resolve(
             .query(
                 "SELECT id::text, scope, content_type, deleted_at IS NOT NULL \
                    FROM merezha_content.entries \
-                  WHERE id = ANY($1::text[]::uuid[]) AND (scope = $2 OR scope = 'app')",
+                  WHERE id = ANY($1::text[]::uuid[]) AND (scope = $2 OR scope = 'app') \
+                  ORDER BY id FOR KEY SHARE",
                 &[&entry_ids, &scope],
             )
             .await
@@ -112,7 +119,7 @@ pub(crate) async fn resolve(
             .query(
                 "SELECT id::text, content_type FROM merezha_content.assets \
                   WHERE id = ANY($1::text[]::uuid[]) AND (scope = $2 OR scope = 'app') \
-                    AND deleted_at IS NULL",
+                    AND deleted_at IS NULL ORDER BY id FOR KEY SHARE",
                 &[&asset_ids, &scope],
             )
             .await

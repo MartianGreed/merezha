@@ -800,6 +800,7 @@ Block events (AP's former `jobs.*` events are `job.*`):
 | `content.model_loaded` / `content.model_activated` / `content.model_tightened` / `content.model_breaking` | info / info / warn / error | `version`, `fingerprint`, `types`, `locales` / `previous_version`, `change_classes` / `content_type`, `counts`, `truncated` / `path`, `change`, `code` |
 | `content.migration_batch` / `content.index_created` / `content.index_dropped` | info | `type`, `rows` / `index`, `content_type`, `field`, `table`, `purpose` / `index`, `reason` |
 | `content.index_failed` (a derived index build that stops activation, CT-C2) | error | `index`, `content_type`, `field`, `code`, `cause`, `attempts` |
+| `content.rebuild_batch` / `content.rebuild_completed` (the background `published` rebuild, CT-C4) | info | `version`, `entries`, `done` / `version`, `entries` |
 | `content.schedule_failed` | warn | `entry_id`, `action`, `code` |
 | `content.blob_cleanup` / `content.spool_cleared` | info | `driver`, `count` |
 

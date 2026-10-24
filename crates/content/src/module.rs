@@ -9,11 +9,11 @@ use crate::{
     schema::MIGRATIONS,
     settings::{ContentSettings, KEYS},
 };
-use merezha_domain::Failure;
+use merezha_domain::{Failure, Identity};
 use merezha_platform::{
     AppContext, BoxFuture, Database, ErrorCode, Migration, Module, ModuleEvents, ModuleSection, Tx,
     config::{ConfigIssue, Origin},
-    ports::{JobContext, JobFailure, JobHandler},
+    ports::{JobContext, JobFailure, JobHandler, KindOptions, ScheduleDeclaration},
 };
 use std::{
     io::Read,
@@ -80,7 +80,7 @@ impl ContentState {
     pub fn path(&self) -> &Path {
         &self.path
     }
-    /// `[modules.content]` limits and revision retention.
+    /// `[modules.content]` limits, revision retention and the trash.
     pub fn settings(&self) -> &ContentSettings {
         &self.settings
     }
@@ -310,6 +310,60 @@ impl ContentModule {
             .state()
             .ok_or_else(|| Failure::permanent("content_not_configured"))
     }
+    /// Enqueue a pending rebuild of this host's model again, keyed by its
+    /// cursor, so a dead-lettered or lost job does not leave it pending for
+    /// good. A run alongside a live one is harmless: the cursor row
+    /// serializes runs and only moves forward. Best effort: a transient
+    /// failure leaves it to the next start; the diff still reports it.
+    async fn resume_rebuild(
+        &self,
+        ctx: &AppContext,
+        state: &Arc<ContentState>,
+    ) -> Result<(), Failure> {
+        if state.is_outdated() {
+            return Ok(());
+        }
+        let store = Store::new(state.clone(), ctx.clone(), ctx.outbox(NAME)?);
+        match store.resume_rebuild(&ctx.jobs(NAME)?).await {
+            Ok(_) => Ok(()),
+            Err(failure) if failure.classification == merezha_domain::Classification::Permanent => {
+                Err(failure)
+            }
+            Err(_) => Ok(()),
+        }
+    }
+    /// Register the content job kinds, each through
+    /// [`ContentState::guard_jobs`], and their schedules (C4):
+    /// `content.trash_purge` on the `content` queue, declared as the cron
+    /// schedule of the same name with `trash.purge_cron` in UTC, and
+    /// `content.published_rebuild`, which activation enqueues.
+    fn register_jobs(&self, ctx: &AppContext, state: &Arc<ContentState>) -> Result<(), Failure> {
+        let jobs = ctx.jobs(NAME)?;
+        let store = Store::new(state.clone(), ctx.clone(), ctx.outbox(NAME)?);
+        jobs.register(
+            crate::trash::TRASH_PURGE,
+            crate::trash::QUEUE,
+            state.guard_jobs(Arc::new(crate::trash::TrashPurge { store })),
+            KindOptions::default(),
+        )?;
+        jobs.register(
+            crate::rebuild::REBUILD_JOB,
+            crate::trash::QUEUE,
+            state.guard_jobs(Arc::new(crate::rebuild::RebuildPublished {
+                store: Store::new(state.clone(), ctx.clone(), ctx.outbox(NAME)?),
+            })),
+            KindOptions::default(),
+        )?;
+        jobs.schedule(ScheduleDeclaration {
+            name: crate::trash::TRASH_PURGE.to_owned(),
+            cron: state.settings().trash.purge_cron.clone(),
+            timezone: crate::settings::PURGE_TIMEZONE.to_owned(),
+            queue: Identity::new(crate::trash::QUEUE)?,
+            kind: Identity::new(crate::trash::TRASH_PURGE)?,
+            payload: serde_json::json!({}),
+        })?;
+        Ok(())
+    }
 }
 
 /// The model options C2 can provide: the content permissions only (the
@@ -473,24 +527,33 @@ impl Module for ContentModule {
             let _ = state.database.set(ctx.database().clone());
             if ctx.migrate() {
                 let outbox = ctx.outbox(NAME)?;
-                match activate(ctx.database(), &outbox, ctx.random(), &model, &self.options).await {
-                    Ok(report) => {
-                        if report.plan.status == crate::Status::Outdated {
-                            state.mark_outdated();
-                        } else {
-                            state.current.store(true, Ordering::SeqCst);
+                let enqueued =
+                    match activate(ctx.database(), &outbox, ctx.random(), &model, &self.options)
+                        .await
+                    {
+                        Ok(report) => {
+                            if report.plan.status == crate::Status::Outdated {
+                                state.mark_outdated();
+                            } else {
+                                state.current.store(true, Ordering::SeqCst);
+                            }
+                            report.rebuild_enqueued
                         }
-                        Ok(())
-                    }
-                    Err(error) => Err(error.failure),
+                        Err(error) => return Err(error.failure),
+                    };
+                self.register_jobs(&ctx, &state)?;
+                // This activation just enqueued its rebuild.
+                if enqueued {
+                    return Ok(());
                 }
+                self.resume_rebuild(&ctx, &state).await
             } else {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let client = match ctx.database().acquire(deadline).await {
                     Ok(client) => client,
                     // Readiness keeps checking; a database that answered the
                     // host's ping is only briefly unavailable.
-                    Err(_) => return Ok(()),
+                    Err(_) => return self.register_jobs(&ctx, &state),
                 };
                 match verify(&**client, &model).await {
                     Ok(Verified::Ready) => state.current.store(true, Ordering::SeqCst),
@@ -506,7 +569,8 @@ impl Module for ContentModule {
                     }
                     Err(_) => {}
                 }
-                Ok(())
+                self.register_jobs(&ctx, &state)?;
+                self.resume_rebuild(&ctx, &state).await
             }
         })
     }
