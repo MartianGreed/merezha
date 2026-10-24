@@ -331,7 +331,10 @@ Slice ids are the designs' own; AP-C* and CT-C* disambiguate the two C series.
 - **K2** contract alignment in K: R1 Outbox shape, R2 Notifier, R5 scopes, R7
   Directory, R8 error registry, R12 `[jobs]`, durations, `app.instance_id`,
   `app.version` and the `[application]` and `[telemetry]` extensions, R13 Principal and
-  BlobStore, R14 `sha2`, and the R15 non-transactional migration step.
+  BlobStore, R14 `sha2`, the R15 non-transactional migration step, and a
+  transaction helper for connections detached from the pool (deadline-bound
+  `SET LOCAL statement_timeout`, `commit_outcome_unknown` mapping) used by
+  projection, reactor and content activation runs.
 - **Stage 1**
   - First: AP-A1, AP-B1 (with R10 columns), TE-T1.
   - Then: AP-A2, AP-B2, AP-B3, AP-A3, TE-T2 to TE-T5; ID PR 1 (needs AP-B3),

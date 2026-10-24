@@ -313,8 +313,10 @@ database: the active model and the hosts running it are untouched.
 `[[migrations]]` blocks are not accepted in v1 (`content_model_invalid`); the
 later slice C10 designs them.
 
-With `database.migrate = true` one host activates a pending model under an
-advisory lock. It builds the indexes the new model adds (section 3), then in
+With `database.migrate = true` one host activates a pending model under a
+session advisory lock held on a connection detached from the pool (as the
+kernel migration runner does), so a cancelled or failed activation closes the
+session and releases the lock. It builds the indexes the new model adds (section 3), then in
 one transaction marks the active `models` row `superseded`, inserts the new
 one as `active`, syncs `locales`, bumps the affected generations and appends
 `content.model_activated`. After that it drops the indexes the new model no
@@ -337,12 +339,15 @@ SELECT 1 FROM merezha_content.models
 
 No row means a newer model is active. The transaction rolls back, the request
 fails with `content_model_superseded` (503, transient, `Retry-After: 1`) so
-the client retries on a current host, a job handler returns a transient
-failure, and the host's readiness turns false with `content_model_outdated`
+the client retries on a current host, the host stops leasing content job
+kinds (a job already leased is released with its attempt refunded, as in a
+drain), and the host's readiness turns false with `content_model_outdated`
 so the load balancer drains it. The shared lock makes activation's update of
 that row wait for writes in flight, and a write that waited on activation
 finds no row, so nothing validated against a superseded model commits after
-activation. This holds for additive changes too: an old host would otherwise
+activation. Every content write shares one row lock, which costs multixact
+churn; at CMS write rates that is acceptable, and the operations guide notes
+it. This holds for additive changes too: an old host would otherwise
 publish entries without a newly required field. Reads keep the loaded model
 until the host is drained, so an old host answers 404 for a new type and
 applies the previous `access` until the deploy completes. A host starting

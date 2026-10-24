@@ -468,8 +468,10 @@ compares it.
 
 **Locks.** Each run (live, rebuild, reactor, explicit catch-up) holds a session advisory lock on its
 own connection, **detached from the pool** as kernel `migrate.rs` does (`db.acquire` then
-`deadpool_postgres::Object::take`; no kernel change). The run sets `statement_timeout` and
-`application_name = 'merezha {key}'` on that session and issues all its reads and commits there:
+`deadpool_postgres::Object::take`). The run sets `application_name = 'merezha {key}'` on that
+session and issues all its reads and commits there through K2's detached-connection transaction
+helper, which applies the deadline-bound `SET LOCAL statement_timeout` and maps an interrupted
+commit to `commit_outcome_unknown` exactly as `Database::transaction` does:
 
 ```sql
 SELECT pg_try_advisory_lock(1297760592 /* 'MZAP' */, hashtext('p:' || $1 || ':' || $2));  -- live catch-up
@@ -564,7 +566,9 @@ serving the last good pair.
 **Explicit catch-up.** `POST .../catch-up` keeps its request and response shape (`{state,
 checkpoint}` for unpartitioned projections, `{checkpoint, head}` for partitioned ones). It tries the
 lock. If another runner holds it, the request waits within its deadline until `checkpoint >= head
-snapshot`, then reads the row. If the deadline passes, it fails `timeout`, and progress stays
+snapshot`, then reads the row. At most `background.max_concurrent` explicit catch-ups hold their own
+lock connection at once; the rest wait on the running one the same way, so detached connections stay
+within the A.8 budget. If the deadline passes, it fails `timeout`, and progress stays
 persisted. `projection_in_flight` remains only for memory and SQLite.
 
 **Rebuild.** PostgreSQL histories are unbounded, so rebuild is a background operation that can
@@ -618,7 +622,7 @@ old revision. Old revision rows stay until `DELETE
 | Projection state | `max_state_bytes` ≤ 256 KiB per row or partition |
 | Partitions touched per batch | ≤ `batch_size` |
 | Background runs per instance | `application.background.max_concurrent` (default 2, max 16) |
-| Advisory-lock connections | one detached connection per active run, outside the pool (`take` shrinks the pool, which reopens a slot): server connections ≤ pool size + `background.max_concurrent` + 1 (`Listener`) + explicit catch-ups in flight |
+| Advisory-lock connections | one detached connection per active run, outside the pool (`take` shrinks the pool, which reopens a slot): server connections ≤ pool size + `background.max_concurrent` + 1 (`Listener`) + at most `background.max_concurrent` explicit catch-ups |
 | Pool size guidance | ≥ `limits.max_concurrent` + `background.max_concurrent` + jobs needs (B.10) + 2; a startup warning when below |
 | Guest runtime concurrency | Startup validation: runtime `max_concurrent_invocations` ≥ `limits.max_concurrent` + `background.max_concurrent`, otherwise background runs make HTTP fail `overloaded`. Fails with `invalid_concurrency_budget`. |
 | NOTIFY payload | a decimal position (≤ 20 bytes) |
