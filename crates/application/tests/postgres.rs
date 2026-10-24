@@ -606,8 +606,11 @@ fn an_instance_with_a_full_pending_registry_still_replays_another_instances_rece
     });
 }
 
+/// Explicit catch-ups on two instances take the run lock (AP-A3): one runs,
+/// the other waits for it, so every batch is applied once and no catch-up
+/// loses a CAS.
 #[test]
-fn concurrent_catch_ups_on_two_instances_publish_or_lose_the_row_revision_cas() {
+fn concurrent_catch_ups_on_two_instances_apply_each_batch_once() {
     let Some(pg) = Pg::new() else { return };
     let writers = Arc::new(Probe::default());
     let views = [Arc::new(Probe::default()), Arc::new(Probe::default())];
@@ -616,23 +619,16 @@ fn concurrent_catch_ups_on_two_instances_publish_or_lose_the_row_revision_cas() 
     let writer = pg.open(c.clone(), &writers);
     let instances = [pg.open(c.clone(), &views[0]), pg.open(c, &views[1])];
     let stop = AtomicBool::new(false);
-    let conflicts = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         let readers: Vec<_> = instances
             .iter()
             .map(|app| {
                 let stop = &stop;
                 scope.spawn(move || {
-                    let mut conflicts = 0;
                     while !stop.load(Ordering::SeqCst) {
-                        match app.catch_up("count") {
-                            Ok(pair) => assert!(pair.state == json!(pair.checkpoint)),
-                            Err(f) => {
-                                assert_eq!(f.code, "projection_conflict");
-                                conflicts += 1;
-                            }
-                        }
+                        let pair = app.catch_up("count").unwrap();
+                        assert!(pair.state == json!(pair.checkpoint));
                     }
-                    conflicts
                 })
             })
             .collect();
@@ -642,25 +638,35 @@ fn concurrent_catch_ups_on_two_instances_publish_or_lose_the_row_revision_cas() 
                 .unwrap();
         }
         stop.store(true, Ordering::SeqCst);
-        readers
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .sum::<usize>()
+        for reader in readers {
+            reader.join().unwrap();
+        }
     });
     let pair = instances[0].catch_up("count").unwrap();
     assert_eq!(pair.state, json!(200));
     assert_eq!(pair.checkpoint, 200);
+    let mut applied: Vec<u64> = views
+        .iter()
+        .flat_map(|view| view.seen.lock().unwrap().clone())
+        .map(|event| event.position)
+        .collect();
+    applied.sort();
+    assert_eq!(
+        applied,
+        (1..=200).collect::<Vec<_>>(),
+        "each event applied once"
+    );
     for app in &instances {
         let model = app
             .query(Query {
                 tag: id("Count"),
                 payload: json!({}),
                 metadata: metadata(),
+                min_position: None,
             })
             .unwrap();
         assert_eq!((model.value, model.checkpoint), (json!(200), 200));
     }
-    eprintln!("catch-up CAS losses: {conflicts}");
 }
 
 #[test]
@@ -1283,6 +1289,7 @@ fn lowering_payload_and_state_limits_keeps_stored_history_readable() {
             tag: id("Count"),
             payload: json!({"len": true}),
             metadata: metadata(),
+            min_position: None,
         })
         .unwrap();
     assert_eq!(size.value, json!(502));
@@ -1307,6 +1314,7 @@ fn a_position_gap_in_the_feed_is_the_transient_event_feed_gap() {
             tag: id("Count"),
             payload: json!({}),
             metadata: metadata(),
+            min_position: None,
         })
         .unwrap()
         .checkpoint,

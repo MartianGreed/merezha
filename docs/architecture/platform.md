@@ -121,7 +121,10 @@ rebuild are checked through the policy as the permissions
 `application.projections.catch_up` and `application.projections.rebuild` at
 `ResourceScope::Application`, for the principal the edge authenticated: none
 until the identity block is enabled, so they fail `401 unauthenticated`, and
-`403 unauthorized` for a principal without the grant. A deployment exposes
+`403 unauthorized` for a principal without the grant. The PostgreSQL
+application's admin routes ([application storage](#application-storage)) need
+`application.admin.read` to read and `application.admin.write` to abandon a
+rebuild or delete a revision, checked the same way. A deployment exposes
 nothing unauthenticated by accident.
 
 ## Configuration reference
@@ -234,19 +237,21 @@ Optional. Without it no application endpoints are mounted. Any
 | --- | --- | --- | --- | --- |
 | `path` | path | required in the section | no | the [application configuration](application.md); its SQLite `path` keeps `serve`'s meaning |
 
-The PostgreSQL application core's tables (AP §D.2). `[application.append]`
-applies to a PostgreSQL application; the others are *reserved* until AP-A3:
+The PostgreSQL application core's tables (AP §D.2). `[application.projections]`,
+`[application.background]` and `[application.append]` apply to a PostgreSQL
+application ([application storage](#application-storage)); memory and SQLite
+applications ignore them. `[application.reactors]` is *reserved* until AP-C3:
 
 | Table | Key | Type | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `[application.projections]` | `catch_up` | `auto` or `manual` | `auto` | `manual`: only the admin endpoints run catch-up |
-| | `interval_ms` | duration | `5000` | 100 ms to 10 min |
-| | `run_timeout_ms` | duration | `30000` | 1 s to 5 min, per background run |
-| | `warm_readiness` | boolean | `true` | |
+| `[application.projections]` | `catch_up` | `auto` or `manual` | `auto` | `auto`: background catch-up on every local commit, `merezha_app_events` notification and `interval_ms`. `manual`: only the admin endpoints run catch-up; new revisions still warm up and requested rebuilds still run in the background |
+| | `interval_ms` | duration | `5000` | 100 ms to 10 min; the wake that covers lost notifications and external restores |
+| | `run_timeout_ms` | duration | `30000` | 1 s to 5 min, per background run; its statements end 5 s later at the latest (`run_timeout`) |
+| | `warm_readiness` | boolean | `true` | `/health/ready` is 503 until this instance's configured projection revisions are warm |
 | `[application.reactors]` | `interval_ms` | duration | `5000` | 100 ms to 10 min |
 | | `retry_base_ms` | duration | `1000` | 100 ms to 10 min; at most `retry_max_ms` (`retry_base_exceeds_max`) |
 | | `retry_max_ms` | duration | `300000` | 1 s to 1 day |
-| `[application.background]` | `max_concurrent` | integer | `2` | 1 to 16, shared by projection, rebuild and reactor runs; at most `database.max_detached - 1` |
+| `[application.background]` | `max_concurrent` | integer | `2` | 1 to 16, shared by projection, rebuild and reactor runs; at most `database.max_detached - 1`. It also caps the explicit catch-ups holding their own lock session. The runtime manifest's `max_concurrent_invocations` must be at least `limits.max_concurrent` plus this (`invalid_concurrency_budget` at startup) |
 | `[application.append]` | `lock_timeout_max_ms` | duration | `5000` | 10 ms to 30 s; the append waits for the head lock at most `min(remaining deadline - 50 ms, lock_timeout_max_ms)`, then fails `503 storage_busy` |
 
 ### `[jobs]`
@@ -835,10 +840,69 @@ concurrency_conflict`; a lock wait beyond the deadline or
 connection lost during the append fails `503 commit_outcome_unknown` and
 nothing needs a restart: retry with the same idempotency key, which replays the
 stored receipt when the first attempt committed. Receipts are rows committed
-with their events, so a keyed command replays on any host. Catch-up and
-rebuild still run synchronously in the request until AP-A3, with a row
-revision compare-and-swap (`409 projection_conflict` when another host
-published first).
+with their events, so a keyed command replays on any host.
+
+#### Projections in the background
+
+Each host runs a scheduler with one live lane and one rebuild lane per
+configured projection revision, at most `[application.background]
+max_concurrent` runs at once ([design](../design/application-platform.md)
+§A.7). With `catch_up = "auto"` a lane wakes on a commit on this host, on a
+`merezha_app_events` notification (one `LISTEN` session per host,
+reconnected with backoff from 100 ms to 10 s, logging `db.listener_lost` and
+`db.listener_restored`; a reconnect wakes every lane) and every
+`interval_ms`. A run holds the session advisory lock `pg_try_advisory_lock(1297760592,
+hashtext('p:{name}:{revision}'))` (`b:` for a rebuild) on a connection
+detached from the pool and named `merezha p:{name}:{revision}` in
+`pg_stat_activity`, so one host runs a projection at a time; pooled sessions
+never take one. Closing the session releases the lock, whether the run ends,
+fails, is cancelled at shutdown or its guest panics. A stuck holder shows in
+`pg_locks` with `classid = 1297760592`; end it with `pg_terminate_backend`.
+Each batch publishes state and checkpoint with a row-revision
+compare-and-swap, so a run whose lock session died cannot overwrite newer
+work. A failed run marks the row `failing` with its `failure_code` (log
+`projection.failed`), keeps the served pair and retries after 1 s, doubling
+to 5 min.
+
+`POST /v1/application/projections/{name}/catch-up` answers `{state,
+checkpoint}` as before: it runs to the head it read under the lock, or, when
+another host's run holds it, waits for that run to reach the head within the
+request deadline (`504 timeout` after it; progress stays). A query may carry
+`"min_position": P` (a command receipt's `position`): the host waits, within
+the deadline, until the projection reached it, else `503 projection_behind`.
+A projection revision new to the database starts at checkpoint 0 and warms up
+in the background with `live = false` up to the head at its creation, then
+`live = true`; until then its queries fail `503 projection_warming` and, with
+`warm_readiness`, the host is not ready (log `projection.warmed`). Old
+revisions keep serving the hosts that still run them.
+
+`POST .../rebuild` (body `{}` or `{"resume": true}`) answers `202
+{"rebuild":{"name","revision","target"}}` and rebuilds in the background, on
+whichever host takes its lock, from the configured initial state up to
+`target`, the head at the request. Queries keep serving the old state; the
+finished candidate replaces it atomically as the next generation (log
+`projection.rebuild_completed`), and live catch-up continues from there. A
+second request fails `409 rebuild_in_progress`; a failed batch marks the
+rebuild `failed` (log `projection.rebuild_failed`) without touching the
+served pair, `{"resume": true}` resumes it from its persisted candidate and
+`DELETE .../rebuild` abandons it (`204`). Embedding callers of
+`Application::rebuild` get the same rebuild run to its swap within the call.
+
+| Route under `/v1/application/` | Permission | Answer |
+| --- | --- | --- |
+| `GET status` | `application.admin.read` | `{"application","head","projections":[{"name","checkpoint","lag_events","lag_seconds","status","failure_code"}],"reactors":[],"instance":{"id","background_runs"},"listener"}`; `listener` is `connected`, `reconnecting` or `off` |
+| `GET projections` | `application.admin.read` | `{"head","projections":[{"name","revision","partitioned","checkpoint","lag","warm","status","failure_code","rebuild"?:{"checkpoint","target","status"},"updated_at"}]}` |
+| `GET projections/{name}` | `application.admin.read` | one entry plus `"revisions":[{"revision","checkpoint","warm"}]` |
+| `POST projections/{name}/catch-up` | `application.projections.catch_up` | `{state, checkpoint}` |
+| `POST projections/{name}/rebuild` | `application.projections.rebuild` | `202` as above |
+| `DELETE projections/{name}/rebuild` | `application.admin.write` | `204` |
+| `DELETE projections/{name}/revisions/{revision}` | `application.admin.write` | `204`; `409 revision_active` for the configured revision |
+
+Connections: each run holds one detached session beside the pool, as do at
+most `max_concurrent` explicit catch-ups, plus one `LISTEN` session. At
+startup the host logs `db.pool_undersized` (warn, `pool_size`,
+`recommended`) when `database.pool_size` is below `limits.max_concurrent +
+background.max_concurrent + 2 + number of job queues + 2`.
 
 `merezha application verify --config merezha.toml` checks, read-only and in
 chunks of 10,000 positions inside one repeatable-read snapshot, that positions

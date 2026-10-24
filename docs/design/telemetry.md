@@ -713,6 +713,7 @@ Stable event names (existing ones kept):
 | `projection.caught_up` / `projection.failed` | debug / warn | `projection`, `from`, `to`, `code` |
 | `migration.applied` / `migration.pending` / `migration.checksum_mismatch` | info / warn / error | `module`, `version` |
 | `db.pool_timeout` / `db.unavailable` | warn / error | `code` |
+| `db.pool_undersized` (startup, a PostgreSQL application whose pool is below AP §A.8's guidance) | warn | `pool_size`, `recommended` |
 | `db.listener_lost` / `db.listener_restored` | warn / info | `code` |
 | `outbound.failed` | warn | `provider`, `operation`, `code` |
 | `telemetry.export_failed` / `telemetry.otel_env_ignored` | warn / info | `signal`, `code`, `dropped` / `names` |

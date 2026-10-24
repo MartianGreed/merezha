@@ -10,6 +10,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 use support::Host;
 
@@ -17,6 +18,10 @@ const DATABASE_ENV: &str = "RUN_TEST_DATABASE_URL";
 
 fn request(address: SocketAddr, path: &str, body: &str) -> (u16, Value) {
     let reply = support::request(address, "POST", path, body);
+    (reply.status, reply.body)
+}
+fn call(address: SocketAddr, method: &str, path: &str, body: &str) -> (u16, Value) {
+    let reply = support::request(address, method, path, body);
     (reply.status, reply.body)
 }
 fn command(stream: &str, key: Option<&str>) -> String {
@@ -37,7 +42,7 @@ fuel=1000000
 max_input_bytes=65536
 max_output_bytes=65536
 timeout_ms=1000
-max_concurrent_invocations=4
+max_concurrent_invocations=32
 [[services]]
 id="protocol"
 path="protocol.wasm"
@@ -275,4 +280,159 @@ fn startup_reports_the_application_storage_code() {
         .failed()["code"],
         "invalid_limits"
     );
+}
+
+#[test]
+fn projections_advance_in_the_background_and_the_admin_api_reports_and_rebuilds() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let config = project(dir.path(), "run-pg", "", true);
+    let mut host = Host::spawn(&config, &[(DATABASE_ENV, test.url())], "admin");
+    let address = host.ready();
+    let mut position = 0;
+    for i in 0..5 {
+        let (status, receipt) = request(
+            address,
+            "/v1/application/commands",
+            &command(&format!("s{i}"), None),
+        );
+        assert_eq!(status, 200, "{receipt}");
+        position = receipt["position"].as_u64().unwrap();
+    }
+    // Read-your-write without an explicit catch-up.
+    let (status, model) = request(
+        address,
+        "/v1/application/queries",
+        &json!({"tag":"Total","payload":{},"min_position":position,
+                "metadata":{"message_id":"q1","correlation_id":"c1"}})
+        .to_string(),
+    );
+    assert_eq!(
+        (status, model["checkpoint"].clone()),
+        (200, json!(5)),
+        "{model}"
+    );
+    let (status, document) = call(address, "GET", "/v1/application/status", "");
+    assert_eq!(status, 200, "{document}");
+    assert_eq!(
+        (
+            document["application"].clone(),
+            document["head"].clone(),
+            document["projections"][0]["name"].clone(),
+            document["projections"][0]["lag_events"].clone(),
+            document["reactors"].clone(),
+        ),
+        (
+            json!("run-pg"),
+            json!(5),
+            json!("total"),
+            json!(0),
+            json!([])
+        )
+    );
+    assert!(document["instance"]["id"].is_string());
+    assert!(matches!(
+        document["listener"].as_str(),
+        Some("connected" | "reconnecting")
+    ));
+    let (status, overview) = call(address, "GET", "/v1/application/projections", "");
+    assert_eq!(status, 200, "{overview}");
+    assert_eq!(overview["head"], 5);
+    assert_eq!(
+        (
+            overview["projections"][0]["checkpoint"].clone(),
+            overview["projections"][0]["warm"].clone(),
+            overview["projections"][0]["status"].clone(),
+        ),
+        (json!(5), json!(true), json!("active"))
+    );
+    // A rebuild is accepted and runs in the background to its swap.
+    let (status, accepted) = request(address, "/v1/application/projections/total/rebuild", "{}");
+    assert_eq!(
+        (status, accepted),
+        (
+            202,
+            json!({"rebuild":{"name":"total","revision":1,"target":5}})
+        )
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, entry) = call(address, "GET", "/v1/application/projections/total", "");
+        assert_eq!(status, 200, "{entry}");
+        if entry.get("rebuild").is_none() {
+            assert_eq!(
+                entry["revisions"],
+                json!([{"revision":1,"checkpoint":5,"warm":true}])
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the rebuild never swapped: {entry}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (status, body) = request(
+        address,
+        "/v1/application/projections/total/rebuild",
+        r#"{"resume":"yes"}"#,
+    );
+    assert_eq!(
+        (status, body["error"]["code"].clone()),
+        (400, json!("invalid_input"))
+    );
+    let (status, _) = call(
+        address,
+        "DELETE",
+        "/v1/application/projections/total/rebuild",
+        "",
+    );
+    assert_eq!(status, 204);
+    let (status, body) = call(
+        address,
+        "DELETE",
+        "/v1/application/projections/total/revisions/1",
+        "",
+    );
+    assert_eq!(
+        (status, body["error"]["code"].clone()),
+        (409, json!("revision_active"))
+    );
+    let (status, body) = call(address, "GET", "/v1/application/projections/missing", "");
+    assert_eq!(
+        (status, body["error"]["code"].clone()),
+        (404, json!("projection_not_found"))
+    );
+    let (status, _) = call(address, "GET", "/health/ready", "");
+    assert_eq!(status, 200);
+    host.stop();
+    let text = fs::read_to_string(config.with_file_name("admin.log")).unwrap();
+    assert!(!text.contains(test.url()), "the database URL was logged");
+}
+
+#[test]
+fn startup_refuses_a_guest_runtime_below_the_concurrency_budget() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let config = project(dir.path(), "run-pg", "[limits]\nmax_concurrent=31", true);
+    assert_eq!(
+        Host::spawn(&config, &[(DATABASE_ENV, test.url())], "budget").failed()["code"],
+        "invalid_concurrency_budget"
+    );
+    // A pool below the guidance only warns.
+    let dir = tempfile::tempdir().unwrap();
+    let config = project(dir.path(), "run-pg", "", true);
+    let mut host = Host::spawn(&config, &[(DATABASE_ENV, test.url())], "pool");
+    host.ready();
+    assert!(
+        host.events()
+            .iter()
+            .any(|e| e["event"] == "db.pool_undersized" && e["pool_size"] == 4),
+        "pool warning"
+    );
+    host.stop();
 }

@@ -7,6 +7,7 @@ mod durable;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 mod sqlite;
+pub mod status;
 pub mod store;
 pub use application::{Application, ProjectionState, QueryResult};
 
@@ -36,6 +37,12 @@ pub trait GuestSession: Send + Sync {
 pub trait Guest: Send + Sync {
     fn session(&self) -> Result<Box<dyn GuestSession>, Failure>;
     fn services(&self) -> Result<Vec<String>, Failure>;
+    /// How many guest calls may run at once, when the guest bounds them.
+    /// PostgreSQL applications check it against HTTP admission plus
+    /// background runs at startup (`invalid_concurrency_budget`).
+    fn max_concurrent_invocations(&self) -> Option<usize> {
+        None
+    }
 }
 /// Policy is composed by the embedding host. It is called after typed payload
 /// validation and before every command replay or query. Metadata is untrusted
@@ -73,6 +80,11 @@ impl Guest for merezha_runtime::Runtime {
     }
     fn services(&self) -> Result<Vec<String>, Failure> {
         Ok(self.catalog().map_err(runtime_failure)?.services)
+    }
+    fn max_concurrent_invocations(&self) -> Option<usize> {
+        merezha_runtime::Runtime::limits(self)
+            .ok()
+            .map(|limits| limits.max_concurrent_invocations)
     }
 }
 impl GuestSession for merezha_runtime::Session {

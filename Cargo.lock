@@ -1608,6 +1608,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tracing",
  "wat",
 ]
 

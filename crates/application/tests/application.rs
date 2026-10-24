@@ -40,6 +40,7 @@ fn query() -> Query {
         tag: id("Total"),
         payload: json!({}),
         metadata: metadata("alice"),
+        min_position: None,
     }
 }
 fn config() -> Config {

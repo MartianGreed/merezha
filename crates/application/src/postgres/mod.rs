@@ -12,13 +12,23 @@
 //! the append function locks the single `merezha_app.head` row and commits
 //! as one autocommit statement (§A.4, §A.5).
 //!
-//! Background projection runners, the shared `Listener` and the admin API
-//! come with AP-A3; [`PostgresStore`] then gains inherent methods for them.
+//! Projections advance in the background (§A.7): a [`Scheduler`] per
+//! instance runs live catch-up and rebuilds under session advisory locks
+//! held on connections detached from the pool, woken by local commits,
+//! `LISTEN merezha_app_events` and an interval. The admin documents
+//! ([`crate::status`]) read the same rows.
+mod admin;
+mod runner;
+mod scheduler;
 mod sql;
 #[cfg(test)]
 mod tests;
 mod verify;
 
+pub use runner::{BackgroundOptions, CatchUp, INTERVAL, MAX_CONCURRENT, RUN_TIMEOUT};
+#[doc(hidden)]
+pub use runner::{Pause, RunHooks};
+pub use scheduler::{EVENTS_CHANNEL, Scheduler};
 pub use verify::{MAX_VIOLATIONS, Subject, VerifyReport, Violation, verify};
 
 use crate::{
@@ -50,6 +60,9 @@ pub const MIGRATIONS: &[Migration] = &[Migration::new(
 )];
 /// The registered name of the append statement, TE's `app.events.append`.
 pub const APPEND_STATEMENT: &str = sql::APPEND_NAME;
+/// The `pg_locks.classid` of every run lock (`'MZAP'`, §A.7): operators
+/// find a stuck holder there and end it with `pg_terminate_backend`.
+pub const RUN_LOCK_CLASS: i32 = sql::LOCK_CLASS;
 /// Below this much time left the append is not attempted (§A.4).
 const APPEND_MARGIN: Duration = Duration::from_millis(50);
 /// Bounds of [`PostgresOptions::lock_timeout_max`], `[application.append]`.
@@ -109,12 +122,15 @@ pub struct PostgresOptions {
     /// `min(remaining deadline - 50 ms, lock_timeout_max)`.
     pub lock_timeout_max: Duration,
     pub trace: Option<Arc<dyn TraceSource>>,
+    /// Background runners and explicit catch-ups.
+    pub background: BackgroundOptions,
 }
 impl Default for PostgresOptions {
     fn default() -> Self {
         Self {
             lock_timeout_max: Duration::from_secs(5),
             trace: None,
+            background: BackgroundOptions::default(),
         }
     }
 }
@@ -123,6 +139,7 @@ impl std::fmt::Debug for PostgresOptions {
         f.debug_struct("PostgresOptions")
             .field("lock_timeout_max", &self.lock_timeout_max)
             .field("trace", &self.trace.is_some())
+            .field("background", &self.background)
             .finish()
     }
 }
@@ -142,6 +159,8 @@ pub struct PostgresStore {
     /// What restores the session's statement timeout after an append; a
     /// test replaces it to make the reset fail or come late.
     reset_statement: &'static str,
+    /// This instance's wakes, lanes and run budgets.
+    shared: Arc<runner::Shared>,
 }
 /// Restores the session default after an append.
 const RESET_STATEMENT: &str = "RESET statement_timeout";
@@ -220,6 +239,7 @@ impl PostgresStore {
         if !(min..=max).contains(&options.lock_timeout_max) {
             return Err(configuration());
         }
+        options.background.validate()?;
         let report = run_migrations(
             db,
             &[ModuleMigrations {
@@ -285,6 +305,10 @@ impl PostgresStore {
                 .iter()
                 .map(|p| (p.name.clone(), p.revision))
                 .collect(),
+            shared: Arc::new(runner::Shared::new(
+                options.background.clone(),
+                &config.projections,
+            )),
             options,
             reset_statement: RESET_STATEMENT,
         })
@@ -562,9 +586,12 @@ impl DurableStore for PostgresStore {
         let row = self.block_on(deadline, self.append(&append, deadline))?;
         #[cfg(test)]
         tests::crash_cut("after_append_before_wake");
-        // AP-A3: the in-process wake of local projection runners goes here,
-        // after an `appended` outcome.
-        match row.get::<_, &str>(0) {
+        let outcome = row.get::<_, &str>(0);
+        if outcome == "appended" && !append.tags.is_empty() {
+            // The in-process wake of this instance's projection runners.
+            self.shared.appended();
+        }
+        match outcome {
             "appended" | "replayed" => Self::receipt_of(c.stream, &row),
             "conflict" => Err(Failure::conflict("concurrency_conflict")),
             "mismatch" => Err(Failure::conflict("idempotency_mismatch")),
@@ -577,27 +604,9 @@ impl DurableStore for PostgresStore {
         deadline: Instant,
     ) -> Result<(ProjectionState, i64), Failure> {
         let (name, revision) = self.configured(p)?;
-        let row = self.block_on(
-            deadline,
-            self.session(deadline, timeout, async |client| {
-                client
-                    .query_opt(sql::PROJECTION, &[&name, &revision])
-                    .await
-                    .map_err(|e| read_error(&e))
-            }),
-        )?;
-        let row = row.ok_or_else(invalid)?;
-        // A partitioned row has no single state; this build has none.
-        let text: Option<&str> = row.get(0);
-        let state: serde_json::Value = decode(text.ok_or_else(invalid)?, MAX_STATE_BYTES)?;
-        compatible_json(&state).map_err(|_| invalid())?;
-        Ok((
-            ProjectionState {
-                state,
-                checkpoint: unsigned(row.get(1))?,
-            },
-            row.get(2),
-        ))
+        let (pair, row_revision, _) =
+            self.block_on(deadline, self.served_row(name, revision, deadline))?;
+        Ok((pair, row_revision))
     }
     fn commit_projection(
         &self,
@@ -631,7 +640,7 @@ impl DurableStore for PostgresStore {
     #[cfg(feature = "test-support")]
     fn independent(
         &self,
-        _: &Config,
+        config: &Config,
     ) -> Result<(Arc<dyn DurableStore>, crate::sqlite::Recovered), Failure> {
         // Same pool, other sessions; nothing is recovered into memory. The
         // PostgreSQL contract fixture opens a second pool instead.
@@ -645,6 +654,10 @@ impl DurableStore for PostgresStore {
                 projections: self.projections.clone(),
                 options: self.options.clone(),
                 reset_statement: self.reset_statement,
+                shared: Arc::new(runner::Shared::new(
+                    self.options.background.clone(),
+                    &config.projections,
+                )),
             }),
             Default::default(),
         ))
@@ -745,5 +758,216 @@ impl PostgresStore {
             Some(failure) => Err(failure),
             None => result.map_err(|e| append_error(&e)),
         }
+    }
+}
+
+/// Reads and writes of the projection rows, shared by queries, runs, the
+/// scheduler and the admin API.
+impl PostgresStore {
+    pub(crate) fn shared(&self) -> &runner::Shared {
+        &self.shared
+    }
+    /// A configured projection's `(name, revision)` key.
+    fn key_of(&self, projection: &crate::config::Projection) -> Result<(String, i32), Failure> {
+        self.configured(&ProjectionRef {
+            name: &projection.name,
+            revision: projection.revision,
+        })
+    }
+    /// The served pair, its row revision and its `warm_position`.
+    pub(crate) async fn served_row(
+        &self,
+        name: String,
+        revision: i32,
+        deadline: Instant,
+    ) -> Result<(ProjectionState, i64, u64), Failure> {
+        let row = self
+            .session(deadline, timeout, async |client| {
+                client
+                    .query_opt(sql::PROJECTION, &[&name, &revision])
+                    .await
+                    .map_err(|e| read_error(&e))
+            })
+            .await?;
+        let row = row.ok_or_else(invalid)?;
+        // A partitioned row has no single state; this build has none.
+        let text: Option<&str> = row.get(0);
+        let state: serde_json::Value = decode(text.ok_or_else(invalid)?, MAX_STATE_BYTES)?;
+        compatible_json(&state).map_err(|_| invalid())?;
+        Ok((
+            ProjectionState {
+                state,
+                checkpoint: unsigned(row.get(1))?,
+            },
+            row.get(2),
+            unsigned(row.get(3))?,
+        ))
+    }
+    pub(crate) fn served(
+        &self,
+        projection: &crate::config::Projection,
+        deadline: Instant,
+    ) -> Result<(ProjectionState, i64, u64), Failure> {
+        let (name, revision) = self.key_of(projection)?;
+        self.block_on(deadline, self.served_row(name, revision, deadline))
+    }
+    pub(crate) async fn head_async(&self, deadline: Instant) -> Result<u64, Failure> {
+        let position: i64 = self
+            .session(deadline, timeout, async |client| {
+                Ok(client
+                    .query_one(sql::HEAD, &[])
+                    .await
+                    .map_err(|e| read_error(&e))?
+                    .get(0))
+            })
+            .await?;
+        unsigned(position)
+    }
+    pub(crate) fn head_at(&self, deadline: Instant) -> Result<u64, Failure> {
+        self.block_on(deadline, self.head_async(deadline))
+    }
+    /// Request a rebuild (§A.7 step 1): the next generation from the
+    /// configured initial state up to the current head. With `resume`, an
+    /// existing rebuild (failed or running) runs again from its candidate;
+    /// without it, an existing one fails `rebuild_in_progress`. Returns the
+    /// target and wakes this instance's rebuild lane.
+    pub(crate) fn request_rebuild(
+        &self,
+        projection: &crate::config::Projection,
+        resume: bool,
+        requested_by: Option<&str>,
+        deadline: Instant,
+    ) -> Result<u64, Failure> {
+        let (name, revision) = self.key_of(projection)?;
+        let initial = encode(&projection.initial)?;
+        let by = requested_by.map(str::to_owned);
+        let target: i64 = self.block_on(
+            deadline,
+            self.db.transaction(deadline, move |tx| {
+                Box::pin(async move {
+                    if let Some(row) = tx
+                        .query_opt(sql::INSERT_REBUILD, &[&name, &revision, &initial, &by])
+                        .await
+                        .map_err(|e| read_error(&e))?
+                    {
+                        return Ok(row.get(0));
+                    }
+                    if !resume {
+                        return Err(Failure::conflict("rebuild_in_progress"));
+                    }
+                    let row = tx
+                        .query_opt(sql::RESUME_REBUILD, &[&name, &revision])
+                        .await
+                        .map_err(|e| read_error(&e))?;
+                    // Swapped between the two statements: nothing to resume.
+                    row.map(|row| row.get(0))
+                        .ok_or_else(|| Failure::conflict("rebuild_in_progress"))
+                })
+            }),
+        )?;
+        self.shared.lane(projection)?.rebuild.notify_one();
+        unsigned(target)
+    }
+    /// `Some(true)` while a rebuild runs, `Some(false)` when it failed,
+    /// `None` without one.
+    pub(crate) async fn rebuild_status_async(
+        &self,
+        name: String,
+        revision: i32,
+        deadline: Instant,
+    ) -> Result<Option<bool>, Failure> {
+        let row = self
+            .session(deadline, timeout, async |client| {
+                client
+                    .query_opt(sql::REBUILD_STATUS, &[&name, &revision])
+                    .await
+                    .map_err(|e| read_error(&e))
+            })
+            .await?;
+        Ok(row.map(|row| row.get::<_, &str>(0) == "running"))
+    }
+    pub(crate) fn rebuild_status(
+        &self,
+        projection: &crate::config::Projection,
+        deadline: Instant,
+    ) -> Result<Option<bool>, Failure> {
+        let (name, revision) = self.key_of(projection)?;
+        self.block_on(
+            deadline,
+            self.rebuild_status_async(name, revision, deadline),
+        )
+    }
+    /// Abandon a rebuild; its runner stops at its next batch. Idempotent.
+    pub(crate) fn abandon_rebuild(
+        &self,
+        projection: &crate::config::Projection,
+        deadline: Instant,
+    ) -> Result<(), Failure> {
+        let (name, revision) = self.key_of(projection)?;
+        self.block_on(
+            deadline,
+            self.session(deadline, timeout, async |client| {
+                client
+                    .execute(sql::DELETE_REBUILD, &[&name, &revision])
+                    .await
+                    .map_err(|e| read_error(&e))
+            }),
+        )?;
+        Ok(())
+    }
+    /// Delete a revision row this instance does not serve (and with it its
+    /// rebuild). `revision_active` for the configured revision,
+    /// `projection_not_found` for a row that does not exist.
+    pub(crate) fn delete_revision(
+        &self,
+        name: &Identity,
+        revision: u32,
+        deadline: Instant,
+    ) -> Result<(), Failure> {
+        if self.projections.contains(&(name.clone(), revision)) {
+            return Err(Failure::conflict("revision_active"));
+        }
+        if !self.projections.iter().any(|(n, _)| n == name) {
+            return Err(Failure::permanent("projection_not_found"));
+        }
+        let text = name.as_str().to_owned();
+        let revision =
+            i32::try_from(revision).map_err(|_| Failure::permanent("projection_not_found"))?;
+        let deleted = self.block_on(
+            deadline,
+            self.session(deadline, timeout, async |client| {
+                client
+                    .execute(sql::DELETE_REVISION, &[&text, &revision])
+                    .await
+                    .map_err(|e| read_error(&e))
+            }),
+        )?;
+        if deleted == 0 {
+            return Err(Failure::permanent("projection_not_found"));
+        }
+        Ok(())
+    }
+    /// Record a failed background run on the row (`status = 'failing'`);
+    /// the served pair stays.
+    pub(crate) async fn record_failure(
+        &self,
+        name: String,
+        revision: i32,
+        failure: &Failure,
+        deadline: Instant,
+    ) -> Result<(), Failure> {
+        let code = failure.code.clone();
+        let class = serde_json::to_value(failure.classification)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(invalid)?;
+        self.session(deadline, timeout, async |client| {
+            client
+                .execute(sql::RECORD_FAILURE, &[&name, &revision, &code, &class])
+                .await
+                .map_err(|e| read_error(&e))
+        })
+        .await?;
+        Ok(())
     }
 }

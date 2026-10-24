@@ -1720,7 +1720,7 @@ only on loopback (`AllowAll`). Durations are in seconds (R9).
 | `POST reactors/{name}/pause` and `/resume` | `{"name","status"}` |
 | `POST reactors/{name}/retry` | retries a halted reactor now |
 | `POST reactors/{name}/skip` | body `{"position":P}` with `P = checkpoint + 1` (exactly the stuck event) or `{"to":"head"}`; records `reactor_skips` with the principal; `{"name","checkpoint"}` |
-| `GET status` | `{"application","head","projections":[{"name","checkpoint","lag_events","lag_seconds","status","failure_code"}],"reactors":[{"name","status","lag_events"}],"instance":{"id","background_runs"},"listener"}`, where `listener` is `connected` or `reconnecting` |
+| `GET status` | `{"application","head","projections":[{"name","checkpoint","lag_events","lag_seconds","status","failure_code"}],"reactors":[{"name","status","lag_events"}],"instance":{"id","background_runs"},"listener"}`, where `listener` is `connected`, `reconnecting` or `off` (no `LISTEN` session, as with manual catch-up) |
 
 `GET status` serves `Application::status()` and `GET queues`/`GET outbox` serve
 `JobsHandle::queue_status()`; TE's `/v1/admin/status` embeds the same documents (R10). Writes need
@@ -1918,6 +1918,30 @@ description (not gated).
    pooled session holds an `MZAP` lock (`pg_locks`). A partitioned batch losing its CAS writes none.
 
 `application.md` gains a PostgreSQL section, exercised as written.
+
+**A3 delivery notes.** As built in AP-A3:
+
+- Partitioned commits, partitioned rebuild generations and the "partitioned batch losing its CAS
+  writes none" check land with C2, which adds migration 0002 and `project.partition`; no partitioned
+  projection exists before it. The live commit and the swap are single CAS-first transactions.
+- Test 3: the killed holder issues every statement on its lock session, so it fails
+  `database_unavailable` and never reaches a CAS. A lost CAS is shown by a run without the lock (test
+  hook, `Application::project_unlocked`) and by a live run racing a rebuild swap.
+- The application opens its own `LISTEN merezha_app_events` session through `Database::listen`,
+  reconnected by the scheduler; the jobs relay keeps its own, so a host holds two listener sessions.
+  A cross-module fan-out listener can replace both later.
+- No metric is emitted until TE's meter lands (TE-T3); the store exposes their sources
+  (`PostgresStore::held_locks`, `contended_locks`, the status lag). Logs use TE's names, plus
+  `db.pool_undersized` for the A.8 warning.
+- `POST .../catch-up` and `POST .../rebuild` keep K's permissions `application.projections.catch_up`
+  and `application.projections.rebuild`; the new reads need `application.admin.read`, and abandoning a
+  rebuild or deleting a revision `application.admin.write`.
+- `catch_up = "manual"` stops live catch-up only: new revisions still warm up and requested rebuilds
+  still run in the background. `Application::rebuild` (the synchronous API) requests or resumes the
+  rebuild and runs it to its swap within the call; `{"resume": true}` without a rebuild starts one.
+- A waiting explicit catch-up retries the run lock every second, and the status `listener` is `off`
+  without a `LISTEN` session (manual catch-up). Memory and SQLite fail `min_position` at once.
+- Reactor lanes, the `r:` lock and the reactor admin routes are C3's; the status lists no reactors.
 
 **B1 tests.**
 

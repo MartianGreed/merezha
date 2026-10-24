@@ -199,6 +199,10 @@ impl Runtime {
             pipelines: registry.pipelines.keys().cloned().collect(),
         })
     }
+    /// The limits of the active generation. A reload may change them.
+    pub fn limits(&self) -> Result<Limits, Error> {
+        Ok(self.snapshot()?.limits.clone())
+    }
     fn snapshot(&self) -> Result<Arc<Registry>, Error> {
         self.0
             .registry

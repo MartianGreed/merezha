@@ -54,6 +54,7 @@ fn query() -> Query {
         tag: id("Total"),
         payload: json!({}),
         metadata: metadata("alice"),
+        min_position: None,
     }
 }
 const CONFIG: &str = r#"
@@ -305,10 +306,25 @@ trait StoreFixture {
     fn independent(&self, app: &Application) -> Result<Application, Failure>;
     fn inject(&self, fault: Fault);
     fn clear(&self, fault: Fault);
-    /// SQLite rebuilds synchronously; PostgreSQL rebuilds in the
-    /// background (AP-A3), and its fixture waits for the swap.
+    /// SQLite rebuilds synchronously; PostgreSQL runs the background
+    /// rebuild to its swap within the request (AP-A3).
     fn rebuild(&self, app: &Application, name: &str) -> Result<ProjectionState, Failure> {
         app.rebuild(name)
+    }
+    /// Whether a racing second run must skip the run lock to race at all.
+    /// PostgreSQL runs hold a session advisory lock, so a second locked
+    /// run waits instead; the CAS that keeps the data correct without the
+    /// lock is raced by an unlocked run, as one whose lock session died.
+    fn locks_runs(&self) -> bool {
+        false
+    }
+}
+/// A racing catch-up or rebuild on `app` for the CAS contracts.
+fn racing(app: &Application, unlocked: bool, rebuild: bool) -> Result<ProjectionState, Failure> {
+    match (unlocked, rebuild) {
+        (true, _) => app.project_unlocked("total", rebuild),
+        (false, false) => app.catch_up("total"),
+        (false, true) => app.rebuild("total"),
     }
 }
 
@@ -414,6 +430,9 @@ impl StoreFixture for Postgres {
             "CREATE FUNCTION contract_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected'; END $$; \
              CREATE TRIGGER contract_fault {target} FOR EACH ROW EXECUTE FUNCTION contract_fault()"
         ));
+    }
+    fn locks_runs(&self) -> bool {
+        true
     }
     fn clear(&self, fault: Fault) {
         let table = match fault {
@@ -653,9 +672,10 @@ fn contract_independent_instances_recheck_stream_key_and_projection_revision(
     assert_eq!(b.command(command(1, Some("late"))).unwrap(), late);
     assert_eq!(control.decisions(), before);
     // Projection: b computes from row revision r, a publishes r + 1 first.
+    let unlocked = f.locks_runs();
     let held = control.hold(Op::Project);
     let other = b.clone();
-    let thread = std::thread::spawn(move || other.catch_up("total"));
+    let thread = std::thread::spawn(move || racing(&other, unlocked, false));
     held.arrived();
     assert_eq!(a.catch_up("total").unwrap(), pair(4, 3));
     held.release();
@@ -667,7 +687,7 @@ fn contract_independent_instances_recheck_stream_key_and_projection_revision(
     // revision, so a candidate computed before it cannot overwrite it.
     let held = control.hold(Op::Project);
     let other = b.clone();
-    let thread = std::thread::spawn(move || other.rebuild("total"));
+    let thread = std::thread::spawn(move || racing(&other, unlocked, true));
     held.arrived();
     assert_eq!(f.rebuild(&a, "total").unwrap(), pair(4, 3));
     held.release();

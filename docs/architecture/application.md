@@ -170,8 +170,8 @@ owns sizing and adapter selection. No setting makes the host a native OS sandbox
 every decision: a command whose stream holds more events fails `history_limit`
 (422) before the guest decides, on every backend, and a keyed retry is not left
 in flight. Memory and SQLite also stop at `max_events`, whichever is lower.
-The host records which `[limits]` keys the file wrote. PostgreSQL storage (a later
-slice) has no total capacity and will refuse a written `max_events`,
+The host records which `[limits]` keys the file wrote. PostgreSQL storage has
+no total capacity and refuses a written `max_events`,
 `max_streams`, `max_store_bytes` or `max_idempotency` with `invalid_limits`.
 
 Every limit must be positive. Registries allow at most 64 command tags, 64
@@ -392,7 +392,11 @@ synchronously:
 ```rust,ignore
 let store = PostgresStore::connect(&db, &config, PostgresOptions::default(), deadline).await?;
 let app = Application::with_postgres(config, guest, authorizer, Arc::new(store))?;
+// Projections advance in the background from here on.
+let scheduler = Scheduler::start(&app)?;
 // Then call `app` only from spawn_blocking or a thread outside the runtime.
+// ...
+scheduler.shutdown(deadline).await;
 ```
 
 The store blocks on the runtime handle it was connected on, so it needs a
@@ -400,7 +404,29 @@ multi-thread runtime and must not be called on an async worker thread. The
 in-process registry keeps pending idempotency claims only; completed receipts
 are read back from the database.
 
+Projections on PostgreSQL differ from the consistency rules above in four
+ways ([platform: projections in the background](platform.md#projections-in-the-background)):
+
+- The `Scheduler` (`PostgresOptions::background`) catches every projection
+  up in the background after commits on any host, one host at a time per
+  projection under a session advisory lock. `catch_up(name)` runs to the head
+  it read or waits for the host that holds the lock; it never fails
+  `projection_in_flight`.
+- `rebuild(name)` requests a resumable rebuild and runs it to its atomic swap
+  within the call; `Admission::request_rebuild` only requests it, for the
+  `202` admin route. Queries serve the previous state until the swap.
+- `Query.min_position` (a receipt's `position`) waits within the deadline
+  until the projection reached it, else fails `projection_behind`. Memory and
+  SQLite fail it at once when the checkpoint is behind.
+- A projection `revision` new to the database warms up in the background;
+  its queries fail `projection_warming` and `Scheduler::ready` is false until
+  it reaches the head it was created at.
+
+`Application::status()` returns the status document on every backend:
+head, per-projection checkpoint, lag and failure, plus on PostgreSQL the
+instance's background runs and listener state.
+
 ```sh
-cargo test --locked -p merezha-application --test postgres --test store_contract
+cargo test --locked -p merezha-application --test postgres --test store_contract --test background
 cargo test --locked -p merezha-cli --test postgres_process
 ```
