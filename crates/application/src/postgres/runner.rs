@@ -388,16 +388,16 @@ impl PostgresStore {
         let client = self.step(bounds, self.db.detach(bounds.hard))?;
         let label = format!("merezha {key}");
         self.step(bounds, async {
-            client
-                .query_one(sql::NAME_SESSION, &[&label])
+            self.db
+                .query_one(&client, &sql::NAME_SESSION, &[&label])
                 .await
                 .map_err(|e| read_error(&e))
         })?;
         if !self.shared.options.hooks().skip_lock {
             let locked: bool = self
                 .step(bounds, async {
-                    client
-                        .query_one(sql::TRY_LOCK, &[&key])
+                    self.db
+                        .query_one(&client, &sql::TRY_LOCK, &[&key])
                         .await
                         .map_err(|e| read_error(&e))
                 })?
@@ -453,8 +453,13 @@ impl PostgresStore {
 impl Session<'_> {
     fn row(&self) -> Result<Row, Failure> {
         let row = self.store.step(self.bounds, async {
-            self.client
-                .query_opt(sql::PROJECTION, &[&self.name, &self.revision])
+            self.store
+                .db
+                .query_opt(
+                    &self.client,
+                    &sql::PROJECTION,
+                    &[&self.name, &self.revision],
+                )
                 .await
                 .map_err(|e| read_error(&e))
         })?;
@@ -473,8 +478,9 @@ impl Session<'_> {
     }
     fn head(&self) -> Result<u64, Failure> {
         let row = self.store.step(self.bounds, async {
-            self.client
-                .query_one(sql::HEAD, &[])
+            self.store
+                .db
+                .query_one(&self.client, &sql::HEAD, &[])
                 .await
                 .map_err(|e| read_error(&e))
         })?;
@@ -485,8 +491,9 @@ impl Session<'_> {
         let from = signed(after)?;
         let count = signed(limit)?;
         let rows = self.store.step(self.bounds, async {
-            self.client
-                .query(&sql::read_all(), &[&from, &count])
+            self.store
+                .db
+                .query(&self.client, &sql::READ_ALL, &[&from, &count])
                 .await
                 .map_err(|e| read_error(&e))
         })?;
@@ -541,18 +548,20 @@ impl Session<'_> {
         let hard = self.bounds.hard;
         let store = self.store;
         let bounds = self.bounds;
+        let db = store.db.clone();
         store.step(
             bounds,
             self.client.transaction(hard, move |tx| {
                 Box::pin(async move {
-                    let row = tx
+                    let row = db
                         .query_opt(
-                            sql::COMMIT_PROJECTION,
+                            tx,
+                            &sql::COMMIT_PROJECTION,
                             &[&name, &revision, &text, &checkpoint, &row_revision],
                         )
                         .await
                         .map_err(|e| read_error(&e))?;
-                    pause_in(tx, sleep, &name).await?;
+                    pause_in(&db, tx, sleep, &name).await?;
                     row.map(|row| row.get(0))
                         .ok_or_else(|| Failure::conflict("projection_conflict"))
                 })
@@ -564,6 +573,7 @@ impl Session<'_> {
 /// stays open, idle or in a `pg_sleep`, so only the run's own bounds can
 /// end it.
 async fn pause_in(
+    db: &merezha_postgres::Database,
     tx: &merezha_postgres::Tx<'_>,
     pause: Option<Arc<Pause>>,
     projection: &str,
@@ -575,7 +585,8 @@ async fn pause_in(
         pause.entered.store(true, Ordering::SeqCst);
         let duration = Duration::from_millis(pause.millis.load(Ordering::SeqCst));
         if pause.statement.load(Ordering::SeqCst) {
-            tx.batch_execute(&format!("SELECT pg_sleep({})", duration.as_secs_f64()))
+            let sleep = format!("SELECT pg_sleep({})", duration.as_secs_f64());
+            db.batch_text(tx, &sql::COMMIT_DELAY, &sleep)
                 .await
                 .map_err(|e| read_error(&e))?;
         } else {
@@ -718,8 +729,9 @@ struct Candidate {
 impl Session<'_> {
     fn candidate(&self) -> Result<Option<Candidate>, Failure> {
         let row = self.store.step(self.bounds, async {
-            self.client
-                .query_opt(sql::REBUILD, &[&self.name, &self.revision])
+            self.store
+                .db
+                .query_opt(&self.client, &sql::REBUILD, &[&self.name, &self.revision])
                 .await
                 .map_err(|e| read_error(&e))
         })?;
@@ -749,18 +761,20 @@ impl Session<'_> {
         let sleep = self.store.shared.options.hooks().pause;
         let hard = self.bounds.hard;
         let (store, bounds) = (self.store, self.bounds);
+        let db = store.db.clone();
         store.step(
             bounds,
             self.client.transaction(hard, move |tx| {
                 Box::pin(async move {
-                    let row = tx
+                    let row = db
                         .query_opt(
-                            sql::COMMIT_CANDIDATE,
+                            tx,
+                            &sql::COMMIT_CANDIDATE,
                             &[&name, &revision, &text, &checkpoint, &row_revision],
                         )
                         .await
                         .map_err(|e| read_error(&e))?;
-                    pause_in(tx, sleep, &name).await?;
+                    pause_in(&db, tx, sleep, &name).await?;
                     Ok(row.map(|row| row.get(0)))
                 })
             }),
@@ -768,9 +782,11 @@ impl Session<'_> {
     }
     fn fail_candidate(&self, row_revision: i64, failure: &Failure) -> Result<(), Failure> {
         self.store.step(self.bounds, async {
-            self.client
+            self.store
+                .db
                 .execute(
-                    sql::FAIL_REBUILD,
+                    &self.client,
+                    &sql::FAIL_REBUILD,
                     &[&self.name, &self.revision, &row_revision, &failure.code],
                 )
                 .await
@@ -786,16 +802,17 @@ impl Session<'_> {
         let sleep = self.store.shared.options.hooks().pause;
         let hard = self.bounds.hard;
         let (store, bounds) = (self.store, self.bounds);
+        let db = store.db.clone();
         let swapped: Option<(String, i64)> = store.step(
             bounds,
             self.client.transaction(hard, move |tx| {
                 Box::pin(async move {
-                    tx.query_opt(sql::LOCK_PROJECTION, &[&name, &revision])
+                    db.query_opt(tx, &sql::LOCK_PROJECTION, &[&name, &revision])
                         .await
                         .map_err(|e| read_error(&e))?
                         .ok_or_else(invalid)?;
-                    let Some(taken) = tx
-                        .query_opt(sql::TAKE_CANDIDATE, &[&name, &revision, &row_revision])
+                    let Some(taken) = db
+                        .query_opt(tx, &sql::TAKE_CANDIDATE, &[&name, &revision, &row_revision])
                         .await
                         .map_err(|e| read_error(&e))?
                     else {
@@ -805,13 +822,14 @@ impl Session<'_> {
                     let state = state.ok_or_else(invalid)?;
                     let checkpoint: i64 = taken.get(1);
                     let generation: i32 = taken.get(2);
-                    tx.query_one(
-                        sql::SWAP,
+                    db.query_one(
+                        tx,
+                        &sql::SWAP,
                         &[&name, &revision, &state, &checkpoint, &generation],
                     )
                     .await
                     .map_err(|e| read_error(&e))?;
-                    pause_in(tx, sleep, &name).await?;
+                    pause_in(&db, tx, sleep, &name).await?;
                     Ok(Some((state, checkpoint)))
                 })
             }),

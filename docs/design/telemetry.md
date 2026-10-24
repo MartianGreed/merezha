@@ -128,7 +128,9 @@ installed by the binary; tests use scoped dispatchers (§8).
 No spans for: `/health/*` requests (metrics only), empty job-lease polls,
 empty relay batches, projection and reactor ticks with no new events, and pool
 acquisitions (their wait is the `merezha.db.pool.wait` attribute on the
-statement span plus a histogram).
+transaction span plus a histogram). DB statement and transaction spans never
+start a trace (T4): outside a caller's span (readiness probes, listener
+probes, background polls) a statement only counts in the metrics.
 
 ### 1.3 Metric catalog
 
@@ -233,7 +235,16 @@ Statements are registered statically: `merezha-postgres` exposes
 `Statement { name, summary, sql }`. `name` (`app.events.append`) becomes
 `merezha.db.statement`; `summary` (`INSERT merezha_app.events`) becomes the
 span name and `db.query.summary`; operation and collection derive from it.
-Unregistered SQL reports as `merezha.db.statement=adhoc` and fails review.
+`Statement::new` checks both at compile time, and `adhoc` is a reserved
+name. Statements run through `Database::query`, `execute` and their
+siblings, which take any session (pooled client, `Tx`, detached client);
+text built at run time runs through `batch_text` under a registered name.
+SQL sent through the driver directly is invisible to telemetry rather than
+reported as `adhoc` (T4: `Tx` stays the driver's transaction type so blocks
+keep compiling), so it fails review instead; a source scan in
+`merezha-postgres` keeps the kernel's own SQL on the registry.
+`error.type` is the `classify` code (`unique_violation`), or `cancelled` when
+the caller dropped a statement before the server answered.
 Pool gauges read `deadpool` `Pool::status()`, which does no I/O.
 
 **Jobs and outbox** (application platform, part B)

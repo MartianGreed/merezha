@@ -379,3 +379,97 @@ fn an_append_that_answered_keeps_its_outcome_when_only_the_reset_fails_or_is_lat
     }
     assert_eq!(count(&runtime, test.url(), "events"), 2);
 }
+
+/// TE §1.3 (T4, owed by AP-A2): the store's statements are registered, the
+/// append reports as `app.events.append`, and every statement a command, a
+/// replay, a query and a rebuild run carries a registered name.
+#[test]
+fn the_store_runs_registered_statements_only_and_reports_the_append() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    assert_eq!(
+        merezha_postgres::check_registry(&[merezha_postgres::KERNEL_STATEMENTS, STATEMENTS]),
+        Ok(())
+    );
+    let harness = merezha_telemetry::testing::Harness::new();
+    let runtime = runtime();
+    let meter = harness
+        .telemetry()
+        .meters()
+        .meter(merezha_postgres::METER_SCOPE);
+    let db = Database::connect_with_meter(&test.config(), &meter)
+        .unwrap()
+        .for_module(MODULE);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let modules = [ModuleMigrations {
+        module: MODULE,
+        migrations: MIGRATIONS,
+    }];
+    runtime
+        .block_on(run_migrations(
+            &db,
+            &modules,
+            MigrationMode::Apply,
+            deadline,
+        ))
+        .unwrap();
+    let store = runtime
+        .block_on(PostgresStore::connect(
+            &db,
+            &config(),
+            PostgresOptions::default(),
+            deadline,
+        ))
+        .unwrap();
+    let app = Application::with_postgres(
+        config(),
+        Arc::new(Counter::default()),
+        Arc::new(AllowAll),
+        Arc::new(store),
+    )
+    .unwrap();
+    tracing::info_span!(target: "merezha_test", "caller").in_scope(|| {
+        app.command(command(Some("k1"))).unwrap();
+        app.command(command(Some("k1"))).unwrap();
+        app.command(command(None)).unwrap();
+        app.query(serde_json::from_value(json!({"tag":"Total","payload":{},"metadata":{"message_id":"q","correlation_id":"c"}})).unwrap())
+            .unwrap();
+        app.rebuild("total").unwrap();
+    });
+    let registered: std::collections::BTreeSet<&str> = merezha_postgres::KERNEL_STATEMENTS
+        .iter()
+        .chain(STATEMENTS)
+        .map(|s| s.name)
+        .collect();
+    let spans: Vec<_> = harness
+        .spans()
+        .into_iter()
+        .filter(|s| s.span_kind == opentelemetry::trace::SpanKind::Client)
+        .collect();
+    let name = |span: &opentelemetry_sdk::trace::SpanData| {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "merezha.db.statement")
+            .map(|kv| kv.value.to_string())
+            .expect("every client span names its statement")
+    };
+    for span in &spans {
+        assert!(registered.contains(name(span).as_str()), "{}", name(span));
+    }
+    let appends = spans
+        .iter()
+        .filter(|s| name(s) == APPEND_STATEMENT)
+        .collect::<Vec<_>>();
+    assert_eq!(appends.len(), 2, "the replay reads its receipt instead");
+    assert_eq!(appends[0].name, "INSERT merezha_app.events");
+    assert!(spans.iter().any(|s| name(s) == "app.receipts.lookup"));
+    assert_eq!(
+        harness.metric("db.client.operation.duration").value(&[
+            ("db.operation.name", "INSERT"),
+            ("db.collection.name", "merezha_app.events"),
+            ("merezha.module", MODULE),
+        ]),
+        Some(2.0)
+    );
+}

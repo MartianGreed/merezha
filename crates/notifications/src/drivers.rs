@@ -13,7 +13,7 @@ use merezha_platform::{
     BoxFuture,
     ports::{Channel, EmailAddress, PhoneNumber},
 };
-use merezha_postgres::{Database, classify};
+use merezha_postgres::{Database, Statement, classify};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
@@ -163,6 +163,34 @@ impl Capture {
 /// Most captures listed at once.
 pub const MAX_CAPTURE_PAGE: u32 = 100;
 
+/// One captured message, unless its delivery and key were captured.
+const CAPTURE_INSERT: Statement = Statement::new(
+    "notify.capture.insert",
+    "INSERT merezha_notify.captures",
+    "INSERT INTO merezha_notify.captures \
+     (delivery_id, channel, target, rendered, captured_at) \
+     VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5) \
+     ON CONFLICT DO NOTHING RETURNING id",
+);
+/// Keep the newest `$1` captures.
+const CAPTURE_TRIM: Statement = Statement::new(
+    "notify.capture.trim",
+    "DELETE merezha_notify.captures",
+    "DELETE FROM merezha_notify.captures WHERE id <= \
+     (SELECT id FROM merezha_notify.captures ORDER BY id DESC \
+      OFFSET $1 LIMIT 1)",
+);
+const CAPTURE_LIST: Statement = Statement::new(
+    "notify.capture.list",
+    "SELECT merezha_notify.captures",
+    "SELECT id, delivery_id::text, channel, target, rendered::text, captured_at \
+     FROM merezha_notify.captures \
+     WHERE $1::text IS NULL OR channel = $1 \
+     ORDER BY id DESC LIMIT $2",
+);
+/// Every statement the notifications block runs.
+pub const STATEMENTS: &[Statement] = &[CAPTURE_INSERT, CAPTURE_TRIM, CAPTURE_LIST];
+
 /// The capture driver for email and SMS (NT §8).
 #[derive(Clone, Debug)]
 pub struct CaptureDriver {
@@ -197,17 +225,16 @@ impl CaptureDriver {
         let rendered = rendered.to_string();
         let target = target.to_owned();
         let keep = i64::from(self.keep);
+        let db = self.database.clone();
         let result = self
             .database
             .transaction(deadline, move |tx| {
                 Box::pin(async move {
                     let id = delivery_id.to_string();
-                    let row = tx
+                    let row = db
                         .query_opt(
-                            "INSERT INTO merezha_notify.captures \
-                             (delivery_id, channel, target, rendered, captured_at) \
-                             VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5) \
-                             ON CONFLICT DO NOTHING RETURNING id",
+                            tx,
+                            &CAPTURE_INSERT,
                             &[
                                 &id,
                                 &channel.as_str(),
@@ -221,14 +248,9 @@ impl CaptureDriver {
                     let Some(row) = row else {
                         return Ok(None);
                     };
-                    tx.execute(
-                        "DELETE FROM merezha_notify.captures WHERE id <= \
-                         (SELECT id FROM merezha_notify.captures ORDER BY id DESC \
-                          OFFSET $1 LIMIT 1)",
-                        &[&keep],
-                    )
-                    .await
-                    .map_err(|e| classify(&e))?;
+                    db.execute(tx, &CAPTURE_TRIM, &[&keep])
+                        .await
+                        .map_err(|e| classify(&e))?;
                     Ok(Some(row.get::<_, i64>(0)))
                 })
             })
@@ -259,14 +281,9 @@ impl CaptureDriver {
         let limit = i64::from(limit.clamp(1, MAX_CAPTURE_PAGE));
         let channel = channel.map(Channel::as_str);
         let client = self.database.acquire(deadline).await?;
-        let rows = client
-            .query(
-                "SELECT id, delivery_id::text, channel, target, rendered::text, captured_at \
-                 FROM merezha_notify.captures \
-                 WHERE $1::text IS NULL OR channel = $1 \
-                 ORDER BY id DESC LIMIT $2",
-                &[&channel, &limit],
-            )
+        let rows = self
+            .database
+            .query(&client, &CAPTURE_LIST, &[&channel, &limit])
             .await
             .map_err(|e| classify(&e))?;
         rows.iter()
@@ -337,5 +354,19 @@ impl SmsDriver for CaptureDriver {
             rendered,
             deadline,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_capture_statements_are_registered_beside_the_kernel() {
+        assert_eq!(
+            merezha_postgres::check_registry(&[
+                merezha_postgres::KERNEL_STATEMENTS,
+                super::STATEMENTS
+            ]),
+            Ok(())
+        );
     }
 }

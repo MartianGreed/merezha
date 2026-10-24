@@ -165,6 +165,7 @@ pub async fn run(
     }
     let options = HostOptions {
         meter: Some(telemetry.meter(EDGE_METER)),
+        meters: telemetry.meters(),
         status: vec![Arc::new(TelemetrySection(telemetry.status_reader()))],
         ..HostOptions::default()
     };

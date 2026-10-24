@@ -859,6 +859,15 @@ impl Telemetry {
             None => opentelemetry::metrics::noop::NoopMeterProvider::new().meter(module),
         }
     }
+    /// The meter source handed to libraries (`merezha-postgres` and the
+    /// blocks): the SDK provider, or no-op meters when metrics are not
+    /// exported.
+    pub fn meters(&self) -> crate::Meters {
+        match &self.meter_provider {
+            Some(provider) => crate::Meters::new(provider.clone()),
+            None => crate::Meters::default(),
+        }
+    }
     /// Whether any OTLP provider runs.
     pub fn exporting(&self) -> bool {
         self.tracer_provider.is_some()

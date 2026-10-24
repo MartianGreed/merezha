@@ -8,10 +8,15 @@
 //! non-transactional step runs its single statement outside any transaction
 //! and is recorded only after it succeeds. Verify mode takes no lock and reads
 //! in one read-only transaction on a pooled session.
-use crate::{Database, classify};
+use crate::{
+    Database, classify,
+    instruments::Telemetry,
+    statement::{Session, kernel},
+};
 use merezha_domain::Failure;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt::Write as _, time::Instant};
+use tracing::Instrument;
 
 /// Advisory lock key for the migration ledger: the ASCII bytes of `merezha1`.
 pub const MIGRATIONS_LOCK: i64 = 0x6d65_7265_7a68_6131;
@@ -462,7 +467,7 @@ fn database(error: &tokio_postgres::Error) -> MigrationError {
     MigrationError::new(classify(error))
 }
 
-const LEDGER: &str = "CREATE SCHEMA IF NOT EXISTS merezha;
+pub(crate) const LEDGER: &str = "CREATE SCHEMA IF NOT EXISTS merezha;
 CREATE TABLE IF NOT EXISTS merezha.migrations (
     module text NOT NULL,
     version integer NOT NULL CHECK (version > 0),
@@ -481,6 +486,10 @@ CREATE TABLE IF NOT EXISTS merezha.migrations (
 /// version sorts below an applied one (`migration_out_of_order`). A failing
 /// migration rolls back alone and reports `migration_failed`; earlier ones stay
 /// applied. Ledger rows of modules absent from `modules` are left untouched.
+///
+/// Inside a caller's span, each module whose migrations an apply run
+/// executes gets a `migrate {module}` span. A successful run sets
+/// `merezha.db.migrations.pending` for every module in `modules`.
 pub async fn run_migrations(
     db: &Database,
     modules: &[ModuleMigrations<'_>],
@@ -489,10 +498,22 @@ pub async fn run_migrations(
 ) -> Result<MigrationReport, MigrationError> {
     validate(modules)?;
     let at = tokio::time::Instant::from_std(deadline);
-    match tokio::time::timeout_at(at, run(db, modules, mode, deadline)).await {
-        Ok(result) => result,
-        Err(_) => Err(MigrationError::new(Failure::transient("migration_timeout"))),
-    }
+    let report = match tokio::time::timeout_at(at, run(db, modules, mode, deadline)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(MigrationError::new(Failure::transient("migration_timeout")));
+        }
+    };
+    db.telemetry
+        .migrations_pending(modules.iter().map(|module| {
+            let pending = report
+                .pending
+                .iter()
+                .filter(|p| p.module == module.module)
+                .count();
+            (module.module, pending as u64)
+        }));
+    Ok(report)
 }
 
 async fn run(
@@ -501,6 +522,7 @@ async fn run(
     mode: MigrationMode,
     deadline: Instant,
 ) -> Result<MigrationReport, MigrationError> {
+    let telemetry = &db.telemetry;
     let budget = || {
         let remaining = deadline.saturating_duration_since(Instant::now());
         remaining.as_millis().clamp(1, i32::MAX as u128)
@@ -510,15 +532,23 @@ async fn run(
         let budget = budget();
         // Readiness verifies repeatedly, so stay on a pooled session: the
         // bound is `SET LOCAL` and ends with this read-only transaction.
-        let transaction = pooled.transaction().await.map_err(|e| database(&e))?;
-        transaction
-            .batch_execute(&format!(
-                "SET LOCAL statement_timeout = {budget}; SET TRANSACTION READ ONLY"
-            ))
+        let transaction = telemetry
+            .observe(&kernel::BEGIN, pooled.transaction())
             .await
             .map_err(|e| database(&e))?;
-        let applied = read_ledger(&*transaction, modules).await?;
-        transaction.commit().await.map_err(|e| database(&e))?;
+        telemetry
+            .batch_text(
+                &transaction,
+                &kernel::MIGRATION_READ_ONLY,
+                &format!("SET LOCAL statement_timeout = {budget}; SET TRANSACTION READ ONLY"),
+            )
+            .await
+            .map_err(|e| database(&e))?;
+        let applied = read_ledger(telemetry, &transaction, modules).await?;
+        telemetry
+            .observe(&kernel::COMMIT, transaction.commit())
+            .await
+            .map_err(|e| database(&e))?;
         return Ok(MigrationReport {
             applied: Vec::new(),
             pending: report(modules, plan(modules, &applied.unwrap_or_default())?),
@@ -529,90 +559,65 @@ async fn run(
     // counts against `max_detached` like any detached session.
     let mut detached = db.detach(deadline).await.map_err(MigrationError::new)?;
     let client = &mut detached.client;
-    client
-        .batch_execute(&format!("SET statement_timeout = {}", budget()))
+    telemetry
+        .batch_text(
+            &*client,
+            &kernel::MIGRATION_TIMEOUT,
+            &format!("SET statement_timeout = {}", budget()),
+        )
         .await
         .map_err(|e| database(&e))?;
-    lock(client, deadline).await?;
-    let transaction = client.transaction().await.map_err(|e| database(&e))?;
-    transaction
-        .batch_execute(LEDGER)
+    lock(telemetry, client, deadline).await?;
+    let transaction = telemetry
+        .observe(&kernel::BEGIN, client.transaction())
         .await
         .map_err(|e| database(&e))?;
-    transaction.commit().await.map_err(|e| database(&e))?;
-    let applied = read_ledger(&**client, modules).await?.unwrap_or_default();
+    telemetry
+        .batch(&transaction, &kernel::MIGRATION_LEDGER)
+        .await
+        .map_err(|e| database(&e))?;
+    telemetry
+        .observe(&kernel::COMMIT, transaction.commit())
+        .await
+        .map_err(|e| database(&e))?;
+    let applied = read_ledger(telemetry, &*client, modules)
+        .await?
+        .unwrap_or_default();
     let pending = plan(modules, &applied)?;
     let mut done = Vec::new();
-    for (index, migration) in pending {
+    // `plan` lists pending migrations module by module, in order.
+    let mut rest = &pending[..];
+    while let Some((index, _)) = rest.first() {
+        let index = *index;
+        let count = rest.iter().take_while(|(i, _)| *i == index).count();
+        let (group, tail) = rest.split_at(count);
+        rest = tail;
         let module = modules[index].module;
-        let fail = |e: &tokio_postgres::Error| {
-            let failure = classify(e);
-            MigrationError {
-                failure: if failure.classification == merezha_domain::Classification::Transient {
-                    failure
-                } else {
-                    Failure::permanent("migration_failed")
-                },
-                module: Some(module.to_owned()),
-                version: Some(migration.version),
-            }
+        let own = telemetry.for_module(module.to_owned());
+        let span = if tracing::Span::current().is_none() {
+            tracing::Span::none()
+        } else {
+            Telemetry::migration_span(module)
         };
-        let version = migration.version as i32;
-        let digest = checksum(migration.sql);
-        let row: [&(dyn tokio_postgres::types::ToSql + Sync); 4] =
-            [&module, &version, &migration.name, &digest];
-        match migration.kind {
-            MigrationKind::Transactional => {
-                let transaction = client.transaction().await.map_err(|e| fail(&e))?;
-                transaction
-                    .batch_execute(migration.sql)
-                    .await
-                    .map_err(|e| fail(&e))?;
-                transaction
-                    .execute(RECORD, &row)
-                    .await
-                    .map_err(|e| fail(&e))?;
-                transaction.commit().await.map_err(|e| MigrationError {
-                    failure: if e.as_db_error().is_some() {
-                        Failure::permanent("migration_failed")
-                    } else {
-                        Failure::transient("commit_outcome_unknown")
-                    },
-                    module: Some(module.to_owned()),
-                    version: Some(migration.version),
-                })?;
+        let applied = async {
+            for (_, migration) in group {
+                apply(&own, client, module, *migration).await?;
+                done.push(PendingMigration {
+                    module: module.to_owned(),
+                    version: migration.version,
+                    name: migration.name,
+                });
             }
-            MigrationKind::NonTransactional => {
-                let invalid =
-                    || MigrationError::at("invalid_migrations", module, Some(migration.version));
-                let statement = single_statement(migration.sql).ok_or_else(invalid)?;
-                let index = concurrent_index(statement).map_err(|()| invalid())?;
-                if let Some(index) = &index {
-                    drop_invalid_index(client, index, module, migration.version)
-                        .await
-                        .map_err(|e| fail(&e))?;
-                }
-                // A single statement in the simple query protocol runs
-                // outside any explicit transaction block. Until the ledger
-                // row below exists, the next apply runs it again.
-                client
-                    .batch_execute(statement)
-                    .await
-                    .map_err(|e| fail(&e))?;
-                client.execute(RECORD, &row).await.map_err(|e| fail(&e))?;
-            }
+            Ok::<_, MigrationError>(())
         }
-        tracing::info!(
-            event = "migration.applied",
-            module,
-            version = migration.version,
-            name = migration.name
-        );
-        done.push(PendingMigration {
-            module: module.to_owned(),
-            version: migration.version,
-            name: migration.name,
-        });
+        .instrument(span.clone())
+        .await;
+        if let Err(error) = applied {
+            // A migration that does not apply stops the host: always a
+            // failure of its own contract.
+            span.record("otel.status_code", "error");
+            return Err(error);
+        }
     }
     // Dropping the detached client closes the session and releases the lock.
     Ok(MigrationReport {
@@ -621,34 +626,116 @@ async fn run(
     })
 }
 
-const RECORD: &str =
-    "INSERT INTO merezha.migrations (module, version, name, checksum) VALUES ($1, $2, $3, $4)";
+/// Apply one pending migration of `module` with its ledger row.
+async fn apply(
+    telemetry: &Telemetry,
+    client: &mut deadpool_postgres::ClientWrapper,
+    module: &str,
+    migration: Migration,
+) -> Result<(), MigrationError> {
+    let fail = |e: &tokio_postgres::Error| {
+        let failure = classify(e);
+        MigrationError {
+            failure: if failure.classification == merezha_domain::Classification::Transient {
+                failure
+            } else {
+                Failure::permanent("migration_failed")
+            },
+            module: Some(module.to_owned()),
+            version: Some(migration.version),
+        }
+    };
+    let version = migration.version as i32;
+    let digest = checksum(migration.sql);
+    let row: [&(dyn tokio_postgres::types::ToSql + Sync); 4] =
+        [&module, &version, &migration.name, &digest];
+    match migration.kind {
+        MigrationKind::Transactional => {
+            let transaction = telemetry
+                .observe(&kernel::BEGIN, client.transaction())
+                .await
+                .map_err(|e| fail(&e))?;
+            telemetry
+                .batch_text(&transaction, &kernel::MIGRATION_APPLY, migration.sql)
+                .await
+                .map_err(|e| fail(&e))?;
+            telemetry
+                .run(&transaction, &kernel::MIGRATION_RECORD, &row)
+                .await
+                .map_err(|e| fail(&e))?;
+            telemetry
+                .observe(&kernel::COMMIT, transaction.commit())
+                .await
+                .map_err(|e| MigrationError {
+                    failure: if e.as_db_error().is_some() {
+                        Failure::permanent("migration_failed")
+                    } else {
+                        Failure::transient("commit_outcome_unknown")
+                    },
+                    module: Some(module.to_owned()),
+                    version: Some(migration.version),
+                })?;
+        }
+        MigrationKind::NonTransactional => {
+            let invalid =
+                || MigrationError::at("invalid_migrations", module, Some(migration.version));
+            let statement = single_statement(migration.sql).ok_or_else(invalid)?;
+            let index = concurrent_index(statement).map_err(|()| invalid())?;
+            if let Some(index) = &index {
+                drop_invalid_index(telemetry, client, index, module, migration.version)
+                    .await
+                    .map_err(|e| fail(&e))?;
+            }
+            // A single statement in the simple query protocol runs
+            // outside any explicit transaction block. Until the ledger
+            // row below exists, the next apply runs it again.
+            telemetry
+                .batch_text(&*client, &kernel::MIGRATION_STEP, statement)
+                .await
+                .map_err(|e| fail(&e))?;
+            telemetry
+                .run(&*client, &kernel::MIGRATION_RECORD, &row)
+                .await
+                .map_err(|e| fail(&e))?;
+        }
+    }
+    merezha_telemetry::event!(
+        INFO,
+        "migration.applied",
+        module,
+        version = migration.version,
+        name = migration.name
+    );
+    Ok(())
+}
 
 /// Drop the invalid index a failed `CREATE INDEX CONCURRENTLY` left behind,
 /// so the retried `IF NOT EXISTS` build creates it again instead of keeping
 /// an index PostgreSQL never uses.
 async fn drop_invalid_index(
-    client: &tokio_postgres::Client,
+    telemetry: &Telemetry,
+    client: &deadpool_postgres::ClientWrapper,
     index: &ConcurrentIndex,
     module: &str,
     version: u32,
 ) -> Result<(), tokio_postgres::Error> {
-    let found = client
-        .query_opt(
-            "SELECT format('%I.%I', n.nspname, c.relname)
-             FROM pg_index i
-             JOIN pg_class c ON c.oid = i.indexrelid
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE i.indrelid = to_regclass($1)::oid AND c.relname = $2 AND NOT i.indisvalid",
+    let found = telemetry
+        .maybe_row(
+            client,
+            &kernel::MIGRATION_FIND_INVALID_INDEX,
             &[&index.table, &index.name],
         )
         .await?;
     if let Some(row) = found {
         let qualified: String = row.get(0);
-        client
-            .batch_execute(&format!("DROP INDEX CONCURRENTLY IF EXISTS {qualified}"))
+        telemetry
+            .batch_text(
+                client,
+                &kernel::MIGRATION_DROP_INVALID_INDEX,
+                &format!("DROP INDEX CONCURRENTLY IF EXISTS {qualified}"),
+            )
             .await?;
-        tracing::warn!(event = "migration.invalid_index_dropped", module, version);
+        merezha_telemetry::event!(WARN, "migration.invalid_index_dropped", module, version);
     }
     Ok(())
 }
@@ -662,10 +749,14 @@ const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// waits, and the holder's `CREATE INDEX CONCURRENTLY` waits for every older
 /// snapshot to end: the two would deadlock. Each `pg_try_advisory_lock`
 /// attempt ends at once, so a waiting runner holds no snapshot.
-async fn lock(client: &tokio_postgres::Client, deadline: Instant) -> Result<(), MigrationError> {
+async fn lock(
+    telemetry: &Telemetry,
+    client: &deadpool_postgres::ClientWrapper,
+    deadline: Instant,
+) -> Result<(), MigrationError> {
     loop {
-        let locked: bool = client
-            .query_one("SELECT pg_try_advisory_lock($1)", &[&MIGRATIONS_LOCK])
+        let locked: bool = telemetry
+            .row(client, &kernel::MIGRATION_LOCK, &[&MIGRATIONS_LOCK])
             .await
             .map_err(|e| match classify(&e).code.as_str() {
                 "database_timeout" => {
@@ -688,11 +779,12 @@ async fn lock(client: &tokio_postgres::Client, deadline: Instant) -> Result<(), 
 
 /// Applied rows for `modules`, or `None` when the ledger does not exist.
 async fn read_ledger(
-    client: &impl tokio_postgres::GenericClient,
+    telemetry: &Telemetry,
+    client: &impl Session,
     modules: &[ModuleMigrations<'_>],
 ) -> Result<Option<BTreeMap<(String, u32), Applied>>, MigrationError> {
-    let exists: bool = client
-        .query_one("SELECT to_regclass('merezha.migrations') IS NOT NULL", &[])
+    let exists: bool = telemetry
+        .row(client, &kernel::MIGRATION_LEDGER_EXISTS, &[])
         .await
         .map_err(|e| database(&e))?
         .get(0);
@@ -700,11 +792,8 @@ async fn read_ledger(
         return Ok(None);
     }
     let names: Vec<&str> = modules.iter().map(|m| m.module).collect();
-    let rows = client
-        .query(
-            "SELECT module, version, name, checksum FROM merezha.migrations WHERE module = ANY($1)",
-            &[&names],
-        )
+    let rows = telemetry
+        .rows(client, &kernel::MIGRATION_LEDGER_READ, &[&names])
         .await
         .map_err(|e| database(&e))?;
     let mut applied = BTreeMap::new();

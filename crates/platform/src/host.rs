@@ -186,6 +186,10 @@ pub struct HostOptions {
     pub authenticator: Option<Arc<dyn Authenticator>>,
     /// The meter of the edge's HTTP instruments; none records nothing.
     pub meter: Option<Meter>,
+    /// The meter source of the kernel's other instruments (the PostgreSQL
+    /// pool's, TE §1.3, built from `meters.meter("merezha-postgres")`); the
+    /// default records nothing. The binary passes `Telemetry::meters()`.
+    pub meters: merezha_telemetry::Meters,
     /// Sections of `/v1/admin/status` other subsystems own.
     pub status: Vec<Arc<dyn StatusSection>>,
     /// Turns `true` on a shutdown signal during startup: the host stops
@@ -319,11 +323,15 @@ impl Host {
                 });
             }
         }
-        let database = Database::connect(&config.database).map_err(|failure| StartupError {
-            failure,
-            migration: None,
-            module: None,
-        })?;
+        let meter = options.meters.meter(merezha_postgres::METER_SCOPE);
+        let database =
+            Database::connect_with_meter(&config.database, &meter).map_err(|failure| {
+                StartupError {
+                    failure,
+                    migration: None,
+                    module: None,
+                }
+            })?;
         let reach =
             Instant::now() + config.database.connect_timeout + config.database.acquire_timeout;
         if let Err(failure) = database.ping(reach).await {
