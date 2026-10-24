@@ -1432,6 +1432,18 @@ drops it `WITH (FORCE)` on drop. Without the variable it prints
 `None`. With `MEREZHA_TEST_REQUIRE_DATABASE=1` a missing variable fails the
 test instead; CI sets both.
 
+Tests share one server and run in parallel, so none depends on how fast a
+statement or a thread is. They force their interleavings with test hooks,
+advisory locks, `pg_stat_activity` polls or a sentinel notification (which
+arrives after any earlier one), date rows back instead of waiting for a
+window to pass, and bound elapsed time only by limits derived from the
+configured timeouts. Waits poll and return as soon as their condition holds.
+The few tests that measure latency or race a client deadline against the
+server's sit in a `timing` module of their test file. A plain
+`cargo test --locked --workspace` runs everything; CI runs the suite with
+`-- --skip timing::`, then the timing tests alone with
+`-- --test-threads=1 timing::`, and both steps gate.
+
 ## Local PostgreSQL
 
 ### Contremaitre
@@ -1476,8 +1488,10 @@ Trust authentication is acceptable only for a disposable loopback server.
 `.github/workflows/host.yml` runs the Linux job with a `postgres:17` service
 container and sets `MEREZHA_TEST_DATABASE_URL` and
 `MEREZHA_TEST_REQUIRE_DATABASE=1`, so the PostgreSQL suites cannot silently
-skip. GitHub's macOS runners cannot start service containers. The macOS job
-runs the same checks, and its PostgreSQL tests print the skip message.
+skip. Both jobs split the tests as described under "Test harness": the
+parallel run, then the `timing` tests one at a time. GitHub's macOS runners
+cannot start service containers. The macOS job runs the same checks, and its
+PostgreSQL tests print the skip message.
 
 ## Jobs and the outbox
 
