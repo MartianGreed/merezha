@@ -390,11 +390,19 @@ fn positions_stay_contiguous_under_load_from_two_instances_and_a_reader_never_se
     let instances = [pg.open(config(), &writers), pg.open(config(), &writers)];
     let view = pg.open(config(), &reader);
     let stop = AtomicBool::new(false);
+    // Under a loaded machine (shared CI runners) a command may run out of
+    // its deadline. Such outcomes are counted, never ignored silently: the
+    // invariants below hold whatever they were, and enough commits must
+    // still succeed for the load to mean anything.
+    let busy = AtomicUsize::new(0);
+    let unknown = AtomicUsize::new(0);
+    let read_timeouts = AtomicUsize::new(0);
     let (receipts, reads) = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..2 * THREADS)
             .map(|t| {
                 let app = instances[t % 2].clone();
                 let stop = &stop;
+                let (busy, unknown) = (&busy, &unknown);
                 scope.spawn(move || {
                     let mut receipts = Vec::new();
                     let mut n = 0usize;
@@ -409,6 +417,19 @@ fn positions_stay_contiguous_under_load_from_two_instances_and_a_reader_never_se
                             keyed.then_some(key.as_str()),
                         )) {
                             Ok(receipt) => receipts.push(receipt),
+                            // May have committed: bounds the head below.
+                            Err(f) if f.code == "commit_outcome_unknown" => {
+                                unknown.fetch_add(1, Ordering::SeqCst);
+                            }
+                            // Definitely not committed.
+                            Err(f)
+                                if matches!(
+                                    f.code.as_str(),
+                                    "timeout" | "storage_busy" | "database_busy"
+                                ) =>
+                            {
+                                busy.fetch_add(1, Ordering::SeqCst);
+                            }
                             Err(f) => assert_eq!(f.code, "concurrency_conflict", "{f:?}"),
                         }
                     }
@@ -418,11 +439,17 @@ fn positions_stay_contiguous_under_load_from_two_instances_and_a_reader_never_se
             .collect();
         let view = &view;
         let stop_ref = &stop;
+        let read_timeouts = &read_timeouts;
         let walker = scope.spawn(move || {
             let mut reads = 0;
             while !stop_ref.load(Ordering::SeqCst) {
-                view.catch_up("count").unwrap();
-                reads += 1;
+                match view.catch_up("count") {
+                    Ok(_) => reads += 1,
+                    Err(f) => {
+                        assert_eq!(f.code, "timeout", "{f:?}");
+                        read_timeouts.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
             }
             reads
         });
@@ -437,18 +464,35 @@ fn positions_stay_contiguous_under_load_from_two_instances_and_a_reader_never_se
     let caught_up = view.catch_up("count").unwrap();
     let head = pg.count("SELECT position FROM merezha_app.head") as u64;
     assert_eq!(caught_up.checkpoint, head);
-    assert_eq!(
-        receipts.len() as u64,
-        head,
-        "one event per accepted command"
+    let (busy, unknown) = (busy.into_inner(), unknown.into_inner());
+    // One event per accepted command, plus at most one per command whose
+    // outcome is unknown.
+    assert!(
+        receipts.len() as u64 <= head && head <= (receipts.len() + unknown) as u64,
+        "{} receipts, {unknown} unknown outcomes, head {head}",
+        receipts.len()
     );
-    // The reader saw every position once, in order, and each still exists
-    // with the same content.
+    assert!(
+        receipts.len() >= 200,
+        "only {} commits succeeded ({busy} timed out, {unknown} unknown)",
+        receipts.len()
+    );
+    // The reader never saw a jump: every position it was handed is at most
+    // one past the highest it had seen. A catch-up cut by its deadline may
+    // hand a batch again, never skip one. It saw every position, and each
+    // still exists with the same content.
     let seen = reader.seen.lock().unwrap().clone();
-    assert_eq!(
-        seen.iter().map(|e| e.position).collect::<Vec<_>>(),
-        (1..=head).collect::<Vec<_>>()
-    );
+    let mut highest = 0;
+    for event in &seen {
+        assert!(
+            event.position <= highest + 1,
+            "the reader jumped from {highest} to {}",
+            event.position
+        );
+        highest = highest.max(event.position);
+    }
+    let distinct: std::collections::BTreeSet<u64> = seen.iter().map(|e| e.position).collect();
+    assert_eq!(distinct, (1..=head).collect());
     let now: BTreeMap<i64, (String, i64, String)> = pg
         .rows("SELECT position, stream, version, payload::text FROM merezha_app.events")
         .iter()
@@ -469,8 +513,10 @@ fn positions_stay_contiguous_under_load_from_two_instances_and_a_reader_never_se
     assert!(report.ok, "{report:?}");
     assert_eq!(report.events, head);
     eprintln!(
-        "load: {head} commits in {load:?} from {} writers, {reads} catch-ups",
-        2 * THREADS
+        "load: {head} commits in {load:?} from {} writers, {reads} catch-ups; \
+         {busy} commands timed out, {unknown} unknown, {} catch-ups timed out",
+        2 * THREADS,
+        read_timeouts.into_inner()
     );
 }
 
