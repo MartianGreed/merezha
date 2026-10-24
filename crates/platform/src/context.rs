@@ -2,8 +2,9 @@
 use crate::{
     edge::TraceContext,
     ports::{
-        Authenticator, Authorizer, BlobStore, CaptureNotifier, Notifier, Outbox,
-        UnavailableBlobStore, UnavailableOutbox,
+        Authenticator, Authorizer, BlobStore, CaptureNotifications, Directory, EmptyDirectory,
+        Notifier, NotifierFactory, Outbox, Source, SourceOutbox, UnavailableBlobStore,
+        UnavailableOutbox,
     },
 };
 use merezha_domain::Failure;
@@ -148,9 +149,35 @@ fn transport(error: reqwest::Error) -> Failure {
 #[derive(Clone)]
 pub struct AppContext {
     inner: Arc<Inner>,
+    /// The module this context was handed to, which fixes the sources it
+    /// may write as. `None` for the host's own context.
+    module: Option<Source>,
+    /// Kernel sources the host granted this module besides its own name.
+    granted: Vec<Source>,
+}
+/// Sources only the host's own context binds: HTTP-supplied requests
+/// (`api`) and reactions (`application`).
+pub const KERNEL_SOURCES: [&str; 2] = ["api", "application"];
+/// The only `(source, module)` grants a module may claim through
+/// [`crate::Module::extra_sources`]: the notifications block's HTTP send
+/// route writes as `api` (NT §3.1). `application` is never granted.
+pub const GRANTABLE_SOURCES: [(&str, &str); 1] = [("api", "notifications")];
+
+/// Check that module `name` may claim `extra` sources; fails permanent
+/// `source_not_granted` otherwise.
+pub fn check_source_grants(name: &str, extra: &[&str]) -> Result<(), Failure> {
+    if extra
+        .iter()
+        .all(|source| GRANTABLE_SOURCES.contains(&(source, name)))
+    {
+        Ok(())
+    } else {
+        Err(Failure::permanent("source_not_granted"))
+    }
 }
 struct Inner {
     app_id: String,
+    instance_id: String,
     database: Database,
     clock: Arc<dyn Clock>,
     random: Arc<dyn Random>,
@@ -158,7 +185,8 @@ struct Inner {
     outbox: Arc<dyn Outbox>,
     authenticator: Option<Arc<dyn Authenticator>>,
     authorizer: Arc<dyn Authorizer>,
-    notifier: Arc<dyn Notifier>,
+    notifications: Arc<dyn NotifierFactory>,
+    directory: Arc<dyn Directory>,
     blobs: Arc<dyn BlobStore>,
 }
 impl std::fmt::Debug for AppContext {
@@ -171,7 +199,8 @@ impl std::fmt::Debug for AppContext {
 }
 impl AppContext {
     /// Start from the disabled-block fallbacks: no authenticator, the given
-    /// policy, a capture notifier, a refusing outbox and blob store.
+    /// policy, capture notifications, an empty directory, a refusing outbox
+    /// and blob store.
     pub fn builder(
         app_id: &str,
         database: Database,
@@ -179,6 +208,7 @@ impl AppContext {
     ) -> AppContextBuilder {
         AppContextBuilder {
             app_id: app_id.to_owned(),
+            instance_id: crate::config::default_instance_id(None),
             database,
             clock: Arc::new(SystemClock),
             random: Arc::new(OsRandom),
@@ -186,12 +216,17 @@ impl AppContext {
             outbox: Arc::new(UnavailableOutbox),
             authenticator: None,
             authorizer,
-            notifier: Arc::new(CaptureNotifier::default()),
+            notifications: Arc::new(CaptureNotifications::default()),
+            directory: Arc::new(EmptyDirectory),
             blobs: Arc::new(UnavailableBlobStore),
         }
     }
     pub fn app_id(&self) -> &str {
         &self.inner.app_id
+    }
+    /// `app.instance_id`: this process among the application's instances.
+    pub fn instance_id(&self) -> &str {
+        &self.inner.instance_id
     }
     pub fn database(&self) -> &Database {
         &self.inner.database
@@ -205,8 +240,46 @@ impl AppContext {
     pub fn http(&self) -> &OutboundHttp {
         &self.inner.http
     }
-    pub fn outbox(&self) -> &Arc<dyn Outbox> {
-        &self.inner.outbox
+    /// The module this context belongs to; `None` for the host's own.
+    pub fn module(&self) -> Option<&str> {
+        self.module.as_ref().map(Source::as_str)
+    }
+    /// This context as handed to module `name`: its handles can only be
+    /// bound to `name`. The host binds each module's context at start.
+    pub(crate) fn for_module(&self, name: &str, extra: &[&str]) -> Result<Self, Failure> {
+        check_source_grants(name, extra)?;
+        Ok(Self {
+            inner: self.inner.clone(),
+            module: Some(Source::new(name)?),
+            granted: extra
+                .iter()
+                .map(|source| Source::new(source))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+    /// The source a handle may be bound to: a module's context binds its
+    /// own name and the kernel sources the host granted it
+    /// ([`GRANTABLE_SOURCES`]), so blocks cannot write in each other's
+    /// dedupe namespace or claim identity's membership exemption; the host's
+    /// context binds any source, [`KERNEL_SOURCES`] included. Fails
+    /// permanent `invalid_source` or `source_not_allowed`.
+    fn source(&self, source: &str) -> Result<Source, Failure> {
+        let source = Source::new(source)?;
+        match &self.module {
+            Some(own) if *own != source && !self.granted.contains(&source) => {
+                Err(Failure::permanent("source_not_allowed"))
+            }
+            _ => Ok(source),
+        }
+    }
+    /// The outbox bound to `source`. It validates every append before the
+    /// implementation sees it. See [`AppContext::module`] for which sources
+    /// a context may bind.
+    pub fn outbox(&self, source: &str) -> Result<SourceOutbox, Failure> {
+        Ok(SourceOutbox::new(
+            self.source(source)?,
+            self.inner.outbox.clone(),
+        ))
     }
     pub fn authenticator(&self) -> Option<&Arc<dyn Authenticator>> {
         self.inner.authenticator.as_ref()
@@ -214,8 +287,18 @@ impl AppContext {
     pub fn authorizer(&self) -> &Arc<dyn Authorizer> {
         &self.inner.authorizer
     }
-    pub fn notifier(&self) -> &Arc<dyn Notifier> {
-        &self.inner.notifier
+    /// The notifier bound to `source`, with the same source rule as
+    /// [`AppContext::outbox`].
+    pub fn notifier(&self, source: &str) -> Result<Arc<dyn Notifier>, Failure> {
+        Ok(self.inner.notifications.bind(&self.source(source)?))
+    }
+    /// `false` while notifications are only captured: blocks that must not
+    /// lose security mail refuse to start on that.
+    pub fn notifications_deliver(&self) -> bool {
+        self.inner.notifications.delivers()
+    }
+    pub fn directory(&self) -> &Arc<dyn Directory> {
+        &self.inner.directory
     }
     pub fn blobs(&self) -> &Arc<dyn BlobStore> {
         &self.inner.blobs
@@ -224,6 +307,7 @@ impl AppContext {
 /// Replaces fallbacks with block implementations.
 pub struct AppContextBuilder {
     app_id: String,
+    instance_id: String,
     database: Database,
     clock: Arc<dyn Clock>,
     random: Arc<dyn Random>,
@@ -231,10 +315,15 @@ pub struct AppContextBuilder {
     outbox: Arc<dyn Outbox>,
     authenticator: Option<Arc<dyn Authenticator>>,
     authorizer: Arc<dyn Authorizer>,
-    notifier: Arc<dyn Notifier>,
+    notifications: Arc<dyn NotifierFactory>,
+    directory: Arc<dyn Directory>,
     blobs: Arc<dyn BlobStore>,
 }
 impl AppContextBuilder {
+    pub fn instance_id(mut self, instance_id: &str) -> Self {
+        self.instance_id = instance_id.to_owned();
+        self
+    }
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
@@ -255,8 +344,12 @@ impl AppContextBuilder {
         self.authenticator = Some(authenticator);
         self
     }
-    pub fn notifier(mut self, notifier: Arc<dyn Notifier>) -> Self {
-        self.notifier = notifier;
+    pub fn notifications(mut self, notifications: Arc<dyn NotifierFactory>) -> Self {
+        self.notifications = notifications;
+        self
+    }
+    pub fn directory(mut self, directory: Arc<dyn Directory>) -> Self {
+        self.directory = directory;
         self
     }
     pub fn blobs(mut self, blobs: Arc<dyn BlobStore>) -> Self {
@@ -269,8 +362,11 @@ impl AppContextBuilder {
             None => OutboundHttp::new()?,
         };
         Ok(AppContext {
+            module: None,
+            granted: Vec::new(),
             inner: Arc::new(Inner {
                 app_id: self.app_id,
+                instance_id: self.instance_id,
                 database: self.database,
                 clock: self.clock,
                 random: self.random,
@@ -278,7 +374,8 @@ impl AppContextBuilder {
                 outbox: self.outbox,
                 authenticator: self.authenticator,
                 authorizer: self.authorizer,
-                notifier: self.notifier,
+                notifications: self.notifications,
+                directory: self.directory,
                 blobs: self.blobs,
             }),
         })
@@ -371,5 +468,74 @@ mod tests {
             !seen[0].contains("b7ad6b7169203331"),
             "a child span id is sent"
         );
+    }
+
+    #[test]
+    fn module_contexts_bind_only_their_own_source() {
+        let db = merezha_postgres::Database::connect(&merezha_postgres::DatabaseConfig::new(
+            merezha_postgres::Secret::new("postgres://127.0.0.1:1/none"),
+        ))
+        .unwrap();
+        let policy = Arc::new(crate::ports::DenyAll);
+        let host = AppContext::builder("tasks", db, policy).build().unwrap();
+        assert_eq!(host.module(), None);
+        for source in ["identity", "api", "application"] {
+            assert!(host.outbox(source).is_ok() && host.notifier(source).is_ok());
+        }
+        let content = host.for_module("content", &[]).unwrap();
+        assert_eq!(content.module(), Some("content"));
+        assert_eq!(
+            content.outbox("content").unwrap().source().as_str(),
+            "content"
+        );
+        assert!(content.notifier("content").is_ok());
+        for spoof in ["identity", "api", "application", "notifications"] {
+            assert_eq!(
+                content.outbox(spoof).unwrap_err().code,
+                "source_not_allowed"
+            );
+            assert_eq!(
+                content.notifier(spoof).err().map(|f| f.code),
+                Some("source_not_allowed".into())
+            );
+        }
+        assert_eq!(content.outbox("Bad").unwrap_err().code, "invalid_source");
+    }
+
+    #[test]
+    fn only_notifications_is_granted_the_api_source() {
+        let db = merezha_postgres::Database::connect(&merezha_postgres::DatabaseConfig::new(
+            merezha_postgres::Secret::new("postgres://127.0.0.1:1/none"),
+        ))
+        .unwrap();
+        let host = AppContext::builder("tasks", db, Arc::new(crate::ports::DenyAll))
+            .build()
+            .unwrap();
+        let notifications = host.for_module("notifications", &["api"]).unwrap();
+        for source in ["notifications", "api"] {
+            assert!(notifications.outbox(source).is_ok(), "{source}");
+            assert!(notifications.notifier(source).is_ok(), "{source}");
+        }
+        for spoof in ["application", "identity"] {
+            assert_eq!(
+                notifications.notifier(spoof).err().map(|f| f.code),
+                Some("source_not_allowed".into())
+            );
+        }
+        // Without the claim, even notifications binds only its own name.
+        let plain = host.for_module("notifications", &[]).unwrap();
+        assert_eq!(plain.outbox("api").unwrap_err().code, "source_not_allowed");
+        for (module, extra) in [
+            ("content", "api"),
+            ("identity", "api"),
+            ("notifications", "application"),
+            ("content", "application"),
+        ] {
+            assert_eq!(
+                host.for_module(module, &[extra]).unwrap_err().code,
+                "source_not_granted",
+                "{module} {extra}"
+            );
+        }
     }
 }

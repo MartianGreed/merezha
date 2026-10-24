@@ -5,6 +5,7 @@ use crate::{
     config::{ConfigErrors, ConfigInput, ConfigIssue, Origin, ProjectConfig, valid_module_name},
     context::AppContext,
     edge,
+    errors::ErrorRegistry,
     health::{self, Readiness},
     module::{Module, RESERVED_NAMES},
     ports::Authorizer,
@@ -133,6 +134,30 @@ pub struct HostParts {
     pub timeouts: Timeouts,
 }
 
+/// The kernel's codes plus every module's, or the first refused module
+/// with its problems logged as `error.registration_refused`.
+pub fn error_registry(modules: &[&dyn Module]) -> Result<ErrorRegistry, StartupError> {
+    let mut registry = ErrorRegistry::kernel();
+    for module in modules {
+        if let Err(refused) = registry.register(module.name(), module.errors()) {
+            for error in &refused {
+                tracing::error!(
+                    event = "error.registration_refused",
+                    module = module.name(),
+                    code = error.code.as_str(),
+                    reason = error.reason
+                );
+            }
+            return Err(StartupError {
+                failure: Failure::permanent("error_code_conflict"),
+                migration: None,
+                module: Some(module.name()),
+            });
+        }
+    }
+    Ok(registry)
+}
+
 /// A started host, ready to serve.
 pub struct Host {
     config: ProjectConfig,
@@ -142,6 +167,7 @@ pub struct Host {
     router: Router,
     timeouts: Timeouts,
     migrations: MigrationReport,
+    errors: Arc<ErrorRegistry>,
 }
 impl std::fmt::Debug for Host {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -155,13 +181,33 @@ impl std::fmt::Debug for Host {
     }
 }
 impl Host {
-    /// Open the pool, prove the database is reachable, verify or apply
-    /// migrations, start modules and compose the router.
+    /// Register error codes, open the pool, prove the database is
+    /// reachable, verify or apply migrations, start modules and compose the
+    /// router.
     pub async fn start(
         config: ProjectConfig,
         modules: Vec<Box<dyn Module>>,
         parts: HostParts,
     ) -> Result<Self, StartupError> {
+        let errors = Arc::new(error_registry(
+            &modules.iter().map(|m| m.as_ref()).collect::<Vec<_>>(),
+        )?);
+        for module in &modules {
+            if let Err(failure) =
+                crate::context::check_source_grants(module.name(), module.extra_sources())
+            {
+                tracing::error!(
+                    event = "module.source_refused",
+                    module = module.name(),
+                    sources = ?module.extra_sources()
+                );
+                return Err(StartupError {
+                    failure,
+                    migration: None,
+                    module: Some(module.name()),
+                });
+            }
+        }
         let database = Database::connect(&config.database).map_err(|failure| StartupError {
             failure,
             migration: None,
@@ -170,11 +216,11 @@ impl Host {
         let reach =
             Instant::now() + config.database.connect_timeout + config.database.acquire_timeout;
         if let Err(failure) = database.ping(reach).await {
-            tracing::error!(event = "database.unavailable", code = failure.code.as_str());
+            tracing::error!(event = "db.unavailable", code = failure.code.as_str());
             return Err(StartupError::new("database_unavailable"));
         }
         tracing::info!(
-            event = "database.connected",
+            event = "db.connected",
             pool_size = config.database.pool_size
         );
         let modules: Vec<Arc<dyn Module>> = modules.into_iter().map(Arc::from).collect();
@@ -199,7 +245,11 @@ impl Host {
             .await
             .map_err(|error| {
                 tracing::error!(
-                    event = "migrations.refused",
+                    event = if error.failure.code == "migration_checksum_mismatch" {
+                        "migration.checksum_mismatch"
+                    } else {
+                        "migration.refused"
+                    },
                     code = error.failure.code.as_str(),
                     module = error.module.as_deref(),
                     version = error.version
@@ -212,7 +262,7 @@ impl Host {
             })?;
         drop(declared);
         tracing::info!(
-            event = "migrations.checked",
+            event = "migration.checked",
             mode = if mode == MigrationMode::Apply {
                 "apply"
             } else {
@@ -221,7 +271,15 @@ impl Host {
             applied = migrations.applied.len(),
             pending = migrations.pending.len()
         );
+        for pending in &migrations.pending {
+            tracing::warn!(
+                event = "migration.pending",
+                module = pending.module.as_str(),
+                version = pending.version
+            );
+        }
         let ctx = AppContext::builder(&config.app.id, database.clone(), parts.authorizer)
+            .instance_id(&config.app.instance_id)
             .build()
             .map_err(|failure| StartupError {
                 failure,
@@ -231,7 +289,14 @@ impl Host {
         let mut started: Vec<Arc<dyn Module>> = Vec::new();
         for module in &modules {
             let at = tokio::time::Instant::from_std(Instant::now() + parts.timeouts.module_start);
-            let result = tokio::time::timeout_at(at, module.start(ctx.clone())).await;
+            let own = ctx
+                .for_module(module.name(), module.extra_sources())
+                .map_err(|failure| StartupError {
+                    failure,
+                    migration: None,
+                    module: Some(module.name()),
+                })?;
+            let result = tokio::time::timeout_at(at, module.start(own)).await;
             if !matches!(result, Ok(Ok(()))) {
                 tracing::error!(event = "module.start_failed", module = module.name());
                 stop_modules(&started, parts.timeouts.module_shutdown).await;
@@ -257,12 +322,20 @@ impl Host {
         ));
         let mut router = health::router(readiness.clone());
         for module in &modules {
-            router = router.nest(&format!("/v1/{}", module.name()), module.routes(&ctx));
+            let own = ctx
+                .for_module(module.name(), module.extra_sources())
+                .map_err(|failure| StartupError {
+                    failure,
+                    migration: None,
+                    module: Some(module.name()),
+                })?;
+            router = router.nest(&format!("/v1/{}", module.name()), module.routes(&own));
         }
         let router = edge::apply(
             router.merge(parts.routes),
             &config.http,
             ctx.authenticator().cloned(),
+            errors.clone(),
         );
         Ok(Self {
             config,
@@ -272,7 +345,12 @@ impl Host {
             router,
             timeouts: parts.timeouts,
             migrations,
+            errors,
         })
+    }
+    /// The registered error codes and statuses.
+    pub fn errors(&self) -> &Arc<ErrorRegistry> {
+        &self.errors
     }
     /// The migration outcome at startup.
     pub fn migrations(&self) -> &MigrationReport {

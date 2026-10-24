@@ -708,6 +708,16 @@ Stable event names (existing ones kept):
 | `telemetry.export_failed` / `telemetry.otel_env_ignored` | warn / info | `signal`, `code`, `dropped` / `names` |
 | `health.not_ready` | warn, once per state change | `check`, `code` |
 | `shutdown.started` / `shutdown.completed` | info | `drain_ms` |
+| `runtime.loaded` (kernel host) | info | `raw_runtime`, `application` |
+| `error.registration_refused` (kernel, startup) | error | `module`, `code`, `reason` |
+| `db.connected` | info | `pool_size` |
+| `migration.checked` / `migration.refused` | info / error | `mode`, `applied`, `pending` / `code`, `module`, `version` |
+| `migration.invalid_index_dropped` (non-transactional step retry, R15) | warn | `module`, `version` |
+| `module.started` / `module.stopped` / `module.start_failed` / `module.shutdown_timeout` | info / info / error / warn | `module` (+ `publishes`, `consumes` on start) |
+| `module.source_refused` (kernel, startup) | error | `module`, `sources` |
+| `listener.drain_timeout` | warn | `drain_ms` |
+| `health.ready` | info, once per state change | none |
+| `notification.captured` (capture fallback without the notifications block) | warn | `source`, `kind`, `topic`, `recipients` (kinds only), `delivered` |
 
 Block events (AP's former `jobs.*` events are `job.*`):
 

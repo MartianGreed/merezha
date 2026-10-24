@@ -306,10 +306,10 @@ fn run_serves_health_runtime_and_application_behind_the_edge_and_stops_gracefull
         .filter_map(|e| e["event"].as_str().map(str::to_owned))
         .collect();
     for expected in [
-        "database.connected",
-        "migrations.checked",
+        "db.connected",
+        "migration.checked",
         "listener.ready",
-        "http.request",
+        "http.request.completed",
         "listener.draining",
         "listener.stopped",
     ] {
@@ -345,18 +345,31 @@ fn a_public_listener_without_identity_denies_application_and_hides_the_raw_runti
             let raw = request(address, method, path, "");
             assert_eq!(raw.status, 404, "{name} {path}: {}", raw.body);
         }
-        for (path, body) in [
-            ("/v1/application/commands", COMMAND),
-            ("/v1/application/queries", QUERY),
-            ("/v1/application/projections/total/catch-up", ""),
-            ("/v1/application/projections/total/rebuild", ""),
+        // Messages carry no principal of their own: the policy refuses them.
+        // Projection controls are permission checks, and an anonymous caller
+        // is unauthenticated.
+        for (path, body, status, code) in [
+            ("/v1/application/commands", COMMAND, 403, "unauthorized"),
+            ("/v1/application/queries", QUERY, 403, "unauthorized"),
+            (
+                "/v1/application/projections/total/catch-up",
+                "",
+                401,
+                "unauthenticated",
+            ),
+            (
+                "/v1/application/projections/total/rebuild",
+                "",
+                401,
+                "unauthenticated",
+            ),
         ] {
             let denied = request(address, "POST", path, body);
             assert_eq!(
                 (denied.status, denied.body),
                 (
-                    403,
-                    json!({"error":{"code":"unauthorized","classification":"permanent"}})
+                    status,
+                    json!({"error":{"code":code,"classification":"permanent"}})
                 ),
                 "{name} {path}"
             );

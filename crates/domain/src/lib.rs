@@ -51,7 +51,7 @@ impl std::fmt::Display for Failure {
 impl std::error::Error for Failure {}
 
 /// Portable identity, validated on construction and deserialization.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Identity(String);
 impl Identity {

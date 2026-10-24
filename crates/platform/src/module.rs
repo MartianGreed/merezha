@@ -3,6 +3,7 @@ use crate::{
     BoxFuture,
     config::{ConfigIssue, ModuleSection},
     context::AppContext,
+    errors::ErrorCode,
 };
 use axum::Router;
 use merezha_domain::Failure;
@@ -10,7 +11,16 @@ use merezha_postgres::Migration;
 use std::time::Instant;
 
 /// Names of route prefixes owned by the host; modules cannot use them.
-pub const RESERVED_NAMES: [&str; 5] = ["application", "services", "pipelines", "reload", "health"];
+/// `api` and `application` are also the kernel-only outbox and notifier
+/// sources.
+pub const RESERVED_NAMES: [&str; 6] = [
+    "application",
+    "api",
+    "services",
+    "pipelines",
+    "reload",
+    "health",
+];
 
 /// Integration events a module publishes and consumes through the outbox.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -47,12 +57,27 @@ pub trait Module: Send + Sync + 'static {
     fn migrations(&self) -> &[Migration] {
         &[]
     }
+    /// Kernel sources this module writes as besides its own name. The host
+    /// grants only the pairs in [`crate::context::GRANTABLE_SOURCES`] (the
+    /// notifications block may claim `api` for its HTTP send route) and
+    /// refuses any other claim at startup with `source_not_granted`.
+    fn extra_sources(&self) -> &[&'static str] {
+        &[]
+    }
+    /// Error codes this module returns with their HTTP statuses, registered
+    /// at startup (R8). A code another module or the kernel registered with
+    /// a different status stops startup with `error_code_conflict`.
+    /// Canonical kernel codes need not be listed.
+    fn errors(&self) -> &[ErrorCode] {
+        &[]
+    }
     /// Integration events, for the catalog and later wiring checks.
     fn events(&self) -> ModuleEvents {
         ModuleEvents::default()
     }
     /// Start background tasks. Bounded by the host's start timeout; a
-    /// failure aborts startup.
+    /// failure aborts startup. `ctx` is bound to this module: its outbox and
+    /// notifier handles can only be bound to [`Module::name`].
     fn start(&self, ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
         let _ = ctx;
         Box::pin(async { Ok(()) })

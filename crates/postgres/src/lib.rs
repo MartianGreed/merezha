@@ -8,9 +8,15 @@ mod tls;
 
 pub use deadpool_postgres::Transaction;
 pub use migrate::{
-    MIGRATIONS_LOCK, Migration, MigrationError, MigrationMode, MigrationReport, ModuleMigrations,
-    PendingMigration, checksum, run_migrations,
+    MIGRATIONS_LOCK, Migration, MigrationError, MigrationKind, MigrationMode, MigrationReport,
+    ModuleMigrations, PendingMigration, checksum, run_migrations,
 };
+
+/// The open transaction every port that writes "inside the caller's
+/// transaction" takes, such as `Outbox::append` and `Notifier::request`, so
+/// one transaction carries the caller's rows, its outbox records and its
+/// notification requests. [`Database::transaction`] hands it out.
+pub type Tx<'a> = Transaction<'a>;
 pub use testing::{REQUIRE_DATABASE_ENV, TEST_DATABASE_ENV, TestDatabase};
 pub use tokio_postgres;
 
@@ -73,11 +79,17 @@ pub struct DatabaseConfig {
     pub migrate: bool,
     pub tls: TlsMode,
     pub tls_ca_file: Option<PathBuf>,
+    /// Most connections detached from the pool at once ([`Database::detach`],
+    /// the migration run included). They are opened beside the pool, so the
+    /// server sees at most `pool_size + max_detached` connections from this
+    /// host (plus listeners the blocks open).
+    pub max_detached: usize,
 }
 /// Inclusive bounds for numeric database settings.
 pub mod limits {
     use std::time::Duration;
     pub const POOL_SIZE: (usize, usize) = (1, 256);
+    pub const MAX_DETACHED: (usize, usize) = (1, 64);
     pub const CONNECT_TIMEOUT: (Duration, Duration) =
         (Duration::from_millis(100), Duration::from_secs(60));
     pub const ACQUIRE_TIMEOUT: (Duration, Duration) =
@@ -90,6 +102,7 @@ impl DatabaseConfig {
     pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
     pub const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
     pub const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+    pub const DEFAULT_MAX_DETACHED: usize = 8;
 
     /// Defaults for everything except the required URL.
     pub fn new(url: Secret) -> Self {
@@ -102,6 +115,7 @@ impl DatabaseConfig {
             migrate: false,
             tls: TlsMode::Disable,
             tls_ca_file: None,
+            max_detached: Self::DEFAULT_MAX_DETACHED,
         }
     }
     /// Every violated rule as `(setting, code)`, empty when valid.
@@ -125,6 +139,10 @@ impl DatabaseConfig {
         let (min, max) = limits::POOL_SIZE;
         if !(min..=max).contains(&self.pool_size) {
             issues.push(("pool_size", "out_of_range"));
+        }
+        let (min, max) = limits::MAX_DETACHED;
+        if !(min..=max).contains(&self.max_detached) {
+            issues.push(("max_detached", "out_of_range"));
         }
         for (name, value, (min, max)) in [
             (
@@ -169,6 +187,7 @@ pub struct Database {
     pool: Pool,
     acquire_timeout: Duration,
     statement_timeout: Duration,
+    detached: Arc<tokio::sync::Semaphore>,
 }
 impl std::fmt::Debug for Database {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -229,6 +248,7 @@ impl Database {
             pool,
             acquire_timeout: config.acquire_timeout,
             statement_timeout: config.statement_timeout,
+            detached: Arc::new(tokio::sync::Semaphore::new(config.max_detached)),
         })
     }
     /// Acquire a pooled client before `deadline` and within the configured
@@ -277,33 +297,38 @@ impl Database {
     pub async fn transaction<T, F>(&self, deadline: Instant, work: F) -> Result<T, Failure>
     where
         T: Send,
-        F: for<'t> FnOnce(&'t Transaction<'t>) -> BoxFuture<'t, Result<T, Failure>> + Send,
+        F: for<'t> FnOnce(&'t mut Tx<'_>) -> BoxFuture<'t, Result<T, Failure>> + Send,
     {
         let mut client = self.acquire(deadline).await?;
-        let budget = statement_budget(deadline, self.statement_timeout)?;
-        let at = tokio::time::Instant::from_std(deadline);
-        let transaction = match tokio::time::timeout_at(at, client.transaction()).await {
-            Ok(Ok(transaction)) => transaction,
-            Ok(Err(error)) => return Err(classify(&error)),
-            Err(_) => return Err(Failure::transient("database_timeout")),
+        run_transaction(&mut client, self.statement_timeout, deadline, work).await
+    }
+    /// Take a connection out of the pool for a long-lived session, such as
+    /// one holding a session advisory lock. The pool reopens the slot; the
+    /// session closes, releasing its locks and rolling back any open
+    /// transaction, when the [`DetachedClient`] drops, whether the caller
+    /// returns, fails or is cancelled.
+    ///
+    /// At most `max_detached` clients exist at once; beyond that the call
+    /// waits for one to drop, within `acquire_timeout` and the deadline, and
+    /// then fails transient `database_busy`.
+    pub async fn detach(&self, deadline: Instant) -> Result<DetachedClient, Failure> {
+        let bound = deadline.min(Instant::now() + self.acquire_timeout);
+        let permit = match tokio::time::timeout_at(
+            bound.into(),
+            self.detached.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(Failure::transient("database_closed")),
+            Err(_) => return Err(Failure::transient("database_busy")),
         };
-        let set = format!("SET LOCAL statement_timeout = {}", budget.as_millis());
-        match tokio::time::timeout_at(at, transaction.batch_execute(&set)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(classify(&error)),
-            Err(_) => return Err(Failure::transient("database_timeout")),
-        }
-        // Dropping the transaction on any early return rolls it back.
-        let value = match tokio::time::timeout_at(at, work(&transaction)).await {
-            Ok(Ok(value)) => value,
-            Ok(Err(failure)) => return Err(failure),
-            Err(_) => return Err(Failure::transient("database_timeout")),
-        };
-        match tokio::time::timeout_at(at, transaction.commit()).await {
-            Ok(Ok(())) => Ok(value),
-            Ok(Err(error)) if error.as_db_error().is_some() => Err(classify(&error)),
-            _ => Err(Failure::transient("commit_outcome_unknown")),
-        }
+        let pooled = self.acquire(deadline).await?;
+        Ok(DetachedClient {
+            client: deadpool_postgres::Object::take(pooled),
+            statement_timeout: self.statement_timeout,
+            _permit: permit,
+        })
     }
     /// The configured per-statement ceiling.
     pub fn statement_timeout(&self) -> Duration {
@@ -321,7 +346,80 @@ impl Database {
     /// Close the pool: idle connections drop and later acquisitions fail
     /// `database_closed`. Checked-out clients close when returned.
     pub fn close(&self) {
+        self.detached.close();
         self.pool.close();
+    }
+}
+
+/// A connection detached from the pool by [`Database::detach`]. It derefs to
+/// the driver client for session-level statements such as
+/// `pg_try_advisory_lock`; run transactions through
+/// [`DetachedClient::transaction`] so they get the same bounds as pooled ones.
+/// After `database_timeout` or `commit_outcome_unknown` the session state is
+/// unknown: drop the client rather than reuse it.
+pub struct DetachedClient {
+    client: deadpool_postgres::ClientWrapper,
+    statement_timeout: Duration,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl std::fmt::Debug for DetachedClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DetachedClient").finish_non_exhaustive()
+    }
+}
+impl std::ops::Deref for DetachedClient {
+    type Target = tokio_postgres::Client;
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+impl DetachedClient {
+    /// Exactly [`Database::transaction`] on this session: the same deadline
+    /// bound, `SET LOCAL statement_timeout`, classification and
+    /// `commit_outcome_unknown` for an interrupted commit.
+    pub async fn transaction<T, F>(&mut self, deadline: Instant, work: F) -> Result<T, Failure>
+    where
+        T: Send,
+        F: for<'t> FnOnce(&'t mut Tx<'_>) -> BoxFuture<'t, Result<T, Failure>> + Send,
+    {
+        run_transaction(&mut self.client, self.statement_timeout, deadline, work).await
+    }
+}
+
+/// The transaction contract shared by pooled and detached clients.
+async fn run_transaction<T, F>(
+    client: &mut deadpool_postgres::ClientWrapper,
+    ceiling: Duration,
+    deadline: Instant,
+    work: F,
+) -> Result<T, Failure>
+where
+    T: Send,
+    F: for<'t> FnOnce(&'t mut Tx<'_>) -> BoxFuture<'t, Result<T, Failure>> + Send,
+{
+    let budget = statement_budget(deadline, ceiling)?;
+    let at = tokio::time::Instant::from_std(deadline);
+    let mut transaction = match tokio::time::timeout_at(at, client.transaction()).await {
+        Ok(Ok(transaction)) => transaction,
+        Ok(Err(error)) => return Err(classify(&error)),
+        Err(_) => return Err(Failure::transient("database_timeout")),
+    };
+    let set = format!("SET LOCAL statement_timeout = {}", budget.as_millis());
+    match tokio::time::timeout_at(at, transaction.batch_execute(&set)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(classify(&error)),
+        Err(_) => return Err(Failure::transient("database_timeout")),
+    }
+    // Dropping the transaction on any early return rolls it back.
+    let value = match tokio::time::timeout_at(at, work(&mut transaction)).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(failure)) => return Err(failure),
+        Err(_) => return Err(Failure::transient("database_timeout")),
+    };
+    match tokio::time::timeout_at(at, transaction.commit()).await {
+        Ok(Ok(())) => Ok(value),
+        Ok(Err(error)) if error.as_db_error().is_some() => Err(classify(&error)),
+        _ => Err(Failure::transient("commit_outcome_unknown")),
     }
 }
 

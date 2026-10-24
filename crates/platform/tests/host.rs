@@ -26,16 +26,12 @@ use std::{
 use tower::ServiceExt;
 
 const NOTES: [Migration; 2] = [
-    Migration {
-        version: 1,
-        name: "create_schema",
-        sql: "CREATE SCHEMA notes; CREATE TABLE notes.items (id bigint PRIMARY KEY);",
-    },
-    Migration {
-        version: 2,
-        name: "seed",
-        sql: "INSERT INTO notes.items VALUES (1), (2);",
-    },
+    Migration::new(
+        1,
+        "create_schema",
+        "CREATE SCHEMA notes; CREATE TABLE notes.items (id bigint PRIMARY KEY);",
+    ),
+    Migration::new(2, "seed", "INSERT INTO notes.items VALUES (1), (2);"),
 ];
 
 /// A minimal block: one schema, a few routes and observable lifecycle hooks.
@@ -424,11 +420,7 @@ async fn verify_mode_refuses_readiness_until_migrations_are_current() {
     .unwrap();
     assert_eq!(ready(&router).await, StatusCode::OK);
     // A changed migration stops the next startup in either mode.
-    const EDITED: [Migration; 1] = [Migration {
-        version: 1,
-        name: "create_schema",
-        sql: "CREATE SCHEMA notes;",
-    }];
+    const EDITED: [Migration; 1] = [Migration::new(1, "create_schema", "CREATE SCHEMA notes;")];
     for migrate in [false, true] {
         let edited = Notes {
             migrations: Some(&EDITED),
@@ -570,5 +562,292 @@ async fn shutdown_drains_in_flight_requests_then_stops_modules() {
     assert!(
         tokio::net::TcpStream::connect(address).await.is_err(),
         "the listener closed"
+    );
+}
+
+/// A block that registers its own error codes.
+struct Ledger {
+    errors: &'static [merezha_platform::ErrorCode],
+}
+impl Module for Ledger {
+    fn name(&self) -> &'static str {
+        "ledger"
+    }
+    fn errors(&self) -> &[merezha_platform::ErrorCode] {
+        self.errors
+    }
+    fn routes(&self, _ctx: &AppContext) -> Router {
+        use merezha_platform::{ErrorReply, FieldError};
+        Router::new()
+            .route(
+                "/locked",
+                get(|| async {
+                    merezha_platform::error_response(&Failure::permanent("entry_locked"))
+                }),
+            )
+            .route(
+                "/unregistered",
+                get(|| async {
+                    merezha_platform::error_response(&Failure::permanent("ledger_odd"))
+                }),
+            )
+            .route(
+                "/invalid",
+                get(|| async {
+                    ErrorReply::new(Failure::permanent("validation_failed"))
+                        .details(vec![FieldError::new("/amount", "min").unwrap()])
+                }),
+            )
+            .route(
+                "/limited",
+                get(|| async {
+                    ErrorReply::new(Failure::transient("rate_limited"))
+                        .retry_after(Duration::from_secs(7))
+                }),
+            )
+            .route(
+                "/busy",
+                get(|| async {
+                    merezha_platform::error_response(&Failure::transient("overloaded"))
+                }),
+            )
+    }
+}
+const LEDGER_CODES: &[merezha_platform::ErrorCode] = &[
+    merezha_platform::ErrorCode::new("entry_locked", 423),
+    merezha_platform::ErrorCode::new("validation_failed", 422),
+];
+
+#[tokio::test]
+async fn module_error_codes_get_their_registered_status_at_the_edge() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let host = Host::start(
+        config(&test, true, ""),
+        vec![Box::new(Ledger {
+            errors: LEDGER_CODES,
+        })],
+        parts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        host.errors().status_of("entry_locked"),
+        Some(StatusCode::LOCKED)
+    );
+    let router = host.router();
+    let (status, body, _) = call(&router, get_request("/v1/ledger/locked")).await;
+    assert_eq!(status, 423, "outside the edge it would be 422");
+    assert_eq!(
+        body,
+        json!({"error": {"code": "entry_locked", "classification": "permanent"}})
+    );
+    let (status, _, _) = call(&router, get_request("/v1/ledger/unregistered")).await;
+    assert_eq!(status, 422);
+    let (status, body, _) = call(&router, get_request("/v1/ledger/invalid")).await;
+    assert_eq!(status, 422);
+    assert_eq!(
+        body["error"]["details"],
+        json!([{"path": "/amount", "code": "min"}])
+    );
+    let (status, body, headers) = call(&router, get_request("/v1/ledger/limited")).await;
+    assert_eq!(
+        (status.as_u16(), &headers["retry-after"]),
+        (429, &axum::http::HeaderValue::from_static("7"))
+    );
+    assert_eq!(body["error"]["classification"], "transient");
+    let (status, _, headers) = call(&router, get_request("/v1/ledger/busy")).await;
+    assert_eq!(
+        (status.as_u16(), &headers["retry-after"]),
+        (503, &axum::http::HeaderValue::from_static("1"))
+    );
+    // Edge failures use the same registry.
+    let (status, body, _) = call(
+        &router,
+        Request::post("/v1/ledger/locked")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status.as_u16(), body["error"]["code"].as_str()),
+        (405, Some("method_not_allowed"))
+    );
+}
+
+#[tokio::test]
+async fn a_code_registered_twice_with_different_statuses_stops_startup() {
+    // Registration runs before the pool opens, so no server is needed.
+    let config = ProjectConfig::parse(
+        "[app]\nid = \"notes-app\"\n[database]\nurl = { env = \"NOTES_DATABASE_URL\" }\n[runtime]\nmanifest = \"runtime.toml\"\n",
+        std::env::temp_dir(),
+        &[("NOTES_DATABASE_URL".into(), "postgres://127.0.0.1:1/none".into())],
+        &[],
+    )
+    .unwrap();
+    const KERNEL_CLASH: &[merezha_platform::ErrorCode] =
+        &[merezha_platform::ErrorCode::new("validation_failed", 400)];
+    let error = Host::start(
+        config.clone(),
+        vec![Box::new(Ledger {
+            errors: KERNEL_CLASH,
+        })],
+        parts(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        (error.failure.code.as_str(), error.module),
+        ("error_code_conflict", Some("ledger"))
+    );
+    struct Other;
+    impl Module for Other {
+        fn name(&self) -> &'static str {
+            "other"
+        }
+        fn errors(&self) -> &[merezha_platform::ErrorCode] {
+            const CODES: &[merezha_platform::ErrorCode] =
+                &[merezha_platform::ErrorCode::new("entry_locked", 409)];
+            CODES
+        }
+    }
+    let error = Host::start(
+        config,
+        vec![
+            Box::new(Ledger {
+                errors: LEDGER_CODES,
+            }),
+            Box::new(Other),
+        ],
+        parts(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        (error.failure.code.as_str(), error.module),
+        ("error_code_conflict", Some("other"))
+    );
+}
+
+/// Tries to write as other sources from the context the host hands it.
+struct Spoofer {
+    refused: Arc<std::sync::Mutex<Vec<String>>>,
+}
+impl Module for Spoofer {
+    fn name(&self) -> &'static str {
+        "spoofer"
+    }
+    fn start(&self, ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
+        Box::pin(async move {
+            assert_eq!(ctx.module(), Some("spoofer"));
+            ctx.outbox("spoofer")?;
+            ctx.notifier("spoofer")?;
+            let mut refused = self.refused.lock().unwrap();
+            for source in ["identity", "api", "application"] {
+                if let Err(failure) = ctx.outbox(source) {
+                    refused.push(format!("outbox:{source}:{}", failure.code));
+                }
+                if let Err(failure) = ctx.notifier(source) {
+                    refused.push(format!("notifier:{source}:{}", failure.code));
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn modules_cannot_bind_handles_for_another_source() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let refused = Arc::new(std::sync::Mutex::new(Vec::new()));
+    Host::start(
+        config(&test, true, ""),
+        vec![Box::new(Spoofer {
+            refused: refused.clone(),
+        })],
+        parts(),
+    )
+    .await
+    .unwrap();
+    let refused = refused.lock().unwrap().clone();
+    assert_eq!(refused.len(), 6, "{refused:?}");
+    assert!(refused.iter().all(|r| r.ends_with(":source_not_allowed")));
+}
+
+/// Claims the `api` source for an HTTP send route, as notifications does.
+struct Sender {
+    name: &'static str,
+    bound: Arc<std::sync::Mutex<Vec<String>>>,
+}
+impl Module for Sender {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn extra_sources(&self) -> &[&'static str] {
+        &["api"]
+    }
+    fn start(&self, ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
+        Box::pin(async move {
+            let mut bound = self.bound.lock().unwrap();
+            for source in ["api", "application", "notifications"] {
+                let outcome = match ctx.notifier(source) {
+                    Ok(_) => "ok".to_owned(),
+                    Err(failure) => failure.code,
+                };
+                bound.push(format!("{source}:{outcome}"));
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn only_the_notifications_module_is_granted_the_api_source() {
+    let bound = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // A claim by any other module stops startup before the pool opens.
+    let config = ProjectConfig::parse(
+        "[app]\nid = \"notes-app\"\n[database]\nurl = { env = \"NOTES_DATABASE_URL\" }\n[runtime]\nmanifest = \"runtime.toml\"\n",
+        std::env::temp_dir(),
+        &[("NOTES_DATABASE_URL".into(), "postgres://127.0.0.1:1/none".into())],
+        &[],
+    )
+    .unwrap();
+    let error = Host::start(
+        config,
+        vec![Box::new(Sender {
+            name: "content",
+            bound: bound.clone(),
+        })],
+        parts(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        (error.failure.code.as_str(), error.module),
+        ("source_not_granted", Some("content"))
+    );
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    Host::start(
+        config_with(&test, true, "", &[]),
+        vec![Box::new(Sender {
+            name: "notifications",
+            bound: bound.clone(),
+        })],
+        parts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *bound.lock().unwrap(),
+        vec![
+            "api:ok".to_owned(),
+            "application:source_not_allowed".to_owned(),
+            "notifications:ok".to_owned()
+        ]
     );
 }

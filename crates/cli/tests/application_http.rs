@@ -39,6 +39,26 @@ impl GuestSession for GuestFixture {
         })
     }
 }
+fn application() -> Application {
+    let config = Config::parse(
+        r#"version=1
+[[commands]]
+tag="Add"
+service="domain"
+aggregate="Counter"
+[[queries]]
+tag="Total"
+service="domain"
+projection="total"
+[[projections]]
+name="total"
+service="domain"
+initial=0
+"#,
+    )
+    .unwrap();
+    Application::in_memory(config, Arc::new(GuestFixture), Arc::new(AllowAll)).unwrap()
+}
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf, Router) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -196,4 +216,103 @@ fn invalid_application_configuration_fails_before_listener_start() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("invalid_config"));
     assert!(!stderr.contains("listener.ready"));
+}
+
+/// Allows application messages and decides permissions from the principal's
+/// grant snapshot, as the identity block's authorizer will.
+struct GrantPolicy;
+impl merezha_application::Authorizer for GrantPolicy {
+    fn authorize(
+        &self,
+        _: merezha_domain::MessageKind,
+        _: &str,
+        _: Option<&str>,
+        _: &Value,
+        _: &merezha_domain::Metadata,
+    ) -> Result<(), Failure> {
+        Ok(())
+    }
+}
+impl merezha_platform::ports::Authorizer for GrantPolicy {
+    fn check(
+        &self,
+        principal: Option<&merezha_platform::Principal>,
+        permission: &Identity,
+        scope: &merezha_platform::ResourceScope,
+    ) -> Result<merezha_platform::ports::Allowed, merezha_platform::ports::AccessDenied> {
+        use merezha_platform::ports::{AccessDenied, DenyReason};
+        match principal {
+            Some(principal) => principal.check(permission, scope),
+            None => Err(AccessDenied::new(DenyReason::Unauthenticated)),
+        }
+    }
+}
+
+#[tokio::test]
+async fn projection_controls_check_the_authenticated_principal_at_application_scope() {
+    use merezha_platform::{
+        Principal,
+        edge::Authenticated,
+        ports::{GrantSnapshot, Grants, PermissionSet, PrincipalKind},
+    };
+    let router = merezha_cli::application_http::router(application(), Some(Arc::new(GrantPolicy)));
+    let user = |grants: GrantSnapshot| {
+        Arc::new(Principal {
+            subject: Identity::new("usr_1").unwrap(),
+            kind: PrincipalKind::User,
+            user: Some(Identity::new("usr_1").unwrap()),
+            service_account: None,
+            tenant: Some(Identity::new("org_1").unwrap()),
+            grants: Arc::new(grants),
+            session: None,
+        })
+    };
+    let grant = |names: &[&str]| -> PermissionSet {
+        names.iter().map(|n| Identity::new(*n).unwrap()).collect()
+    };
+    let call = |principal: Option<Arc<Principal>>, path: &'static str| {
+        let router = router.clone();
+        async move {
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .extension(Authenticated(principal))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            let body = to_bytes(response.into_body(), 4096).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&body).unwrap())
+        }
+    };
+    const CATCH_UP: &str = "/v1/application/projections/total/catch-up";
+    const REBUILD: &str = "/v1/application/projections/total/rebuild";
+    let (status, body) = call(None, CATCH_UP).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (401, Some("unauthenticated"))
+    );
+    let operator = user(GrantSnapshot::empty().with_application(Grants::new(
+        vec![Identity::new("operator").unwrap()],
+        grant(&["application.projections.catch_up"]),
+    )));
+    assert_eq!(call(Some(operator.clone()), CATCH_UP).await.0, 200);
+    let (status, body) = call(Some(operator), REBUILD).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (403, Some("unauthorized"))
+    );
+    // A tenant grant never satisfies the application-scope check.
+    let tenant_admin = user(GrantSnapshot::empty().with_tenant(Grants::new(
+        vec![Identity::new("owner").unwrap()],
+        grant(&[
+            "application.projections.catch_up",
+            "application.projections.rebuild",
+        ]),
+    )));
+    assert_eq!(call(Some(tenant_admin), REBUILD).await.0, 403);
 }

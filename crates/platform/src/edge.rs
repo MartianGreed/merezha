@@ -1,14 +1,18 @@
 //! The HTTP edge: client address through trusted proxies, request id, W3C
 //! trace context, request logging, CORS, body limits, authentication and the
-//! single error shape `{ "error": { "code", "classification" } }`.
+//! single error shape `{ "error": { "code", "classification", "details"? } }`
+//! with statuses from the [`ErrorRegistry`].
 use crate::{
     config::{CorsConfig, HttpConfig},
     context::{OsRandom, Random, hex},
+    errors::{
+        ErrorBody, ErrorRegistry, FieldError, MAX_DETAILS, kernel_registry, needs_retry_after,
+    },
     net::Cidr,
     ports::{Authenticator, Principal},
 };
 use axum::{
-    Json, Router,
+    Router,
     body::Body,
     extract::{ConnectInfo, MatchedPath, Request, State},
     http::{HeaderName, HeaderValue, Method, StatusCode, header},
@@ -20,7 +24,7 @@ use serde_json::json;
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::Instrument;
 
@@ -33,29 +37,106 @@ const FORWARDED: HeaderName = HeaderName::from_static("forwarded");
 /// Hops read from `X-Forwarded-For`; longer chains use the last ones.
 const MAX_FORWARDED_HOPS: usize = 32;
 
-/// HTTP status for a classified failure. Stable codes with a fixed meaning
-/// map first; anything else maps by classification.
+/// HTTP status for a classified failure from the kernel's codes alone. Behind
+/// the edge, [`ErrorReply`] responses get the host registry's status instead,
+/// which includes every module's codes.
 pub fn status_for(failure: &Failure) -> StatusCode {
-    match failure.code.as_str() {
-        "not_found" | "handler_not_found" | "projection_not_found" => StatusCode::NOT_FOUND,
-        "method_not_allowed" => StatusCode::METHOD_NOT_ALLOWED,
-        "unauthenticated" => StatusCode::UNAUTHORIZED,
-        "unauthorized" => StatusCode::FORBIDDEN,
-        "body_limit" | "input_limit" | "payload_limit" => StatusCode::PAYLOAD_TOO_LARGE,
-        "timeout" | "upstream_timeout" => StatusCode::GATEWAY_TIMEOUT,
-        "overloaded" | "database_busy" => StatusCode::TOO_MANY_REQUESTS,
-        "invalid_input" => StatusCode::BAD_REQUEST,
-        _ => match failure.classification {
-            Classification::Permanent => StatusCode::UNPROCESSABLE_ENTITY,
-            Classification::Conflict => StatusCode::CONFLICT,
-            Classification::Transient => StatusCode::SERVICE_UNAVAILABLE,
-        },
+    kernel_registry().status(failure)
+}
+/// The one error response for `failure`. Only the stable code and
+/// classification are sent: never messages, secrets or guest text.
+pub fn error_response(failure: &Failure) -> Response {
+    ErrorReply::new(failure.clone()).into_response()
+}
+
+/// An error response under construction: a failure, optional field-level
+/// `details` and an optional `Retry-After`.
+///
+/// Outside a host its status comes from the kernel codes; behind the edge
+/// the host's [`ErrorRegistry`] sets it, so a module code keeps one status
+/// everywhere. Every 429 and 503 carries `Retry-After`, one second unless
+/// set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ErrorReply {
+    failure: Failure,
+    details: Vec<FieldError>,
+    retry_after: Option<Duration>,
+}
+impl ErrorReply {
+    pub fn new(failure: Failure) -> Self {
+        Self {
+            failure,
+            details: Vec::new(),
+            retry_after: None,
+        }
+    }
+    /// Field-level validation errors, at most [`MAX_DETAILS`]; later ones
+    /// are dropped.
+    pub fn details(mut self, details: Vec<FieldError>) -> Self {
+        self.details = details;
+        self.details.truncate(MAX_DETAILS);
+        self
+    }
+    pub fn retry_after(mut self, after: Duration) -> Self {
+        self.retry_after = Some(after);
+        self
+    }
+    pub fn failure(&self) -> &Failure {
+        &self.failure
+    }
+    /// The JSON body bytes. Without details they are byte for byte the
+    /// kernel's earlier `{"error":{"classification":..,"code":..}}`.
+    pub fn body(&self) -> Vec<u8> {
+        let body = json!({ "error": ErrorBody {
+            code: &self.failure.code,
+            classification: self.failure.classification,
+            details: &self.details,
+        }});
+        serde_json::to_vec(&body).unwrap_or_default()
+    }
+    fn response(&self, status: StatusCode) -> Response {
+        let mut response = (
+            status,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            self.body(),
+        )
+            .into_response();
+        set_retry_after(&mut response, self.retry_after);
+        response.extensions_mut().insert(Registered {
+            failure: self.failure.clone(),
+            retry_after: self.retry_after,
+        });
+        response
     }
 }
-/// The one error response. Only the stable code and classification are
-/// sent: never messages, secrets or guest text.
-pub fn error_response(failure: &Failure) -> Response {
-    (status_for(failure), Json(json!({ "error": failure }))).into_response()
+impl IntoResponse for ErrorReply {
+    fn into_response(self) -> Response {
+        self.response(status_for(&self.failure))
+    }
+}
+/// Marks an [`ErrorReply`] response so the edge applies the host registry.
+#[derive(Clone, Debug)]
+struct Registered {
+    failure: Failure,
+    retry_after: Option<Duration>,
+}
+/// Add `Retry-After` in whole seconds (at least 1) to a 429 or 503 lacking it.
+fn set_retry_after(response: &mut Response, after: Option<Duration>) {
+    if !needs_retry_after(response.status()) {
+        return;
+    }
+    let seconds = after
+        .map(|d| d.as_secs() + u64::from(d.subsec_nanos() > 0))
+        .unwrap_or(1)
+        .max(1);
+    if after.is_some() || !response.headers().contains_key(header::RETRY_AFTER) {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+    }
 }
 
 /// The request id, from a trusted proxy or generated here.
@@ -76,7 +157,7 @@ pub struct ClientInfo {
 /// The authenticated principal, inserted by the edge when an
 /// [`Authenticator`] is configured. `None` is an anonymous request.
 #[derive(Clone, Debug)]
-pub struct Authenticated(pub Option<Principal>);
+pub struct Authenticated(pub Option<Arc<Principal>>);
 
 /// W3C trace context for one server span.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,20 +254,24 @@ struct EdgeState {
     trusted: Arc<[Cidr]>,
     body_limit: usize,
     authenticator: Option<Arc<dyn Authenticator>>,
+    errors: Arc<ErrorRegistry>,
 }
 
 /// Wrap a composed router with the edge layers. Handlers can extract
 /// [`RequestId`], [`ClientInfo`], [`TraceContext`] and, when an
-/// authenticator is set, [`Authenticated`] from request extensions.
+/// authenticator is set, [`Authenticated`] from request extensions. Error
+/// statuses come from `errors`.
 pub fn apply(
     router: Router,
     http: &HttpConfig,
     authenticator: Option<Arc<dyn Authenticator>>,
+    errors: Arc<ErrorRegistry>,
 ) -> Router {
     let state = EdgeState {
         trusted: http.trusted_proxies.clone().into(),
         body_limit: http.body_limit,
         authenticator,
+        errors,
     };
     let router = router
         .fallback(|| async { error_response(&Failure::permanent("not_found")) })
@@ -198,7 +283,10 @@ pub fn apply(
         // Extractors such as `Bytes` and `Json` carry their own 2 MiB default;
         // `http.body_limit` replaces it in both directions.
         .layer(axum::extract::DefaultBodyLimit::max(http.body_limit))
-        .layer(middleware::from_fn(normalize_errors));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            normalize_errors,
+        ));
     let router = match cors(&http.cors) {
         Some(layer) => router.layer(layer),
         None => router,
@@ -357,7 +445,7 @@ async fn context(State(state): State<EdgeState>, mut request: Request, next: Nex
         response.headers_mut().insert(REQUEST_ID, value);
     }
     tracing::info!(
-        event = "http.request",
+        event = "http.request.completed",
         method = method.as_str(),
         route = route.as_deref().unwrap_or("unmatched"),
         status = response.status().as_u16(),
@@ -398,13 +486,43 @@ fn code_for(status: StatusCode) -> &'static str {
     }
 }
 
-/// Give every error response the one shape. Handler failures already in
-/// shape and JSON objects without an `error` member pass through; `{ "error": { "code" } }` documents from the raw
+/// An error member already in the one shape.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Shaped {
+    #[allow(dead_code)]
+    code: String,
+    #[allow(dead_code)]
+    classification: Classification,
+    #[serde(default)]
+    details: Option<Vec<FieldError>>,
+}
+fn shaped(error: &serde_json::Value) -> bool {
+    serde_json::from_value::<Failure>(error.clone()).is_ok()
+        || serde_json::from_value::<Shaped>(error.clone()).is_ok_and(|s| {
+            let details = s.details.unwrap_or_default();
+            details.len() <= MAX_DETAILS && details.iter().all(FieldError::is_valid)
+        })
+}
+
+/// Give every error response the one shape. [`ErrorReply`] responses get
+/// the registry's status for their code and `Retry-After` on 429 and 503.
+/// Other failures already in shape and JSON objects without an `error`
+/// member pass through; `{ "error": { "code" } }` documents from the raw
 /// runtime gain the classification implied by their status; anything else,
 /// such as an extractor's plain-text rejection, is replaced by a code derived
-/// from the status. The status itself is never changed.
-async fn normalize_errors(request: Request, next: Next) -> Response {
-    let response = next.run(request).await;
+/// from the status. Only [`ErrorReply`] statuses are ever changed.
+async fn normalize_errors(
+    State(state): State<EdgeState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    if let Some(registered) = response.extensions_mut().remove::<Registered>() {
+        *response.status_mut() = state.errors.status(&registered.failure);
+        set_retry_after(&mut response, registered.retry_after);
+        return response;
+    }
     let status = response.status();
     if !(status.is_client_error() || status.is_server_error()) {
         return response;
@@ -427,10 +545,14 @@ async fn normalize_errors(request: Request, next: Next) -> Response {
     // Shaped failures and JSON documents that are not errors, such as the
     // readiness status, pass through unchanged.
     if let (Some(bytes), Some(document)) = (bytes.as_ref(), document.as_ref())
-        && error.is_none_or(|e| serde_json::from_value::<Failure>(e.clone()).is_ok())
+        && error.is_none_or(shaped)
         && document.is_object()
     {
-        return Response::from_parts(parts, Body::from(bytes.clone()));
+        let mut response = Response::from_parts(parts, Body::from(bytes.clone()));
+        if error.is_some() {
+            set_retry_after(&mut response, None);
+        }
+        return response;
     }
     let code = error
         .and_then(|e| e.get("code"))
@@ -444,7 +566,9 @@ async fn normalize_errors(request: Request, next: Next) -> Response {
         HeaderValue::from_static("application/json"),
     );
     let body = serde_json::to_vec(&json!({ "error": failure })).unwrap_or_default();
-    Response::from_parts(parts, Body::from(body))
+    let mut response = Response::from_parts(parts, Body::from(body));
+    set_retry_after(&mut response, None);
+    response
 }
 
 async fn limit_body(State(state): State<EdgeState>, request: Request, next: Next) -> Response {
@@ -552,5 +676,58 @@ mod tests {
         assert_eq!(status_for(&Failure::permanent("other")), 422);
         assert_eq!(status_for(&Failure::conflict("other")), 409);
         assert_eq!(status_for(&Failure::transient("other")), 503);
+        assert_eq!(status_for(&Failure::transient("overloaded")), 503);
+    }
+    #[tokio::test]
+    async fn error_replies_keep_the_shape_and_add_details_and_retry_after() {
+        let plain = error_response(&Failure::permanent("not_found"));
+        assert_eq!(plain.status(), 404);
+        let bytes = axum::body::to_bytes(plain.into_body(), 1024).await.unwrap();
+        // Byte for byte what `json!({"error": failure})` always produced.
+        assert_eq!(
+            &bytes[..],
+            serde_json::to_vec(&json!({"error": Failure::permanent("not_found")})).unwrap()
+        );
+        assert_eq!(
+            &bytes[..],
+            br#"{"error":{"classification":"permanent","code":"not_found"}}"#
+        );
+        let invalid = ErrorReply::new(Failure::permanent("validation_failed"))
+            .details(vec![
+                FieldError::new("/email", "invalid").unwrap(),
+                FieldError::new("/fields/title", "required").unwrap(),
+            ])
+            .into_response();
+        assert_eq!(invalid.status(), 422);
+        let bytes = axum::body::to_bytes(invalid.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            json!({"error": {"code": "validation_failed", "classification": "permanent",
+                "details": [{"path": "/email", "code": "invalid"},
+                            {"path": "/fields/title", "code": "required"}]}})
+        );
+        assert!(shaped(&body["error"]));
+        assert!(!shaped(
+            &json!({"code": "x", "classification": "permanent", "details": [{"path": "no-slash", "code": "x"}]})
+        ));
+        assert!(!shaped(
+            &json!({"code": "x", "classification": "permanent", "message": "leak"})
+        ));
+        let limited = ErrorReply::new(Failure::transient("rate_limited"))
+            .retry_after(Duration::from_millis(2500))
+            .into_response();
+        assert_eq!(limited.status(), 429);
+        assert_eq!(limited.headers()[header::RETRY_AFTER], "3");
+        let overloaded = error_response(&Failure::transient("overloaded"));
+        assert_eq!(overloaded.status(), 503);
+        assert_eq!(overloaded.headers()[header::RETRY_AFTER], "1");
+        assert!(
+            !error_response(&Failure::permanent("other"))
+                .headers()
+                .contains_key(header::RETRY_AFTER)
+        );
     }
 }

@@ -1,5 +1,5 @@
 //! Structured logs through `tracing`. Events carry a stable `event` field
-//! (`listener.ready`, `http.request`, ...) and only allowlisted metadata.
+//! (`listener.ready`, `http.request.completed`, ...) and only allowlisted metadata.
 //! The telemetry block adds OTLP exporters through `extra` layers.
 use crate::config::{LogFormat, LogLevel, TelemetryConfig};
 use merezha_domain::Failure;

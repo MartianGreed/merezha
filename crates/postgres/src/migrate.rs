@@ -1,10 +1,13 @@
 //! Forward-only module migrations recorded in `merezha.migrations`.
 //!
 //! Apply mode takes a session advisory lock on a connection removed from the
-//! pool, so concurrent hosts serialize and the lock is released when that
-//! connection closes, even if the caller is cancelled. Each pending migration
-//! runs with its ledger row in one transaction. Verify mode takes no lock and
-//! reads in one read-only transaction on a pooled session.
+//! pool, polling for it so a waiting runner holds no snapshot, so concurrent
+//! hosts serialize and the lock is released when that
+//! connection closes, even if the caller is cancelled. Each pending
+//! transactional migration runs with its ledger row in one transaction. A
+//! non-transactional step runs its single statement outside any transaction
+//! and is recorded only after it succeeds. Verify mode takes no lock and reads
+//! in one read-only transaction on a pooled session.
 use crate::{Database, classify};
 use merezha_domain::Failure;
 use sha2::{Digest, Sha256};
@@ -16,13 +19,59 @@ const MAX_MIGRATIONS: usize = 1024;
 const MAX_SQL_BYTES: usize = 1_048_576;
 const MAX_MODULES: usize = 64;
 
-/// One forward-only schema change. `version` orders a module's migrations;
-/// `sql` may contain several statements and must not manage transactions.
+/// How the runner executes a migration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MigrationKind {
+    /// The SQL and its ledger row commit together in one transaction. The
+    /// SQL may contain several statements and must not manage transactions.
+    #[default]
+    Transactional,
+    /// One statement run outside any transaction, for statements PostgreSQL
+    /// refuses inside one, such as `CREATE INDEX CONCURRENTLY`. The ledger
+    /// row is written only after the statement succeeded, so a failed or
+    /// interrupted step runs again on the next apply and must be safe to
+    /// repeat: `CREATE INDEX CONCURRENTLY` must say `IF NOT EXISTS`, and an
+    /// invalid index left by an earlier failed build is dropped and rebuilt.
+    NonTransactional,
+}
+
+/// One forward-only schema change. `version` orders a module's migrations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Migration {
     pub version: u32,
     pub name: &'static str,
     pub sql: &'static str,
+    pub kind: MigrationKind,
+}
+impl Migration {
+    /// A transactional migration: `sql` and the ledger row commit together.
+    pub const fn new(version: u32, name: &'static str, sql: &'static str) -> Self {
+        Self {
+            version,
+            name,
+            sql,
+            kind: MigrationKind::Transactional,
+        }
+    }
+    /// A declared non-transactional step: exactly one statement, run outside
+    /// a transaction under the run's advisory lock, recorded after success.
+    ///
+    /// ```
+    /// use merezha_postgres::Migration;
+    /// const BY_TITLE: Migration = Migration::non_transactional(
+    ///     3,
+    ///     "entries_by_title",
+    ///     "CREATE INDEX CONCURRENTLY IF NOT EXISTS entries_by_title ON content.entries (title)",
+    /// );
+    /// ```
+    pub const fn non_transactional(version: u32, name: &'static str, sql: &'static str) -> Self {
+        Self {
+            version,
+            name,
+            sql,
+            kind: MigrationKind::NonTransactional,
+        }
+    }
 }
 /// A module's declared migrations in strictly increasing version order.
 #[derive(Clone, Copy, Debug)]
@@ -136,11 +185,17 @@ fn validate(modules: &[ModuleMigrations<'_>]) -> Result<(), MigrationError> {
         }
         let mut previous = 0;
         for migration in module.migrations {
+            let step_ok = match migration.kind {
+                MigrationKind::Transactional => true,
+                MigrationKind::NonTransactional => single_statement(migration.sql)
+                    .is_some_and(|statement| concurrent_index(statement).is_ok()),
+            };
             if migration.version <= previous
                 || migration.version > i32::MAX as u32
                 || !valid_label(migration.name, 128)
                 || migration.sql.trim().is_empty()
                 || migration.sql.len() > MAX_SQL_BYTES
+                || !step_ok
             {
                 return Err(MigrationError::at(
                     "invalid_migrations",
@@ -152,6 +207,198 @@ fn validate(modules: &[ModuleMigrations<'_>]) -> Result<(), MigrationError> {
         }
     }
     Ok(())
+}
+
+/// The one statement of `sql`, without its trailing semicolons, or `None`
+/// when `sql` holds no statement or more than one. Quotes, dollar quotes and
+/// comments are skipped, so a `;` inside them does not split the statement.
+fn single_statement(sql: &str) -> Option<&str> {
+    let bytes = sql.as_bytes();
+    let mut end = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        let comment = matches!((byte, next), (b'-', Some(b'-')) | (b'/', Some(b'*')));
+        if end.is_some() && !(byte.is_ascii_whitespace() || byte == b';' || comment) {
+            return None;
+        }
+        match byte {
+            b'\'' | b'"' => {
+                index += 1;
+                while index < bytes.len() && bytes[index] != byte {
+                    index += 1;
+                }
+                if index == bytes.len() {
+                    return None;
+                }
+            }
+            b'-' if next == Some(b'-') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+                continue;
+            }
+            b'/' if next == Some(b'*') => {
+                // PostgreSQL block comments nest.
+                let mut depth = 0usize;
+                while index < bytes.len() {
+                    if bytes[index..].starts_with(b"/*") {
+                        depth += 1;
+                        index += 2;
+                    } else if bytes[index..].starts_with(b"*/") {
+                        depth -= 1;
+                        index += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        index += 1;
+                    }
+                }
+                if depth != 0 {
+                    return None;
+                }
+                continue;
+            }
+            b'$' => {
+                let tag_end = bytes[index + 1..]
+                    .iter()
+                    .position(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+                    .map(|p| index + 1 + p);
+                if let Some(tag_end) = tag_end
+                    && bytes[tag_end] == b'$'
+                    && !bytes.get(index + 1).is_some_and(u8::is_ascii_digit)
+                {
+                    let tag = &bytes[index..=tag_end];
+                    let body = tag_end + 1;
+                    let close = bytes[body..].windows(tag.len()).position(|w| w == tag)?;
+                    index = body + close + tag.len();
+                    continue;
+                }
+            }
+            b';' => {
+                end.get_or_insert(index);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    let statement = sql[..end.unwrap_or(sql.len())].trim();
+    (!statement.is_empty()).then_some(statement)
+}
+
+/// `sql` with each `--` and (nested) `/* */` comment outside quotes replaced
+/// by one space, or `None` when a comment or quote is not closed.
+fn without_comments(sql: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if bytes[index..].starts_with(b"--") {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            out.push(b' ');
+        } else if bytes[index..].starts_with(b"/*") {
+            let mut depth = 0usize;
+            loop {
+                if index >= bytes.len() {
+                    return None;
+                }
+                if bytes[index..].starts_with(b"/*") {
+                    depth += 1;
+                    index += 2;
+                } else if bytes[index..].starts_with(b"*/") {
+                    depth -= 1;
+                    index += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            out.push(b' ');
+        } else if byte == b'\'' || byte == b'"' {
+            let close = bytes[index + 1..].iter().position(|b| *b == byte)?;
+            let end = index + 1 + close + 1;
+            out.extend_from_slice(&bytes[index..end]);
+            index = end;
+        } else {
+            out.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The index a `CREATE [UNIQUE] INDEX CONCURRENTLY` statement builds.
+#[derive(Debug, PartialEq, Eq)]
+struct ConcurrentIndex {
+    /// The index name as stored in `pg_class`.
+    name: String,
+    /// The table as written, for `to_regclass`.
+    table: String,
+}
+/// `Ok(None)` for any statement other than a concurrent index build, and
+/// `Err` for a concurrent build that is not safe to retry: it must say
+/// `IF NOT EXISTS` and name its index.
+fn concurrent_index(statement: &str) -> Result<Option<ConcurrentIndex>, ()> {
+    // Comments may sit anywhere, before `CREATE` or between keywords: match
+    // on the statement with every comment replaced by a space.
+    let statement = without_comments(statement).ok_or(())?;
+    let mut words = statement.split_whitespace().peekable();
+    let mut keyword = |expected: &str| {
+        let matched = words
+            .peek()
+            .is_some_and(|w| w.eq_ignore_ascii_case(expected));
+        if matched {
+            words.next();
+        }
+        matched
+    };
+    if !keyword("create") {
+        return Ok(None);
+    }
+    keyword("unique");
+    if !keyword("index") || !keyword("concurrently") {
+        return Ok(None);
+    }
+    if !(keyword("if") && keyword("not") && keyword("exists")) {
+        return Err(());
+    }
+    let name = words.next().ok_or(())?;
+    if name.eq_ignore_ascii_case("on") {
+        return Err(());
+    }
+    if name.matches('"').count() % 2 != 0 {
+        return Err(());
+    }
+    let name = match name.strip_prefix('"').and_then(|n| n.strip_suffix('"')) {
+        Some(quoted) if !quoted.is_empty() => quoted.replace("\"\"", "\""),
+        Some(_) => return Err(()),
+        None if name.contains(['"', '.', '(']) => return Err(()),
+        None => name.to_ascii_lowercase(),
+    };
+    if !words.next().is_some_and(|w| w.eq_ignore_ascii_case("on")) {
+        return Err(());
+    }
+    let mut table = words.next().ok_or(())?;
+    if table.eq_ignore_ascii_case("only") {
+        table = words.next().ok_or(())?;
+    }
+    let table = table.split('(').next().unwrap_or_default();
+    // Quoted names with spaces would split into several words: refuse them
+    // rather than guess, so the invalid-index lookup always finds its table.
+    if table.is_empty() || table.matches('"').count() % 2 != 0 {
+        return Err(());
+    }
+    Ok(Some(ConcurrentIndex {
+        name,
+        table: table.to_owned(),
+    }))
 }
 
 struct Applied {
@@ -254,10 +501,13 @@ async fn run(
     mode: MigrationMode,
     deadline: Instant,
 ) -> Result<MigrationReport, MigrationError> {
-    let mut pooled = db.acquire(deadline).await.map_err(MigrationError::new)?;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let budget = remaining.as_millis().clamp(1, i32::MAX as u128);
+    let budget = || {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        remaining.as_millis().clamp(1, i32::MAX as u128)
+    };
     if mode == MigrationMode::Verify {
+        let mut pooled = db.acquire(deadline).await.map_err(MigrationError::new)?;
+        let budget = budget();
         // Readiness verifies repeatedly, so stay on a pooled session: the
         // bound is `SET LOCAL` and ends with this read-only transaction.
         let transaction = pooled.transaction().await.map_err(|e| database(&e))?;
@@ -275,26 +525,22 @@ async fn run(
         });
     }
     // Detach from the pool: session settings and the advisory lock die with
-    // this connection instead of leaking into later borrowers.
-    let mut client = deadpool_postgres::Object::take(pooled);
+    // this connection instead of leaking into later borrowers. The run
+    // counts against `max_detached` like any detached session.
+    let mut detached = db.detach(deadline).await.map_err(MigrationError::new)?;
+    let client = &mut detached.client;
     client
-        .batch_execute(&format!("SET statement_timeout = {budget}"))
+        .batch_execute(&format!("SET statement_timeout = {}", budget()))
         .await
         .map_err(|e| database(&e))?;
-    client
-        .execute("SELECT pg_advisory_lock($1)", &[&MIGRATIONS_LOCK])
-        .await
-        .map_err(|e| match classify(&e).code.as_str() {
-            "database_timeout" => MigrationError::new(Failure::transient("migration_lock_timeout")),
-            _ => database(&e),
-        })?;
+    lock(client, deadline).await?;
     let transaction = client.transaction().await.map_err(|e| database(&e))?;
     transaction
         .batch_execute(LEDGER)
         .await
         .map_err(|e| database(&e))?;
     transaction.commit().await.map_err(|e| database(&e))?;
-    let applied = read_ledger(&*client, modules).await?.unwrap_or_default();
+    let applied = read_ledger(&**client, modules).await?.unwrap_or_default();
     let pending = plan(modules, &applied)?;
     let mut done = Vec::new();
     for (index, migration) in pending {
@@ -311,32 +557,51 @@ async fn run(
                 version: Some(migration.version),
             }
         };
-        let transaction = client.transaction().await.map_err(|e| fail(&e))?;
-        transaction
-            .batch_execute(migration.sql)
-            .await
-            .map_err(|e| fail(&e))?;
-        transaction
-            .execute(
-                "INSERT INTO merezha.migrations (module, version, name, checksum) VALUES ($1, $2, $3, $4)",
-                &[
-                    &module,
-                    &(migration.version as i32),
-                    &migration.name,
-                    &checksum(migration.sql),
-                ],
-            )
-            .await
-            .map_err(|e| fail(&e))?;
-        transaction.commit().await.map_err(|e| MigrationError {
-            failure: if e.as_db_error().is_some() {
-                Failure::permanent("migration_failed")
-            } else {
-                Failure::transient("commit_outcome_unknown")
-            },
-            module: Some(module.to_owned()),
-            version: Some(migration.version),
-        })?;
+        let version = migration.version as i32;
+        let digest = checksum(migration.sql);
+        let row: [&(dyn tokio_postgres::types::ToSql + Sync); 4] =
+            [&module, &version, &migration.name, &digest];
+        match migration.kind {
+            MigrationKind::Transactional => {
+                let transaction = client.transaction().await.map_err(|e| fail(&e))?;
+                transaction
+                    .batch_execute(migration.sql)
+                    .await
+                    .map_err(|e| fail(&e))?;
+                transaction
+                    .execute(RECORD, &row)
+                    .await
+                    .map_err(|e| fail(&e))?;
+                transaction.commit().await.map_err(|e| MigrationError {
+                    failure: if e.as_db_error().is_some() {
+                        Failure::permanent("migration_failed")
+                    } else {
+                        Failure::transient("commit_outcome_unknown")
+                    },
+                    module: Some(module.to_owned()),
+                    version: Some(migration.version),
+                })?;
+            }
+            MigrationKind::NonTransactional => {
+                let invalid =
+                    || MigrationError::at("invalid_migrations", module, Some(migration.version));
+                let statement = single_statement(migration.sql).ok_or_else(invalid)?;
+                let index = concurrent_index(statement).map_err(|()| invalid())?;
+                if let Some(index) = &index {
+                    drop_invalid_index(client, index, module, migration.version)
+                        .await
+                        .map_err(|e| fail(&e))?;
+                }
+                // A single statement in the simple query protocol runs
+                // outside any explicit transaction block. Until the ledger
+                // row below exists, the next apply runs it again.
+                client
+                    .batch_execute(statement)
+                    .await
+                    .map_err(|e| fail(&e))?;
+                client.execute(RECORD, &row).await.map_err(|e| fail(&e))?;
+            }
+        }
         tracing::info!(
             event = "migration.applied",
             module,
@@ -354,6 +619,71 @@ async fn run(
         applied: done,
         pending: Vec::new(),
     })
+}
+
+const RECORD: &str =
+    "INSERT INTO merezha.migrations (module, version, name, checksum) VALUES ($1, $2, $3, $4)";
+
+/// Drop the invalid index a failed `CREATE INDEX CONCURRENTLY` left behind,
+/// so the retried `IF NOT EXISTS` build creates it again instead of keeping
+/// an index PostgreSQL never uses.
+async fn drop_invalid_index(
+    client: &tokio_postgres::Client,
+    index: &ConcurrentIndex,
+    module: &str,
+    version: u32,
+) -> Result<(), tokio_postgres::Error> {
+    let found = client
+        .query_opt(
+            "SELECT format('%I.%I', n.nspname, c.relname)
+             FROM pg_index i
+             JOIN pg_class c ON c.oid = i.indexrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE i.indrelid = to_regclass($1)::oid AND c.relname = $2 AND NOT i.indisvalid",
+            &[&index.table, &index.name],
+        )
+        .await?;
+    if let Some(row) = found {
+        let qualified: String = row.get(0);
+        client
+            .batch_execute(&format!("DROP INDEX CONCURRENTLY IF EXISTS {qualified}"))
+            .await?;
+        tracing::warn!(event = "migration.invalid_index_dropped", module, version);
+    }
+    Ok(())
+}
+
+/// Pause between attempts to take the advisory lock.
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Take the session advisory lock before `deadline`.
+///
+/// A blocking `pg_advisory_lock` would hold its statement's snapshot while it
+/// waits, and the holder's `CREATE INDEX CONCURRENTLY` waits for every older
+/// snapshot to end: the two would deadlock. Each `pg_try_advisory_lock`
+/// attempt ends at once, so a waiting runner holds no snapshot.
+async fn lock(client: &tokio_postgres::Client, deadline: Instant) -> Result<(), MigrationError> {
+    loop {
+        let locked: bool = client
+            .query_one("SELECT pg_try_advisory_lock($1)", &[&MIGRATIONS_LOCK])
+            .await
+            .map_err(|e| match classify(&e).code.as_str() {
+                "database_timeout" => {
+                    MigrationError::new(Failure::transient("migration_lock_timeout"))
+                }
+                _ => database(&e),
+            })?
+            .get(0);
+        if locked {
+            return Ok(());
+        }
+        if Instant::now() + LOCK_POLL >= deadline {
+            return Err(MigrationError::new(Failure::transient(
+                "migration_lock_timeout",
+            )));
+        }
+        tokio::time::sleep(LOCK_POLL).await;
+    }
 }
 
 /// Applied rows for `modules`, or `None` when the ledger does not exist.
@@ -409,16 +739,8 @@ fn report(
 mod tests {
     use super::*;
 
-    const ONE: Migration = Migration {
-        version: 1,
-        name: "create",
-        sql: "CREATE TABLE t (id int)",
-    };
-    const TWO: Migration = Migration {
-        version: 2,
-        name: "index",
-        sql: "CREATE INDEX ON t (id)",
-    };
+    const ONE: Migration = Migration::new(1, "create", "CREATE TABLE t (id int)");
+    const TWO: Migration = Migration::new(2, "index", "CREATE INDEX ON t (id)");
 
     #[test]
     fn checksum_is_sha256_hex() {
@@ -517,6 +839,110 @@ mod tests {
         assert_eq!(
             plan(&modules, &applied).unwrap_err().failure.code,
             "migration_out_of_order"
+        );
+    }
+    #[test]
+    fn non_transactional_steps_hold_exactly_one_statement() {
+        assert_eq!(single_statement(" SELECT 1 ;; \n"), Some("SELECT 1"));
+        assert_eq!(
+            single_statement("SELECT ';', \"a;b\", $$;$$, $t$;$t$ -- ; x\n /* ; /* ; */ */"),
+            Some("SELECT ';', \"a;b\", $$;$$, $t$;$t$ -- ; x\n /* ; /* ; */ */")
+        );
+        assert_eq!(single_statement("SELECT 1; -- done\n"), Some("SELECT 1"));
+        for bad in [
+            "",
+            " ; ",
+            "SELECT 1; SELECT 2",
+            "SELECT 1; 'x'",
+            "SELECT 'open",
+            "SELECT /* open",
+            "SELECT $$open",
+        ] {
+            assert_eq!(single_statement(bad), None, "{bad}");
+        }
+        let step = |sql| Migration::non_transactional(1, "step", sql);
+        let declare = |migration: Migration| {
+            validate(&[ModuleMigrations {
+                module: "content",
+                migrations: &[migration],
+            }])
+        };
+        assert!(declare(step("CREATE INDEX CONCURRENTLY IF NOT EXISTS i ON t (a)")).is_ok());
+        assert!(declare(step("ALTER TYPE mood ADD VALUE IF NOT EXISTS 'ok'")).is_ok());
+        for bad in [
+            "CREATE INDEX CONCURRENTLY i ON t (a)",
+            "CREATE INDEX CONCURRENTLY ON t (a)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS ON t (a)",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS i ON t (a); SELECT 1",
+        ] {
+            assert_eq!(
+                declare(step(bad)).unwrap_err().failure.code,
+                "invalid_migrations",
+                "{bad}"
+            );
+        }
+        // Several statements stay fine in a transactional migration.
+        assert!(declare(Migration::new(1, "m", "SELECT 1; SELECT 2")).is_ok());
+    }
+    #[test]
+    fn concurrent_index_targets_name_the_index_and_its_table() {
+        assert_eq!(
+            concurrent_index(
+                "create unique index concurrently if not exists Entries_Title on only content.entries(title)"
+            ),
+            Ok(Some(ConcurrentIndex {
+                name: "entries_title".into(),
+                table: "content.entries".into()
+            }))
+        );
+        assert_eq!(
+            concurrent_index(
+                r#"CREATE INDEX CONCURRENTLY IF NOT EXISTS "By""Title""" ON "Entries" (t)"#
+            ),
+            Ok(Some(ConcurrentIndex {
+                name: r#"By"Title""#.into(),
+                table: r#""Entries""#.into()
+            }))
+        );
+        for unsupported in [
+            r#"CREATE INDEX CONCURRENTLY IF NOT EXISTS "By Title" ON t (a)"#,
+            r#"CREATE INDEX CONCURRENTLY IF NOT EXISTS i ON "My Table" (a)"#,
+        ] {
+            assert_eq!(concurrent_index(unsupported), Err(()), "{unsupported}");
+        }
+        // Comments before or between the keywords do not hide a concurrent
+        // build: the IF NOT EXISTS rule and the invalid-index rebuild apply.
+        for hidden in [
+            "-- note\nCREATE INDEX CONCURRENTLY i ON t (a)",
+            "/* x */ CREATE INDEX /* y */ CONCURRENTLY i ON t (a)",
+            "/* a /* nested */ */ create index concurrently i on t (a)",
+        ] {
+            assert_eq!(concurrent_index(hidden), Err(()), "{hidden}");
+            let step = Migration::non_transactional(1, "step", hidden);
+            let declared = [step];
+            assert!(
+                validate(&[ModuleMigrations {
+                    module: "content",
+                    migrations: &declared,
+                }])
+                .is_err(),
+                "{hidden}"
+            );
+        }
+        assert_eq!(
+            concurrent_index(
+                "/* x */ CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS u -- why\n ON t (a)"
+            ),
+            Ok(Some(ConcurrentIndex {
+                name: "u".into(),
+                table: "t".into()
+            }))
+        );
+        assert_eq!(concurrent_index("/* open CREATE INDEX"), Err(()));
+        assert_eq!(concurrent_index("CREATE INDEX i ON t (a)"), Ok(None));
+        assert_eq!(
+            concurrent_index("DROP INDEX CONCURRENTLY IF EXISTS i"),
+            Ok(None)
         );
     }
 }
