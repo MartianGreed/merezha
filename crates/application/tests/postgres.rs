@@ -185,6 +185,12 @@ impl GuestSession for Fake {
                     state: json!(count),
                 })
             }
+            // `{"len":true}` asks for the state's encoded size instead.
+            Operation::Query { state, payload, .. } if payload["len"] == true => {
+                Ok(Reply::Queried {
+                    value: json!(state.to_string().len()),
+                })
+            }
             Operation::Query { state, .. } => Ok(Reply::Queried { value: state }),
         }
     }
@@ -263,32 +269,41 @@ impl Pg {
         });
     }
     /// A session holding `merezha_app.head FOR UPDATE` until it rolls back.
-    fn hold_head(&self) -> PooledClient {
+    /// A session that ran `statements` and stays open, as another host
+    /// mid-transaction.
+    fn begin(&self, statements: &str) -> PooledClient {
         self.runtime.block_on(async {
             let client = self.admin.acquire(deadline()).await.unwrap();
-            client
-                .batch_execute(
-                    "BEGIN; SELECT position FROM merezha_app.head WHERE id = 1 FOR UPDATE",
-                )
-                .await
-                .unwrap();
+            client.batch_execute(statements).await.unwrap();
             client
         })
     }
-    fn release_head(&self, client: PooledClient) {
+    fn finish(&self, client: PooledClient, statements: &str) {
         self.runtime
-            .block_on(client.batch_execute("ROLLBACK"))
+            .block_on(client.batch_execute(statements))
             .unwrap();
     }
-    /// Wait until `n` appends wait on the head lock.
+    /// A session holding `merezha_app.head FOR UPDATE` until it rolls back.
+    fn hold_head(&self) -> PooledClient {
+        self.begin("BEGIN; SELECT position FROM merezha_app.head WHERE id = 1 FOR UPDATE")
+    }
+    fn release_head(&self, client: PooledClient) {
+        self.finish(client, "ROLLBACK");
+    }
+    /// Wait until `n` appends wait on a lock.
     fn wait_for_lock_waiters(&self, n: i64) {
+        self.wait_for_waiters("merezha_app.append", n);
+    }
+    /// Wait until `n` sessions running a statement containing `text` wait
+    /// on a lock.
+    fn wait_for_waiters(&self, text: &str, n: i64) {
         let until = Instant::now() + Duration::from_secs(10);
-        while self.count(
+        let statement = format!(
             "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
-             AND query LIKE '%merezha_app.append%' AND datname = current_database()",
-        ) < n
-        {
-            assert!(Instant::now() < until, "appends never queued on the lock");
+             AND query LIKE '%{text}%' AND datname = current_database()"
+        );
+        while self.count(&statement) < n {
+            assert!(Instant::now() < until, "no session waited on {text}");
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -1009,6 +1024,8 @@ fn verify_reports_each_broken_invariant() {
         "DELETE FROM merezha_app.events WHERE position = 3; \
          UPDATE merezha_app.head SET position = 9; \
          UPDATE merezha_app.streams SET last_position = 8 WHERE stream = 'Counter/two'; \
+         UPDATE merezha_app.receipts SET stream = 'Counter/two' WHERE key = 'k0'; \
+         UPDATE merezha_app.receipts SET version = version + 1 WHERE key = 'k2'; \
          UPDATE merezha_app.projections SET checkpoint = 10",
     );
     let report = pg.verify();
@@ -1030,6 +1047,15 @@ fn verify_reports_each_broken_invariant() {
             "receipt_matches_events",
             json!({"receipt": {"tag": "Add", "tenant": "", "actor": "alice", "key": "k1"}}),
         ),
+        // Events of another stream, and the right positions at wrong versions.
+        (
+            "receipt_matches_events",
+            json!({"receipt": {"tag": "Add", "tenant": "", "actor": "alice", "key": "k0"}}),
+        ),
+        (
+            "receipt_matches_events",
+            json!({"receipt": {"tag": "Add", "tenant": "", "actor": "alice", "key": "k2"}}),
+        ),
         (
             "checkpoint_within_head",
             json!({"projection": {"name": "count", "revision": 1}}),
@@ -1041,6 +1067,212 @@ fn verify_reports_each_broken_invariant() {
         );
     }
     assert_eq!(report.violation_count as usize, report.violations.len());
+}
+
+/// The append of another host committing key `k` for `Counter/one` at
+/// version 0, as `fingerprint` binds it, from a session that may hold locks.
+fn foreign_append(fingerprint: &str) -> String {
+    format!(
+        "SELECT * FROM merezha_app.append('Counter/one', NULL, 0, ARRAY['Added'], ARRAY[1], \
+         ARRAY['1']::text[]::json[], '{{\"message_id\":\"other\",\"correlation_id\":\"other\"}}'::text::json, \
+         0, NULL, NULL, 'Add', '', 'alice', 'k', '{fingerprint}', 1000)"
+    )
+}
+
+#[test]
+fn a_key_committed_between_the_stream_check_and_the_receipt_lookup_replays() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let app = pg.open(config(), &probe);
+    // Reads of `streams` block, so the append stops at its stream check
+    // while another host commits the same key.
+    let other = pg.begin("BEGIN; LOCK TABLE merezha_app.streams IN ACCESS EXCLUSIVE MODE");
+    let replayed = std::thread::scope(|scope| {
+        let command = scope.spawn(|| app.command(command("one", json!(1), Some("k"))));
+        pg.wait_for_lock_waiters(1);
+        pg.finish(
+            other,
+            &format!(
+                "{}; COMMIT",
+                foreign_append(r#"{"expected_version":null,"payload":1,"stream":"Counter/one"}"#)
+            ),
+        );
+        command.join().unwrap()
+    });
+    let receipt = replayed.unwrap();
+    assert_eq!(
+        (receipt.position, receipt.version, receipt.events),
+        (1, 1, 1)
+    );
+    assert_eq!(pg.count("SELECT count(*) FROM merezha_app.events"), 1);
+}
+
+#[test]
+fn a_key_committed_between_the_receipt_fast_path_and_the_history_load_replays() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let app = pg.open(config(), &probe);
+    // The fast path finds no receipt; the history load then waits while
+    // another host commits the key, and sees a stale expected version.
+    let other = pg.begin("BEGIN; LOCK TABLE merezha_app.events IN ACCESS EXCLUSIVE MODE");
+    let replayed = std::thread::scope(|scope| {
+        let command = scope.spawn(|| {
+            let mut keyed = command("one", json!(1), Some("k"));
+            keyed.expected_version = Some(0);
+            app.command(keyed)
+        });
+        pg.wait_for_waiters("FROM merezha_app.events WHERE stream", 1);
+        pg.finish(
+            other,
+            &format!(
+                "{}; COMMIT",
+                foreign_append(r#"{"expected_version":0,"payload":1,"stream":"Counter/one"}"#)
+            ),
+        );
+        command.join().unwrap()
+    });
+    let receipt = replayed.unwrap();
+    assert_eq!(
+        (receipt.position, receipt.version, receipt.events),
+        (1, 1, 1)
+    );
+    assert_eq!(probe.decisions.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn an_append_losing_its_key_to_a_zero_event_command_rolls_back_in_flight() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let app = pg.open(config(), &probe);
+    // Receipt inserts block (reads do not), so the append holds the head
+    // and its events when a zero-event command, which takes no head lock,
+    // commits the same key.
+    let other = pg.begin("BEGIN; LOCK TABLE merezha_app.receipts IN SHARE MODE");
+    let lost = std::thread::scope(|scope| {
+        let command = scope.spawn(|| app.command(command("one", json!(1), Some("k"))));
+        pg.wait_for_lock_waiters(1);
+        pg.finish(
+            other,
+            "SELECT * FROM merezha_app.append('Counter/one', NULL, 0, ARRAY[]::text[], \
+             ARRAY[]::integer[], ARRAY[]::json[], '{}'::json, 0, NULL, NULL, 'Add', '', 'alice', 'k', \
+             'zero', 1000); COMMIT",
+        );
+        command.join().unwrap()
+    });
+    assert_eq!(code(lost), "idempotency_in_flight");
+    assert_eq!(pg.count("SELECT count(*) FROM merezha_app.events"), 0);
+    assert_eq!(pg.count("SELECT position FROM merezha_app.head"), 0);
+    assert_eq!(
+        pg.count("SELECT count(*) FROM merezha_app.receipts WHERE events = 0"),
+        1
+    );
+}
+
+#[test]
+fn a_slow_pool_acquire_still_bounds_the_lock_wait_by_the_time_left() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let mut c = config();
+    c.limits.timeout_ms = 3000;
+    let db = pg.pool(1);
+    let store = pg
+        .runtime
+        .block_on(PostgresStore::connect(
+            &db,
+            &c,
+            PostgresOptions::default(),
+            deadline(),
+        ))
+        .unwrap();
+    let app =
+        Application::with_postgres(c, guest(&probe), Arc::new(AllowAll), Arc::new(store)).unwrap();
+    let holder = pg.hold_head();
+    let (arrived, release) = probe.hold();
+    let started = Instant::now();
+    let result = std::thread::scope(|scope| {
+        let command = scope.spawn(|| app.command(command("one", json!(1), None)));
+        arrived.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The decision is made; the only pooled session is busy for 1.5 s.
+        let busy = pg.runtime.block_on(db.acquire(deadline())).unwrap();
+        release.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        drop(busy);
+        command.join().unwrap()
+    });
+    assert_eq!(code(result), "storage_busy");
+    assert!(started.elapsed() < Duration::from_millis(3000));
+    pg.release_head(holder);
+    // Nothing commits later behind the caller's back.
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(pg.count("SELECT count(*) FROM merezha_app.events"), 0);
+    assert_eq!(pg.count("SELECT position FROM merezha_app.head"), 0);
+}
+
+#[test]
+fn lowering_payload_and_state_limits_keeps_stored_history_readable() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let mut wide = config();
+    wide.limits.max_payload_bytes = 1024;
+    let app = pg.open(wide, &probe);
+    app.command(command("one", json!({"pad": 500}), None))
+        .unwrap();
+    drop(app);
+    // A rolling deploy lowers both limits: stored rows stay readable, new
+    // writes obey the new limits.
+    let mut narrow = config();
+    narrow.limits.max_payload_bytes = 128;
+    narrow.limits.max_state_bytes = 128;
+    let app = pg.open(narrow, &probe);
+    assert_eq!(
+        app.command(command("one", json!({"pad": 10}), None))
+            .unwrap()
+            .version,
+        2
+    );
+    assert_eq!(
+        code(app.command(command("one", json!({"pad": 500}), None))),
+        "payload_limit"
+    );
+    assert_eq!(app.catch_up("count").unwrap().checkpoint, 2);
+    pg.execute(&format!(
+        "UPDATE merezha_app.projections SET state = '\"{}\"'",
+        "x".repeat(500)
+    ));
+    let size = app
+        .query(Query {
+            tag: id("Count"),
+            payload: json!({"len": true}),
+            metadata: metadata(),
+        })
+        .unwrap();
+    assert_eq!(size.value, json!(502));
+}
+
+#[test]
+fn a_position_gap_in_the_feed_is_the_transient_event_feed_gap() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let app = pg.open(config(), &probe);
+    for i in 0..3 {
+        app.command(command("one", json!(i), None)).unwrap();
+    }
+    pg.execute("DELETE FROM merezha_app.events WHERE position = 2");
+    let failure = app.catch_up("count").err().unwrap();
+    assert_eq!(
+        (failure.code.as_str(), failure.classification),
+        ("event_feed_gap", merezha_domain::Classification::Transient)
+    );
+    assert_eq!(
+        app.query(Query {
+            tag: id("Count"),
+            payload: json!({}),
+            metadata: metadata(),
+        })
+        .unwrap()
+        .checkpoint,
+        0
+    );
 }
 
 /// Recorded throughput for the PR description (§E, not gated).

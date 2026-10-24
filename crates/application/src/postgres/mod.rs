@@ -23,7 +23,7 @@ pub use verify::{MAX_VIOLATIONS, Subject, VerifyReport, Violation, verify};
 
 use crate::{
     application::{Key, ProjectionState},
-    config::{Config, Limits, StorageConfig},
+    config::{Config, Limits, MAX_PAYLOAD_BYTES, MAX_STATE_BYTES, StorageConfig},
     durable::{CommitCommand, DurableStore, ProjectionRef},
 };
 use merezha_domain::{Event, Failure, Identity, Metadata, Receipt, StoredEvent, compatible_json};
@@ -328,7 +328,9 @@ impl PostgresStore {
     fn event(&self, row: &Row) -> Result<StoredEvent, Failure> {
         let position = unsigned(row.get(0))?;
         let payload: serde_json::Value =
-            decode(row.get::<_, &str>(5), self.limits.max_payload_bytes)?;
+            // Read up to the hard ceiling: a lowered `max_payload_bytes`
+            // binds new writes only, so stored history stays readable.
+            decode(row.get::<_, &str>(5), MAX_PAYLOAD_BYTES)?;
         compatible_json(&payload).map_err(|_| invalid())?;
         let schema_version = u16::try_from(row.get::<_, i32>(4)).map_err(|_| invalid())?;
         let metadata: Metadata = decode(row.get::<_, &str>(6), METADATA_BYTES)?;
@@ -366,15 +368,20 @@ impl PostgresStore {
             i32::try_from(p.revision).map_err(|_| configuration())?,
         ))
     }
-    /// The lock wait the append may spend: what is left of the deadline
-    /// minus a margin for the commit, capped by the configured maximum.
-    fn lock_timeout(&self, deadline: Instant) -> Result<i32, Failure> {
-        let left = deadline
-            .checked_duration_since(Instant::now())
-            .and_then(|left| left.checked_sub(APPEND_MARGIN))
-            .filter(|left| *left >= Duration::from_millis(1))
-            .ok_or_else(timeout)?;
-        i32::try_from(left.min(self.options.lock_timeout_max).as_millis()).map_err(|_| timeout())
+    /// Server-side bounds of an append about to be sent: its head-lock wait
+    /// is what is left of the deadline minus [`APPEND_MARGIN`] (capped by
+    /// the configured maximum), and the whole statement gets half the margin
+    /// less than what is left. The server thus gives up before the caller
+    /// does, with a definite rollback. `None` below the margin: the append
+    /// is not sent.
+    fn append_bounds(&self, deadline: Instant) -> Option<(i32, u128)> {
+        let left = deadline.checked_duration_since(Instant::now())?;
+        let budget = left
+            .checked_sub(APPEND_MARGIN)
+            .filter(|budget| *budget >= Duration::from_millis(1))?;
+        let lock = i32::try_from(budget.min(self.options.lock_timeout_max).as_millis()).ok()?;
+        let statement = left.checked_sub(APPEND_MARGIN / 2)?.as_millis();
+        Some((lock, statement))
     }
 }
 
@@ -391,7 +398,6 @@ struct Append {
     trace: Option<TraceContext>,
     key: Option<[String; 4]>,
     fingerprint: Option<String>,
-    lock_timeout_ms: i32,
 }
 
 impl DurableStore for PostgresStore {
@@ -536,7 +542,6 @@ impl DurableStore for PostgresStore {
                 .and_then(|source| source.current()),
             key: c.claim.map(|(key, _)| key_parts(key)),
             fingerprint: c.claim.map(|(_, fingerprint)| fingerprint.to_owned()),
-            lock_timeout_ms: self.lock_timeout(deadline)?,
         };
         #[cfg(test)]
         tests::crash_cut("before_append");
@@ -570,8 +575,7 @@ impl DurableStore for PostgresStore {
         let row = row.ok_or_else(invalid)?;
         // A partitioned row has no single state; this build has none.
         let text: Option<&str> = row.get(0);
-        let state: serde_json::Value =
-            decode(text.ok_or_else(invalid)?, self.limits.max_state_bytes)?;
+        let state: serde_json::Value = decode(text.ok_or_else(invalid)?, MAX_STATE_BYTES)?;
         compatible_json(&state).map_err(|_| invalid())?;
         Ok((
             ProjectionState {
@@ -644,8 +648,9 @@ fn key_parts(key: &Key) -> [String; 4] {
     ]
 }
 impl PostgresStore {
-    /// The append statement on a pooled session. A deadline cut while the
-    /// statement runs leaves its outcome unknown.
+    /// The append statement on a pooled session. Its bounds are computed
+    /// after the session wait, from the time then left. A deadline cut while
+    /// the statement runs leaves its outcome unknown.
     async fn append(&self, a: &Append, deadline: Instant) -> Result<Row, Failure> {
         let client = self.db.acquire(deadline).await?;
         let statement = match tokio::time::timeout_at(
@@ -661,46 +666,65 @@ impl PostgresStore {
                 return Err(timeout());
             }
         };
+        let Some((lock_timeout_ms, statement_ms)) = self.append_bounds(deadline) else {
+            return Err(timeout());
+        };
         let key = a.key.as_ref();
         let part = |i: usize| key.map(|k| k[i].as_str());
-        let result = tokio::time::timeout_at(
-            deadline.into(),
-            client.query_one(
-                &statement,
-                &[
-                    &a.stream,
-                    &a.tenant,
-                    &a.expected,
-                    &a.tags,
-                    &a.schema_versions,
-                    &a.payloads,
-                    &a.metadata,
-                    &a.accepted_unix_ms,
-                    &a.trace.as_ref().map(TraceContext::traceparent),
-                    &a.trace.as_ref().and_then(TraceContext::tracestate),
-                    &part(0),
-                    &part(1),
-                    &part(2),
-                    &part(3),
-                    &a.fingerprint,
-                    &a.lock_timeout_ms,
-                ],
-            ),
-        )
+        let (traceparent, tracestate) = (
+            a.trace.as_ref().map(TraceContext::traceparent),
+            a.trace.as_ref().and_then(TraceContext::tracestate),
+        );
+        let (key_tag, key_tenant, key_actor, key_text) = (part(0), part(1), part(2), part(3));
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 16] = [
+            &a.stream,
+            &a.tenant,
+            &a.expected,
+            &a.tags,
+            &a.schema_versions,
+            &a.payloads,
+            &a.metadata,
+            &a.accepted_unix_ms,
+            &traceparent,
+            &tracestate,
+            &key_tag,
+            &key_tenant,
+            &key_actor,
+            &key_text,
+            &a.fingerprint,
+            &lock_timeout_ms,
+        ];
+        let bound = format!("SET statement_timeout = {statement_ms}");
+        // Pipelined in order in one round trip: the session statement
+        // timeout, the autocommit append, then the session default again.
+        // The head lock is held only by the middle statement.
+        let sent = tokio::time::timeout_at(deadline.into(), async {
+            tokio::join!(
+                biased;
+                client.batch_execute(&bound),
+                client.query_one(&statement, &params),
+                client.batch_execute("RESET statement_timeout"),
+            )
+        })
         .await;
-        match result {
-            Ok(Ok(row)) => Ok(row),
-            Ok(Err(error)) => {
-                let failure = append_error(&error);
-                if failure.code == "commit_outcome_unknown" {
-                    drop(PooledClient::take(client));
-                }
-                Err(failure)
-            }
-            Err(_) => {
-                drop(PooledClient::take(client));
-                Err(commit_unknown())
-            }
+        let Ok((bounded, result, reset)) = sent else {
+            drop(PooledClient::take(client));
+            return Err(commit_unknown());
+        };
+        let failure = result.as_ref().err().map(append_error);
+        // A session whose statement timeout may not be the default again,
+        // or whose outcome is unknown, is closed instead of pooled.
+        if bounded.is_err()
+            || reset.is_err()
+            || failure
+                .as_ref()
+                .is_some_and(|f| f.code == "commit_outcome_unknown")
+        {
+            drop(PooledClient::take(client));
+        }
+        match failure {
+            Some(failure) => Err(failure),
+            None => result.map_err(|e| append_error(&e)),
         }
     }
 }

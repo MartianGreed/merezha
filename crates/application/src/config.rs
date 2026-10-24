@@ -26,6 +26,12 @@ const CAPACITY_KEYS: [&str; 4] = [
 ];
 /// Default and ceiling of `max_stream_events`.
 const MAX_STREAM_EVENTS: usize = 4096;
+/// Hard ceiling of `max_payload_bytes`. Durable stores read stored events
+/// up to it, so lowering the configured limit never makes history
+/// unreadable; the configured limit binds writes.
+pub(crate) const MAX_PAYLOAD_BYTES: usize = 65_536;
+/// Hard ceiling of `max_state_bytes`, read like [`MAX_PAYLOAD_BYTES`].
+pub(crate) const MAX_STATE_BYTES: usize = 262_144;
 
 /// The `[limits]` keys a parsed document wrote. Defaults, and values set
 /// in code after parsing, are not present.
@@ -145,8 +151,8 @@ impl Limits {
             (self.max_streams, 256),
             (self.max_store_bytes, 8_388_608),
             (self.max_idempotency, 1024),
-            (self.max_payload_bytes, 65_536),
-            (self.max_state_bytes, 262_144),
+            (self.max_payload_bytes, MAX_PAYLOAD_BYTES),
+            (self.max_state_bytes, MAX_STATE_BYTES),
             (self.batch_size, 64),
             (self.max_concurrent, 64),
             (self.max_stream_events, MAX_STREAM_EVENTS),

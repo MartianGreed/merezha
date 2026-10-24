@@ -450,6 +450,15 @@ impl Admission {
         }
         let expected = history.last().map_or(0, |event| event.version);
         if command.expected_version.is_some_and(|v| v != expected) {
+            // Another instance may have committed this very key since the
+            // fast path, which is what made the precondition stale: replay
+            // its receipt rather than refuse the retry.
+            if let (Some(pending), Storage::Durable(store)) = (&claim, &self.inner.store)
+                && let Some(receipt) =
+                    store.receipt(&pending.key, &pending.fingerprint, self.deadline)?
+            {
+                return Ok(receipt);
+            }
             return Err(Failure::conflict("concurrency_conflict"));
         }
         let reply = invoke(

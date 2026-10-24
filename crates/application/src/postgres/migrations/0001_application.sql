@@ -96,13 +96,13 @@ LANGUAGE sql SET search_path = '' AS $$
 -- One command commit. Called as a single statement outside an explicit
 -- transaction, so lock, inserts and commit take one round trip.
 CREATE FUNCTION merezha_app.append(
-    p_stream text, p_tenant text,
+    p_stream text, p_tenant text,                  -- p_tenant NULL for application streams
     p_expected bigint,
     p_tags text[], p_schema_versions integer[], p_payloads json[],
     p_metadata json, p_accepted_unix_ms bigint,
-    p_trace_parent text, p_trace_state text,
-    p_key_tag text, p_key_tenant text, p_key_actor text, p_key text,
-    p_fingerprint text,
+    p_trace_parent text, p_trace_state text,       -- current command span; NULL when not recording
+    p_key_tag text, p_key_tenant text, p_key_actor text, p_key text,   -- all NULL without a key
+    p_fingerprint text,                            -- canonical JSON {stream, payload, expected_version}
     p_lock_timeout_ms integer
 ) RETURNS TABLE (outcome text, r_version bigint, r_position bigint, r_events integer)
 LANGUAGE plpgsql SET search_path = '' AS $$
@@ -114,13 +114,22 @@ DECLARE
 BEGIN
     IF p_key IS NOT NULL THEN
         v_digest := sha256(convert_to(p_fingerprint, 'UTF8'));
-        RETURN QUERY SELECT * FROM merezha_app.lookup_receipt(p_key_tag, p_key_tenant, p_key_actor, p_key, v_digest);
-        IF FOUND THEN RETURN; END IF;
     END IF;
-    -- Fail fast without the lock when the precondition is already stale.
+    -- Fail fast without the lock when the precondition is already stale. The
+    -- stream check runs before the receipt lookup: a same-key commit landing
+    -- between the two is then found by the lookup, and one landing before the
+    -- check by the lookup of the conflict branch, so it replays either way.
     SELECT coalesce(max(s.version), 0) INTO v_current FROM merezha_app.streams s WHERE s.stream = p_stream;
     IF v_current <> p_expected THEN
+        IF p_key IS NOT NULL THEN
+            RETURN QUERY SELECT * FROM merezha_app.lookup_receipt(p_key_tag, p_key_tenant, p_key_actor, p_key, v_digest);
+            IF FOUND THEN RETURN; END IF;
+        END IF;
         RETURN QUERY SELECT 'conflict'::text, v_current, 0::bigint, 0; RETURN;
+    END IF;
+    IF p_key IS NOT NULL THEN
+        RETURN QUERY SELECT * FROM merezha_app.lookup_receipt(p_key_tag, p_key_tenant, p_key_actor, p_key, v_digest);
+        IF FOUND THEN RETURN; END IF;
     END IF;
 
     IF v_n > 0 THEN
@@ -134,6 +143,10 @@ BEGIN
         END IF;
         SELECT coalesce(max(s.version), 0) INTO v_current FROM merezha_app.streams s WHERE s.stream = p_stream;
         IF v_current <> p_expected THEN
+            IF p_key IS NOT NULL THEN
+                RETURN QUERY SELECT * FROM merezha_app.lookup_receipt(p_key_tag, p_key_tenant, p_key_actor, p_key, v_digest);
+                IF FOUND THEN RETURN; END IF;
+            END IF;
             RETURN QUERY SELECT 'conflict'::text, v_current, v_base, 0; RETURN;
         END IF;
         UPDATE merezha_app.head SET position = v_base + v_n WHERE id = 1;
