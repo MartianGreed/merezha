@@ -4,10 +4,11 @@
 //! the DDL. W3C `traceparent`, version `00`, exactly 55 bytes; `tracestate`
 //! at most 512 bytes and 32 members.
 //!
-//! The edge trust policy (T2), event and job filling (T3, T5) and span
-//! links build on these helpers.
+//! The edge trust policy ([`trusts`], [`continue_inbound`], TE §2.1) and
+//! later event and job filling (T3, T5) build on these helpers.
+use crate::config::TrustInbound;
 use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState};
-use std::str::FromStr;
+use std::{net::IpAddr, str::FromStr};
 
 /// Length of a version-00 `traceparent`.
 pub const TRACE_PARENT_LEN: usize = 55;
@@ -117,6 +118,85 @@ pub fn parse_traceparent(trace_parent: &str, trace_state: Option<&str>) -> Optio
     ))
 }
 
+/// The edge trust policy (TE §2.1, `telemetry.traces.trust_inbound`):
+/// whether an inbound `traceparent` from this peer may parent the server
+/// span. `trusted_proxies` honors only peers in `http.trusted_proxies`
+/// (`via_trusted_proxy`) or on loopback.
+pub fn trusts(policy: TrustInbound, peer: Option<IpAddr>, via_trusted_proxy: bool) -> bool {
+    match policy {
+        TrustInbound::Always => true,
+        TrustInbound::Never => false,
+        TrustInbound::TrustedProxies => {
+            via_trusted_proxy || peer.is_some_and(|ip| ip.to_canonical().is_loopback())
+        }
+    }
+}
+
+/// What the edge did with an inbound trace context.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Inbound {
+    /// No valid `traceparent`: a new root under the ratio sampler.
+    Absent,
+    /// A trusted caller's context, now the server span's parent; its
+    /// sampled flag is honored.
+    Parent(SpanContext),
+    /// An untrusted caller's context: the server span is a new root under
+    /// the ratio sampler and links to it with
+    /// `merezha.link.reason=untrusted_parent`, so public clients cannot
+    /// force sampling but their trace stays joinable.
+    Linked(SpanContext),
+}
+impl Inbound {
+    /// The caller's context, whatever was done with it.
+    pub fn context(&self) -> Option<&SpanContext> {
+        match self {
+            Self::Absent => None,
+            Self::Parent(context) | Self::Linked(context) => Some(context),
+        }
+    }
+}
+
+/// Apply an inbound `traceparent` and `tracestate` to `span`, a new
+/// server span that has not started yet (TE §2.1 steps 1 to 4). Malformed
+/// headers are ignored; an invalid `tracestate` alone drops the state and
+/// keeps the parent.
+pub fn continue_inbound(
+    span: &tracing::Span,
+    traceparent: Option<&str>,
+    tracestate: Option<&str>,
+    trusted: bool,
+) -> Inbound {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    let Some(context) = traceparent.and_then(|parent| {
+        parse_traceparent(parent, tracestate).or_else(|| parse_traceparent(parent, None))
+    }) else {
+        return Inbound::Absent;
+    };
+    if trusted {
+        let _ = span
+            .set_parent(opentelemetry::Context::new().with_remote_span_context(context.clone()));
+        Inbound::Parent(context)
+    } else {
+        span.add_link_with_attributes(
+            context.clone(),
+            vec![crate::names::attr::link_reason(
+                crate::names::LinkReason::UntrustedParent,
+            )],
+        );
+        Inbound::Linked(context)
+    }
+}
+
+/// The started span's own context, when a span bridge records it.
+pub fn span_context(span: &tracing::Span) -> Option<SpanContext> {
+    use opentelemetry::trace::TraceContextExt;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    let context = span.context();
+    let span_context = context.span().span_context().clone();
+    span_context.is_valid().then_some(span_context)
+}
+
 /// Format a span context as a version-00 `traceparent`.
 pub fn format_traceparent(context: &SpanContext) -> String {
     format!(
@@ -168,6 +248,39 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         assert!(StoredContext::parse(PARENT, Some(&many)).is_none());
+    }
+
+    #[test]
+    fn the_trust_policy_honors_proxies_and_loopback_by_default() {
+        let public: IpAddr = "203.0.113.7".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        let policy = TrustInbound::TrustedProxies;
+        assert!(!trusts(policy, Some(public), false));
+        assert!(trusts(policy, Some(public), true));
+        assert!(trusts(policy, Some(loopback), false));
+        assert!(trusts(policy, Some(mapped), false));
+        assert!(!trusts(policy, None, false));
+        assert!(trusts(TrustInbound::Always, Some(public), false));
+        assert!(!trusts(TrustInbound::Never, Some(loopback), true));
+    }
+
+    #[test]
+    fn inbound_contexts_without_a_bridge_keep_the_decision() {
+        let span = tracing::Span::none();
+        assert_eq!(
+            continue_inbound(&span, Some("garbage"), None, true),
+            Inbound::Absent
+        );
+        let trusted = continue_inbound(&span, Some(PARENT), Some("not a state!"), true);
+        assert!(matches!(trusted, Inbound::Parent(ref c) if c.trace_state().header().is_empty()));
+        let untrusted = continue_inbound(&span, Some(PARENT), None, false);
+        assert!(matches!(untrusted, Inbound::Linked(_)));
+        assert_eq!(
+            untrusted.context().map(format_traceparent).as_deref(),
+            Some(PARENT)
+        );
+        assert!(span_context(&span).is_none());
     }
 
     #[test]

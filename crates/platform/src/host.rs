@@ -1,24 +1,27 @@
-//! Process lifecycle: configuration with module validation, database and
-//! migrations, module start, the composed router behind the edge, serving
-//! with a bounded graceful drain and module shutdown.
+//! Process lifecycle: configuration with module validation, the early
+//! listener, database and migrations, module start, the composed router
+//! behind the edge, serving, and the drain sequence: readiness off, a drain
+//! delay for load balancers, a bounded graceful drain and module shutdown.
 use crate::{
     config::{ConfigErrors, ConfigInput, ConfigIssue, Origin, ProjectConfig, valid_module_name},
     context::AppContext,
-    edge,
+    edge::{self, EdgeSettings, HttpMetrics},
     errors::ErrorRegistry,
-    health::{self, Readiness},
+    health::{self, Lifecycle, Readiness},
     module::{JobsRuntime, Module, RESERVED_NAMES},
-    ports::Authorizer,
+    ports::{Authenticator, Authorizer},
+    status::{self, ServiceInfo, StatusSection, StatusState},
 };
-use axum::Router;
+use axum::{Router, extract::Request};
 use merezha_domain::Failure;
 use merezha_postgres::{
     Database, MigrationError, MigrationMode, MigrationReport, ModuleMigrations, run_migrations,
 };
+use opentelemetry::metrics::Meter;
 use std::{
     future::Future,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, PoisonError, RwLock},
     time::{Duration, Instant},
 };
 
@@ -37,6 +40,9 @@ pub struct Timeouts {
     pub drain: Duration,
     /// All module `shutdown` calls together.
     pub module_shutdown: Duration,
+    /// How often readiness is re-evaluated in the background
+    /// ([`health::READINESS_INTERVAL`]); probes read the cached result.
+    pub readiness_interval: Duration,
 }
 impl Default for Timeouts {
     fn default() -> Self {
@@ -45,6 +51,7 @@ impl Default for Timeouts {
             module_start: Duration::from_secs(10),
             drain: Duration::from_secs(30),
             module_shutdown: Duration::from_secs(10),
+            readiness_interval: health::READINESS_INTERVAL,
         }
     }
 }
@@ -166,6 +173,74 @@ pub fn error_registry(modules: &[&dyn Module]) -> Result<ErrorRegistry, StartupE
     Ok(registry)
 }
 
+/// What an embedding binary adds beyond [`HostParts`]: the lifecycle the
+/// early listener shares, the identity authenticator, the meter for the
+/// edge's instruments and the extra status sections.
+#[derive(Clone, Default)]
+pub struct HostOptions {
+    /// The early listener's lifecycle ([`EarlyListener::lifecycle`]); a new
+    /// one otherwise, marked started when [`Host::start_with`] returns.
+    pub lifecycle: Option<Arc<Lifecycle>>,
+    /// The identity block's authenticator. With one, `/v1/admin/status`
+    /// requires `system.status.read` at application scope.
+    pub authenticator: Option<Arc<dyn Authenticator>>,
+    /// The meter of the edge's HTTP instruments; none records nothing.
+    pub meter: Option<Meter>,
+    /// Sections of `/v1/admin/status` other subsystems own.
+    pub status: Vec<Arc<dyn StatusSection>>,
+    /// Turns `true` on a shutdown signal during startup: the host stops
+    /// before its next step, interrupts a running migration or module
+    /// start, shuts down the modules already started within
+    /// `Timeouts::module_shutdown`, and fails `startup_interrupted`.
+    pub interrupt: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+/// Resolve once `interrupt` turns `true`; never without one, or once its
+/// sender is gone without having signalled.
+async fn interrupted(interrupt: Option<tokio::sync::watch::Receiver<bool>>) {
+    if let Some(mut interrupt) = interrupt
+        && interrupt.wait_for(|stop| *stop).await.is_ok()
+    {
+        return;
+    }
+    std::future::pending::<()>().await;
+}
+impl std::fmt::Debug for HostOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostOptions")
+            .field("authenticator", &self.authenticator.is_some())
+            .field(
+                "status",
+                &self.status.iter().map(|s| s.name()).collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// The edge settings of `config` with `errors`, `options`' authenticator
+/// and meter.
+fn edge_settings(
+    config: &ProjectConfig,
+    errors: Arc<ErrorRegistry>,
+    authenticator: Option<Arc<dyn Authenticator>>,
+    meter: Option<&Meter>,
+) -> EdgeSettings {
+    EdgeSettings::new(&config.http, errors)
+        .authenticator(authenticator)
+        .trust(config.telemetry.traces.trust_inbound)
+        .metrics(meter.map(HttpMetrics::new).unwrap_or_default())
+}
+
+/// Whether `config` describes a private listener: not public, a loopback
+/// address and no trusted proxy (requests through a proxy come from
+/// elsewhere even on loopback). Without identity, only a private listener
+/// keeps the allow-all policy and serves `/v1/admin/status`.
+pub fn private_listener(config: &ProjectConfig) -> bool {
+    !config.http.public
+        && config.http.listen.ip().is_loopback()
+        && config.http.trusted_proxies.is_empty()
+}
+
 /// A started host, ready to serve.
 pub struct Host {
     config: ProjectConfig,
@@ -191,12 +266,34 @@ impl std::fmt::Debug for Host {
 impl Host {
     /// Register error codes, open the pool, prove the database is
     /// reachable, verify or apply migrations, start modules and compose the
-    /// router.
+    /// router. The host is started when this returns.
     pub async fn start(
         config: ProjectConfig,
         modules: Vec<Box<dyn Module>>,
         parts: HostParts,
     ) -> Result<Self, StartupError> {
+        Self::start_with(config, modules, parts, HostOptions::default()).await
+    }
+    /// [`Host::start`] with `options`. With the early listener's lifecycle
+    /// the host stays `starting` until [`EarlyListener::serve`] switches to
+    /// its router.
+    pub async fn start_with(
+        config: ProjectConfig,
+        modules: Vec<Box<dyn Module>>,
+        parts: HostParts,
+        options: HostOptions,
+    ) -> Result<Self, StartupError> {
+        if options
+            .interrupt
+            .as_ref()
+            .is_some_and(|stop| *stop.borrow())
+        {
+            return Err(StartupError::new("startup_interrupted"));
+        }
+        // An authenticator means identity: permission checks must be real.
+        if options.authenticator.is_some() && parts.authorizer.allows_all() {
+            return Err(StartupError::new("allow_all_with_authenticator"));
+        }
         let jobs = parts.jobs.clone();
         let errors = Arc::new(error_registry(
             &modules
@@ -259,33 +356,38 @@ impl Host {
                 MigrationMode::Apply => parts.timeouts.migrate,
                 MigrationMode::Verify => Duration::from_secs(30),
             };
-        let migrations = run_migrations(&database, &declared, mode, deadline)
-            .await
-            .map_err(|error| {
-                let (code, module) = (error.failure.code.as_str(), error.module.as_deref());
-                if code == "migration_checksum_mismatch" {
-                    merezha_telemetry::event!(
-                        ERROR,
-                        "migration.checksum_mismatch",
-                        code,
-                        module,
-                        version = error.version
-                    );
-                } else {
-                    merezha_telemetry::event!(
-                        ERROR,
-                        "migration.refused",
-                        code,
-                        module,
-                        version = error.version
-                    );
-                }
-                StartupError {
-                    failure: error.failure.clone(),
-                    migration: Some(error),
-                    module: None,
-                }
-            })?;
+        let run = tokio::select! {
+            run = run_migrations(&database, &declared, mode, deadline) => run,
+            // A migration interrupted mid-way rolls back with its session.
+            () = interrupted(options.interrupt.clone()) => {
+                return Err(StartupError::new("startup_interrupted"));
+            }
+        };
+        let migrations = run.map_err(|error| {
+            let (code, module) = (error.failure.code.as_str(), error.module.as_deref());
+            if code == "migration_checksum_mismatch" {
+                merezha_telemetry::event!(
+                    ERROR,
+                    "migration.checksum_mismatch",
+                    code,
+                    module,
+                    version = error.version
+                );
+            } else {
+                merezha_telemetry::event!(
+                    ERROR,
+                    "migration.refused",
+                    code,
+                    module,
+                    version = error.version
+                );
+            }
+            StartupError {
+                failure: error.failure.clone(),
+                migration: Some(error),
+                module: None,
+            }
+        })?;
         drop(declared);
         merezha_telemetry::event!(
             INFO,
@@ -306,9 +408,13 @@ impl Host {
                 version = pending.version
             );
         }
-        let mut builder = AppContext::builder(&config.app.id, database.clone(), parts.authorizer)
-            .instance_id(&config.app.instance_id)
-            .migrate(config.database.migrate);
+        let mut builder =
+            AppContext::builder(&config.app.id, database.clone(), parts.authorizer.clone())
+                .instance_id(&config.app.instance_id)
+                .migrate(config.database.migrate);
+        if let Some(authenticator) = options.authenticator.clone() {
+            builder = builder.authenticator(authenticator);
+        }
         if let Some(ports) = ports {
             builder = builder.outbox(ports.outbox).jobs(ports.jobs);
         }
@@ -335,7 +441,15 @@ impl Host {
                     migration: None,
                     module: Some(module.name()),
                 })?;
-            let result = tokio::time::timeout_at(at, module.start(own)).await;
+            let result = tokio::select! {
+                result = tokio::time::timeout_at(at, module.start(own)) => result,
+                () = interrupted(options.interrupt.clone()) => {
+                    // The modules already started shut down within their
+                    // budget; the one interrupted mid-start is abandoned.
+                    stop_modules(&started, parts.timeouts.module_shutdown).await;
+                    return Err(StartupError::new("startup_interrupted"));
+                }
+            };
             if !matches!(result, Ok(Ok(()))) {
                 let code = match &result {
                     Ok(Err(failure)) => failure.code.as_str(),
@@ -364,12 +478,46 @@ impl Host {
             );
             started.push(module.clone());
         }
+        let external = options.lifecycle.is_some();
+        let lifecycle = options.lifecycle.clone().unwrap_or_else(Lifecycle::new);
+        lifecycle.set_max_age(health::staleness_bound(parts.timeouts.readiness_interval));
         let readiness = Arc::new(Readiness::new(
             database.clone(),
             modules.clone(),
             migrations.is_current(),
+            lifecycle.clone(),
         ));
-        let mut router = health::router(readiness.clone());
+        let service = merezha_telemetry::Service::resolve(
+            &config.telemetry.resource,
+            &config.app.id,
+            config.app.version.as_deref(),
+            &config.app.instance_id,
+        );
+        let status = Arc::new(StatusState {
+            lifecycle: lifecycle.clone(),
+            readiness: readiness.clone(),
+            database: database.clone(),
+            modules: modules
+                .iter()
+                .map(|m| (m.name(), m.migrations().len()))
+                .collect(),
+            pending: migrations.pending.clone(),
+            service: ServiceInfo {
+                name: service.name,
+                version: service.version,
+                instance_id: config.app.instance_id.clone(),
+            },
+            private: private_listener(&config),
+            authenticated: ctx.authenticator().is_some(),
+            authorizer: parts.authorizer.clone(),
+            jobs: match parts.jobs {
+                Some(_) => ctx.jobs("jobs").ok(),
+                None => None,
+            },
+            sections: options.status.clone(),
+            gate: tokio::sync::Semaphore::new(1),
+        });
+        let mut router = health::router(lifecycle.clone()).merge(status::router(status));
         for module in &modules {
             let own = ctx
                 .for_module(module.name(), module.extra_sources())
@@ -382,10 +530,20 @@ impl Host {
         }
         let router = edge::apply(
             router.merge(parts.routes),
-            &config.http,
-            ctx.authenticator().cloned(),
-            errors.clone(),
+            edge_settings(
+                &config,
+                errors.clone(),
+                ctx.authenticator().cloned(),
+                options.meter.as_ref(),
+            ),
         );
+        // The first evaluation runs before the host is handed out, so a
+        // started host reports its real readiness at once.
+        readiness.check().await;
+        health::spawn_refresh(&readiness, parts.timeouts.readiness_interval);
+        if !external {
+            lifecycle.complete();
+        }
         Ok(Self {
             config,
             database,
@@ -408,6 +566,9 @@ impl Host {
     pub fn readiness(&self) -> &Arc<Readiness> {
         &self.readiness
     }
+    pub fn lifecycle(&self) -> &Arc<Lifecycle> {
+        self.readiness.lifecycle()
+    }
     /// The full router behind the edge, for in-process tests.
     pub fn router(&self) -> Router {
         self.router.clone()
@@ -421,10 +582,10 @@ impl Host {
             .await
             .map_err(|_| StartupError::new("listener_failed"))
     }
-    /// Serve until `shutdown` resolves, then stop admitting connections,
-    /// report not ready, drain in-flight requests for at most the drain
-    /// timeout, shut modules down and close the pool. Emits
-    /// `listener.ready`, `listener.draining` and `listener.stopped`.
+    /// Serve on `listener` until `shutdown` resolves, then run the drain
+    /// sequence: readiness off at once, `http.drain_delay_ms`, then a
+    /// bounded graceful drain and module shutdown. Emits `listener.ready`
+    /// first.
     pub async fn serve(
         self,
         listener: tokio::net::TcpListener,
@@ -440,26 +601,53 @@ impl Host {
             app = self.config.app.id.as_str(),
             modules = ?self.modules.iter().map(|m| m.name()).collect::<Vec<_>>()
         );
-        let signalled = Arc::new(tokio::sync::Notify::new());
-        let readiness = self.readiness.clone();
-        let notify = signalled.clone();
-        let server = axum::serve(
-            listener,
-            self.router
-                .into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async move {
-            shutdown.await;
-            readiness.drain();
-            merezha_telemetry::event!(INFO, "listener.draining");
-            notify.notify_one();
-        });
-        let drain = self.timeouts.drain;
-        let result = tokio::select! {
-            result = server => result.map_err(|_| Failure::transient("listener_failed")),
-            () = async { signalled.notified().await; tokio::time::sleep(drain).await } => {
-                merezha_telemetry::event!(WARN, "listener.drain_timeout", drain_ms = drain.as_millis() as u64);
-                Ok(())
+        let server = Server::spawn(listener, self.router.clone());
+        self.drain(server, shutdown).await
+    }
+    /// The drain sequence (TE §5): serve until `shutdown` resolves; then
+    /// readiness turns `not_ready` at once while liveness stays 200, the
+    /// listener keeps serving for `http.drain_delay_ms` so load balancers
+    /// stop routing, then stops accepting and drains in-flight requests for
+    /// at most the drain timeout; modules shut down in reverse order (the
+    /// jobs runtime first) and the pool closes. Emits `shutdown.started`,
+    /// `listener.draining`, `listener.stopped` and `shutdown.completed`.
+    async fn drain(
+        self,
+        mut server: Server,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), Failure> {
+        let failed = tokio::select! {
+            () = shutdown => None,
+            result = &mut server.task => Some(result),
+        };
+        let signalled = Instant::now();
+        let delay = self.config.http.drain_delay;
+        let result = match failed {
+            Some(_) => Err(Failure::transient("listener_failed")),
+            None => {
+                self.readiness.drain();
+                merezha_telemetry::event!(
+                    INFO,
+                    "shutdown.started",
+                    drain_ms = delay.as_millis() as u64
+                );
+                merezha_telemetry::event!(INFO, "listener.draining");
+                tokio::time::sleep(delay).await;
+                server.stop();
+                let drain = self.timeouts.drain;
+                match tokio::time::timeout(drain, &mut server.task).await {
+                    Ok(Ok(Ok(()))) => Ok(()),
+                    Ok(_) => Err(Failure::transient("listener_failed")),
+                    Err(_) => {
+                        server.task.abort();
+                        merezha_telemetry::event!(
+                            WARN,
+                            "listener.drain_timeout",
+                            drain_ms = drain.as_millis() as u64
+                        );
+                        Ok(())
+                    }
+                }
             }
         };
         stop_modules(&self.modules, self.timeouts.module_shutdown).await;
@@ -473,7 +661,159 @@ impl Host {
                 "listener_failed"
             }
         );
+        merezha_telemetry::event!(
+            INFO,
+            "shutdown.completed",
+            drain_ms = signalled.elapsed().as_millis() as u64
+        );
         result
+    }
+}
+
+/// The router a listener serves, switched once startup completes.
+type Slot = Arc<RwLock<Router>>;
+
+/// A spawned `axum::serve` over a switchable router, stopped gracefully on
+/// [`Server::stop`].
+struct Server {
+    slot: Slot,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+impl Server {
+    fn spawn(listener: tokio::net::TcpListener, router: Router) -> Self {
+        let slot: Slot = Arc::new(RwLock::new(router));
+        let current = slot.clone();
+        // Each request goes to the router in the slot at the time it
+        // arrives; requests already admitted finish on theirs.
+        let app = Router::new().fallback_service(tower::service_fn(move |request: Request| {
+            let router = current
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            tower::ServiceExt::oneshot(router, request)
+        }));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = stopped.await;
+            })
+            .into_future(),
+        );
+        Self {
+            slot,
+            task,
+            stop: Some(stop),
+        }
+    }
+    fn switch(&self, router: Router) {
+        *self.slot.write().unwrap_or_else(PoisonError::into_inner) = router;
+    }
+    /// Stop accepting and drain open connections.
+    fn stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+/// The early listener (TE §5): bound right after configuration, before the
+/// database and modules. Until startup completes it answers `/health/*`
+/// (`/health/startup` and `/health/ready` with 503) and every other route
+/// with `503 starting` and `Retry-After: 1`, so a startup probe can cover
+/// long migrations. [`EarlyListener::serve`] switches it to the started
+/// host's router.
+pub struct EarlyListener {
+    address: SocketAddr,
+    lifecycle: Arc<Lifecycle>,
+    server: Server,
+}
+impl std::fmt::Debug for EarlyListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EarlyListener")
+            .field("address", &self.address)
+            .finish_non_exhaustive()
+    }
+}
+impl EarlyListener {
+    /// Bind `http.listen` (or `listen`) and serve health at once. Emits
+    /// `listener.ready` with the bound address. Fails `listener_failed`.
+    pub async fn bind(
+        config: &ProjectConfig,
+        listen: Option<SocketAddr>,
+        options: &HostOptions,
+    ) -> Result<Self, StartupError> {
+        let listener = tokio::net::TcpListener::bind(listen.unwrap_or(config.http.listen))
+            .await
+            .map_err(|_| StartupError::new("listener_failed"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|_| StartupError::new("listener_failed"))?;
+        let lifecycle = options.lifecycle.clone().unwrap_or_else(Lifecycle::new);
+        let router = edge::apply(
+            health::router(lifecycle.clone()),
+            edge_settings(
+                config,
+                Arc::new(ErrorRegistry::kernel()),
+                None,
+                options.meter.as_ref(),
+            )
+            .starting(),
+        );
+        // The modules are the configured blocks; the host adds its own
+        // (`application`, `jobs`) once it starts them.
+        merezha_telemetry::event!(
+            INFO,
+            "listener.ready",
+            address = address.to_string(),
+            app = config.app.id.as_str(),
+            modules = ?config.modules.keys().collect::<Vec<_>>()
+        );
+        Ok(Self {
+            address,
+            lifecycle,
+            server: Server::spawn(listener, router),
+        })
+    }
+    pub fn address(&self) -> SocketAddr {
+        self.address
+    }
+    /// The lifecycle to pass to [`Host::start_with`] through
+    /// [`HostOptions::lifecycle`].
+    pub fn lifecycle(&self) -> &Arc<Lifecycle> {
+        &self.lifecycle
+    }
+    /// Switch to `host`'s router, mark startup complete (logging
+    /// `startup.completed`), then serve until `shutdown` and drain as
+    /// [`Host::serve`] does.
+    pub async fn serve(
+        self,
+        host: Host,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), Failure> {
+        self.server.switch(host.router.clone());
+        self.lifecycle.complete();
+        if !Arc::ptr_eq(&self.lifecycle, host.lifecycle()) {
+            host.lifecycle().complete();
+        }
+        host.drain(self.server, shutdown).await
+    }
+    /// Startup failed or was interrupted: stop accepting, let open
+    /// requests finish within `within`, and log `listener.stopped`.
+    pub async fn close(mut self, within: Duration) {
+        self.lifecycle.drain();
+        self.server.stop();
+        if tokio::time::timeout(within, &mut self.server.task)
+            .await
+            .is_err()
+        {
+            self.server.task.abort();
+        }
+        merezha_telemetry::event!(INFO, "listener.stopped", code = "ok");
     }
 }
 

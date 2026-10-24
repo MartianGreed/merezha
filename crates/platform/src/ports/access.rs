@@ -425,6 +425,13 @@ pub trait Authorizer: ApplicationAuthorizer {
         permission: &Permission,
         scope: &ResourceScope,
     ) -> Result<Allowed, AccessDenied>;
+    /// Whether this policy grants every check whatever the principal, as
+    /// [`LoopbackAllowAll`] does. The host refuses such a policy beside an
+    /// authenticator (`allow_all_with_authenticator`), so identity can never
+    /// run with permission checks switched off.
+    fn allows_all(&self) -> bool {
+        false
+    }
 }
 
 /// Fallback policy without the identity block. Constructible only for a
@@ -461,6 +468,9 @@ impl Authorizer for LoopbackAllowAll {
         _: &ResourceScope,
     ) -> Result<Allowed, AccessDenied> {
         Ok(Allowed::Grant)
+    }
+    fn allows_all(&self) -> bool {
+        true
     }
 }
 /// Fallback policy for a public listener without the identity block: every

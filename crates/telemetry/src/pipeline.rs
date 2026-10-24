@@ -577,6 +577,39 @@ pub unsafe fn scrub_otel_environment() -> Vec<String> {
     names
 }
 
+/// Reads the `telemetry` status section from the pipeline's accounts.
+#[derive(Clone)]
+pub struct StatusReader {
+    accounts: Arc<Accounts>,
+    config: Arc<TelemetryConfig>,
+}
+impl std::fmt::Debug for StatusReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatusReader")
+            .field("signals", &self.config.signals)
+            .finish_non_exhaustive()
+    }
+}
+impl StatusReader {
+    /// Codes, counts and the endpoint origin only; never header values.
+    pub fn read(&self) -> TelemetryStatus {
+        let (enabled, protocol, endpoint, sampling_ratio) = TelemetryStatus::summary(&self.config);
+        TelemetryStatus {
+            enabled,
+            protocol,
+            endpoint,
+            sampling_ratio,
+            signals: self
+                .config
+                .signals
+                .iter()
+                .map(|s| (s.as_str(), self.accounts.signal(*s).counts()))
+                .collect(),
+            stderr_dropped: self.accounts.stderr_dropped(),
+        }
+    }
+}
+
 /// Per-signal counts at the end of [`Telemetry::shutdown`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShutdownReport {
@@ -851,19 +884,15 @@ impl Telemetry {
     }
     /// The `telemetry` section of `/v1/admin/status`.
     pub fn status(&self) -> TelemetryStatus {
-        let (enabled, protocol, endpoint, sampling_ratio) = TelemetryStatus::summary(&self.config);
-        TelemetryStatus {
-            enabled,
-            protocol,
-            endpoint,
-            sampling_ratio,
-            signals: self
-                .config
-                .signals
-                .iter()
-                .map(|s| (s.as_str(), self.accounts.signal(*s).counts()))
-                .collect(),
-            stderr_dropped: self.accounts.stderr_dropped(),
+        self.status_reader().read()
+    }
+    /// A cheap handle that reads [`Telemetry::status`] while the host
+    /// serves; the status endpoint holds it, the binary keeps the
+    /// pipeline for its shutdown flush.
+    pub fn status_reader(&self) -> StatusReader {
+        StatusReader {
+            accounts: self.accounts.clone(),
+            config: Arc::new(self.config.clone()),
         }
     }
     /// Flush traces, then logs, then metrics within `shutdown_timeout` in

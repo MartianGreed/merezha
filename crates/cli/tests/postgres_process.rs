@@ -337,6 +337,24 @@ fn projections_advance_in_the_background_and_the_admin_api_reports_and_rebuilds(
         document["listener"].as_str(),
         Some("connected" | "reconnecting")
     ));
+    // TE §5, R10: `/v1/admin/status` embeds AP's status document as
+    // returned. Background runs come and go between two reads, so the
+    // documents are compared until two consecutive reads agree.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, own) = call(address, "GET", "/v1/application/status", "");
+        let (status, admin) = call(address, "GET", "/v1/admin/status", "");
+        assert_eq!(status, 200, "{admin}");
+        if admin["application"] == own {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the application section differs: {} vs {own}",
+            admin["application"]
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let (status, overview) = call(address, "GET", "/v1/application/projections", "");
     assert_eq!(status, 200, "{overview}");
     assert_eq!(overview["head"], 5);

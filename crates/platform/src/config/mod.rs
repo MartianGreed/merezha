@@ -178,6 +178,10 @@ pub struct HttpConfig {
     pub public: bool,
     pub trusted_proxies: Vec<Cidr>,
     pub body_limit: usize,
+    /// `http.drain_delay_ms`: after SIGTERM, how long readiness reports
+    /// `not_ready` before the listener stops accepting, so load balancers
+    /// stop routing first (TE §5).
+    pub drain_delay: Duration,
     pub cors: CorsConfig,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -982,6 +986,11 @@ fn build(
         }
     }
     let body_limit = r.integer("body_limit", 1_048_576, 1024, 67_108_864) as usize;
+    let drain_delay = r.duration(
+        "drain_delay_ms",
+        Duration::from_millis(5_000),
+        (Duration::ZERO, Duration::from_secs(600)),
+    );
     r.finish();
     let (mut r, _) = reader(layers, "http.cors", issues);
     let origins = r.list("allowed_origins", 64);
@@ -1156,6 +1165,7 @@ fn build(
                 public,
                 trusted_proxies,
                 body_limit,
+                drain_delay,
                 cors,
             },
             database: database?,
