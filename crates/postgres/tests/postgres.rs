@@ -226,10 +226,8 @@ async fn lock_wait_is_bounded_by_the_deadline() {
     )
     .await
     .unwrap_err();
-    assert!(
-        ["migration_lock_timeout", "migration_timeout"].contains(&error.failure.code.as_str()),
-        "{error}"
-    );
+    // The poll loop gives up before the run's outer deadline fires.
+    assert_eq!(error.failure.code, "migration_lock_timeout", "{error}");
     holder
         .execute(
             "SELECT pg_advisory_unlock($1)",
@@ -465,7 +463,8 @@ const BODY_INDEX: Migration = Migration::non_transactional(
 const UNIQUE_BODY: Migration = Migration::non_transactional(
     3,
     "notes_body_unique",
-    "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS notes_body_unique ON notes (body)",
+    // A leading comment must not hide the concurrent build from the runner.
+    "-- one body per note\n/* rebuilt if invalid */ CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS notes_body_unique ON notes (body)",
 );
 const DUPLICATES: Migration = Migration::new(
     2,
@@ -848,7 +847,39 @@ async fn a_detached_session_keeps_its_lock_across_transactions_and_releases_it_o
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(free, "dropping the detached client closed its session");
-    // The pool slot reopened.
-    assert!(db.status().max_size >= 1);
-    db.ping(soon()).await.unwrap();
+}
+
+#[tokio::test]
+async fn detached_sessions_are_bounded_and_leave_their_pool_slot_open() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let mut config = test.config();
+    config.pool_size = 1;
+    config.max_detached = 1;
+    config.acquire_timeout = Duration::from_millis(300);
+    let db = Database::connect(&config).unwrap();
+    let first = db.detach(soon()).await.unwrap();
+    // The single pool slot reopened: a pooled client is still available
+    // while the detached session lives.
+    let pooled = db.acquire(soon()).await.unwrap();
+    pooled.simple_query("SELECT 1").await.unwrap();
+    drop(pooled);
+    let started = Instant::now();
+    let error = db.detach(soon()).await.unwrap_err();
+    assert_eq!(error.code, "database_busy");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // A migration run is a detached session too.
+    let error = run_migrations(&db, &module(&[CREATE]), MigrationMode::Apply, soon())
+        .await
+        .unwrap_err();
+    assert_eq!(error.failure.code, "database_busy");
+    drop(first);
+    let second = db.detach(soon()).await.unwrap();
+    drop(second);
+    run_migrations(&db, &module(&[CREATE]), MigrationMode::Apply, soon())
+        .await
+        .unwrap();
+    config.max_detached = 0;
+    assert_eq!(config.validate(), vec![("max_detached", "out_of_range")]);
 }

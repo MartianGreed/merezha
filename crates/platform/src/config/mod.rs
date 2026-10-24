@@ -1027,6 +1027,12 @@ fn build(
         defaults.statement_timeout,
         merezha_postgres::limits::STATEMENT_TIMEOUT,
     );
+    let max_detached = r.integer(
+        "max_detached",
+        defaults.max_detached as u64,
+        merezha_postgres::limits::MAX_DETACHED.0 as u64,
+        merezha_postgres::limits::MAX_DETACHED.1 as u64,
+    ) as usize;
     let migrate = r.boolean("migrate", false);
     let tls = r.choice(
         "tls",
@@ -1043,6 +1049,7 @@ fn build(
         migrate,
         tls,
         tls_ca_file,
+        max_detached,
     });
     if let Some(database) = &database {
         for (key, code) in database.validate() {

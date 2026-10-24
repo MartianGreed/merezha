@@ -79,11 +79,17 @@ pub struct DatabaseConfig {
     pub migrate: bool,
     pub tls: TlsMode,
     pub tls_ca_file: Option<PathBuf>,
+    /// Most connections detached from the pool at once ([`Database::detach`],
+    /// the migration run included). They are opened beside the pool, so the
+    /// server sees at most `pool_size + max_detached` connections from this
+    /// host (plus listeners the blocks open).
+    pub max_detached: usize,
 }
 /// Inclusive bounds for numeric database settings.
 pub mod limits {
     use std::time::Duration;
     pub const POOL_SIZE: (usize, usize) = (1, 256);
+    pub const MAX_DETACHED: (usize, usize) = (1, 64);
     pub const CONNECT_TIMEOUT: (Duration, Duration) =
         (Duration::from_millis(100), Duration::from_secs(60));
     pub const ACQUIRE_TIMEOUT: (Duration, Duration) =
@@ -96,6 +102,7 @@ impl DatabaseConfig {
     pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
     pub const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
     pub const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(5);
+    pub const DEFAULT_MAX_DETACHED: usize = 8;
 
     /// Defaults for everything except the required URL.
     pub fn new(url: Secret) -> Self {
@@ -108,6 +115,7 @@ impl DatabaseConfig {
             migrate: false,
             tls: TlsMode::Disable,
             tls_ca_file: None,
+            max_detached: Self::DEFAULT_MAX_DETACHED,
         }
     }
     /// Every violated rule as `(setting, code)`, empty when valid.
@@ -131,6 +139,10 @@ impl DatabaseConfig {
         let (min, max) = limits::POOL_SIZE;
         if !(min..=max).contains(&self.pool_size) {
             issues.push(("pool_size", "out_of_range"));
+        }
+        let (min, max) = limits::MAX_DETACHED;
+        if !(min..=max).contains(&self.max_detached) {
+            issues.push(("max_detached", "out_of_range"));
         }
         for (name, value, (min, max)) in [
             (
@@ -175,6 +187,7 @@ pub struct Database {
     pool: Pool,
     acquire_timeout: Duration,
     statement_timeout: Duration,
+    detached: Arc<tokio::sync::Semaphore>,
 }
 impl std::fmt::Debug for Database {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -235,6 +248,7 @@ impl Database {
             pool,
             acquire_timeout: config.acquire_timeout,
             statement_timeout: config.statement_timeout,
+            detached: Arc::new(tokio::sync::Semaphore::new(config.max_detached)),
         })
     }
     /// Acquire a pooled client before `deadline` and within the configured
@@ -293,11 +307,27 @@ impl Database {
     /// session closes, releasing its locks and rolling back any open
     /// transaction, when the [`DetachedClient`] drops, whether the caller
     /// returns, fails or is cancelled.
+    ///
+    /// At most `max_detached` clients exist at once; beyond that the call
+    /// waits for one to drop, within `acquire_timeout` and the deadline, and
+    /// then fails transient `database_busy`.
     pub async fn detach(&self, deadline: Instant) -> Result<DetachedClient, Failure> {
+        let bound = deadline.min(Instant::now() + self.acquire_timeout);
+        let permit = match tokio::time::timeout_at(
+            bound.into(),
+            self.detached.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(Failure::transient("database_closed")),
+            Err(_) => return Err(Failure::transient("database_busy")),
+        };
         let pooled = self.acquire(deadline).await?;
         Ok(DetachedClient {
             client: deadpool_postgres::Object::take(pooled),
             statement_timeout: self.statement_timeout,
+            _permit: permit,
         })
     }
     /// The configured per-statement ceiling.
@@ -316,6 +346,7 @@ impl Database {
     /// Close the pool: idle connections drop and later acquisitions fail
     /// `database_closed`. Checked-out clients close when returned.
     pub fn close(&self) {
+        self.detached.close();
         self.pool.close();
     }
 }
@@ -329,6 +360,7 @@ impl Database {
 pub struct DetachedClient {
     client: deadpool_postgres::ClientWrapper,
     statement_timeout: Duration,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 impl std::fmt::Debug for DetachedClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

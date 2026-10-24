@@ -288,6 +288,52 @@ fn single_statement(sql: &str) -> Option<&str> {
     (!statement.is_empty()).then_some(statement)
 }
 
+/// `sql` with each `--` and (nested) `/* */` comment outside quotes replaced
+/// by one space, or `None` when a comment or quote is not closed.
+fn without_comments(sql: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if bytes[index..].starts_with(b"--") {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            out.push(b' ');
+        } else if bytes[index..].starts_with(b"/*") {
+            let mut depth = 0usize;
+            loop {
+                if index >= bytes.len() {
+                    return None;
+                }
+                if bytes[index..].starts_with(b"/*") {
+                    depth += 1;
+                    index += 2;
+                } else if bytes[index..].starts_with(b"*/") {
+                    depth -= 1;
+                    index += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            out.push(b' ');
+        } else if byte == b'\'' || byte == b'"' {
+            let close = bytes[index + 1..].iter().position(|b| *b == byte)?;
+            let end = index + 1 + close + 1;
+            out.extend_from_slice(&bytes[index..end]);
+            index = end;
+        } else {
+            out.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// The index a `CREATE [UNIQUE] INDEX CONCURRENTLY` statement builds.
 #[derive(Debug, PartialEq, Eq)]
 struct ConcurrentIndex {
@@ -300,6 +346,9 @@ struct ConcurrentIndex {
 /// `Err` for a concurrent build that is not safe to retry: it must say
 /// `IF NOT EXISTS` and name its index.
 fn concurrent_index(statement: &str) -> Result<Option<ConcurrentIndex>, ()> {
+    // Comments may sit anywhere, before `CREATE` or between keywords: match
+    // on the statement with every comment replaced by a space.
+    let statement = without_comments(statement).ok_or(())?;
     let mut words = statement.split_whitespace().peekable();
     let mut keyword = |expected: &str| {
         let matched = words
@@ -452,10 +501,13 @@ async fn run(
     mode: MigrationMode,
     deadline: Instant,
 ) -> Result<MigrationReport, MigrationError> {
-    let mut pooled = db.acquire(deadline).await.map_err(MigrationError::new)?;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let budget = remaining.as_millis().clamp(1, i32::MAX as u128);
+    let budget = || {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        remaining.as_millis().clamp(1, i32::MAX as u128)
+    };
     if mode == MigrationMode::Verify {
+        let mut pooled = db.acquire(deadline).await.map_err(MigrationError::new)?;
+        let budget = budget();
         // Readiness verifies repeatedly, so stay on a pooled session: the
         // bound is `SET LOCAL` and ends with this read-only transaction.
         let transaction = pooled.transaction().await.map_err(|e| database(&e))?;
@@ -473,20 +525,22 @@ async fn run(
         });
     }
     // Detach from the pool: session settings and the advisory lock die with
-    // this connection instead of leaking into later borrowers.
-    let mut client = deadpool_postgres::Object::take(pooled);
+    // this connection instead of leaking into later borrowers. The run
+    // counts against `max_detached` like any detached session.
+    let mut detached = db.detach(deadline).await.map_err(MigrationError::new)?;
+    let client = &mut detached.client;
     client
-        .batch_execute(&format!("SET statement_timeout = {budget}"))
+        .batch_execute(&format!("SET statement_timeout = {}", budget()))
         .await
         .map_err(|e| database(&e))?;
-    lock(&client, deadline).await?;
+    lock(client, deadline).await?;
     let transaction = client.transaction().await.map_err(|e| database(&e))?;
     transaction
         .batch_execute(LEDGER)
         .await
         .map_err(|e| database(&e))?;
     transaction.commit().await.map_err(|e| database(&e))?;
-    let applied = read_ledger(&*client, modules).await?.unwrap_or_default();
+    let applied = read_ledger(&**client, modules).await?.unwrap_or_default();
     let pending = plan(modules, &applied)?;
     let mut done = Vec::new();
     for (index, migration) in pending {
@@ -534,7 +588,7 @@ async fn run(
                 let statement = single_statement(migration.sql).ok_or_else(invalid)?;
                 let index = concurrent_index(statement).map_err(|()| invalid())?;
                 if let Some(index) = &index {
-                    drop_invalid_index(&client, index, module, migration.version)
+                    drop_invalid_index(client, index, module, migration.version)
                         .await
                         .map_err(|e| fail(&e))?;
                 }
@@ -856,6 +910,35 @@ mod tests {
         ] {
             assert_eq!(concurrent_index(unsupported), Err(()), "{unsupported}");
         }
+        // Comments before or between the keywords do not hide a concurrent
+        // build: the IF NOT EXISTS rule and the invalid-index rebuild apply.
+        for hidden in [
+            "-- note\nCREATE INDEX CONCURRENTLY i ON t (a)",
+            "/* x */ CREATE INDEX /* y */ CONCURRENTLY i ON t (a)",
+            "/* a /* nested */ */ create index concurrently i on t (a)",
+        ] {
+            assert_eq!(concurrent_index(hidden), Err(()), "{hidden}");
+            let step = Migration::non_transactional(1, "step", hidden);
+            let declared = [step];
+            assert!(
+                validate(&[ModuleMigrations {
+                    module: "content",
+                    migrations: &declared,
+                }])
+                .is_err(),
+                "{hidden}"
+            );
+        }
+        assert_eq!(
+            concurrent_index(
+                "/* x */ CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS u -- why\n ON t (a)"
+            ),
+            Ok(Some(ConcurrentIndex {
+                name: "u".into(),
+                table: "t".into()
+            }))
+        );
+        assert_eq!(concurrent_index("/* open CREATE INDEX"), Err(()));
         assert_eq!(concurrent_index("CREATE INDEX i ON t (a)"), Ok(None));
         assert_eq!(
             concurrent_index("DROP INDEX CONCURRENTLY IF EXISTS i"),
