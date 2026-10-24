@@ -316,6 +316,20 @@ database: the active model and the hosts running it are untouched.
 `[[migrations]]` blocks are not accepted in v1 (`content_model_invalid`); the
 later slice C10 designs them.
 
+The table leaves some keys open; C2 classifies them by the same rule (does
+stored data still fit, unrewritten?). Removing a component, changing a
+field's `component`, `cardinality` or decimal `scale` (stored decimals are
+normalized to it), and removing a `blocks` component are refused, like a
+removed enum value. Removing a `to` target, an `accept` type or rich text
+`styles`, `marks`, `annotations`, `lists` or `embeds`, setting
+`entry_link_to`, and lowering `precision`, `max_blocks`, `max_text_length`
+or `max_bytes` are tightening; a changed `pattern` counts as tightening
+because a wider one cannot be told apart. Descriptions, defaults, slug
+`from`, `title_field`, field, locale and enum value order, and a new locale
+fallback are additive. Any key the classifier does not know is refused.
+The tightening count validates at most 100,000 drafts and published rows
+per type, against save-time and publish-time rules respectively.
+
 With `database.migrate = true` one host activates a pending model under a
 session advisory lock held on a connection detached from the pool (as the
 kernel migration runner does), so a cancelled or failed activation closes the
@@ -324,8 +338,11 @@ one transaction marks the active `models` row `superseded`, inserts the new
 one as `active`, syncs `locales`, bumps the affected generations and appends
 `content.model_activated`. After that it drops the indexes the new model no
 longer needs and rebuilds the `published` fallback rows that a new locale or
-a changed fallback affects, in batches of 500 entries. Readiness stays false
-until all of it completes. With `database.migrate = false`, a pending model
+a changed fallback affects, in batches of 500 entries (C4 adds this step
+with materialization; until then nothing writes `published`). Readiness
+stays false until all of it completes. A lost session loses its lock too,
+so the run reopens one (twice at most), retakes the lock and plans again,
+keeping each index's attempt count. With `database.migrate = false`, a pending model
 change fails readiness with `content_model_pending`.
 
 ### Mixed model versions

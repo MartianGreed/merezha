@@ -88,6 +88,13 @@ pub trait Module: Send + Sync + 'static {
         let _ = ctx;
         Box::pin(async { Ok(()) })
     }
+    /// How long [`Module::start`] may take; `None` keeps the host's
+    /// `Timeouts::module_start`. A module whose start runs schema work, such
+    /// as content model activation with its index builds, declares a longer
+    /// bound of its own.
+    fn start_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
     /// Routes, nested under `/v1/<name>`. Called once after `start`. Errors
     /// should use [`crate::edge::error_response`].
     fn routes(&self, ctx: &AppContext) -> Router {

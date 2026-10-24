@@ -852,3 +852,65 @@ async fn only_the_notifications_module_is_granted_the_api_source() {
         ]
     );
 }
+
+/// A module whose start takes `delay` and declares `own` as its bound, and
+/// records whether its context says the host migrates.
+struct Slow {
+    delay: Duration,
+    own: Option<Duration>,
+    migrate: Arc<AtomicBool>,
+}
+impl Module for Slow {
+    fn name(&self) -> &'static str {
+        "slow"
+    }
+    fn start_timeout(&self) -> Option<Duration> {
+        self.own
+    }
+    fn start(&self, ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
+        self.migrate.store(ctx.migrate(), Ordering::SeqCst);
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_module_may_declare_its_own_start_bound_and_sees_the_migrate_setting() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let short = || HostParts {
+        timeouts: Timeouts {
+            module_start: Duration::from_millis(100),
+            ..parts().timeouts
+        },
+        ..parts()
+    };
+    let slow = |own| Slow {
+        delay: Duration::from_millis(400),
+        own,
+        migrate: Arc::new(AtomicBool::new(false)),
+    };
+    let error = Host::start(config(&test, true, ""), vec![Box::new(slow(None))], short())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (error.failure.code.as_str(), error.module),
+        ("module_start_failed", Some("slow"))
+    );
+    let module = slow(Some(Duration::from_secs(5)));
+    let migrate = module.migrate.clone();
+    Host::start(config(&test, true, ""), vec![Box::new(module)], short())
+        .await
+        .unwrap();
+    assert!(migrate.load(Ordering::SeqCst));
+    let module = slow(Some(Duration::from_secs(5)));
+    let migrate = module.migrate.clone();
+    Host::start(config(&test, false, ""), vec![Box::new(module)], short())
+        .await
+        .unwrap();
+    assert!(!migrate.load(Ordering::SeqCst));
+}

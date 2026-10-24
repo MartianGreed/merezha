@@ -16,6 +16,8 @@ merezha-runtime = { path = "../runtime" }
 merezha-platform = { path = "../platform" }
 merezha-jobs = { path = "../jobs" }
 merezha-notifications = { path = "../notifications" }
+merezha-content = { path = "../content" }
+merezha-postgres = { path = "../postgres" }
 anyhow.workspace = true
 serde_json.workspace = true
 axum.workspace = true
@@ -25,7 +27,6 @@ tracing.workspace = true
 [dev-dependencies]
 # The process tests drive the relay through MEREZHA_JOBS_TEST_RELAY.
 merezha-jobs = { path = "../jobs", features = ["test-hooks"] }
-merezha-postgres = { path = "../postgres" }
 tempfile.workspace = true
 wat.workspace = true
 tower.workspace = true

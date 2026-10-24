@@ -8,11 +8,19 @@ license.workspace = true
 [dependencies]
 merezha-domain = { path = "../domain" }
 merezha-platform = { path = "../platform" }
+merezha-postgres = { path = "../postgres" }
 deunicode.workspace = true
 jiff.workspace = true
 regex.workspace = true
 rust_decimal.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tokio.workspace = true
 toml.workspace = true
+tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+merezha-jobs = { path = "../jobs" }
+tempfile.workspace = true

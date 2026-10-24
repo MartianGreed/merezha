@@ -1574,6 +1574,7 @@ dependencies = [
  "anyhow",
  "axum",
  "merezha-application",
+ "merezha-content",
  "merezha-domain",
  "merezha-jobs",
  "merezha-notifications",
@@ -1592,15 +1593,21 @@ dependencies = [
 name = "merezha-content"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "deunicode",
  "jiff",
  "merezha-domain",
+ "merezha-jobs",
  "merezha-platform",
+ "merezha-postgres",
  "regex",
  "rust_decimal",
  "serde_json",
  "sha2 0.11.1",
+ "tempfile",
+ "tokio",
  "toml",
+ "tracing",
  "uuid",
 ]
 

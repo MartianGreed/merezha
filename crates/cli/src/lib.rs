@@ -57,6 +57,7 @@ pub fn app_with_application(
 pub mod application_cli;
 pub mod application_http;
 pub mod application_module;
+pub mod content;
 pub mod notifications;
 pub mod run;
 
@@ -64,9 +65,21 @@ pub mod run;
 /// its `[modules.<name>]` section is present. The notifications block reads
 /// the facts its cross-section checks need from the same `input`.
 pub fn modules(input: &merezha_platform::ConfigInput) -> Vec<Box<dyn merezha_platform::Module>> {
-    vec![Box::new(merezha_notifications::Notifications::new(
-        merezha_notifications::HostFacts::load(input),
-    ))]
+    blocks(input, merezha_content::ContentModule::new())
+}
+
+/// [`modules`] with the given content module, so the caller keeps its
+/// [`merezha_content::ContentHandle`] (`merezha content diff`).
+pub fn blocks(
+    input: &merezha_platform::ConfigInput,
+    content: merezha_content::ContentModule,
+) -> Vec<Box<dyn merezha_platform::Module>> {
+    vec![
+        Box::new(content),
+        Box::new(merezha_notifications::Notifications::new(
+            merezha_notifications::HostFacts::load(input),
+        )),
+    ]
 }
 
 /// Read, validate and open an application configuration with the runtime as
