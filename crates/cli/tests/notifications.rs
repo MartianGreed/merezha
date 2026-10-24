@@ -1,15 +1,14 @@
 //! The notifications block through the `merezha` binary: `merezha
 //! notifications check` and the block mounted by `merezha run`.
+mod support;
 use merezha_postgres::TestDatabase;
 use serde_json::Value;
 use std::{
-    fs::{self, File},
-    io::{Read, Write},
-    net::{SocketAddr, TcpStream},
+    fs,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{Duration, Instant},
+    process::Command,
 };
+use support::{Host, request};
 
 /// base64 of 32 bytes.
 const KEY: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
@@ -142,25 +141,6 @@ fn check_reports_every_problem_without_values() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("invalid_arguments"));
 }
 
-fn get(address: SocketAddr, path: &str) -> (u16, String) {
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    let (head, body) = response.split_once("\r\n\r\n").unwrap();
-    (
-        head.split_whitespace().nth(1).unwrap().parse().unwrap(),
-        body.to_owned(),
-    )
-}
-
 #[test]
 fn run_mounts_the_block_and_applies_its_migration() {
     let Some(test) = TestDatabase::create() else {
@@ -171,40 +151,22 @@ fn run_mounts_the_block_and_applies_its_migration() {
         dir.path(),
         "[modules.notifications]\nsecret_key = { env = \"NOTIFY_KEY\" }\n",
     );
-    let log = dir.path().join("run.log");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_merezha"))
-        .args(["run", "--config"])
-        .arg(&config)
-        .env("NOTIFY_TEST_DATABASE_URL", test.url())
-        .env("NOTIFY_KEY", KEY)
-        .stdout(Stdio::null())
-        .stderr(File::create(&log).unwrap())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let address: SocketAddr = loop {
-        let text = fs::read_to_string(&log).unwrap();
-        if let Some(event) = text
-            .lines()
-            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .find(|e| e["event"] == "listener.ready")
-        {
-            break event["address"].as_str().unwrap().parse().unwrap();
-        }
-        assert!(child.try_wait().unwrap().is_none(), "host exited: {text}");
-        assert!(Instant::now() < deadline, "readiness timeout: {text}");
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let (status, body) = get(address, "/v1/notifications/templates");
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("identity.magic_link"));
-    let (status, _) = get(address, "/v1/notifications/dev/captures");
-    assert_eq!(status, 200);
-    let (status, _) = get(address, "/health/ready");
-    assert_eq!(status, 200);
-    let text = fs::read_to_string(&log).unwrap();
+    let mut host = Host::spawn(
+        &config,
+        &[
+            ("NOTIFY_TEST_DATABASE_URL", test.url()),
+            ("NOTIFY_KEY", KEY),
+        ],
+        "run",
+    );
+    let address = host.ready();
+    let templates = request(address, "GET", "/v1/notifications/templates", "");
+    assert_eq!(templates.status, 200, "{}", templates.body);
+    assert!(templates.body.to_string().contains("identity.magic_link"));
+    let captures = request(address, "GET", "/v1/notifications/dev/captures", "");
+    assert_eq!(captures.status, 200);
+    assert_eq!(request(address, "GET", "/health/ready", "").status, 200);
+    let text = fs::read_to_string(&host.log).unwrap();
     assert!(text.contains("\"module\":\"notifications\""), "{text}");
     assert!(!text.contains(KEY), "the secret key is never logged");
-    let _ = child.kill();
-    let _ = child.wait();
 }

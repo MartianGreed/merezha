@@ -6,122 +6,18 @@ mod support;
 use merezha_postgres::TestDatabase;
 use serde_json::{Value, json};
 use std::{
-    fs::{self, File},
-    io::{Read, Write},
-    net::{SocketAddr, TcpStream},
+    fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    time::{Duration, Instant},
+    process::Command,
 };
+use support::Host;
 
 const DATABASE_ENV: &str = "RUN_TEST_DATABASE_URL";
 
-struct Host {
-    child: Child,
-    log: PathBuf,
-}
-impl Host {
-    fn spawn(config: &Path, url: &str, name: &str) -> Self {
-        let log = config.with_file_name(format!("{name}.log"));
-        let child = Command::new(env!("CARGO_BIN_EXE_merezha"))
-            .args(["run", "--config"])
-            .arg(config)
-            .env(DATABASE_ENV, url)
-            .stdout(Stdio::null())
-            .stderr(File::create(&log).unwrap())
-            .spawn()
-            .unwrap();
-        Self { child, log }
-    }
-    fn events(&self) -> Vec<Value> {
-        fs::read_to_string(&self.log)
-            .unwrap()
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
-    }
-    fn ready(&mut self) -> SocketAddr {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Some(event) = self
-                .events()
-                .into_iter()
-                .find(|e| e["event"] == "listener.ready")
-            {
-                return event["address"].as_str().unwrap().parse().unwrap();
-            }
-            let text = fs::read_to_string(&self.log).unwrap();
-            assert!(
-                self.child.try_wait().unwrap().is_none(),
-                "host exited before readiness: {text}"
-            );
-            assert!(Instant::now() < deadline, "readiness timeout: {text}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-    /// Wait for exit code 2 and return the `startup.failed` code.
-    fn failed(&mut self) -> String {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                assert_eq!(status.code(), Some(2));
-                return self
-                    .events()
-                    .into_iter()
-                    .find(|e| e["event"] == "startup.failed")
-                    .expect("startup.failed event")["code"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned();
-            }
-            assert!(Instant::now() < deadline, "host failure timeout");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-    fn stop(&mut self) {
-        assert!(
-            Command::new("kill")
-                .args(["-TERM", &self.child.id().to_string()])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                assert!(status.success(), "graceful host exit: {status}");
-                return;
-            }
-            assert!(Instant::now() < deadline, "host shutdown timeout");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
-impl Drop for Host {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 fn request(address: SocketAddr, path: &str, body: &str) -> (u16, Value) {
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    write!(
-        stream,
-        "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    let (headers, body) = response.split_once("\r\n\r\n").unwrap();
-    (
-        headers.split_whitespace().nth(1).unwrap().parse().unwrap(),
-        serde_json::from_str(body).unwrap_or_else(|_| json!(body)),
-    )
+    let reply = support::request(address, "POST", path, body);
+    (reply.status, reply.body)
 }
 fn command(stream: &str, key: Option<&str>) -> String {
     json!({"tag":"Add","stream":stream,"payload":{"amount":1},"idempotency_key":key,
@@ -218,9 +114,9 @@ fn two_hosts_on_one_database_both_serve_commands_and_verify_passes() {
         .iter()
         .map(|d| project(d.path(), "run-pg", "", true))
         .collect();
-    let mut a = Host::spawn(&configs[0], test.url(), "a");
-    let mut b = Host::spawn(&configs[1], test.url(), "b");
-    let (left, right) = (a.ready(), b.ready());
+    let mut a = Host::spawn(&configs[0], &[(DATABASE_ENV, test.url())], "a");
+    let mut b = Host::spawn(&configs[1], &[(DATABASE_ENV, test.url())], "b");
+    let (left, right) = (a.listening(), b.listening());
     // Both hosts append to one position space, without gaps.
     let mut positions = Vec::new();
     for i in 0..6 {
@@ -303,8 +199,8 @@ fn verify_exits_one_on_a_violation_and_two_without_the_schema() {
     let (code, report) = verify(&config, test.url());
     assert_eq!(code, Some(2), "{report}");
     assert_eq!(report["error"]["code"], "storage_schema");
-    let mut host = Host::spawn(&config, test.url(), "host");
-    let address = host.ready();
+    let mut host = Host::spawn(&config, &[(DATABASE_ENV, test.url())], "host");
+    let address = host.listening();
     let (status, _) = request(address, "/v1/application/commands", &command("one", None));
     assert_eq!(status, 200);
     host.stop();
@@ -352,19 +248,19 @@ fn startup_reports_the_application_storage_code() {
     let dir = tempfile::tempdir().unwrap();
     let pending = project(dir.path(), "run-pg", "", false);
     assert_eq!(
-        Host::spawn(&pending, test.url(), "pending").failed(),
+        Host::spawn(&pending, &[(DATABASE_ENV, test.url())], "pending").failed()["code"],
         "storage_schema"
     );
     // The first start records the identity; another one is refused.
     let dir = tempfile::tempdir().unwrap();
     let first = project(dir.path(), "run-pg", "", true);
-    let mut host = Host::spawn(&first, test.url(), "first");
-    host.ready();
+    let mut host = Host::spawn(&first, &[(DATABASE_ENV, test.url())], "first");
+    host.listening();
     host.stop();
     let dir = tempfile::tempdir().unwrap();
     let other = project(dir.path(), "someone-else", "", true);
     assert_eq!(
-        Host::spawn(&other, test.url(), "other").failed(),
+        Host::spawn(&other, &[(DATABASE_ENV, test.url())], "other").failed()["code"],
         "storage_configuration"
     );
     // Total-capacity keys fail before the database is touched.
@@ -373,10 +269,10 @@ fn startup_reports_the_application_storage_code() {
     assert_eq!(
         Host::spawn(
             &capacity,
-            "postgres://nobody:pw@127.0.0.1:1/none",
+            &[(DATABASE_ENV, "postgres://nobody:pw@127.0.0.1:1/none")],
             "capacity"
         )
-        .failed(),
+        .failed()["code"],
         "invalid_limits"
     );
 }
