@@ -11,7 +11,7 @@ use super::{
     PostgresStore,
     runner::{self, Bounds, CatchUp, Lane, Outcome, Until},
 };
-use crate::{Application, config::Projection};
+use crate::{Application, config::Projection, instrument::RunFailure};
 use merezha_domain::Failure;
 use std::{
     sync::{
@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{sync::watch, task::JoinHandle};
+use tracing::instrument::WithSubscriber;
 
 /// The channel the append function notifies with the new head (§A.4).
 pub const EVENTS_CHANNEL: &str = "merezha_app_events";
@@ -81,15 +82,23 @@ impl Scheduler {
             gate: Arc::new(tokio::sync::Semaphore::new(options.max_concurrent)),
             stop: stopped,
         });
+        // The lanes keep the caller's dispatcher (scoped in tests), so their
+        // runs and logs reach the same subscriber; their spans are roots.
         let mut tasks = Vec::new();
         for projection in &app.config().projections {
-            tasks.push(handle.spawn(live_lane(context.clone(), projection.clone())));
-            tasks.push(handle.spawn(rebuild_lane(context.clone(), projection.clone())));
+            tasks.push(
+                handle.spawn(
+                    live_lane(context.clone(), projection.clone()).with_current_subscriber(),
+                ),
+            );
+            tasks.push(handle.spawn(
+                rebuild_lane(context.clone(), projection.clone()).with_current_subscriber(),
+            ));
         }
-        tasks.push(handle.spawn(interval(context.clone())));
+        tasks.push(handle.spawn(interval(context.clone()).with_current_subscriber()));
         if options.catch_up == CatchUp::Auto && !options.hooks().skip_listen {
             store.shared().listener.store(2, Ordering::SeqCst);
-            tasks.push(handle.spawn(listen(context)));
+            tasks.push(handle.spawn(listen(context).with_current_subscriber()));
         }
         Ok(Self {
             store,
@@ -174,8 +183,8 @@ fn backoff(failures: u32) -> Duration {
 async fn run(
     context: &Arc<Context>,
     projection: &Projection,
-    work: fn(&Application, &PostgresStore, &Projection, &Bounds) -> Result<Outcome, Failure>,
-) -> Option<Result<Outcome, Failure>> {
+    work: fn(&Application, &PostgresStore, &Projection, &Bounds) -> Result<Outcome, RunFailure>,
+) -> Option<Result<Outcome, RunFailure>> {
     // Subscribe first, then check for shutdown: `shutdown` sets `stop`
     // before it cancels, so a run either sees the stop here or the cancel
     // at its first step.
@@ -197,21 +206,21 @@ async fn run(
         context.store.clone(),
         projection.clone(),
     );
-    let result = tokio::task::spawn_blocking(move || {
+    let result = merezha_telemetry::spawn_blocking_in_span(move || {
         let bounds = Bounds::background(store.shared(), cancel);
         work(&app, &store, &projection, &bounds)
     })
     .await;
     shared.runs.fetch_sub(1, Ordering::SeqCst);
     drop(slot);
-    Some(result.unwrap_or_else(|_| Err(Failure::transient("internal"))))
+    Some(result.unwrap_or_else(|_| Err(Failure::transient("internal").into())))
 }
 fn live_work(
     app: &Application,
     store: &PostgresStore,
     projection: &Projection,
     bounds: &Bounds,
-) -> Result<Outcome, Failure> {
+) -> Result<Outcome, RunFailure> {
     runner::live(app, store, projection, bounds, Until::Head)
 }
 
@@ -253,7 +262,7 @@ async fn live_lane(context: Arc<Context>, projection: Projection) {
             Err(failure) => {
                 // The interval retries; report once per streak.
                 if !reported {
-                    report_failure(&projection, &failure);
+                    report_failure(&projection, &failure.code);
                 }
                 reported = true;
                 continue;
@@ -277,15 +286,16 @@ async fn live_lane(context: Arc<Context>, projection: Projection) {
                 }
             }
             Ok(_) => {}
-            Err(failure) if failure.code == "cancelled" => armed = true,
-            Err(failure) => {
+            Err(run) if run.failure.code == "cancelled" => armed = true,
+            Err(run) => {
                 failures = failures.saturating_add(1);
+                // A guest's own code never reaches the log (TE §1.4 rule 3).
                 if !reported {
-                    report_failure(&projection, &failure);
+                    report_failure(&projection, run.log_code());
                 }
                 reported = true;
                 let _ = store
-                    .record_failure(name.clone(), revision, &failure, Instant::now() + READ)
+                    .record_failure(name.clone(), revision, &run.failure, Instant::now() + READ)
                     .await;
                 if !sleep_until(&context, Instant::now() + backoff(failures)).await {
                     return;
@@ -295,11 +305,12 @@ async fn live_lane(context: Arc<Context>, projection: Projection) {
         }
     }
 }
-fn report_failure(projection: &Projection, failure: &Failure) {
-    tracing::warn!(
-        event = "projection.failed",
+fn report_failure(projection: &Projection, code: &str) {
+    merezha_telemetry::event!(
+        WARN,
+        "projection.failed",
         projection = projection.name.as_str(),
-        code = failure.code.as_str()
+        code
     );
 }
 
@@ -333,8 +344,9 @@ async fn rebuild_lane(context: Arc<Context>, projection: Projection) {
         match result {
             Ok(Outcome::Swapped(pair)) => {
                 failures = 0;
-                tracing::info!(
-                    event = "projection.rebuild_completed",
+                merezha_telemetry::event!(
+                    INFO,
+                    "projection.rebuild_completed",
                     projection = projection.name.as_str(),
                     revision = projection.revision,
                     checkpoint = pair.checkpoint
@@ -354,14 +366,15 @@ async fn rebuild_lane(context: Arc<Context>, projection: Projection) {
                 }
             }
             Ok(_) => {}
-            Err(failure) if failure.code == "cancelled" => armed = true,
-            Err(failure) => {
+            Err(run) if run.failure.code == "cancelled" => armed = true,
+            Err(run) => {
                 failures = failures.saturating_add(1);
-                tracing::warn!(
-                    event = "projection.rebuild_failed",
+                merezha_telemetry::event!(
+                    WARN,
+                    "projection.rebuild_failed",
                     projection = projection.name.as_str(),
                     revision = projection.revision,
-                    code = failure.code.as_str()
+                    code = run.log_code()
                 );
                 // A failed batch marked the rebuild failed; anything else
                 // (the database) retries with backoff.
@@ -420,7 +433,11 @@ async fn listen(context: Arc<Context>) {
             Err(failure) => {
                 shared.listener.store(2, Ordering::SeqCst);
                 if !lost.swap(true, Ordering::SeqCst) {
-                    tracing::warn!(event = "db.listener_lost", code = failure.code.as_str());
+                    merezha_telemetry::event!(
+                        WARN,
+                        "db.listener_lost",
+                        code = failure.code.as_str()
+                    );
                 }
                 if !sleep_until(&context, Instant::now() + delay).await {
                     return;
@@ -431,7 +448,7 @@ async fn listen(context: Arc<Context>) {
         };
         shared.listener.store(1, Ordering::SeqCst);
         if lost.swap(false, Ordering::SeqCst) {
-            tracing::info!(event = "db.listener_restored");
+            merezha_telemetry::event!(INFO, "db.listener_restored");
         }
         delay = RECONNECT.0;
         // Notifications may have been lost while disconnected.
@@ -457,7 +474,7 @@ async fn listen(context: Arc<Context>) {
         drop(listener);
         shared.listener.store(2, Ordering::SeqCst);
         lost.store(true, Ordering::SeqCst);
-        tracing::warn!(event = "db.listener_lost", code);
+        merezha_telemetry::event!(WARN, "db.listener_lost", code);
         if !sleep_until(&context, Instant::now() + delay).await {
             return;
         }

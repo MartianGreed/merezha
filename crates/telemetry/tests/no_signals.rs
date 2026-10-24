@@ -1,6 +1,9 @@
 //! With `signals = []` no OpenTelemetry thread starts (TE §3, T1): the
 //! stderr writer is the only thread the telemetry block adds. Its own test
 //! binary, so no other test starts threads meanwhile.
+// The pipeline's own tests drive shutdown and emitters on raw blocking
+// threads: the ban on `spawn_blocking` (clippy.toml) exempts this crate.
+#![allow(clippy::disallowed_methods)]
 use merezha_telemetry::{Signal, Telemetry, TelemetryConfig, config::Service};
 
 #[cfg(target_os = "linux")]

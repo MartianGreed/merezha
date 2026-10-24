@@ -47,6 +47,25 @@ The epoch thread checks every two milliseconds; scheduling delays can make
 wall-clock interruption late. A final deadline check prevents a late success.
 Fuel is deterministic work accounting, not a CPU rate limit.
 
+The host observes guests from outside; guests get no telemetry API (TE §2.4).
+Every guest call runs in a `guest {service} {operation}` span (`raw` for the
+local transport, `validate`, `decide`, `project` or `query` for the
+application), instantiation included, carrying the fuel limit and fuel
+consumed (the limit minus what remained, so a pipeline step's limit is what
+the previous steps left), the peak linear memory the limiter allowed
+(initial memory included) and its limit, input and output bytes, the
+catalog generation and `merezha.guest.outcome` (`ok` or the `Error::code()`).
+Limits, traps, overload and internal failures set the span status to error;
+guest errors, bad input and unknown services do not. A raw pipeline's steps
+are children of one `pipeline {id}` span. Span names and attribute values
+are built once per service and pipeline when the catalog loads.
+`Runtime::load_with_meters` builds the `merezha.guest.*` and
+`merezha.catalog.*` instruments once when metrics are exported
+(`Runtime::load` and disabled meters build none and record spans only); an
+unknown service id records `_unknown`, never the requested id. `Output::fuel_consumed` reports the
+whole invocation's fuel. The runtime uses only the `tracing` and
+OpenTelemetry APIs and the default features of `merezha-telemetry`.
+
 One store permits one linear memory, at most 32 core instances, 16 tables, and
 10000 elements per table. The memory cap is 64 KiB through 256 MiB. Initial
 memory and growth use the same limiter. Growth failure traps and is classified

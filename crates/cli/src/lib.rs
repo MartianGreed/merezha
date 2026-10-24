@@ -181,7 +181,7 @@ async fn invoke(
     };
     // Admission already owns the permit, including while a blocking task waits
     // for an executor thread. Dropped HTTP callers cannot detach unbounded work.
-    let result = tokio::task::spawn_blocking(move || invocation.run(&input)).await;
+    let result = merezha_telemetry::spawn_blocking_in_span(move || invocation.run(&input)).await;
     let result = match result {
         Ok(result) => result,
         Err(_) => Err(Error::Internal),
@@ -253,7 +253,7 @@ async fn reload(State(state): State<AppState>, request: Request) -> Response {
         Ok(Ok(_)) => {}
         _ => return failure(Error::InvalidInput),
     }
-    let result = tokio::task::spawn_blocking(move || {
+    let result = merezha_telemetry::spawn_blocking_in_span(move || {
         let _permit = permit;
         state.runtime.reload()
     })

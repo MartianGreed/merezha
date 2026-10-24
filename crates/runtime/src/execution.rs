@@ -50,6 +50,9 @@ pub(crate) struct StoreState {
     limits: StoreLimits,
     denied: bool,
     deadline: Instant,
+    /// The largest linear memory size this store was allowed to grow to,
+    /// initial memory included (TE §1.3 `merezha.guest.memory.peak`).
+    pub(crate) peak_memory: usize,
 }
 
 impl ResourceLimiter for StoreState {
@@ -60,7 +63,10 @@ impl ResourceLimiter for StoreState {
         maximum: Option<usize>,
     ) -> Result<bool> {
         match self.limits.memory_growing(current, desired, maximum) {
-            Ok(true) => Ok(true),
+            Ok(true) => {
+                self.peak_memory = self.peak_memory.max(desired);
+                Ok(true)
+            }
             other => {
                 self.denied = true;
                 other
@@ -114,6 +120,7 @@ pub(crate) fn create_store(
             .build(),
         denied: false,
         deadline,
+        peak_memory: 0,
     };
     let mut store = Store::new(engine, state);
     store.limiter(|s| s);

@@ -1175,6 +1175,35 @@ ID PR 2 and PR 3, NT-N2 to NT-N8 and CT-C2 to CT-C8 in stage 2. Stage 3
 brings T6's reactor rows in AP-C3, and T7, whose dashboards fill in as
 signals land.
 
+**T3 delivery notes.** As built in TE-T3:
+
+- The lag sampler runs every `telemetry.metrics.sample_interval_ms` (the
+  §3 key for database-backed gauges, default 15 s) rather than every 5 s,
+  and only while metrics are exported. Between samples, local commits and
+  catch-ups keep the cache current.
+- `merezha.projection.trigger` takes `background` for every scheduler run
+  (commit, notification and interval wakes coalesce), `admin` for explicit
+  catch-ups and `rebuild`; `commit` and `interval` stay reserved, since no
+  catch-up runs inside a request. Explicit catch-ups are roots too.
+- A `projection {name}` span covers one stretch of batches up to one target;
+  a background run that lingers and is woken again opens another span.
+- `merezha.projection.lock.held` reports the older of a projection's live
+  and rebuild locks; `merezha.projection.lock.contended` sums both kinds.
+  Both read AP-A3's in-memory sources.
+- The runtime does not decode domain replies, so the guest's own failure
+  codes are recognised in the application: a code out of a guest call that
+  the call path does not produce itself is the guest's reply, recorded as
+  `merezha.guest.error_code` on the dispatch or projection span, with
+  `error.type` and the log `code` (`command.completed`, `query.completed`,
+  `projection.failed`, `projection.rebuild_failed`) set to `guest_error`.
+  Guest output that does not decode as a protocol response is
+  `invalid_response` and counts as `failed`.
+- `AppContext::telemetry()` returns `merezha_telemetry::Meters` (default
+  features), which the host takes from `HostOptions.meters`.
+- `testing::Harness` registers one extra inert dispatcher per process: with a
+  single registered dispatcher, `tracing-core` would cache a callsite first
+  hit on another test's thread as never.
+
 ## 11. Decisions
 
 The owner answered this design's open questions on 2026-10-24.

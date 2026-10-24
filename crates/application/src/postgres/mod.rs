@@ -113,10 +113,22 @@ impl TraceContext {
     }
 }
 /// Where the store reads the current command span's context, on the thread
-/// that commits. The telemetry block implements it from the current span
-/// (TE-T3); without one, events carry no trace context.
+/// that commits. [`CurrentSpan`] reads it from the current `tracing` span;
+/// without a source, events carry no trace context.
 pub trait TraceSource: Send + Sync {
     fn current(&self) -> Option<TraceContext>;
+}
+/// The [`TraceSource`] of `merezha run` (TE §2.2): the context of the
+/// current span, the `command {tag}` span on the committing thread, sampled
+/// or not. `None` outside a span with a valid OpenTelemetry context, so a
+/// host that exports no traces stores no context.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CurrentSpan;
+impl TraceSource for CurrentSpan {
+    fn current(&self) -> Option<TraceContext> {
+        let stored = merezha_telemetry::propagation::StoredContext::current()?;
+        TraceContext::new(stored.trace_parent(), stored.trace_state())
+    }
 }
 
 /// Host settings of the store (`merezha.toml` `[application.append]`).
@@ -388,6 +400,17 @@ impl PostgresStore {
     fn events(&self, rows: &[Row]) -> Result<Vec<StoredEvent>, Failure> {
         rows.iter().map(|row| self.event(row)).collect()
     }
+    /// The stored trace contexts of feed rows (`sql::read_all`, columns 8
+    /// and 9), for span links. Malformed values are ignored.
+    fn traces(rows: &[Row]) -> Vec<Option<merezha_telemetry::propagation::StoredContext>> {
+        rows.iter()
+            .map(|row| {
+                let parent: Option<&str> = row.get(8);
+                let state: Option<&str> = row.get(9);
+                merezha_telemetry::propagation::StoredContext::parse(parent?, state)
+            })
+            .collect()
+    }
     fn receipt_of(stream: &Identity, row: &Row) -> Result<Receipt, Failure> {
         Ok(Receipt {
             stream: stream.clone(),
@@ -535,7 +558,7 @@ impl DurableStore for PostgresStore {
             _ => Err(invalid()),
         }
     }
-    fn commit_command(&self, c: CommitCommand<'_>, deadline: Instant) -> Result<Receipt, Failure> {
+    fn commit(&self, c: CommitCommand<'_>, deadline: Instant) -> Result<(Receipt, bool), Failure> {
         // The host checks what SQLite checks before its transaction; the
         // table constraints are only a backstop.
         if c.events.len() > self.limits.batch_size {
@@ -601,7 +624,9 @@ impl DurableStore for PostgresStore {
             self.shared.appended();
         }
         match outcome {
-            "appended" | "replayed" => Self::receipt_of(c.stream, &row),
+            "appended" | "replayed" => {
+                Self::receipt_of(c.stream, &row).map(|receipt| (receipt, outcome == "replayed"))
+            }
             "conflict" => Err(Failure::conflict("concurrency_conflict")),
             "mismatch" => Err(Failure::conflict("idempotency_mismatch")),
             _ => Err(invalid()),
@@ -787,6 +812,11 @@ impl PostgresStore {
 impl PostgresStore {
     pub(crate) fn shared(&self) -> &runner::Shared {
         &self.shared
+    }
+    /// The run-lock sources of `merezha.projection.lock.*`, read from
+    /// memory by the gauge callbacks.
+    pub(crate) fn lock_source(&self) -> Arc<runner::Shared> {
+        self.shared.clone()
     }
     /// A configured projection's `(name, revision)` key.
     fn key_of(&self, projection: &crate::config::Projection) -> Result<(String, i32), Failure> {

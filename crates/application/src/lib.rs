@@ -4,12 +4,14 @@
 mod application;
 pub mod config;
 mod durable;
+mod instrument;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 mod sqlite;
 pub mod status;
 pub mod store;
 pub use application::{Application, ProjectionState, QueryResult};
+pub use instrument::SCOPE;
 
 use merezha_domain::{Failure, MessageKind, Metadata, Operation, Reply};
 use serde_json::Value;
@@ -111,18 +113,46 @@ impl GuestSession for merezha_runtime::Session {
         operation: Operation,
         deadline: std::time::Instant,
     ) -> Result<Reply, Failure> {
+        let kind = guest_operation(&operation);
         let input = merezha_domain::encode(&merezha_domain::Request::new(operation))?;
         let output = self
-            .invoke_service_until(service, &input, deadline)
+            .invoke_operation_until(service, kind, &input, deadline)
             .map_err(runtime_failure)?;
-        merezha_domain::Response::decode(&output.output)
+        reply(&output.output)
     }
     fn invoke(&self, service: &str, operation: Operation) -> Result<Reply, Failure> {
-        let input = merezha_domain::encode(&merezha_domain::Request::new(operation))?;
-        let output = self
-            .invoke_service(service, &input)
-            .map_err(runtime_failure)?;
-        merezha_domain::Response::decode(&output.output)
+        // The generation's own timeout bounds the call.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(24 * 3600);
+        self.invoke_until(service, operation, deadline)
+    }
+}
+/// The guest's protocol response. Output that is not a response (not JSON,
+/// another shape, another version or an invalid failure code) is
+/// `invalid_response`: the guest broke the protocol, which counts as
+/// `failed` (TE §1.3), unlike a payload the guest refused itself.
+fn reply(output: &str) -> Result<Reply, Failure> {
+    let invalid = || Failure::permanent("invalid_response");
+    let response: merezha_domain::Response =
+        merezha_domain::decode(output).map_err(|_| invalid())?;
+    if response.version != merezha_domain::PROTOCOL_VERSION {
+        return Err(Failure::permanent("protocol_version"));
+    }
+    match response.outcome {
+        merezha_domain::Outcome::Ok { reply } => Ok(reply),
+        merezha_domain::Outcome::Err { error } if merezha_domain::valid_name(&error.code) => {
+            Err(error)
+        }
+        merezha_domain::Outcome::Err { .. } => Err(invalid()),
+    }
+}
+/// The span and metric name of a guest operation (TE §1.2).
+fn guest_operation(operation: &Operation) -> merezha_runtime::GuestOperation {
+    use merezha_runtime::GuestOperation;
+    match operation {
+        Operation::Validate { .. } => GuestOperation::Validate,
+        Operation::Decide { .. } => GuestOperation::Decide,
+        Operation::Project { .. } => GuestOperation::Project,
+        Operation::Query { .. } => GuestOperation::Query,
     }
 }
 fn runtime_failure(error: merezha_runtime::Error) -> Failure {

@@ -1695,6 +1695,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-opentelemetry",
  "wat",
 ]
 
@@ -1869,9 +1870,13 @@ dependencies = [
 name = "merezha-runtime"
 version = "0.1.0"
 dependencies = [
+ "merezha-telemetry",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "serde",
  "tempfile",
  "toml",
+ "tracing",
  "wasmparser 0.258.3",
  "wasmtime",
  "wat",

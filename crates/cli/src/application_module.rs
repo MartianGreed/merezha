@@ -27,6 +27,9 @@ const CONNECT_BUDGET: Duration = Duration::from_secs(8);
 
 pub struct ApplicationModule {
     config: Config,
+    /// How often the lag gauges are sampled while metrics are exported.
+    sample_interval: Duration,
+    sampler: OnceLock<tokio::task::AbortHandle>,
     guest: Arc<dyn Guest>,
     policy: Arc<dyn Authorizer>,
     options: PostgresOptions,
@@ -48,6 +51,8 @@ impl ApplicationModule {
     ) -> Self {
         Self {
             config,
+            sample_interval: Duration::from_secs(15),
+            sampler: OnceLock::new(),
             guest,
             policy,
             options,
@@ -56,6 +61,12 @@ impl ApplicationModule {
             scheduler: OnceLock::new(),
             failure: Arc::new(OnceLock::new()),
         }
+    }
+    /// Sample the projection lag every `interval` while metrics are
+    /// exported (`telemetry.metrics.sample_interval_ms`, 15 s by default).
+    pub fn sample_interval(mut self, interval: Duration) -> Self {
+        self.sample_interval = interval;
+        self
     }
     /// Why [`Module::start`] failed, such as `storage_configuration` for
     /// another application's database. The host only reports
@@ -78,7 +89,7 @@ impl ApplicationModule {
             + self.jobs_connections
             + 2;
         if pool_size < recommended {
-            tracing::warn!(event = "db.pool_undersized", pool_size, recommended);
+            merezha_telemetry::event!(WARN, "db.pool_undersized", pool_size, recommended);
         }
     }
     async fn open(&self, ctx: &AppContext) -> Result<Application, Failure> {
@@ -93,6 +104,7 @@ impl ApplicationModule {
             policy,
             Arc::new(store),
         )
+        .map(|application| application.with_meters(ctx.telemetry()))
     }
 }
 impl Module for ApplicationModule {
@@ -112,6 +124,11 @@ impl Module for ApplicationModule {
             match started {
                 Ok((application, scheduler)) => {
                     self.check_pool(&ctx);
+                    if ctx.telemetry().enabled()
+                        && let Ok(sampler) = application.spawn_lag_sampler(self.sample_interval)
+                    {
+                        let _ = self.sampler.set(sampler);
+                    }
                     let _ = self.application.set(application);
                     let _ = self.scheduler.set(scheduler);
                     Ok(())
@@ -146,6 +163,9 @@ impl Module for ApplicationModule {
     /// sessions close.
     fn shutdown(&self, deadline: Instant) -> BoxFuture<'_, ()> {
         Box::pin(async move {
+            if let Some(sampler) = self.sampler.get() {
+                sampler.abort();
+            }
             if let Some(scheduler) = self.scheduler.get() {
                 scheduler.shutdown(deadline).await;
             }

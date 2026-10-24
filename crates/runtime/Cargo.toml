@@ -10,7 +10,14 @@ serde.workspace = true
 toml.workspace = true
 wasmparser.workspace = true
 wasmtime.workspace = true
+# Guest spans and metrics (TE §1.2, §1.3, §2.4): the `tracing` and
+# OpenTelemetry APIs and the name catalog only, never the SDK.
+tracing.workspace = true
+opentelemetry.workspace = true
+merezha-telemetry = { path = "../telemetry" }
 
 [dev-dependencies]
+merezha-telemetry = { path = "../telemetry", features = ["testing"] }
+opentelemetry_sdk.workspace = true
 tempfile.workspace = true
 wat.workspace = true

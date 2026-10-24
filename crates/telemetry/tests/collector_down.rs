@@ -4,6 +4,9 @@
 //! log events from 8 tasks while serving 10 000 HTTP requests. Telemetry
 //! never blocks, memory stays bounded, accounting is exact, shutdown keeps
 //! its budget and exports resume when a receiver appears.
+// The pipeline's own tests drive shutdown and emitters on raw blocking
+// threads: the ban on `spawn_blocking` (clippy.toml) exempts this crate.
+#![allow(clippy::disallowed_methods)]
 use axum::{Router, extract::State, routing::get};
 use merezha_telemetry::{
     Signal, Telemetry, TelemetryConfig,
