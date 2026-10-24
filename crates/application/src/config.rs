@@ -325,6 +325,11 @@ pub enum StorageConfig {
         #[serde(default)]
         initialize: bool,
     },
+    /// The `merezha_app` schema on the host's `[database]` pool (AP-A2).
+    /// There is no URL here and no `initialize`: the first start on a
+    /// migrated, empty schema records `application` in the manifest row,
+    /// and every later start must name the same identity.
+    Postgres { application: Identity },
 }
 /// The application configuration. Version 1 is the original format.
 /// Version 2 adds `limits.max_stream_events`, which this build enforces,
@@ -410,6 +415,10 @@ impl Config {
         }
         if unsupported {
             return Err(Failure::permanent("unsupported_in_this_build"));
+        }
+        // Total capacity is an operator disk concern on PostgreSQL (§A.6).
+        if matches!(self.storage, StorageConfig::Postgres { .. }) {
+            self.limits.reject_capacity_keys()?;
         }
         Ok(())
     }

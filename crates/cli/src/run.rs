@@ -1,7 +1,14 @@
 //! `merezha run --config merezha.toml`: the platform host. It loads the
 //! project, opens the PostgreSQL pool, applies or verifies migrations, builds
 //! the runtime and the optional application, and serves everything behind the
-//! platform edge until SIGINT or SIGTERM.
+//! platform edge until SIGINT or SIGTERM. An application with
+//! `backend = "postgres"` runs as the host module `application` on the
+//! project's pool; memory and SQLite applications open before the pool.
+use crate::application_module::ApplicationModule;
+use merezha_application::{
+    config::StorageConfig,
+    postgres::{MODULE, PostgresOptions},
+};
 use merezha_domain::Failure;
 use merezha_platform::{
     ConfigInput, HostParts, Module, Timeouts,
@@ -136,22 +143,49 @@ pub async fn run(
         Ok(allow) if private => Arc::new(allow),
         _ => Arc::new(DenyAll),
     };
+    let mut modules = modules;
+    let mut application_failure = None;
     let application = match config.application.clone() {
-        Some(application) => {
-            let guest = runtime.clone();
-            let policy: Arc<dyn merezha_application::Authorizer> = authorizer.clone();
-            match tokio::task::spawn_blocking(move || {
-                crate::open_application(&application.path, guest, policy)
-            })
-            .await
-            {
-                Ok(Ok(application)) => Some(application),
+        Some(section) => {
+            let path = section.path.clone();
+            let read =
+                tokio::task::spawn_blocking(move || crate::read_application_config(&path)).await;
+            let application = match read {
+                Ok(Ok(application)) => application,
                 Ok(Err(failure)) => return failed(&failure.code),
                 Err(_) => return failed("invalid_application_config"),
+            };
+            let guest = runtime.clone();
+            let policy: Arc<dyn merezha_application::Authorizer> = authorizer.clone();
+            if let StorageConfig::Postgres { .. } = application.storage {
+                // Opened by the host as a module once its migrations ran.
+                let module = ApplicationModule::new(
+                    application,
+                    Arc::new(guest),
+                    authorizer.clone(),
+                    PostgresOptions {
+                        lock_timeout_max: section.append.lock_timeout_max,
+                        trace: None,
+                    },
+                );
+                application_failure = Some(module.failure());
+                modules.insert(0, Box::new(module) as Box<dyn Module>);
+                None
+            } else {
+                match tokio::task::spawn_blocking(move || {
+                    merezha_application::Application::open(application, Arc::new(guest), policy)
+                })
+                .await
+                {
+                    Ok(Ok(application)) => Some(application),
+                    Ok(Err(failure)) => return failed(&failure.code),
+                    Err(_) => return failed("invalid_application_config"),
+                }
             }
         }
         None => None,
     };
+    // A PostgreSQL application's routes come from its module instead.
     let routes = match (private, application) {
         (true, Some(application)) => crate::app(runtime).merge(crate::application_http::router(
             application,
@@ -177,7 +211,11 @@ pub async fn run(
     };
     let host = match Host::start(config, modules, parts).await {
         Ok(host) => host,
-        Err(error) => return failed(&error.failure.code),
+        // The application module's own reason, not `module_start_failed`.
+        Err(error) => match application_failure.as_ref().and_then(|f| f.get()) {
+            Some(failure) if error.module == Some(MODULE) => return failed(&failure.code),
+            _ => return failed(&error.failure.code),
+        },
     };
     let listener = match host.bind(None).await {
         Ok(listener) => listener,

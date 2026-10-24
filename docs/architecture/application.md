@@ -366,10 +366,11 @@ cargo test --locked -p merezha-cli --test sqlite_process -- --nocapture
 canonical replay, zero-event receipts, pending keys and racing writes, two
 independent instances rechecking stream, key and projection row revision, failed
 catch-up and rebuild, the state and history limits, multi-event batches and
-statement-failure rollback. It runs on SQLite (`sqlite::contract_*`); the
-PostgreSQL store will run the same functions. The second instance comes from the
-test-only `test-support` feature, which shares the owner lock because the owner
-gate forbids two hosts on one file.
+statement-failure rollback. It runs on SQLite (`sqlite::contract_*`) and, when
+`MEREZHA_TEST_DATABASE_URL` is set, on PostgreSQL (`postgres::contract_*`). The
+SQLite second instance comes from the test-only `test-support` feature, which
+shares the owner lock because the owner gate forbids two hosts on one file; the
+PostgreSQL one is another application on its own pool.
 
 The first command covers reopen, receipt/event rollback, recovered-data bounds,
 independent-connection CAS, forced transaction/rebuild interruption and failure
@@ -377,3 +378,29 @@ recovery. The second starts real no-import CLI hosts over ephemeral loopback
 HTTP, checks owner exclusion, restart, raw service behavior and closed restore.
 Its component has fixed protocol replies; arithmetic and failed guest projection
 recovery are tested separately through application guest fixtures.
+
+## PostgreSQL storage
+
+`backend = "postgres"` keeps the application in the `merezha_app` schema of the
+project database, for `merezha run` only: `serve` has no pool and refuses it
+with `storage_configuration`. Several hosts may serve one database; see
+[platform: application storage](platform.md#application-storage) for the
+configuration, the error codes and `merezha application verify`. An embedding
+host connects the store on its runtime and constructs the application
+synchronously:
+
+```rust,ignore
+let store = PostgresStore::connect(&db, &config, PostgresOptions::default(), deadline).await?;
+let app = Application::with_postgres(config, guest, authorizer, Arc::new(store))?;
+// Then call `app` only from spawn_blocking or a thread outside the runtime.
+```
+
+The store blocks on the runtime handle it was connected on, so it needs a
+multi-thread runtime and must not be called on an async worker thread. The
+in-process registry keeps pending idempotency claims only; completed receipts
+are read back from the database.
+
+```sh
+cargo test --locked -p merezha-application --test postgres --test store_contract
+cargo test --locked -p merezha-cli --test postgres_process
+```

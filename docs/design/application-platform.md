@@ -107,9 +107,20 @@ crates/application/src/
 ```
 
 `postgres` is a cargo feature of `merezha-application`, on in `merezha-cli`. It pulls in
-`merezha-postgres` (pool, migrations, test harness) and `merezha-platform` (`Outbox`, `Notifier`,
-`Principal`, `Authorizer`, `ResourceScope`). It is not a separate crate, because it needs the
-crate-private `Key`, `Record` and `ProjectionState` internals and the `Storage` enum.
+`merezha-postgres` (pool, migrations, test harness) and `tokio` (the runtime handle), and nothing
+else. It is not a separate crate, because it needs the crate-private `Key`, `Record` and
+`ProjectionState` internals and the `Storage` enum.
+
+**Dependency direction (decided in AP-A2).** `merezha-platform` already depends on
+`merezha-application`: the kernel `Authorizer` extends the application one (`ports/access.rs`). So
+`merezha-application` never depends on `merezha-platform`, with or without the `postgres` feature;
+that would be a cycle. Whatever the application core later needs from the platform ports
+(`Notifier`, `Outbox`, `Principal`, `ResourceScope` for C2 and C3) goes through small traits defined
+in `merezha-application` and implemented by adapters in `merezha-platform` or `merezha-cli`. A2
+needs none. The host side lives in `merezha-cli`: `run` adds the PostgreSQL application as the
+host-provided module `application` (a reserved name no block can register), so the kernel host
+applies or verifies its migrations with every module's, then starts it on the project pool and nests
+its routes under `/v1/application`.
 
 ```rust
 pub(crate) trait DurableStore: Send + Sync {
@@ -134,8 +145,8 @@ Option<Identity>`, serialized with `skip_serializing_if = "Option::is_none"`, so
 receipt keys keep encoding byte for byte. PostgreSQL-only operations (partitions, rebuild staging,
 reactors, advisory locks) are inherent methods of `PostgresStore` used by `postgres/runner.rs`.
 
-Opening: `PostgresStore::connect(ctx: &AppContext, config: &Config) -> impl Future` runs in the
-async startup. It verifies that migrations are current (the kernel runner), checks or inserts the
+Opening: `PostgresStore::connect(db: &Database, config: &Config, options: PostgresOptions,
+deadline: Instant) -> impl Future` runs in the async startup (the module's `start`). It verifies that migrations are current (the kernel runner), checks or inserts the
 manifest row, and syncs projection and reactor rows. Then `Application::with_postgres(config, guest,
 authorizer, store)` constructs synchronously.
 
@@ -357,7 +368,10 @@ a backstop only.
 fails `timeout` before calling.
 
 The trace columns hold the command span's context (TE §2.2). They are not part of `StoredEvent`
-and never reach guests; `read_all` returns them only for span links.
+and never reach guests; `read_all` returns them only for span links. The store reads the context through
+`postgres::TraceSource::current()` on the committing thread, so it sees the command span; TE-T3
+implements the source from the current span, and without one the columns stay NULL. A malformed
+context is stored as NULL rather than failing the command.
 
 ## A.5 Contiguous positions with several instances
 

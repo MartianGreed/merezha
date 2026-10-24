@@ -50,11 +50,16 @@ struct Inner {
     authorizer: Arc<dyn Authorizer>,
     store: Storage,
     idempotency: Mutex<BTreeMap<Key, Record>>,
+    /// Whether completed records stay in `idempotency`. Memory and SQLite
+    /// keep them (SQLite preloads them at open, within `max_idempotency`).
+    /// PostgreSQL has no such cap, so the map holds pending claims only and
+    /// completed receipts come from the store.
+    retain_receipts: bool,
     projections: BTreeMap<Identity, Mutex<ProjectionState>>,
     active: AtomicUsize,
 }
 /// A process-local `EventStore` port, or a durable store that also keeps
-/// receipts and projection pairs (SQLite; PostgreSQL from AP-A2).
+/// receipts and projection pairs (SQLite or PostgreSQL).
 enum Storage {
     Volatile(Arc<dyn EventStore>),
     Durable(Arc<dyn DurableStore>),
@@ -126,7 +131,9 @@ impl Claim {
             .idempotency
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(record) = records.get_mut(&self.key) {
+        if !self.inner.retain_receipts {
+            records.remove(&self.key);
+        } else if let Some(record) = records.get_mut(&self.key) {
             record.result = Some(receipt.clone());
         }
         self.completed = true;
@@ -158,9 +165,35 @@ impl Application {
                 records,
                 recovered,
             )
+        } else if let StorageConfig::Postgres { .. } = &config.storage {
+            // PostgreSQL needs the host's pool and an async connect:
+            // `PostgresStore::connect`, then `Application::with_postgres`.
+            Err(Failure::permanent("storage_configuration"))
         } else {
             Self::in_memory(config, guest, authorizer)
         }
+    }
+    /// Construct over a connected PostgreSQL store. Synchronous: the store
+    /// already checked the schema, the manifest and the projection rows.
+    /// Every dispatch must then run on a blocking thread
+    /// (`spawn_blocking`) or a thread outside the runtime, never on an
+    /// async worker, because the store blocks on its runtime handle.
+    #[cfg(feature = "postgres")]
+    pub fn with_postgres(
+        config: Config,
+        guest: Arc<dyn Guest>,
+        authorizer: Arc<dyn Authorizer>,
+        store: Arc<crate::postgres::PostgresStore>,
+    ) -> Result<Self, Failure> {
+        store.check_config(&config)?;
+        Self::construct(
+            config,
+            guest,
+            authorizer,
+            Storage::Durable(store),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
     }
     pub fn in_memory(
         config: Config,
@@ -197,6 +230,10 @@ impl Application {
         mut recovered: BTreeMap<Identity, ProjectionState>,
     ) -> Result<Self, Failure> {
         validate_services(&config, guest.as_ref())?;
+        let retain_receipts = !matches!(
+            config.storage,
+            crate::config::StorageConfig::Postgres { .. }
+        );
         let mut projections = BTreeMap::new();
         for projection in &config.projections {
             compatible_json(&projection.initial)?;
@@ -219,6 +256,7 @@ impl Application {
             store,
             projections,
             idempotency: Mutex::new(records),
+            retain_receipts,
             active: AtomicUsize::new(0),
         })))
     }
@@ -311,6 +349,21 @@ impl Admission {
         }
         Ok(())
     }
+    /// The in-process record for `key`: a completed receipt replays, a
+    /// pending claim is `idempotency_in_flight`, another fingerprint is
+    /// `idempotency_mismatch`. `None` when this instance has no record.
+    fn local_record(
+        &self,
+        key: &Key,
+        fingerprint: &str,
+    ) -> Result<Option<Result<Receipt, Failure>>, Failure> {
+        let records = self
+            .inner
+            .idempotency
+            .lock()
+            .map_err(|_| Failure::transient("internal"))?;
+        Ok(records.get(key).map(|record| replay(record, fingerprint)))
+    }
     pub fn command(self, command: Command) -> Result<Receipt, Failure> {
         let route = self
             .inner
@@ -352,19 +405,26 @@ impl Admission {
             let fingerprint = canonical(
                 &serde_json::json!({"stream":stream,"payload":payload,"expected_version":command.expected_version}),
             )?;
+            if let Some(replay) = self.local_record(&key, &fingerprint)? {
+                return replay;
+            }
+            // Fast-path replay of a key another instance (or an earlier
+            // process) committed, before the guest decides. It runs before
+            // the local capacity check, so a full local registry still
+            // replays stored receipts. No map lock is held during SQL.
+            if let Storage::Durable(store) = &self.inner.store
+                && let Some(receipt) = store.receipt(&key, &fingerprint, self.deadline)?
+            {
+                return Ok(receipt);
+            }
             let mut records = self
                 .inner
                 .idempotency
                 .lock()
                 .map_err(|_| Failure::transient("internal"))?;
+            // A same-key caller on this instance may have claimed meanwhile.
             if let Some(record) = records.get(&key) {
-                if record.payload != fingerprint {
-                    return Err(Failure::conflict("idempotency_mismatch"));
-                }
-                return record
-                    .result
-                    .clone()
-                    .ok_or_else(|| Failure::conflict("idempotency_in_flight"));
+                return replay(record, &fingerprint);
             }
             if records.len() >= self.inner.config.limits.max_idempotency {
                 return Err(Failure::transient("idempotency_capacity"));
@@ -382,16 +442,6 @@ impl Admission {
                 fingerprint,
                 completed: false,
             });
-        }
-        if let (Some(pending), Storage::Durable(store)) = (&claim, &self.inner.store)
-            && let Some(receipt) =
-                store.receipt(&pending.key, &pending.fingerprint, self.deadline)?
-        {
-            // Another instance committed this key: replay without deciding.
-            if let Some(claim) = claim {
-                claim.complete(&receipt);
-            }
-            return Ok(receipt);
         }
         let history = self.inner.store.load(&stream, self.deadline)?;
         let limits = &self.inner.config.limits;
@@ -583,6 +633,18 @@ impl Admission {
         *current = pending;
         Ok(current.clone())
     }
+}
+/// The answer an in-process record gives: its completed receipt, or
+/// `idempotency_in_flight` while pending, or `idempotency_mismatch` for
+/// another fingerprint.
+fn replay(record: &Record, fingerprint: &str) -> Result<Receipt, Failure> {
+    if record.payload != fingerprint {
+        return Err(Failure::conflict("idempotency_mismatch"));
+    }
+    record
+        .result
+        .clone()
+        .ok_or_else(|| Failure::conflict("idempotency_in_flight"))
 }
 fn projection_ref(projection: &crate::config::Projection) -> ProjectionRef<'_> {
     ProjectionRef {

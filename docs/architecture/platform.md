@@ -50,8 +50,11 @@ and one `startup.failed` event carrying a stable `code`:
    Issues name settings and layers, never values.
 2. Install the log subscriber from `[telemetry]`.
 3. Load the runtime manifest (`invalid_manifest`).
-4. Open the optional application with its configured storage (memory or
-   SQLite, as with `serve`).
+4. Read and validate the optional application configuration, then open a
+   memory or SQLite application as `serve` does. A PostgreSQL application
+   (`[storage] backend = "postgres"`) is only validated here, including the
+   refusal of total-capacity limits (`invalid_limits`); it opens in step 7
+   as the host module `application`.
 5. Register every enabled module's error codes (`error_code_conflict`, see
    [Errors](#errors)), then open the pool and prove it with `SELECT 1`
    (`database_unavailable`).
@@ -61,8 +64,11 @@ and one `startup.failed` event carrying a stable `code`:
    startup; readiness stays false until they are applied.
 7. Start modules in registration order, each within 10 s
    (`module_start_failed`; modules already started are shut down). The
-   jobs runtime starts last, once every module declared its job handlers
-   and subscriptions, and stops first.
+   PostgreSQL application module starts first and reports its own code
+   instead: `storage_schema` while its migrations are pending,
+   `storage_configuration` when the database belongs to another
+   application identity. The jobs runtime starts last, once every module
+   declared its job handlers and subscriptions, and stops first.
 8. Bind `http.listen` and log `listener.ready` with the bound address.
 
 SIGINT or SIGTERM starts a graceful stop: readiness turns false, the listener
@@ -77,7 +83,7 @@ the process exits 0. A serving failure exits 1.
 | `GET /health/live` | kernel | always |
 | `GET /health/ready` | kernel | always |
 | `/v1/<module>/...` | each enabled module | its `[modules.<module>]` section exists |
-| `/v1/application/...` | application layer | `[application]` is set |
+| `/v1/application/...` | application layer (the `application` module on PostgreSQL) | `[application]` is set |
 | `/health`, `/v1/services/...`, `/v1/pipelines/...`, `/v1/reload` | raw runtime | the listener is private |
 
 Without the identity block there is no authentication. A listener is private
@@ -125,9 +131,9 @@ such as the `[jobs.retention]` ones, take strings only. A malformed value is
 `expected_duration`.
 
 Every key below validates at startup. Keys marked *reserved* have no effect
-yet: the jobs runtime (AP-B1 onward), the PostgreSQL application core (AP-A2
-onward) and the telemetry block (TE-T1 onward) give them their behaviour.
-Configuring them now fails early on typos instead of being ignored.
+yet: the jobs runtime (AP-B1 onward), the PostgreSQL application core's
+background work (AP-A3) and the telemetry block (TE-T1 onward) give them their
+behaviour. Configuring them now fails early on typos instead of being ignored.
 
 Secret settings accept `{ env = "NAME" }` or `{ file = "PATH" }` in the file,
 never a literal string (`secret_literal`). A `MEREZHA_` environment variable may
@@ -204,7 +210,8 @@ Optional. Without it no application endpoints are mounted. Any
 | --- | --- | --- | --- | --- |
 | `path` | path | required in the section | no | the [application configuration](application.md); its SQLite `path` keeps `serve`'s meaning |
 
-The PostgreSQL application core's tables (AP §D.2), all *reserved*:
+The PostgreSQL application core's tables (AP §D.2). `[application.append]`
+applies to a PostgreSQL application; the others are *reserved* until AP-A3:
 
 | Table | Key | Type | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -216,7 +223,7 @@ The PostgreSQL application core's tables (AP §D.2), all *reserved*:
 | | `retry_base_ms` | duration | `1000` | 100 ms to 10 min; at most `retry_max_ms` (`retry_base_exceeds_max`) |
 | | `retry_max_ms` | duration | `300000` | 1 s to 1 day |
 | `[application.background]` | `max_concurrent` | integer | `2` | 1 to 16, shared by projection, rebuild and reactor runs; at most `database.max_detached - 1` |
-| `[application.append]` | `lock_timeout_max_ms` | duration | `5000` | 10 ms to 30 s |
+| `[application.append]` | `lock_timeout_max_ms` | duration | `5000` | 10 ms to 30 s; the append waits for the head lock at most `min(remaining deadline - 50 ms, lock_timeout_max_ms)`, then fails `503 storage_busy` |
 
 ### `[jobs]`
 
@@ -703,6 +710,51 @@ first failed use.
   session. The jobs relay
   holds one per host.
 
+### Application storage
+
+An application whose `application.toml` says
+
+```toml
+[storage]
+backend = "postgres"
+application = "tasks-v1"   # identity recorded in merezha_app.manifest
+```
+
+stores its events, receipts and projections in the schema `merezha_app` on the
+project pool ([design](../design/application-platform.md) §A). There is no URL
+and no `initialize` key; the migration runner creates the schema under the
+ledger key `application`. The first start on the migrated schema records the
+identity, and a host naming another identity fails `storage_configuration`.
+Several `merezha run` hosts may serve one database at once; there is no owner
+lock. `[limits]` total-capacity keys (`max_events`, `max_streams`,
+`max_store_bytes`, `max_idempotency`) fail `invalid_limits`, because capacity
+is a disk concern here; `max_stream_events` bounds each history.
+
+Every command commits through one autocommit call of `merezha_app.append`,
+which locks the single `merezha_app.head` row. Positions have no gaps and
+commit in position order across hosts. A stale expected version fails `409
+concurrency_conflict`; a lock wait beyond the deadline or
+`[application.append] lock_timeout_max_ms` fails `503 storage_busy`; a
+connection lost during the append fails `503 commit_outcome_unknown` and
+nothing needs a restart: retry with the same idempotency key, which replays the
+stored receipt when the first attempt committed. Receipts are rows committed
+with their events, so a keyed command replays on any host. Catch-up and
+rebuild still run synchronously in the request until AP-A3, with a row
+revision compare-and-swap (`409 projection_conflict` when another host
+published first).
+
+`merezha application verify --config merezha.toml` checks, read-only and in
+chunks of 10,000 positions inside one repeatable-read snapshot, that positions
+are contiguous, the head equals the highest position, stream rows and versions
+match their events, every receipt names its events and every checkpoint is at
+most the head. It prints one JSON report on stdout,
+`{"ok","head","events","streams","receipts","projections","violation_count","violations":[{"check","subject"}]}`
+(at most 100 violations listed), and exits 0 when everything holds, 1 on a
+violation and 2 when it could not check, printing
+`{"ok":false,"error":{"code","classification"}}` (for example `storage_schema`
+before the migrations ran). It reads the whole history, so it is not part of
+startup; run it after a restore. It stops after 10 minutes.
+
 ### Migrations
 
 `run_migrations(&db, &[ModuleMigrations], mode, deadline)`:
@@ -941,10 +993,11 @@ itself.
   work.
 - `Host::start` installs no `Authenticator` yet, so the edge never
   authenticates until identity's block registers one.
-- The outbox and jobs `trace_parent`/`trace_state` columns exist but stay
-  empty until the telemetry block fills them from the current span
-  (TE-T5).
+- The events, outbox and jobs `trace_parent`/`trace_state` columns exist
+  but stay empty until the telemetry block fills them from the current span
+  (TE-T3 for events, TE-T5 for the outbox and jobs).
 - Jobs are created but not leased or run: dispatch, retry, drain,
   retention and the jobs admin API are AP-B2, cron is AP-B3.
-- The application layer still uses memory or SQLite storage. PostgreSQL
-  storage is stage 1.
+- PostgreSQL application storage (AP-A2) has no background projection
+  runners, warm-up readiness or application admin API yet (AP-A3); catch-up
+  and rebuild run in the request.

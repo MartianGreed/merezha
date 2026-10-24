@@ -4,10 +4,10 @@
 //! fault-injects one store. "Reopen" is a new `Application` over the same
 //! data; an "independent instance" is a second live one, as another host.
 //!
-//! SQLite runs always (`sqlite::*`). AP-A2 adds a PostgreSQL fixture over
-//! `merezha_postgres::TestDatabase` with `contracts!(postgres, ...)`; its
-//! constructor returns `None`, and each test returns early, with the
-//! kernel's explicit skip message when `MEREZHA_TEST_DATABASE_URL` is unset.
+//! SQLite runs always (`sqlite::*`). PostgreSQL (`postgres::*`) runs over a
+//! fresh `merezha_postgres::TestDatabase` per contract; its constructor
+//! returns `None`, and each test returns early, with the kernel's explicit
+//! skip message when `MEREZHA_TEST_DATABASE_URL` is unset.
 use merezha_application::{
     AllowAll, Application, Authorizer, Guest, GuestSession, ProjectionState,
     config::{Config, StorageConfig},
@@ -309,6 +309,120 @@ trait StoreFixture {
     /// background (AP-A3), and its fixture waits for the swap.
     fn rebuild(&self, app: &Application, name: &str) -> Result<ProjectionState, Failure> {
         app.rebuild(name)
+    }
+}
+
+/// One fresh database per contract, migrated once. Every `Application` gets
+/// its own pool, so a reopen or an independent instance is another host.
+struct Postgres {
+    // Dropped before the database, so no pool outlives it.
+    runtime: tokio::runtime::Runtime,
+    test: merezha_postgres::TestDatabase,
+    last: Mutex<Option<Opened>>,
+}
+/// What the last application was opened with.
+type Opened = (Config, Arc<dyn Guest>, Arc<dyn Authorizer>);
+impl Postgres {
+    fn new() -> Option<Self> {
+        use merezha_application::postgres::{MIGRATIONS, MODULE};
+        use merezha_postgres::{Database, MigrationMode, ModuleMigrations, run_migrations};
+        let test = merezha_postgres::TestDatabase::create()?;
+        // The store blocks on its runtime from caller threads, which needs
+        // a multi-thread runtime to keep driving I/O meanwhile.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let db = Database::connect(&test.config()).unwrap();
+            let modules = [ModuleMigrations {
+                module: MODULE,
+                migrations: MIGRATIONS,
+            }];
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            run_migrations(&db, &modules, MigrationMode::Apply, deadline)
+                .await
+                .unwrap();
+            db.close();
+        });
+        Some(Self {
+            runtime,
+            test,
+            last: Mutex::new(None),
+        })
+    }
+    fn open(
+        &self,
+        mut config: Config,
+        guest: Arc<dyn Guest>,
+        authorizer: Arc<dyn Authorizer>,
+    ) -> Result<Application, Failure> {
+        use merezha_application::postgres::{PostgresOptions, PostgresStore};
+        config.storage = StorageConfig::Postgres {
+            application: id("contract-v1"),
+        };
+        let db = merezha_postgres::Database::connect(&self.test.config())?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let store = self.runtime.block_on(PostgresStore::connect(
+            &db,
+            &config,
+            PostgresOptions::default(),
+            deadline,
+        ))?;
+        *self.last.lock().unwrap() = Some((config.clone(), guest.clone(), authorizer.clone()));
+        Application::with_postgres(config, guest, authorizer, Arc::new(store))
+    }
+    fn sql(&self, statement: &str) {
+        self.runtime.block_on(async {
+            let db = merezha_postgres::Database::connect(&self.test.config()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let client = db.acquire(deadline).await.unwrap();
+            client.batch_execute(statement).await.unwrap();
+        });
+    }
+}
+impl StoreFixture for Postgres {
+    fn create(
+        &self,
+        config: Config,
+        guest: Arc<dyn Guest>,
+        authorizer: Arc<dyn Authorizer>,
+    ) -> Result<Application, Failure> {
+        self.open(config, guest, authorizer)
+    }
+    fn reopen(
+        &self,
+        config: Config,
+        guest: Arc<dyn Guest>,
+        authorizer: Arc<dyn Authorizer>,
+    ) -> Result<Application, Failure> {
+        self.open(config, guest, authorizer)
+    }
+    /// Another host: its own pool, pending claims and projection cache over
+    /// the configuration `app` was opened with.
+    fn independent(&self, _: &Application) -> Result<Application, Failure> {
+        let (config, guest, authorizer) = self.last.lock().unwrap().clone().unwrap();
+        self.open(config, guest, authorizer)
+    }
+    fn inject(&self, fault: Fault) {
+        let target = match fault {
+            Fault::ReceiptInsert => "BEFORE INSERT ON merezha_app.receipts",
+            Fault::ProjectionCommit => "BEFORE UPDATE OF checkpoint ON merezha_app.projections",
+        };
+        self.sql(&format!(
+            "CREATE FUNCTION contract_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected'; END $$; \
+             CREATE TRIGGER contract_fault {target} FOR EACH ROW EXECUTE FUNCTION contract_fault()"
+        ));
+    }
+    fn clear(&self, fault: Fault) {
+        let table = match fault {
+            Fault::ReceiptInsert => "merezha_app.receipts",
+            Fault::ProjectionCommit => "merezha_app.projections",
+        };
+        self.sql(&format!(
+            "DROP TRIGGER contract_fault ON {table}; DROP FUNCTION contract_fault()"
+        ));
     }
 }
 
@@ -723,6 +837,20 @@ macro_rules! contracts {
 }
 contracts!(
     sqlite, Some(Sqlite::new());
+    contract_reopen_retains_receipt_and_projection,
+    contract_keyed_replay_is_scoped_and_canonical_but_still_validates_and_authorizes,
+    contract_zero_event_receipts_survive_reopen,
+    contract_one_instance_shares_pending_keys_and_commits_one_of_two_racing_writes,
+    contract_independent_instances_recheck_stream_key_and_projection_revision,
+    contract_failed_catch_up_and_rebuild_preserve_the_last_persisted_pair,
+    contract_state_limit_holds_across_reopen,
+    contract_history_limit_bounds_each_decision,
+    contract_multi_event_batches_keep_contiguous_versions_and_roll_back_an_invalid_tail,
+    contract_statement_failure_rolls_back_events_receipt_position_and_projection_pair,
+);
+
+contracts!(
+    postgres, Postgres::new();
     contract_reopen_retains_receipt_and_projection,
     contract_keyed_replay_is_scoped_and_canonical_but_still_validates_and_authorizes,
     contract_zero_event_receipts_survive_reopen,

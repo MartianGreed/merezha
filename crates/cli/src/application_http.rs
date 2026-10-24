@@ -28,14 +28,16 @@ struct Routes {
 /// passes no policy, keeps them open on its loopback listener and keeps its
 /// own error statuses.
 pub fn router(application: Application, policy: Option<Arc<dyn Authorizer>>) -> Router {
+    Router::new().nest("/v1/application", routes(application, policy))
+}
+/// The same routes relative to `/v1/application`, for the platform host,
+/// which nests the PostgreSQL application module's routes under its name.
+pub fn routes(application: Application, policy: Option<Arc<dyn Authorizer>>) -> Router {
     Router::new()
-        .route("/v1/application/commands", post(command))
-        .route("/v1/application/queries", post(query))
-        .route(
-            "/v1/application/projections/{name}/catch-up",
-            post(catch_up),
-        )
-        .route("/v1/application/projections/{name}/rebuild", post(rebuild))
+        .route("/commands", post(command))
+        .route("/queries", post(query))
+        .route("/projections/{name}/catch-up", post(catch_up))
+        .route("/projections/{name}/rebuild", post(rebuild))
         .with_state(Routes {
             application,
             policy,
