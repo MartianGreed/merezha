@@ -1,0 +1,7 @@
+{% extends "_layouts/email.html" %}
+{% block unsubscribe %}Se désabonner{% endblock %}
+{% block content %}
+<p>Bonjour{% if recipient.name %} {{ recipient.name }}{% endif %},</p>
+<p>Une connexion à votre compte {{ app.name }} a eu lieu{% if signed_in_at is defined %} le {{ signed_in_at | datetime("%d/%m/%Y à %H:%M %Z") }}{% endif %}.</p>
+<p>Si c’était vous, il n’y a rien à faire. Sinon, réinitialisez votre mot de passe maintenant.</p>
+{% endblock %}

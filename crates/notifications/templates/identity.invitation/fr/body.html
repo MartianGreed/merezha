@@ -1,0 +1,8 @@
+{% extends "_layouts/email.html" %}
+{% block unsubscribe %}Se désabonner{% endblock %}
+{% block content %}
+<p>Bonjour{% if recipient.name %} {{ recipient.name }}{% endif %},</p>
+<p>Vous êtes invité à rejoindre {% if organization_name is defined %}{{ organization_name }}{% else %}une organisation{% endif %} sur {{ app.name }}. Ouvrez ce lien pour accepter :</p>
+<p><a href="{{ secret.link | url }}" style="display:inline-block;padding:10px 16px;background:#1c1917;color:#ffffff;border-radius:6px;text-decoration:none">Accepter l’invitation</a></p>
+<p>Si vous n’attendiez pas cette invitation, ignorez cet e-mail.</p>
+{% endblock %}

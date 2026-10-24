@@ -533,6 +533,125 @@ pass what they learned in (`NotificationRequest::members`).
 | `Directory` | `users(ids)` (at most 100) to verified `Contact`s, `tenant_members(tenant, roles?, PageRequest)` and `application_members(roles?, PageRequest)` (pages of at most 500, keyset by user id), `is_member(user, tenant)` (R7) | `EmptyDirectory`: resolves nothing; nobody is a member |
 | `BlobStore` | `put(key, BlobBody, attrs) -> BlobStat` streaming, `get(key, range?) -> BlobRead` streaming, `head`, idempotent `delete`, `signed_get_url(key, ttl) -> Option<String>` (CT §6); `BlobKey` is 1 to 1024 bytes of `[A-Za-z0-9._-]` segments; `BlobError` maps to classified failures | `UnavailableBlobStore`: fails permanent `blob_store_unavailable` |
 
+## Notifications block
+
+`merezha run` registers the notifications block (`crates/notifications`,
+[design](../design/notifications.md)). It stays off until
+`[modules.notifications]` is present. Slice NT-N1 ships its configuration,
+templates, previews and capture drivers; the `Notifier` (requests from other
+blocks), expansion, delivery workers and the other channels arrive with
+NT-N2 to NT-N8, so until then other blocks still get the kernel's capture
+fallback and nothing is sent.
+
+```toml
+[modules.notifications]
+secret_key = { env = "MEREZHA_NOTIFY_SECRET_KEY" } # base64 of at least 32 bytes
+
+[modules.notifications.templates]
+locales = ["en", "fr"]
+```
+
+Check a project without starting it:
+
+```sh
+cargo run --locked -p merezha-cli -- notifications check --config merezha.toml
+```
+
+It loads the whole configuration as `merezha run` does and prints one JSON
+object on stdout: `status` `ok` with the topic and template counts, the
+locales and the channel drivers, and exit code 0; or `status` `invalid` with
+`issues: [{key, code, origin}]` and exit code 2. `merezha run` refuses to start on the same issues
+(`invalid_config`). Issues name settings and template files, never values.
+
+### What starts with the block
+
+- Migration 1 (`core`) creates the schema `merezha_notify` with the core
+  tables of NT §2.4: `notifications`, `deliveries`, `delivery_attempts`,
+  `provider_events`, `preferences`, `user_settings`, `suppressions` and
+  `captures`. Its checksum is pinned by a test; later slices add migrations.
+- The block claims the `api` source (`Module::extra_sources`) for its HTTP
+  send route.
+- Routes under `/v1/notifications/`:
+
+  | Method and path | Access | Answer |
+  | --- | --- | --- |
+  | `GET templates` | `notifications.templates.preview` at `Application` | `[{name, description, locales, channels}]` |
+  | `POST templates/{name}/preview` | same | `{locale?, data?, channels?}` renders every channel: `{email: {subject, html, text}, sms: {text, encoding, segments}, push: {title, body, url}, inbox: {title, body, link, payload}}`. Without `data`, the template's preview data. `data.secret` is the preview's secret data. 422 `render_failed` with `details: [{path: "/channels/<channel>", code}]`, `reserved_data_key`, `data_too_large`, `channel_not_allowed`, `invalid_locale`; 400 `invalid_input`; 404 for an unknown template |
+  | `GET templates/{name}/preview.html?locale=` | same | the HTML email with `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; sandbox` |
+  | `GET dev/captures?channel=email\|sms&limit=1..100` | a loopback peer (not through a trusted proxy) while a capture driver is active | the newest captured messages, `[{delivery_id, channel, target, rendered, captured_at}]`; 404 otherwise |
+
+  The three template routes answer 404 when `templates.preview = false`.
+  Without the identity block the kernel policy decides: allowed on a private
+  loopback listener, 401 elsewhere.
+- The capture drivers (`email.driver = "capture"`, the default, and
+  `sms.driver = "capture"`) keep each rendered message in
+  `merezha_notify.captures`, the newest `retention.captures` rows, and accept
+  it with provider `capture`. A second capture with the same delivery and
+  idempotency key answers duplicate, as Brevo does. Captures hold rendered
+  secret data, which is why `http.public = true` refuses a capture driver.
+
+### Templates
+
+Project files live under `templates.dir` (default `notifications/templates`,
+relative to `merezha.toml`) and replace the embedded `en` and `fr` defaults
+of the built-in topics file by file (NT §4 shows the layout).
+`template.toml` takes `description`, `required` (data keys) and `[preview]`
+data; its `[preview.secret]` table is the preview's secret data. Locale
+directories must be in `templates.locales`. Every topic needs its template
+in the default locale, so with a default locale other than `en` or `fr` the
+project provides the built-in templates in it too. Rendering uses strict undefined,
+HTML escaping for `.html` files only, `templates.fuel` and the output limits
+of NT §4. The filters are `url` (`https:`, or `http:` to loopback with
+`templates.allow_http_links`), `datetime(format)` (a jiff `strftime` format,
+default `%Y-%m-%d %H:%M %Z`, in `recipient.timezone`) and `truncate_chars(n)`
+(the first `n` characters).
+
+Startup renders every template's preview in every listed locale and fails on
+the first problem of each file, reported together. Template issue keys are
+`modules.notifications.templates."<name>/<locale>/<file>"` or
+`modules.notifications.templates."<name>".preview.<locale>.<channel>`.
+
+### Settings
+
+Keys and defaults are NT §7.2. Bounds and checks the block adds:
+
+| Key | Bounds |
+| --- | --- |
+| `secret_key`, `secret_key_previous` | secrets; base64 (standard or URL-safe) of 32 to 1024 bytes (`invalid_secret_key`) |
+| `public_base_url`, `templates.app_base_url`, `links.*` | `https`, or `http` to a loopback host; no userinfo or fragment (`invalid_url`) |
+| `limits` | `max_recipients` 1 to 100, `max_targets` 1 to 100000, `max_marketing_targets` 1 to 1000 and at most `max_targets`, `max_data_bytes` 1024 to 49152 |
+| `retention` | durations 1 h to 3650 d; `captures` 1 to 100000 |
+| `templates` | `locales` at most 32 of `^[a-z]{2,3}(-[A-Z]{2})?$`, `default_locale` among them (`default_locale_not_listed`); `app_name` defaults to `app.name`; `fuel` 1000 to 10000000 |
+| `email.from`, `email.reply_to` | `Name <local@domain>` or `local@domain` (`invalid_sender`); `from` required with `driver = "brevo"` |
+| `sms` | `sender` required unless disabled: at most 11 alphanumerics or 15 digits; `max_segments` 1 to 10 |
+| `brevo` | required with a `brevo` driver; `api_key` required then, `webhook_token` (at least 32 characters, `secret_too_short`) with the email driver; `timeout` 1 s to 60 s, `connect_timeout` 100 ms to 30 s |
+| `push` | `vapid_private_key` a PKCS#8 PEM or base64url of 32 bytes (`invalid_vapid_key`), `vapid_subject` `mailto:` or `https:`; `ttl` 0 to 28 d; `allowed_hosts` at most 64 lowercase host names; `max_subscriptions_per_user` 1 to 100 |
+| `inbox` | durations 1 d to 3650 d |
+| `sse` | `heartbeat` 1 s to 5 min, `reconcile_interval` 1 s to 10 min, `replay_max` 1 to 10000, `max_streams_per_user` 1 to 64, `max_streams` 1 to 100000, `max_lifetime` 1 min to 1 d, `reauth_interval` 10 s to 1 h |
+| `webhooks` | `max_endpoints_per_tenant` 1 to 1000, `max_payload_bytes` 1024 to 1048576, `timeout` 1 s to 60 s, `concurrency_per_endpoint` 1 to 64, `auto_disable_after` 1 h to 30 d; `event_types` names follow R11, at most 256 |
+| `topics."<name>"` | names follow R11 (`invalid_topic_name`); `category` and `channels` required for project topics; built-ins keep their category (`category_fixed`); security topics are never `user_configurable` (`security_not_configurable`) |
+| `quiet_hours` | refused in v1 (`unsupported_section`) |
+
+Checks across sections, reported with the rest: a declared topic channel
+without its driver or section (`channel_unavailable`; built-in topics keep
+their channels and are filtered at delivery), `default_channels` outside
+`channels`, `http.public = true` with a capture driver,
+`allow_private_networks`, `webhooks.allow_http`, `allow_http_links`, a
+non-https `brevo.base_url` or `preview` without `preview_in_public`
+(`refused_when_public`), a missing `public_base_url` with Brevo SMS or with
+Brevo email and a non-security email topic, a `notify.email`,
+`notify.sms` or `notify.webhook` `lease_ms` under three provider timeouts
+(`lease_too_short`), a `notify.webhook` `backoff_max_ms` under 24 h
+(`backoff_max_too_short`), and with `MEREZHA_NOTIFY_NO_EGRESS=1` a
+non-loopback `brevo.base_url` (`egress_not_loopback`).
+
+`Module::configure` sees only the module's section, so the binary hands
+the block the facts these checks need (`HostFacts::load`: the configuration
+directory, `http.public`, `app.name`, `[jobs]` and
+`MEREZHA_NOTIFY_NO_EGRESS`) when it registers it. When the kernel sections
+do not load, the cross checks that need them are skipped; startup fails on
+the kernel issues anyway.
+
 ## PostgreSQL
 
 `Database::connect(&DatabaseConfig)` builds a `deadpool-postgres` pool. Each

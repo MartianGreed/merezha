@@ -1,0 +1,7 @@
+{% extends "_layouts/email.html" %}
+{% block content %}
+<p>Hello{% if recipient.name %} {{ recipient.name }}{% endif %},</p>
+<p>Open this link to sign in to {{ app.name }}. It works once and expires soon.</p>
+<p><a href="{{ secret.link | url }}" style="display:inline-block;padding:10px 16px;background:#1c1917;color:#ffffff;border-radius:6px;text-decoration:none">Sign in</a></p>
+<p>If you did not ask to sign in, you can ignore this email.</p>
+{% endblock %}

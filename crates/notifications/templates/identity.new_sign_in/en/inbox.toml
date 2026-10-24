@@ -1,0 +1,3 @@
+title = "New sign-in to your account"
+body = "Your account was signed in to{% if signed_in_at is defined %} on {{ signed_in_at | datetime(\"%Y-%m-%d at %H:%M %Z\") }}{% endif %}. If this was not you, reset your password."
+link = "{% if links.app %}{{ links.app }}{% endif %}"

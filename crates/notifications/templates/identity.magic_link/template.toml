@@ -1,0 +1,4 @@
+description = "A one-time sign-in link"
+
+[preview.secret]
+link = "https://app.example.com/magic?token=preview"

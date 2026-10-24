@@ -1,0 +1,3 @@
+title = "Your password was changed"
+body = "The password of your {{ app.name }} account was changed. If this was not you, reset it now."
+link = "{% if links.app %}{{ links.app }}{% endif %}"

@@ -87,6 +87,11 @@ and one error shape. It stops gracefully on SIGINT or SIGTERM.
 cargo run --locked -p merezha-cli -- run --config merezha.toml
 ```
 
+`[modules.notifications]` turns on the notifications block: templates with
+previews and capture drivers today, delivery in later slices.
+`merezha notifications check --config merezha.toml` validates its settings
+and templates without starting the host.
+
 PostgreSQL tests run when `MEREZHA_TEST_DATABASE_URL` points to a server
 where the role can create databases; otherwise they print a skip message.
 `.contremaitre.yaml` provides a local PostgreSQL 17. The

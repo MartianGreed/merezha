@@ -1,0 +1,7 @@
+description = "An invitation to join an organization"
+
+[preview]
+organization_name = "Acme Research"
+
+[preview.secret]
+link = "https://app.example.com/invitations/preview"

@@ -1,0 +1,8 @@
+{% extends "_layouts/email.html" %}
+{% block unsubscribe %}Se désabonner{% endblock %}
+{% block content %}
+<p>Bonjour{% if recipient.name %} {{ recipient.name }}{% endif %},</p>
+<p>Confirmez votre adresse e-mail pour {{ app.name }} en ouvrant ce lien :</p>
+<p><a href="{{ secret.link | url }}" style="display:inline-block;padding:10px 16px;background:#1c1917;color:#ffffff;border-radius:6px;text-decoration:none">Confirmer mon adresse e-mail</a></p>
+<p>Si vous n’avez pas créé de compte, vous pouvez ignorer cet e-mail.</p>
+{% endblock %}

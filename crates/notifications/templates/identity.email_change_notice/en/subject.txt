@@ -1,0 +1,1 @@
+The email address of your {{ app.name }} account is changing

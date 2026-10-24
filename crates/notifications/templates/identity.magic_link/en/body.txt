@@ -1,0 +1,8 @@
+Hello{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+Open this link to sign in to {{ app.name }}. It works once and expires soon.
+{{ secret.link | url }}
+
+If you did not ask to sign in, you can ignore this email.{% if links.unsubscribe %}
+
+Unsubscribe: {{ links.unsubscribe }}{% endif %}

@@ -1,0 +1,4 @@
+description = "Confirm the email address of a new account"
+
+[preview.secret]
+link = "https://app.example.com/verify?token=preview"

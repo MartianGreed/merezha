@@ -1,0 +1,8 @@
+Hello{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+You are invited to join {% if organization_name is defined %}{{ organization_name }}{% else %}an organization{% endif %} on {{ app.name }}. Open this link to accept:
+{{ secret.link | url }}
+
+If you were not expecting this invitation, you can ignore this email.{% if links.unsubscribe %}
+
+Unsubscribe: {{ links.unsubscribe }}{% endif %}

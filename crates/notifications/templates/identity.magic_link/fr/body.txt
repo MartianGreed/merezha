@@ -1,0 +1,8 @@
+Bonjour{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+Ouvrez ce lien pour vous connecter à {{ app.name }}. Il ne fonctionne qu’une fois et expire bientôt.
+{{ secret.link | url }}
+
+Si vous n’avez pas demandé à vous connecter, ignorez cet e-mail.{% if links.unsubscribe %}
+
+Se désabonner : {{ links.unsubscribe }}{% endif %}

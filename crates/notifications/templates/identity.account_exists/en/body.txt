@@ -1,0 +1,9 @@
+Hello{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+Someone tried to create a {{ app.name }} account with this email address, which already has one.
+
+If it was you, sign in instead, or reset your password if you forgot it.{% if links.app %} {{ links.app }}{% endif %}
+
+If it was not you, you can ignore this email. Nothing changed.{% if links.unsubscribe %}
+
+Unsubscribe: {{ links.unsubscribe }}{% endif %}

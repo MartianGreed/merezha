@@ -1,0 +1,1 @@
+Un point de terminaison webhook {{ app.name }} a été désactivé

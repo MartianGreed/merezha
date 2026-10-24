@@ -45,6 +45,9 @@ async fn main() -> std::process::ExitCode {
     if std::env::args().nth(1).as_deref() == Some("run") {
         return merezha_cli::run::main(std::env::args().skip(2)).await;
     }
+    if std::env::args().nth(1).as_deref() == Some("notifications") {
+        return merezha_cli::notifications::main(std::env::args().skip(2));
+    }
     let (manifest, application, address) = match arguments() {
         Ok(args) => args,
         Err(_) => {

@@ -1,0 +1,7 @@
+{% extends "_layouts/email.html" %}
+{% block unsubscribe %}Se désabonner{% endblock %}
+{% block content %}
+<p>Bonjour{% if recipient.name %} {{ recipient.name }}{% endif %},</p>
+<p>Le mot de passe de votre compte {{ app.name }} vient d’être modifié.</p>
+<p>Si vous n’êtes pas à l’origine de ce changement, réinitialisez votre mot de passe et vérifiez votre compte.</p>
+{% endblock %}

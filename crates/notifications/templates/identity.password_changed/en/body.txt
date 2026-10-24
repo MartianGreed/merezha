@@ -1,0 +1,7 @@
+Hello{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+The password of your {{ app.name }} account was just changed.
+
+If you did not do this, reset your password now and review your account.{% if links.unsubscribe %}
+
+Unsubscribe: {{ links.unsubscribe }}{% endif %}

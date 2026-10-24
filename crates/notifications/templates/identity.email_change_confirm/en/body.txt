@@ -1,0 +1,8 @@
+Hello{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+Open this link to use this address for your {{ app.name }} account:
+{{ secret.link | url }}
+
+If you did not ask for this change, you can ignore this email.{% if links.unsubscribe %}
+
+Unsubscribe: {{ links.unsubscribe }}{% endif %}

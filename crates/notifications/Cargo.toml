@@ -1,0 +1,27 @@
+[package]
+name = "merezha-notifications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+merezha-domain = { path = "../domain" }
+merezha-platform = { path = "../platform" }
+merezha-postgres = { path = "../postgres" }
+axum.workspace = true
+base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+jiff.workspace = true
+minijinja = { version = "3.0.3", default-features = false, features = ["builtins", "macros", "multi_template", "fuel", "urlencode", "serde"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+url = "2.5.8"
+uuid.workspace = true
+
+[dev-dependencies]
+merezha-application = { path = "../application" }
+tempfile.workspace = true
+tower.workspace = true

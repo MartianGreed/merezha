@@ -55,7 +55,17 @@ pub fn app_with_application(
     app(runtime).merge(application_http::router(application, None))
 }
 pub mod application_http;
+pub mod notifications;
 pub mod run;
+
+/// The blocks the `merezha` binary registers. Each stays disabled until
+/// its `[modules.<name>]` section is present. The notifications block reads
+/// the facts its cross-section checks need from the same `input`.
+pub fn modules(input: &merezha_platform::ConfigInput) -> Vec<Box<dyn merezha_platform::Module>> {
+    vec![Box::new(merezha_notifications::Notifications::new(
+        merezha_notifications::HostFacts::load(input),
+    ))]
+}
 
 /// Read, validate and open an application configuration with the runtime as
 /// its guest. Blocking: call it from `spawn_blocking`. Fails

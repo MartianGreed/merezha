@@ -1,0 +1,8 @@
+Hello{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+Someone asked to reset the password of your {{ app.name }} account. Open this link to choose a new one:
+{{ secret.link | url }}
+
+If you did not ask for this, you can ignore this email. Your password stays the same.{% if links.unsubscribe %}
+
+Unsubscribe: {{ links.unsubscribe }}{% endif %}

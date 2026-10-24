@@ -1,0 +1,6 @@
+{% extends "_layouts/email.html" %}
+{% block content %}
+<p>Hello{% if recipient.name %} {{ recipient.name }}{% endif %},</p>
+<p>The webhook endpoint {{ endpoint_id }} kept failing and was disabled. Events are no longer sent to it.</p>
+<p>Fix the receiver, then enable the endpoint again. Deliveries cancelled while it was disabled can be sent again with redeliver.</p>
+{% endblock %}

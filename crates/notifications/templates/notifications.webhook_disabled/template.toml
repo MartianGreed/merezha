@@ -1,0 +1,5 @@
+description = "A webhook endpoint was disabled after repeated failures"
+required = ["endpoint_id"]
+
+[preview]
+endpoint_id = "0192f5c4-7a1e-7b3d-9c2a-5e8f1d6b4a00"

@@ -1,0 +1,3 @@
+title = "Votre mot de passe a été modifié"
+body = "Le mot de passe de votre compte {{ app.name }} a été modifié. Si ce n’était pas vous, réinitialisez-le maintenant."
+link = "{% if links.app %}{{ links.app }}{% endif %}"

@@ -1,0 +1,7 @@
+Bonjour{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+Une connexion à votre compte {{ app.name }} a eu lieu{% if signed_in_at is defined %} le {{ signed_in_at | datetime("%d/%m/%Y à %H:%M %Z") }}{% endif %}.
+
+Si c’était vous, il n’y a rien à faire. Sinon, réinitialisez votre mot de passe maintenant.{% if links.unsubscribe %}
+
+Se désabonner : {{ links.unsubscribe }}{% endif %}

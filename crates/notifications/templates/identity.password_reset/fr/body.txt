@@ -1,0 +1,8 @@
+Bonjour{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+Une réinitialisation du mot de passe de votre compte {{ app.name }} a été demandée. Ouvrez ce lien pour en choisir un nouveau :
+{{ secret.link | url }}
+
+Si vous n’êtes pas à l’origine de cette demande, ignorez cet e-mail. Votre mot de passe ne change pas.{% if links.unsubscribe %}
+
+Se désabonner : {{ links.unsubscribe }}{% endif %}

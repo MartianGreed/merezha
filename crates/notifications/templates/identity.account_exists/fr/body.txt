@@ -1,0 +1,9 @@
+Bonjour{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+Quelqu’un a tenté de créer un compte {{ app.name }} avec cette adresse e-mail, qui en possède déjà un.
+
+Si c’était vous, connectez-vous, ou réinitialisez votre mot de passe si vous l’avez oublié.{% if links.app %} {{ links.app }}{% endif %}
+
+Si ce n’était pas vous, ignorez cet e-mail. Rien n’a changé.{% if links.unsubscribe %}
+
+Se désabonner : {{ links.unsubscribe }}{% endif %}

@@ -1,0 +1,7 @@
+{% extends "_layouts/email.html" %}
+{% block unsubscribe %}Se désabonner{% endblock %}
+{% block content %}
+<p>Bonjour{% if recipient.name %} {{ recipient.name }}{% endif %},</p>
+<p>Le point de terminaison webhook {{ endpoint_id }} échouait de façon répétée et a été désactivé. Les événements ne lui sont plus envoyés.</p>
+<p>Corrigez le récepteur, puis réactivez le point de terminaison. Les livraisons annulées pendant la désactivation peuvent être renvoyées avec redeliver.</p>
+{% endblock %}

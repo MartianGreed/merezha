@@ -1,0 +1,7 @@
+{
+  "email": {
+    "html": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Tasks</title>\n</head>\n<body style=\"margin:0;padding:24px;background:#f5f5f4;font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;color:#1c1917;line-height:1.5\">\n<div style=\"max-width:560px;margin:0 auto;background:#ffffff;border-radius:8px;padding:32px\">\n\n<p>Hello Ada Lovelace,</p>\n<p>You are invited to join Acme Research on Tasks. Open this link to accept:</p>\n<p><a href=\"https:&#x2f;&#x2f;app.example.com&#x2f;invitations&#x2f;preview\" style=\"display:inline-block;padding:10px 16px;background:#1c1917;color:#ffffff;border-radius:6px;text-decoration:none\">Accept the invitation</a></p>\n<p>If you were not expecting this invitation, you can ignore this email.</p>\n\n</div>\n<p style=\"max-width:560px;margin:16px auto 0;font-size:12px;color:#78716c\">Tasks &middot; <a href=\"https:&#x2f;&#x2f;example.invalid&#x2f;v1&#x2f;notifications&#x2f;unsubscribe?token=preview\" style=\"color:#78716c\">Unsubscribe</a></p>\n</body>\n</html>",
+    "subject": "You are invited to join Acme Research on Tasks",
+    "text": "Hello Ada Lovelace,\n\nYou are invited to join Acme Research on Tasks. Open this link to accept:\nhttps://app.example.com/invitations/preview\n\nIf you were not expecting this invitation, you can ignore this email.\n\nUnsubscribe: https://example.invalid/v1/notifications/unsubscribe?token=preview"
+  }
+}

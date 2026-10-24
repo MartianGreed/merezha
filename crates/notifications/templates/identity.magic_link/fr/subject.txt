@@ -1,0 +1,1 @@
+Votre lien de connexion à {{ app.name }}
