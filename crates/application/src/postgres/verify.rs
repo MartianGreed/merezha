@@ -4,7 +4,7 @@
 //! violations. It is O(history) and never runs at startup.
 use super::{MIGRATIONS, MODULE, read_error, unsigned};
 use merezha_domain::Failure;
-use merezha_postgres::{Database, MigrationMode, ModuleMigrations, Tx, run_migrations};
+use merezha_postgres::{Database, MigrationMode, ModuleMigrations, Statement, Tx, run_migrations};
 use serde::Serialize;
 use std::time::Instant;
 
@@ -16,6 +16,62 @@ const ROW_CHUNK: i64 = 1_000;
 const MISSING_PER_CHUNK: i64 = 10;
 /// Violations listed in a report; later ones are only counted.
 pub const MAX_VIOLATIONS: usize = 100;
+
+pub(crate) const SNAPSHOT: Statement = Statement::new(
+    "app.verify.snapshot",
+    "SET",
+    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
+);
+pub(crate) const POSITIONS: Statement = Statement::new(
+    "app.verify.positions",
+    "SELECT merezha_app.events",
+    "SELECT (SELECT position FROM merezha_app.head WHERE id = 1), \
+            (SELECT coalesce(max(position), 0) FROM merezha_app.events)",
+);
+pub(crate) const GAP_COUNT: Statement = Statement::new(
+    "app.verify.gap_count",
+    "SELECT merezha_app.events",
+    "SELECT count(*) FROM merezha_app.events WHERE position > $1 AND position <= $2",
+);
+pub(crate) const GAPS: Statement = Statement::new(
+    "app.verify.gaps",
+    "SELECT merezha_app.events",
+    "SELECT s.p FROM generate_series($1::bigint + 1, $2::bigint) AS s (p) \
+      WHERE NOT EXISTS (SELECT 1 FROM merezha_app.events e WHERE e.position = s.p) \
+      ORDER BY s.p LIMIT $3",
+);
+pub(crate) const STREAMS: Statement = Statement::new(
+    "app.verify.streams",
+    "SELECT merezha_app.streams",
+    "SELECT s.stream, s.version, s.first_position, s.last_position, count(e.position), \
+            coalesce(min(e.version), 0), coalesce(max(e.version), 0), \
+            coalesce(min(e.position), 0), coalesce(max(e.position), 0) \
+       FROM (SELECT * FROM merezha_app.streams WHERE stream > $1 ORDER BY stream LIMIT $2) s \
+       LEFT JOIN merezha_app.events e ON e.stream = s.stream \
+      GROUP BY s.stream, s.version, s.first_position, s.last_position \
+      ORDER BY s.stream",
+);
+pub(crate) const RECEIPTS: Statement = Statement::new(
+    "app.verify.receipts",
+    "SELECT merezha_app.receipts",
+    "SELECT r.tag, r.tenant, r.actor, r.key, r.events, \
+            (SELECT count(*) FROM merezha_app.events e \
+              WHERE e.position > r.position - r.events AND e.position <= r.position \
+                AND e.stream = r.stream AND e.version = r.version - (r.position - e.position)) \
+       FROM merezha_app.receipts r \
+      WHERE (r.tag, r.tenant, r.actor, r.key) > ($1, $2, $3, $4) \
+      ORDER BY r.tag, r.tenant, r.actor, r.key LIMIT $5",
+);
+pub(crate) const CHECKPOINTS: Statement = Statement::new(
+    "app.verify.checkpoints",
+    "SELECT merezha_app.projections",
+    "SELECT 'projection', name, revision, checkpoint > (SELECT position FROM merezha_app.head WHERE id = 1) \
+       FROM merezha_app.projections \
+     UNION ALL \
+     SELECT 'rebuild', name, revision, checkpoint > (SELECT position FROM merezha_app.head WHERE id = 1) \
+       FROM merezha_app.projection_rebuilds \
+     ORDER BY 1, 2, 3",
+);
 
 /// What a violation concerns.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -88,16 +144,18 @@ pub async fn verify(db: &Database, deadline: Instant) -> Result<VerifyReport, Fa
     if !report.is_current() {
         return Err(Failure::permanent("storage_schema"));
     }
-    db.transaction(deadline, |tx| {
+    let handle = db.clone();
+    db.transaction(deadline, move |tx| {
         Box::pin(async move {
-            tx.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            handle
+                .batch(tx, &SNAPSHOT)
                 .await
                 .map_err(|e| read_error(&e))?;
             let mut report = VerifyReport::default();
-            positions(tx, &mut report).await?;
-            streams(tx, &mut report).await?;
-            receipts(tx, &mut report).await?;
-            checkpoints(tx, &mut report).await?;
+            positions(&handle, tx, &mut report).await?;
+            streams(&handle, tx, &mut report).await?;
+            receipts(&handle, tx, &mut report).await?;
+            checkpoints(&handle, tx, &mut report).await?;
             report.ok = report.violation_count == 0;
             Ok(report)
         })
@@ -105,13 +163,9 @@ pub async fn verify(db: &Database, deadline: Instant) -> Result<VerifyReport, Fa
     .await
 }
 
-async fn positions(tx: &Tx<'_>, report: &mut VerifyReport) -> Result<(), Failure> {
-    let row = tx
-        .query_one(
-            "SELECT (SELECT position FROM merezha_app.head WHERE id = 1), \
-                    (SELECT coalesce(max(position), 0) FROM merezha_app.events)",
-            &[],
-        )
+async fn positions(db: &Database, tx: &Tx<'_>, report: &mut VerifyReport) -> Result<(), Failure> {
+    let row = db
+        .query_one(tx, &POSITIONS, &[])
         .await
         .map_err(|e| read_error(&e))?;
     let head: i64 = row.get(0);
@@ -123,23 +177,15 @@ async fn positions(tx: &Tx<'_>, report: &mut VerifyReport) -> Result<(), Failure
     let mut low = 0;
     while low < max {
         let high = (low + POSITION_CHUNK).min(max);
-        let count: i64 = tx
-            .query_one(
-                "SELECT count(*) FROM merezha_app.events WHERE position > $1 AND position <= $2",
-                &[&low, &high],
-            )
+        let count: i64 = db
+            .query_one(tx, &GAP_COUNT, &[&low, &high])
             .await
             .map_err(|e| read_error(&e))?
             .get(0);
         report.events += unsigned(count)?;
         if count != high - low {
-            for row in tx
-                .query(
-                    "SELECT s.p FROM generate_series($1::bigint + 1, $2::bigint) AS s (p) \
-                      WHERE NOT EXISTS (SELECT 1 FROM merezha_app.events e WHERE e.position = s.p) \
-                      ORDER BY s.p LIMIT $3",
-                    &[&low, &high, &MISSING_PER_CHUNK],
-                )
+            for row in db
+                .query(tx, &GAPS, &[&low, &high, &MISSING_PER_CHUNK])
                 .await
                 .map_err(|e| read_error(&e))?
             {
@@ -157,20 +203,11 @@ async fn positions(tx: &Tx<'_>, report: &mut VerifyReport) -> Result<(), Failure
     Ok(())
 }
 
-async fn streams(tx: &Tx<'_>, report: &mut VerifyReport) -> Result<(), Failure> {
+async fn streams(db: &Database, tx: &Tx<'_>, report: &mut VerifyReport) -> Result<(), Failure> {
     let mut after = String::new();
     loop {
-        let rows = tx
-            .query(
-                "SELECT s.stream, s.version, s.first_position, s.last_position, count(e.position), \
-                        coalesce(min(e.version), 0), coalesce(max(e.version), 0), \
-                        coalesce(min(e.position), 0), coalesce(max(e.position), 0) \
-                   FROM (SELECT * FROM merezha_app.streams WHERE stream > $1 ORDER BY stream LIMIT $2) s \
-                   LEFT JOIN merezha_app.events e ON e.stream = s.stream \
-                  GROUP BY s.stream, s.version, s.first_position, s.last_position \
-                  ORDER BY s.stream",
-                &[&after, &ROW_CHUNK],
-            )
+        let rows = db
+            .query(tx, &STREAMS, &[&after, &ROW_CHUNK])
             .await
             .map_err(|e| read_error(&e))?;
         for row in &rows {
@@ -198,18 +235,13 @@ async fn streams(tx: &Tx<'_>, report: &mut VerifyReport) -> Result<(), Failure> 
     }
 }
 
-async fn receipts(tx: &Tx<'_>, report: &mut VerifyReport) -> Result<(), Failure> {
+async fn receipts(db: &Database, tx: &Tx<'_>, report: &mut VerifyReport) -> Result<(), Failure> {
     let mut after = [String::new(), String::new(), String::new(), String::new()];
     loop {
-        let rows = tx
+        let rows = db
             .query(
-                "SELECT r.tag, r.tenant, r.actor, r.key, r.events, \
-                        (SELECT count(*) FROM merezha_app.events e \
-                          WHERE e.position > r.position - r.events AND e.position <= r.position \
-                            AND e.stream = r.stream AND e.version = r.version - (r.position - e.position)) \
-                   FROM merezha_app.receipts r \
-                  WHERE (r.tag, r.tenant, r.actor, r.key) > ($1, $2, $3, $4) \
-                  ORDER BY r.tag, r.tenant, r.actor, r.key LIMIT $5",
+                tx,
+                &RECEIPTS,
                 &[&after[0], &after[1], &after[2], &after[3], &ROW_CHUNK],
             )
             .await
@@ -239,17 +271,9 @@ async fn receipts(tx: &Tx<'_>, report: &mut VerifyReport) -> Result<(), Failure>
     }
 }
 
-async fn checkpoints(tx: &Tx<'_>, report: &mut VerifyReport) -> Result<(), Failure> {
-    let rows = tx
-        .query(
-            "SELECT 'projection', name, revision, checkpoint > (SELECT position FROM merezha_app.head WHERE id = 1) \
-               FROM merezha_app.projections \
-             UNION ALL \
-             SELECT 'rebuild', name, revision, checkpoint > (SELECT position FROM merezha_app.head WHERE id = 1) \
-               FROM merezha_app.projection_rebuilds \
-             ORDER BY 1, 2, 3",
-            &[],
-        )
+async fn checkpoints(db: &Database, tx: &Tx<'_>, report: &mut VerifyReport) -> Result<(), Failure> {
+    let rows = db
+        .query(tx, &CHECKPOINTS, &[])
         .await
         .map_err(|e| read_error(&e))?;
     for row in &rows {

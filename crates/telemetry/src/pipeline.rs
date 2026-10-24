@@ -851,12 +851,23 @@ impl Telemetry {
         ))
     }
 
-    /// A meter for `module`'s instruments; a no-op meter when metrics are
-    /// not exported. Libraries build their instruments once from it.
+    /// A meter for `module`'s instruments, the same as
+    /// `self.meters().meter(module)`; a no-op meter when metrics are not
+    /// exported. Libraries build their instruments once from it.
     pub fn meter(&self, module: &'static str) -> Meter {
         match &self.meter_provider {
             Some(provider) => provider.meter(module),
             None => opentelemetry::metrics::noop::NoopMeterProvider::new().meter(module),
+        }
+    }
+    /// The meter source handed to the host and every library
+    /// (`HostOptions::meters`): the SDK provider, enabled, when metrics are
+    /// exported; [`crate::Meters::noop`] otherwise. The single meter API;
+    /// [`Telemetry::meter`] is `meters().meter(scope)`.
+    pub fn meters(&self) -> crate::Meters {
+        match &self.meter_provider {
+            Some(provider) => crate::Meters::new(provider.clone()),
+            None => crate::Meters::default(),
         }
     }
     /// Whether any OTLP provider runs.

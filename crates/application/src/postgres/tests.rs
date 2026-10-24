@@ -379,3 +379,201 @@ fn an_append_that_answered_keeps_its_outcome_when_only_the_reset_fails_or_is_lat
     }
     assert_eq!(count(&runtime, test.url(), "events"), 2);
 }
+
+/// A counter whose projection fails while `fail` is set.
+#[derive(Clone, Default)]
+struct Flaky {
+    counter: Counter,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Guest for Flaky {
+    fn services(&self) -> Result<Vec<String>, Failure> {
+        self.counter.services()
+    }
+    fn session(&self) -> Result<Box<dyn GuestSession>, Failure> {
+        Ok(Box::new(self.clone()))
+    }
+}
+impl GuestSession for Flaky {
+    fn invoke(&self, service: &str, op: Operation) -> Result<Reply, Failure> {
+        if matches!(op, Operation::Project { .. })
+            && self.fail.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Failure::permanent("guest_error"));
+        }
+        self.counter.invoke(service, op)
+    }
+}
+
+/// TE §1.3 (T4, owed by AP-A2): the store runs registered statements only,
+/// the append reports as `app.events.append`, and driving every store path
+/// (commands, a replay, reads, a catch-up commit, a paused rebuild, a
+/// failing rebuild with resume and abandon, the admin reads, a recorded
+/// failure and `verify`) exercises exactly the statements `STATEMENTS`
+/// lists.
+#[test]
+fn the_store_runs_exactly_its_registered_statements_and_reports_the_append() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    assert_eq!(
+        merezha_postgres::check_registry(&[merezha_postgres::KERNEL_STATEMENTS, STATEMENTS]),
+        Ok(())
+    );
+    let harness = merezha_telemetry::testing::Harness::new();
+    let runtime = runtime();
+    let meter = harness
+        .telemetry()
+        .meters()
+        .meter(merezha_postgres::METER_SCOPE);
+    let db = Database::connect_with_meter(&test.config(), &meter)
+        .unwrap()
+        .for_module(MODULE);
+    let deadline = || Instant::now() + Duration::from_secs(30);
+    let pause = Arc::new(Pause::default());
+    let options = PostgresOptions {
+        background: BackgroundOptions {
+            catch_up: CatchUp::Manual,
+            interval: Duration::from_secs(600),
+            hooks: RunHooks {
+                pause: Some(pause.clone()),
+                ..RunHooks::default()
+            },
+            ..BackgroundOptions::default()
+        },
+        ..PostgresOptions::default()
+    };
+    let guest = Flaky::default();
+    let config = config();
+    let projection = config.projections[0].clone();
+    let caller = tracing::info_span!(target: "merezha_test", "caller");
+    let _entered = caller.enter();
+    let modules = [ModuleMigrations {
+        module: MODULE,
+        migrations: MIGRATIONS,
+    }];
+    runtime
+        .block_on(run_migrations(
+            &db,
+            &modules,
+            MigrationMode::Apply,
+            deadline(),
+        ))
+        .unwrap();
+    let store = Arc::new(
+        runtime
+            .block_on(PostgresStore::connect(&db, &config, options, deadline()))
+            .unwrap(),
+    );
+    let app = Application::with_postgres(
+        config.clone(),
+        Arc::new(guest.clone()),
+        Arc::new(AllowAll),
+        store.clone(),
+    )
+    .unwrap();
+    app.command(command(Some("k1"))).unwrap();
+    app.command(command(Some("k1"))).unwrap();
+    app.command(command(None)).unwrap();
+    app.query(
+        serde_json::from_value(
+            json!({"tag":"Total","payload":{},"metadata":{"message_id":"q","correlation_id":"c"}}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let stream = Identity::new("one").unwrap();
+    store.load(&stream, deadline()).unwrap();
+    store.read_all(0, 10, deadline()).unwrap();
+    store.head(deadline()).unwrap();
+    let reference = ProjectionRef {
+        name: &projection.name,
+        revision: projection.revision,
+    };
+    let (pair, row_revision) = store.projection(&reference, deadline()).unwrap();
+    store
+        .commit_projection(&reference, row_revision, &pair, deadline())
+        .unwrap();
+    // A rebuild whose commits pause in a server-side sleep.
+    pause.arm_statement(projection.name.as_str(), Duration::from_millis(10));
+    app.rebuild("total").unwrap();
+    // A rebuild that fails, resumed, then abandoned.
+    guest.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(app.rebuild("total").unwrap_err().code, "guest_error");
+    guest.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    store
+        .request_rebuild(&projection, true, None, deadline())
+        .unwrap();
+    store.rebuild_status(&projection, deadline()).unwrap();
+    store.abandon_rebuild(&projection, deadline()).unwrap();
+    store.overview(&[&projection], deadline()).unwrap();
+    store.revisions(&projection.name, deadline()).unwrap();
+    assert_eq!(
+        store
+            .delete_revision(&projection.name, 99, deadline())
+            .unwrap_err()
+            .code,
+        "projection_not_found"
+    );
+    runtime
+        .block_on(store.record_failure(
+            projection.name.as_str().to_owned(),
+            projection.revision as i32,
+            &Failure::transient("database_timeout"),
+            deadline(),
+        ))
+        .unwrap();
+    assert!(runtime.block_on(verify(&db, deadline())).unwrap().ok);
+    // A missing position makes `verify` list the gap.
+    runtime.block_on(async {
+        let client = db.acquire(deadline()).await.unwrap();
+        client
+            .batch_execute(
+                "ALTER TABLE merezha_app.events DISABLE TRIGGER USER; \
+                 DELETE FROM merezha_app.events WHERE position = 1",
+            )
+            .await
+            .unwrap();
+    });
+    assert!(!runtime.block_on(verify(&db, deadline())).unwrap().ok);
+    drop(_entered);
+
+    let spans: Vec<_> = harness
+        .spans()
+        .into_iter()
+        .filter(|s| s.span_kind == opentelemetry::trace::SpanKind::Client)
+        .collect();
+    let name = |span: &opentelemetry_sdk::trace::SpanData| {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "merezha.db.statement")
+            .map(|kv| kv.value.to_string())
+            .expect("every client span names its statement")
+    };
+    let seen: std::collections::BTreeSet<String> = spans.iter().map(name).collect();
+    let kernel: std::collections::BTreeSet<&str> = merezha_postgres::KERNEL_STATEMENTS
+        .iter()
+        .map(|s| s.name)
+        .collect();
+    let store_seen: std::collections::BTreeSet<&str> = seen
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !kernel.contains(n))
+        .collect();
+    let registered: std::collections::BTreeSet<&str> = STATEMENTS.iter().map(|s| s.name).collect();
+    assert_eq!(store_seen, registered);
+    let appends = spans
+        .iter()
+        .filter(|s| name(s) == APPEND_STATEMENT)
+        .collect::<Vec<_>>();
+    assert_eq!(appends.len(), 2, "the replay reads its receipt instead");
+    assert_eq!(appends[0].name, "INSERT merezha_app.events");
+    assert_eq!(
+        harness.metric("db.client.operation.duration").value(&[
+            ("db.operation.name", "INSERT"),
+            ("db.collection.name", "merezha_app.events"),
+            ("merezha.module", MODULE),
+        ]),
+        Some(2.0)
+    );
+}

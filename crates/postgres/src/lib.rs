@@ -2,10 +2,18 @@
 //! pool, deadline-scoped transactions, the module migration runner and a test
 //! harness. Errors are classified [`Failure`] values with stable codes; no
 //! error carries SQL text, server messages or connection strings.
+//!
+//! Every statement runs under a registered [`Statement`] name
+//! ([`statement`]), timed in `db.client.operation.duration` and traced
+//! without SQL text or values (TE §1.3, T4).
+mod instruments;
 mod listen;
 mod migrate;
+pub mod statement;
 mod testing;
 mod tls;
+
+pub use statement::{KERNEL_STATEMENTS, Session, Statement, check_registry};
 
 pub use deadpool_postgres::Transaction;
 pub use listen::{Listener, MAX_PENDING_NOTIFICATIONS, Notification};
@@ -23,7 +31,10 @@ pub use testing::{REQUIRE_DATABASE_ENV, TEST_DATABASE_ENV, TestDatabase};
 pub use tokio_postgres;
 
 use deadpool_postgres::{Manager, ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime};
-use merezha_domain::Failure;
+use instruments::{Instruments, Telemetry, record_failure};
+use merezha_domain::{Classification, Failure};
+use opentelemetry::metrics::Meter;
+use statement::kernel;
 use std::{
     future::Future,
     path::PathBuf,
@@ -33,6 +44,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio_postgres::error::SqlState;
+use tracing::Instrument;
 
 /// A boxed `Send` future, used where trait objects or higher-ranked closures
 /// cannot name their future type.
@@ -188,6 +200,9 @@ pub struct PoolStatus {
 /// running statement, and ends the session, releasing its locks.
 pub const CONNECTION_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Instrumentation scope of the pool's meter.
+pub const METER_SCOPE: &str = "merezha-postgres";
+
 /// A cloneable handle to the bounded pool.
 #[derive(Clone)]
 pub struct Database {
@@ -197,10 +212,14 @@ pub struct Database {
     acquire_timeout: Duration,
     statement_timeout: Duration,
     detached: Arc<tokio::sync::Semaphore>,
+    /// Instruments shared by every clone, and the module this handle is
+    /// scoped to.
+    telemetry: Telemetry,
 }
 impl std::fmt::Debug for Database {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Database")
+            .field("module", &self.telemetry.module())
             .field("status", &self.status())
             .finish_non_exhaustive()
     }
@@ -209,9 +228,21 @@ impl std::fmt::Debug for Database {
 pub type PooledClient = deadpool_postgres::Object;
 
 impl Database {
-    /// Build the pool. Connections open lazily; call [`Database::ping`] to
-    /// prove reachability. Fails `invalid_database_config` or `tls_config`.
+    /// Build the pool with no-op instruments. Connections open lazily; call
+    /// [`Database::ping`] to prove reachability. Fails
+    /// `invalid_database_config` or `tls_config`.
     pub fn connect(config: &DatabaseConfig) -> Result<Self, Failure> {
+        Self::connect_with_meter(
+            config,
+            &merezha_telemetry::Meters::default().meter(METER_SCOPE),
+        )
+    }
+    /// [`Database::connect`] with the PostgreSQL instruments of TE §1.3
+    /// built once from `meter`: `db.client.operation.duration`, the pool
+    /// gauges, `db.client.connection.wait_time` and `.timeouts`,
+    /// `merezha.db.listener.reconnects` and `merezha.db.migrations.pending`.
+    /// The host passes the meter of scope [`METER_SCOPE`].
+    pub fn connect_with_meter(config: &DatabaseConfig, meter: &Meter) -> Result<Self, Failure> {
         if !config.validate().is_empty() {
             return Err(Failure::permanent("invalid_database_config"));
         }
@@ -258,29 +289,69 @@ impl Database {
             .runtime(Runtime::Tokio1)
             .build()
             .map_err(|_| Failure::permanent("invalid_database_config"))?;
+        let detached = Arc::new(tokio::sync::Semaphore::new(config.max_detached));
+        let telemetry = Telemetry::new(Instruments::new(
+            meter,
+            &pool,
+            &detached,
+            config.max_detached,
+        ));
         Ok(Self {
             pool,
             session,
             acquire_timeout: config.acquire_timeout,
             statement_timeout: config.statement_timeout,
-            detached: Arc::new(tokio::sync::Semaphore::new(config.max_detached)),
+            detached,
+            telemetry,
         })
     }
-    /// Acquire a pooled client before `deadline` and within the configured
-    /// acquisition timeout.
-    pub async fn acquire(&self, deadline: Instant) -> Result<PooledClient, Failure> {
-        let bound = deadline.min(Instant::now() + self.acquire_timeout);
-        match tokio::time::timeout_at(bound.into(), self.pool.get()).await {
-            Ok(Ok(client)) => Ok(client),
-            Ok(Err(error)) => Err(pool_failure(&error)),
-            Err(_) => Err(Failure::transient("database_busy")),
+    /// This pool, with statements, transactions and listeners labelled
+    /// `merezha.module = module` (a module name, closed at startup). The
+    /// host hands each module a handle scoped to its name; an unscoped
+    /// handle labels them `kernel`. Clones share the pool and instruments.
+    pub fn for_module(&self, module: &'static str) -> Self {
+        Self {
+            telemetry: self.telemetry.for_module(module),
+            ..self.clone()
         }
     }
-    /// Run `SELECT 1` on a pooled connection before `deadline`.
+    /// The module this handle is scoped to (`kernel` when unscoped).
+    pub fn module(&self) -> &str {
+        self.telemetry.module()
+    }
+    /// Acquire a pooled client before `deadline` and within the configured
+    /// acquisition timeout. The wait is recorded in
+    /// `db.client.connection.wait_time`; giving up counts in
+    /// `db.client.connection.timeouts` and logs `db.pool_timeout` (at most
+    /// every 10 s).
+    pub async fn acquire(&self, deadline: Instant) -> Result<PooledClient, Failure> {
+        let started = Instant::now();
+        let bound = deadline.min(started + self.acquire_timeout);
+        match tokio::time::timeout_at(bound.into(), self.pool.get()).await {
+            Ok(Ok(client)) => {
+                self.telemetry.acquired(started.elapsed());
+                Ok(client)
+            }
+            Ok(Err(error)) => {
+                let failure = pool_failure(&error);
+                if failure.code == "database_busy" {
+                    self.telemetry.pool_timeout();
+                }
+                Err(failure)
+            }
+            Err(_) => {
+                self.telemetry.pool_timeout();
+                Err(Failure::transient("database_busy"))
+            }
+        }
+    }
+    /// Run `SELECT 1` ([`statement::kernel::PING`]) on a pooled connection
+    /// before `deadline`.
     pub async fn ping(&self, deadline: Instant) -> Result<(), Failure> {
         let client = self.acquire(deadline).await?;
-        match tokio::time::timeout_at(deadline.into(), client.simple_query("SELECT 1")).await {
-            Ok(Ok(_)) => Ok(()),
+        let probe = self.telemetry.probe(&client, &kernel::PING);
+        match tokio::time::timeout_at(deadline.into(), probe).await {
+            Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(classify(&error)),
             Err(_) => Err(Failure::transient("database_timeout")),
         }
@@ -293,14 +364,21 @@ impl Database {
     /// interrupted commit returns `commit_outcome_unknown`: the caller must
     /// not assume a rollback.
     ///
+    /// Inside a caller's span the transaction is the span
+    /// `transaction {module}`, carrying the pool wait as
+    /// `merezha.db.pool.wait` (seconds); its statements are its children.
+    ///
     /// ```no_run
     /// # async fn example(db: merezha_postgres::Database) -> Result<(), merezha_domain::Failure> {
+    /// const ANSWER: merezha_postgres::Statement =
+    ///     merezha_postgres::Statement::new("example.answer", "SELECT", "SELECT 40 + 2");
     /// let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     /// let total: i64 = db
     ///     .transaction(deadline, |tx| {
+    ///         let db = db.clone();
     ///         Box::pin(async move {
-    ///             let row = tx
-    ///                 .query_one("SELECT 40 + 2", &[])
+    ///             let row = db
+    ///                 .query_one(tx, &ANSWER, &[])
     ///                 .await
     ///                 .map_err(|e| merezha_postgres::classify(&e))?;
     ///             Ok(row.get::<_, i32>(0) as i64)
@@ -314,8 +392,26 @@ impl Database {
         T: Send,
         F: for<'t> FnOnce(&'t mut Tx<'_>) -> BoxFuture<'t, Result<T, Failure>> + Send,
     {
-        let mut client = self.acquire(deadline).await?;
-        run_transaction(&mut client, self.statement_timeout, deadline, work).await
+        let span = self.telemetry.transaction_span();
+        let wait = span.clone();
+        let run = async move {
+            let started = Instant::now();
+            let mut client = self.acquire(deadline).await?;
+            wait.record("merezha.db.pool.wait", started.elapsed().as_secs_f64());
+            run_transaction(
+                &self.telemetry,
+                &mut client,
+                self.statement_timeout,
+                deadline,
+                work,
+            )
+            .await
+        };
+        let result = run.instrument(span.clone()).await;
+        if let Err(failure) = &result {
+            record_failure(&span, failure);
+        }
+        result
     }
     /// Take a connection out of the pool for a long-lived session, such as
     /// one holding a session advisory lock. The pool reopens the slot; the
@@ -331,7 +427,9 @@ impl Database {
     /// waits for one to drop, within `acquire_timeout` and the deadline, and
     /// then fails transient `database_busy`.
     pub async fn detach(&self, deadline: Instant) -> Result<DetachedClient, Failure> {
-        let bound = deadline.min(Instant::now() + self.acquire_timeout);
+        let started = Instant::now();
+        let bound = deadline.min(started + self.acquire_timeout);
+        let waiting = self.telemetry.detached_waiting();
         let permit = match tokio::time::timeout_at(
             bound.into(),
             self.detached.clone().acquire_owned(),
@@ -340,19 +438,22 @@ impl Database {
         {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => return Err(Failure::transient("database_closed")),
-            Err(_) => return Err(Failure::transient("database_busy")),
+            Err(_) => {
+                drop(waiting);
+                self.telemetry.detached_timeout();
+                return Err(Failure::transient("database_busy"));
+            }
         };
+        drop(waiting);
+        self.telemetry.detached_acquired(started.elapsed());
         let pooled = self.acquire(deadline).await?;
         let client = deadpool_postgres::Object::take(pooled);
         // A dropped client only closes its socket. Without this setting a
         // backend busy in a long statement (a `CREATE INDEX CONCURRENTLY`
         // waiting for older transactions, say) keeps running, and keeps the
         // session's advisory locks, until its statement timeout.
-        let set = format!(
-            "SET client_connection_check_interval = {}",
-            CONNECTION_CHECK_INTERVAL.as_millis()
-        );
-        match tokio::time::timeout_at(deadline.into(), client.batch_execute(&set)).await {
+        let set = self.telemetry.batch(&client, &kernel::CONNECTION_CHECK);
+        match tokio::time::timeout_at(deadline.into(), set).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(classify(&error)),
             Err(_) => return Err(Failure::transient("database_timeout")),
@@ -360,6 +461,7 @@ impl Database {
         Ok(DetachedClient {
             client,
             statement_timeout: self.statement_timeout,
+            telemetry: self.telemetry.clone(),
             _permit: permit,
         })
     }
@@ -372,7 +474,7 @@ impl Database {
     /// Fails permanent `invalid_input` for bad channel names, else like
     /// [`Database::ping`].
     pub async fn listen(&self, channels: &[&str], deadline: Instant) -> Result<Listener, Failure> {
-        listen::open(&self.session, channels, deadline).await
+        listen::open(&self.session, &self.telemetry, channels, deadline).await
     }
     /// The configured per-statement ceiling.
     pub fn statement_timeout(&self) -> Duration {
@@ -404,6 +506,7 @@ impl Database {
 pub struct DetachedClient {
     client: deadpool_postgres::ClientWrapper,
     statement_timeout: Duration,
+    telemetry: Telemetry,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 impl std::fmt::Debug for DetachedClient {
@@ -426,12 +529,26 @@ impl DetachedClient {
         T: Send,
         F: for<'t> FnOnce(&'t mut Tx<'_>) -> BoxFuture<'t, Result<T, Failure>> + Send,
     {
-        run_transaction(&mut self.client, self.statement_timeout, deadline, work).await
+        let span = self.telemetry.transaction_span();
+        let result = run_transaction(
+            &self.telemetry,
+            &mut self.client,
+            self.statement_timeout,
+            deadline,
+            work,
+        )
+        .instrument(span.clone())
+        .await;
+        if let Err(failure) = &result {
+            record_failure(&span, failure);
+        }
+        result
     }
 }
 
 /// The transaction contract shared by pooled and detached clients.
 async fn run_transaction<T, F>(
+    telemetry: &Telemetry,
     client: &mut deadpool_postgres::ClientWrapper,
     ceiling: Duration,
     deadline: Instant,
@@ -443,13 +560,15 @@ where
 {
     let budget = statement_budget(deadline, ceiling)?;
     let at = tokio::time::Instant::from_std(deadline);
-    let mut transaction = match tokio::time::timeout_at(at, client.transaction()).await {
+    let begin = telemetry.observe(&kernel::BEGIN, client.transaction());
+    let mut transaction = match tokio::time::timeout_at(at, begin).await {
         Ok(Ok(transaction)) => transaction,
         Ok(Err(error)) => return Err(classify(&error)),
         Err(_) => return Err(Failure::transient("database_timeout")),
     };
     let set = format!("SET LOCAL statement_timeout = {}", budget.as_millis());
-    match tokio::time::timeout_at(at, transaction.batch_execute(&set)).await {
+    let bound = telemetry.batch_text(&transaction, &kernel::TRANSACTION_TIMEOUT, &set);
+    match tokio::time::timeout_at(at, bound).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => return Err(classify(&error)),
         Err(_) => return Err(Failure::transient("database_timeout")),
@@ -460,7 +579,8 @@ where
         Ok(Err(failure)) => return Err(failure),
         Err(_) => return Err(Failure::transient("database_timeout")),
     };
-    match tokio::time::timeout_at(at, transaction.commit()).await {
+    let commit = telemetry.observe(&kernel::COMMIT, transaction.commit());
+    match tokio::time::timeout_at(at, commit).await {
         Ok(Ok(())) => Ok(value),
         Ok(Err(error)) if error.as_db_error().is_some() => Err(classify(&error)),
         _ => Err(Failure::transient("commit_outcome_unknown")),
@@ -491,27 +611,33 @@ fn pool_failure(error: &PoolError) -> Failure {
 /// Map a driver error to a stable classified failure. Server messages,
 /// details and SQL never leave this function.
 pub fn classify(error: &tokio_postgres::Error) -> Failure {
+    let (classification, code) = failure_code(error);
+    Failure::new(code, classification)
+}
+
+/// The classification and code [`classify`] gives `error`.
+pub(crate) fn failure_code(error: &tokio_postgres::Error) -> (Classification, &'static str) {
     let Some(code) = error.code() else {
-        return Failure::transient("database_unavailable");
+        return (Classification::Transient, "database_unavailable");
     };
     if *code == SqlState::T_R_SERIALIZATION_FAILURE || *code == SqlState::T_R_DEADLOCK_DETECTED {
-        Failure::conflict("database_conflict")
+        (Classification::Conflict, "database_conflict")
     } else if *code == SqlState::UNIQUE_VIOLATION {
-        Failure::conflict("unique_violation")
+        (Classification::Conflict, "unique_violation")
     } else if *code == SqlState::QUERY_CANCELED {
-        Failure::transient("database_timeout")
+        (Classification::Transient, "database_timeout")
     } else if *code == SqlState::LOCK_NOT_AVAILABLE {
-        Failure::transient("database_busy")
+        (Classification::Transient, "database_busy")
     } else if code.code().starts_with("08")
         || code.code().starts_with("53")
         || code.code().starts_with("57P")
     {
         // Connection exceptions, insufficient resources, operator intervention.
-        Failure::transient("database_unavailable")
+        (Classification::Transient, "database_unavailable")
     } else if code.code().starts_with("23") {
-        Failure::permanent("constraint_violation")
+        (Classification::Permanent, "constraint_violation")
     } else {
-        Failure::permanent("database_error")
+        (Classification::Permanent, "database_error")
     }
 }
 

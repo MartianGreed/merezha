@@ -149,6 +149,9 @@ fn transport(error: reqwest::Error) -> Failure {
 #[derive(Clone)]
 pub struct AppContext {
     inner: Arc<Inner>,
+    /// The pool, scoped to [`AppContext::module`] so its statements are
+    /// labelled with the module (TE §1.3).
+    database: Database,
     /// The module this context was handed to, which fixes the sources it
     /// may write as. `None` for the host's own context.
     module: Option<Source>,
@@ -232,8 +235,11 @@ impl AppContext {
     pub fn instance_id(&self) -> &str {
         &self.inner.instance_id
     }
+    /// The pool. A module's context hands it out scoped to the module:
+    /// its statements, transactions and listeners carry
+    /// `merezha.module = <module>`.
     pub fn database(&self) -> &Database {
-        &self.inner.database
+        &self.database
     }
     /// `database.migrate`: this host applies schema changes at startup.
     /// Modules with schema work of their own beyond migrations (content
@@ -257,10 +263,11 @@ impl AppContext {
     }
     /// This context as handed to module `name`: its handles can only be
     /// bound to `name`. The host binds each module's context at start.
-    pub(crate) fn for_module(&self, name: &str, extra: &[&str]) -> Result<Self, Failure> {
+    pub(crate) fn for_module(&self, name: &'static str, extra: &[&str]) -> Result<Self, Failure> {
         check_source_grants(name, extra)?;
         Ok(Self {
             inner: self.inner.clone(),
+            database: self.inner.database.for_module(name),
             module: Some(Source::new(name)?),
             granted: extra
                 .iter()
@@ -394,6 +401,7 @@ impl AppContextBuilder {
         Ok(AppContext {
             module: None,
             granted: Vec::new(),
+            database: self.database.clone(),
             inner: Arc::new(Inner {
                 app_id: self.app_id,
                 instance_id: self.instance_id,
@@ -516,6 +524,9 @@ mod tests {
         }
         let content = host.for_module("content", &[]).unwrap();
         assert_eq!(content.module(), Some("content"));
+        // Its pool handle labels statements with the module (TE §1.3).
+        assert_eq!(content.database().module(), "content");
+        assert_eq!(host.database().module(), "kernel");
         assert_eq!(
             content.outbox("content").unwrap().source().as_str(),
             "content"

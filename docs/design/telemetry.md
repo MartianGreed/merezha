@@ -128,7 +128,9 @@ installed by the binary; tests use scoped dispatchers (§8).
 No spans for: `/health/*` requests (metrics only), empty job-lease polls,
 empty relay batches, projection and reactor ticks with no new events, and pool
 acquisitions (their wait is the `merezha.db.pool.wait` attribute on the
-statement span plus a histogram).
+transaction span plus a histogram). DB statement and transaction spans never
+start a trace (T4): outside a caller's span (readiness probes, listener
+probes, background polls) a statement only counts in the metrics.
 
 ### 1.3 Metric catalog
 
@@ -233,7 +235,16 @@ Statements are registered statically: `merezha-postgres` exposes
 `Statement { name, summary, sql }`. `name` (`app.events.append`) becomes
 `merezha.db.statement`; `summary` (`INSERT merezha_app.events`) becomes the
 span name and `db.query.summary`; operation and collection derive from it.
-Unregistered SQL reports as `merezha.db.statement=adhoc` and fails review.
+`Statement::new` checks both at compile time, and `adhoc` is a reserved
+name. Statements run through `Database::query`, `execute` and their
+siblings, which take any session (pooled client, `Tx`, detached client);
+text built at run time runs through `batch_text` under a registered name.
+SQL sent through the driver directly is invisible to telemetry rather than
+reported as `adhoc` (T4: `Tx` stays the driver's transaction type so blocks
+keep compiling), so it fails review instead; a source scan in
+`merezha-postgres` keeps the kernel's own SQL on the registry.
+`error.type` is the `classify` code (`unique_violation`), or `cancelled` when
+the caller dropped a statement before the server answered.
 Pool gauges read `deadpool` `Pool::status()`, which does no I/O.
 
 **Jobs and outbox** (application platform, part B)
@@ -1151,8 +1162,8 @@ K2.
 | T1 | `merezha-telemetry` core: feature split, `names.rs` with every block's rows, config section and validation (extending K's `[telemetry]`), resource from `app.instance_id`, three providers, guarded and allowlist processors, counting exporters, JSON formatter (replaces `merezha_cli::emit`, keeping its field names), event macro and catalog, shutdown flush, test harness | All §8 config tests pass. The collector-down test passes for both protocols within its bounds. Exact drop accounting holds. Existing CLI process tests still find `listener.ready` on stderr with the same fields. `startup.failed` logs at error. The canary test passes for the startup path. With `signals = []`, no OTel threads start. A library built with default features links no SDK exporter. |
 | T2 | Edge and health: HTTP server spans and metrics, traceparent trust policy and links, `x-request-id`, early listener with `starting` gating and its registered code, `/health/startup`, cached readiness with module warm-up, drain sequence, `/v1/admin/status` (database, telemetry and modules sections) | The §8 HTTP, propagation-at-edge and health tests pass. Readiness is independent of the collector. Status is gated by `system.status.read` at application scope and passes the canary scan. |
 | T3 | Runtime and application: `spawn_blocking_in_span` everywhere plus the clippy ban, guest spans and metrics (peak memory and fuel accounting in `merezha-runtime`), command, query and projection spans and metrics, outcome mapping, lag gauges and sampler, host-minted correlation ids, filling and reading AP's `events.trace_parent`/`trace_state`, projection links, the status `application` section from `Application::status()` (AP-A3) | The guest outcome matrix, the command outcome matrix, the lag test, the correlation tests and the cardinality tests pass. `merezha-runtime` gains no dependency beyond `tracing`, the `opentelemetry` API and `merezha-telemetry` default features. |
-| T4 | PostgreSQL: `Statement` registry, DB spans and duration metric, pool gauges and timeouts, listener reconnects, migration spans and pending gauge | The DB tests pass. No span contains SQL text or values (canary via unique violation). Every statement in the kernel and the application store is registered. |
-| T5 | Jobs and outbox: filling and reading AP-B1's `trace_parent`/`trace_state` columns, `send`, `relay` and `process` spans, every `merezha.job.*` and `merezha.outbox.*` instrument including the gauges and their sampler over `JobsHandle::queue_status()`, replay links, the status `jobs` section | The full outbox propagation test (§8, steps 1–7) passes on PostgreSQL, including the unsampled case. The dead-letter counter is exact. AP-B2 defines no instrument of its own. |
+| T4 | PostgreSQL: `Statement` registry, DB spans and duration metric, pool gauges (the pool, detached sessions, listener sessions) and timeouts, listener reconnects, migration spans and pending gauge | The DB tests pass. No span contains SQL text or values (canary via unique violation). Every statement in the kernel and the application store is registered. Jobs, content and `merezha content diff` adopt the registry in T5 and content's next slice (issue #41). |
+| T5 | Jobs and outbox: filling and reading AP-B1's `trace_parent`/`trace_state` columns, `send`, `relay` and `process` spans, every `merezha.job.*` and `merezha.outbox.*` instrument including the gauges and their sampler over `JobsHandle::queue_status()`, replay links, the status `jobs` section; every `merezha-jobs` statement registered with T4's `Statement` registry (issue #41) and its legacy `event = "…"` calls moved to `event!` | The full outbox propagation test (§8, steps 1–7) passes on PostgreSQL, including the unsampled case. The dead-letter counter is exact. AP-B2 defines no instrument of its own. `merezha_jobs::STATEMENTS` passes `check_registry` beside the kernel's, and `merezha_postgres::statement::scan_sources` finds no unregistered SQL in `crates/jobs/src`. |
 | T6 | Block instrumentation, landing in those blocks' PRs as a checklist owned by this design: `Endpoint` descriptors on the AppContext client and `outbound_hosts` injection; identity, notifications and content rows of §1.3, §1.5 and §4; reactor rows in AP-C3 | Each block PR includes its rows and passes the catalog test and the canary test for its inputs (password, token, session id, recipient, `secret_data`, body, field values). The fake provider receives no `traceparent`. |
 | T7 | Local stack and artifacts: `deploy/telemetry/` dashboards and rules, `merezha telemetry export`, the scaffold's `ops/telemetry/`, the Contremaitre manifest for the example application, the operations guide section (production backends, sampling, collector topology) | `promtool check rules` and a dashboard JSON schema lint pass in CI. In the Contremaitre environment, one command produces a trace visible in Tempo with linked logs in Loki and a populated overview dashboard, checked by a verification profile that queries the Tempo and Prometheus HTTP APIs inside the `otel` service. |
 

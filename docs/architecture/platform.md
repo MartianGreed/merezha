@@ -448,7 +448,7 @@ directory relative paths resolve against (the canonical directory of
   refused (`merezha.reason`: `starting` from the early listener, `body_limit`
   for a declared or read body over `http.body_limit`; a module's
   `overloaded` or `timeout` reply is not an edge rejection), through the
-  meter the binary passes in `HostOptions::meter`. `client.address` is not
+  meter of scope `merezha.edge` (`EDGE_SCOPE`) from the meters the binary passes in `HostOptions::meters`. `client.address` is not
   recorded on server spans yet, so `telemetry.privacy.record_client_address
   = true` has no effect.
 - refuses bodies over `http.body_limit`: a larger `Content-Length` fails at
@@ -638,7 +638,7 @@ fails a suite that emits anything else. The `merezha` binary installs one
 `invalid_arguments` lines written before the subscriber exists.
 
 Kernel events: `startup.failed`, `startup.completed`, `runtime.loaded`, `error.registration_refused`,
-`db.connected`, `db.unavailable`, `migration.checked`, `migration.pending`,
+`db.connected`, `db.unavailable`, `db.pool_timeout`, `migration.checked`, `migration.pending`,
 `migration.applied`, `migration.checksum_mismatch`, `migration.refused`,
 `migration.invalid_index_dropped`, `module.started`, `module.start_failed`,
 `module.stopped`, `module.shutdown_timeout`, `listener.ready`,
@@ -940,6 +940,100 @@ first failed use.
   `Listener::check(deadline)` runs `SELECT 1` to detect a half-open
   session. The jobs relay
   holds one per host.
+
+### Statements and telemetry
+
+Every statement runs under a registered name ([telemetry design](../design/telemetry.md)
+§1.3, TE-T4). A `Statement` constant carries a `name` (`notify.capture.insert`),
+a `summary` (`INSERT merezha_notify.captures`) and its `sql`;
+`Statement::new` checks the labels at compile time: names are two or more
+dotted `[a-z][a-z0-9_]*` segments, never `adhoc`; summaries are one to three
+upper-case words (the operation) and at most one lower-case target (the
+collection), or a function written `name()`. Statements run through the pool
+handle, on any session (`PooledClient`, `Tx`, `DetachedClient` or the
+driver's own client and transaction), with the driver method's contract:
+
+```rust
+const INSERT_NOTE: Statement = Statement::new(
+    "notes.insert",
+    "INSERT notes.notes",
+    "INSERT INTO notes.notes (id, body) VALUES ($1, $2)",
+);
+db.execute(tx, &INSERT_NOTE, &[&id, &body]).await.map_err(|e| classify(&e))?;
+```
+
+`query`, `query_one`, `query_opt`, `execute` and `batch` run `statement.sql`;
+`batch_text` runs text built at run time (DDL naming a derived index, a
+computed `SET`) under a registered name. The kernel's own statements are
+`merezha_postgres::KERNEL_STATEMENTS` (`kernel.*`); a block lists its own
+and checks them against the kernel's with `check_registry` in a test: the
+application store's are `merezha_application::postgres::STATEMENTS`
+(`app.*`; the append is `app.events.append`, summary
+`INSERT merezha_app.events`, run prepared through `query_one_prepared`), the
+capture driver's `merezha_notifications::drivers::STATEMENTS`. SQL
+sent through the driver directly is not observed at all, so each crate
+scans its own sources in a test: `statement::scan_sources(dir, skip)`
+walks every `.rs` file and reports each call of a driver method
+(`query`, `query_typed`, `execute`, `batch_execute`, `simple_query`,
+`prepare`, `prepare_cached`, `copy_in` and the rest of
+`statement::DRIVER_METHODS`) whose second argument is not a registered
+`&STATEMENT`, comments and string contents ignored. The kernel, the
+application store and the notifications block run it; jobs, content and
+`merezha content diff` adopt the registry next (issue #41). The append
+prepares through `Database::prepare_cached(&client, &STATEMENT)`.
+
+- **`db.client.operation.duration`** (seconds) times every registered
+  statement with `db.system.name = postgresql`, `db.operation.name` and
+  `db.collection.name` from the summary, `merezha.module`, and on failure
+  `db.response.status_code` (the SQLSTATE) and `error.type` (the `classify`
+  code, or `cancelled` when the caller dropped the statement first).
+- **Spans.** Inside a caller's span the span bridge records (a
+  `merezha*` span at `info` or above, with a valid OpenTelemetry context), a statement is a CLIENT span named
+  after its summary with the same attributes plus `db.query.summary` and
+  `merezha.db.statement`; `Database::transaction` and
+  `DetachedClient::transaction` open `transaction {module}` with
+  `merezha.db.pool.wait` (seconds), the statements (`BEGIN`, the
+  `SET LOCAL` bound, the work, `COMMIT`) as children. Without a caller span
+  (readiness probes, background polls) nothing opens a span; the metrics
+  still count. Spans never carry SQL text, parameters or server messages. A
+  span's status is `Error` for transient failures and `database_error`;
+  conflicts and constraint violations leave it unset.
+- **Module.** `Database::for_module(name)` labels a handle's statements,
+  transactions and listeners with `merezha.module = name`; each module's
+  `AppContext::database()` is scoped to the module. The host's own handle
+  is `kernel`.
+- **Pool.** `db.client.connection.count` (`idle`, `used`),
+  `db.client.connection.max` and `db.client.connection.pending_requests`
+  read the pool's status, without I/O, at each collection;
+  `db.client.connection.wait_time` records each successful acquisition;
+  `db.client.connection.timeouts` counts acquisitions that gave up
+  (`database_busy`), which also log `db.pool_timeout` at most every 10 s.
+  The pool name is `merezha`. Detached sessions are the pool
+  `merezha.detached` (`count{used}`, `max` = `max_detached`,
+  `pending_requests`, `wait_time` and `timeouts` of slot waits), and open
+  listener sessions the pool `merezha.listen` (`count{used}` only: they are
+  not bounded).
+- **Listeners.** A listener session that ended (`recv` returned `None`) or
+  failed `check` is lost; the next successful `listen` on the same channels
+  counts one `merezha.db.listener.reconnects`. The `db.listener_lost` and
+  `db.listener_restored` events stay with the blocks that reconnect.
+- **Migrations.** Inside a caller's span (the host's `startup`), an apply
+  run opens `migrate {module}` for each module whose migrations it executes,
+  with that module's statements as children; a failed migration sets its
+  status `Error`. Each successful run sets `merezha.db.migrations.pending`
+  per declared module (0 after an apply), so readiness's verify runs keep it
+  current.
+
+The instruments come from the meter the pool was built with:
+`Database::connect_with_meter(&config, &meter)`; `Database::connect` uses
+no-op instruments. `merezha_telemetry::Meters` is the one meter source
+of the workspace: `Meters::new(provider)` (enabled), `Meters::noop()` or
+`Meters::default()` (records nothing), `enabled()`, and `meter(scope)`.
+`Telemetry::meters()` returns the SDK provider's when metrics are
+exported and no-op meters otherwise. `HostOptions::meters` builds the edge
+instruments from `meter("merezha.edge")` and the kernel pool from
+`meter("merezha-postgres")`; `merezha run` passes `Telemetry::meters()`,
+and `Host::start` keeps no-op meters.
 
 ### Application storage
 

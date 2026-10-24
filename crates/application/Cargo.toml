@@ -26,6 +26,9 @@ test-support = []
 [dev-dependencies]
 merezha-application = { path = ".", features = ["test-support", "postgres"] }
 merezha-postgres = { path = "../postgres" }
+merezha-telemetry = { path = "../telemetry", features = ["testing"] }
+opentelemetry = { workspace = true, features = ["trace"] }
+opentelemetry_sdk.workspace = true
 tokio.workspace = true
 tempfile.workspace = true
 wat.workspace = true

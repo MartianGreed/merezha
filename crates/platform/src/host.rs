@@ -17,7 +17,6 @@ use merezha_domain::Failure;
 use merezha_postgres::{
     Database, MigrationError, MigrationMode, MigrationReport, ModuleMigrations, run_migrations,
 };
-use opentelemetry::metrics::Meter;
 use std::{
     future::Future,
     net::SocketAddr,
@@ -184,8 +183,11 @@ pub struct HostOptions {
     /// The identity block's authenticator. With one, `/v1/admin/status`
     /// requires `system.status.read` at application scope.
     pub authenticator: Option<Arc<dyn Authenticator>>,
-    /// The meter of the edge's HTTP instruments; none records nothing.
-    pub meter: Option<Meter>,
+    /// The meter source of the kernel's instruments: the edge's from
+    /// `meters.meter(EDGE_SCOPE)`, the PostgreSQL pool's from
+    /// `meters.meter(merezha_postgres::METER_SCOPE)` (TE §1.3). The
+    /// default records nothing; the binary passes `Telemetry::meters()`.
+    pub meters: merezha_telemetry::Meters,
     /// Sections of `/v1/admin/status` other subsystems own.
     pub status: Vec<Arc<dyn StatusSection>>,
     /// Turns `true` on a shutdown signal during startup: the host stops
@@ -218,17 +220,17 @@ impl std::fmt::Debug for HostOptions {
 }
 
 /// The edge settings of `config` with `errors`, `options`' authenticator
-/// and meter.
+/// and the edge meter of `meters`.
 fn edge_settings(
     config: &ProjectConfig,
     errors: Arc<ErrorRegistry>,
     authenticator: Option<Arc<dyn Authenticator>>,
-    meter: Option<&Meter>,
+    meters: &merezha_telemetry::Meters,
 ) -> EdgeSettings {
     EdgeSettings::new(&config.http, errors)
         .authenticator(authenticator)
         .trust(config.telemetry.traces.trust_inbound)
-        .metrics(meter.map(HttpMetrics::new).unwrap_or_default())
+        .metrics(HttpMetrics::new(&meters.meter(crate::edge::EDGE_SCOPE)))
 }
 
 /// Whether `config` describes a private listener: not public, a loopback
@@ -319,11 +321,15 @@ impl Host {
                 });
             }
         }
-        let database = Database::connect(&config.database).map_err(|failure| StartupError {
-            failure,
-            migration: None,
-            module: None,
-        })?;
+        let meter = options.meters.meter(merezha_postgres::METER_SCOPE);
+        let database =
+            Database::connect_with_meter(&config.database, &meter).map_err(|failure| {
+                StartupError {
+                    failure,
+                    migration: None,
+                    module: None,
+                }
+            })?;
         let reach =
             Instant::now() + config.database.connect_timeout + config.database.acquire_timeout;
         if let Err(failure) = database.ping(reach).await {
@@ -534,7 +540,7 @@ impl Host {
                 &config,
                 errors.clone(),
                 ctx.authenticator().cloned(),
-                options.meter.as_ref(),
+                &options.meters,
             ),
         );
         // The first evaluation runs before the host is handed out, so a
@@ -760,7 +766,7 @@ impl EarlyListener {
                 config,
                 Arc::new(ErrorRegistry::kernel()),
                 None,
-                options.meter.as_ref(),
+                &options.meters,
             )
             .starting(),
         );

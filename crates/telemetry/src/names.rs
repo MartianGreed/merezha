@@ -237,7 +237,7 @@ metrics! {
         [key::DB_SYSTEM_NAME, key::DB_OPERATION_NAME, key::DB_COLLECTION_NAME, key::DB_RESPONSE_STATUS_CODE, key::ERROR_TYPE, key::MODULE],
         "registered statements x SQLSTATEs seen x modules x buckets";
     DB_CLIENT_CONNECTION_COUNT = "db.client.connection.count", Gauge, "{connection}", NONE,
-        [key::DB_CLIENT_CONNECTION_POOL_NAME, key::DB_CLIENT_CONNECTION_STATE], "pools x 2 states";
+        [key::DB_CLIENT_CONNECTION_POOL_NAME, key::DB_CLIENT_CONNECTION_STATE], "3 pools (merezha, merezha.detached, merezha.listen) x 2 states";
     DB_CLIENT_CONNECTION_MAX = "db.client.connection.max", Gauge, "{connection}", NONE,
         [key::DB_CLIENT_CONNECTION_POOL_NAME], "pools";
     DB_CLIENT_CONNECTION_PENDING_REQUESTS = "db.client.connection.pending_requests", Gauge, "{request}", NONE,
@@ -1593,6 +1593,134 @@ pub fn is_event_name(name: &str) -> bool {
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
         })
+}
+
+// ---------------------------------------------------------------------------
+// PostgreSQL (TE §1.3 "PostgreSQL", T4): values and typed constructors for
+// the statement registry, the pool gauges and the migration gauge.
+// ---------------------------------------------------------------------------
+
+/// Closed values and typed constructors of the PostgreSQL rows (T4). Every
+/// value either is a constant here or comes from a registered statement, a
+/// module name or a server SQLSTATE validated to its five-character shape.
+pub mod db {
+    use super::{KeyValue, key};
+
+    /// `db.system.name` of every statement.
+    pub const SYSTEM: &str = "postgresql";
+    /// `db.client.connection.pool.name` of the kernel pool, the one pool a
+    /// host opens (`application_name` of its sessions is the same).
+    pub const POOL: &str = "merezha";
+    /// The sessions `Database::detach` took out of the pool, bounded by
+    /// `database.max_detached`.
+    pub const DETACHED_POOL: &str = "merezha.detached";
+    /// The open `LISTEN` sessions, outside the pool and the detached budget.
+    pub const LISTEN_POOL: &str = "merezha.listen";
+    /// `merezha.module` of statements run through a `Database` no module
+    /// was scoped to: the host's own probes, the migration ledger.
+    pub const KERNEL_MODULE: &str = "kernel";
+    /// `error.type` of a statement whose future was dropped before the
+    /// server answered (the caller's deadline or cancellation).
+    pub const CANCELLED: &str = "cancelled";
+    /// `db.response.status_code` for a server code outside the SQLSTATE
+    /// shape (never expected from PostgreSQL).
+    pub const OTHER_STATUS: &str = "_OTHER";
+
+    /// `db.client.connection.state` values.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ConnectionState {
+        Idle,
+        Used,
+    }
+    impl ConnectionState {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Idle => "idle",
+                Self::Used => "used",
+            }
+        }
+    }
+
+    pub fn system() -> KeyValue {
+        KeyValue::new(key::DB_SYSTEM_NAME, SYSTEM)
+    }
+    /// The operation of a registered statement summary.
+    pub fn operation(operation: &'static str) -> KeyValue {
+        KeyValue::new(key::DB_OPERATION_NAME, operation)
+    }
+    /// The collection of a registered statement summary.
+    pub fn collection(collection: &'static str) -> KeyValue {
+        KeyValue::new(key::DB_COLLECTION_NAME, collection)
+    }
+    /// A server SQLSTATE: five ASCII digits or upper-case letters, anything
+    /// else [`OTHER_STATUS`].
+    pub fn status_code(sqlstate: &str) -> KeyValue {
+        KeyValue::new(key::DB_RESPONSE_STATUS_CODE, sqlstate_value(sqlstate))
+    }
+    /// The value [`status_code`] records.
+    pub fn sqlstate_value(sqlstate: &str) -> String {
+        if sqlstate.len() == 5
+            && sqlstate
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+        {
+            sqlstate.to_owned()
+        } else {
+            OTHER_STATUS.to_owned()
+        }
+    }
+    /// `error.type`: a `merezha_postgres::classify` code or [`CANCELLED`],
+    /// never server text.
+    pub fn error_type(code: &'static str) -> KeyValue {
+        KeyValue::new(key::ERROR_TYPE, code)
+    }
+    /// `merezha.module`: a module name (closed at startup) or
+    /// [`KERNEL_MODULE`].
+    pub fn module(module: impl Into<opentelemetry::StringValue>) -> KeyValue {
+        KeyValue::new(key::MODULE, opentelemetry::Value::String(module.into()))
+    }
+    pub fn pool() -> KeyValue {
+        pool_named(POOL)
+    }
+    /// One of [`POOL`], [`DETACHED_POOL`] and [`LISTEN_POOL`].
+    pub fn pool_named(name: &'static str) -> KeyValue {
+        KeyValue::new(key::DB_CLIENT_CONNECTION_POOL_NAME, name)
+    }
+    pub fn connection_state(state: ConnectionState) -> KeyValue {
+        KeyValue::new(key::DB_CLIENT_CONNECTION_STATE, state.as_str())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn sqlstates_keep_their_shape_and_nothing_else() {
+            assert_eq!(sqlstate_value("23505"), "23505");
+            assert_eq!(sqlstate_value("P0001"), "P0001");
+            for odd in ["", "2350", "235055", "2350a", "key (x)=(y)"] {
+                assert_eq!(sqlstate_value(odd), OTHER_STATUS, "{odd}");
+            }
+        }
+        #[test]
+        fn constructors_use_catalog_keys_allowed_on_the_db_metric() {
+            let row = super::super::metric::DB_CLIENT_OPERATION_DURATION;
+            for kv in [
+                system(),
+                operation("INSERT"),
+                collection("merezha.migrations"),
+                status_code("23505"),
+                error_type("unique_violation"),
+                module("jobs"),
+            ] {
+                assert!(row.attributes.contains(&kv.key.as_str()), "{}", kv.key);
+            }
+            let count = super::super::metric::DB_CLIENT_CONNECTION_COUNT;
+            for kv in [pool(), connection_state(ConnectionState::Used)] {
+                assert!(count.attributes.contains(&kv.key.as_str()));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

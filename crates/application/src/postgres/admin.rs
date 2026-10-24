@@ -36,20 +36,22 @@ impl PostgresStore {
             .iter()
             .map(|p| i32::try_from(p.revision).map_err(|_| invalid()))
             .collect::<Result<Vec<i32>, _>>()?;
+        let handle = self.db.clone();
         let (head, rows) = self.block_on(
             deadline,
             self.db.transaction(deadline, move |tx| {
                 Box::pin(async move {
-                    tx.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                    handle
+                        .batch(tx, &sql::ADMIN_SNAPSHOT)
                         .await
                         .map_err(|e| read_error(&e))?;
-                    let head: i64 = tx
-                        .query_one(sql::HEAD, &[])
+                    let head: i64 = handle
+                        .query_one(tx, &sql::HEAD, &[])
                         .await
                         .map_err(|e| read_error(&e))?
                         .get(0);
-                    let rows = tx
-                        .query(sql::OVERVIEW, &[&names, &revisions])
+                    let rows = handle
+                        .query(tx, &sql::OVERVIEW, &[&names, &revisions])
                         .await
                         .map_err(|e| read_error(&e))?;
                     Ok((head, rows))
@@ -98,8 +100,8 @@ impl PostgresStore {
         let rows = self.block_on(
             deadline,
             self.session(deadline, timeout, async |client| {
-                client
-                    .query(sql::REVISIONS, &[&text])
+                self.db
+                    .query(client, &sql::REVISIONS, &[&text])
                     .await
                     .map_err(|e| read_error(&e))
             }),

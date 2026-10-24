@@ -5,8 +5,9 @@
 //!
 //! - default: [`names`] (the R9 catalog and typed attribute constructors),
 //!   the [`event!`] macro, [`config`] (the `[telemetry]` model the kernel
-//!   parses) and [`blocking`]. Only `tracing` and the `opentelemetry` API;
-//!   every library may depend on it.
+//!   parses), [`blocking`] and [`Meters`], the meter source libraries
+//!   take. Only `tracing` and the `opentelemetry` API; every library may
+//!   depend on it.
 //! - `propagation`: the `propagation` module, with the stored trace context and
 //!   span parents and links through `tracing-opentelemetry`. No SDK, no
 //!   network code.
@@ -20,6 +21,7 @@
 //! the one process global, installed by the binary.
 pub mod blocking;
 pub mod config;
+pub mod meters;
 pub mod names;
 
 #[cfg(feature = "propagation")]
@@ -41,6 +43,7 @@ pub mod testing;
 
 pub use blocking::spawn_blocking_in_span;
 pub use config::{Service, Signal, TelemetryConfig};
+pub use meters::Meters;
 #[cfg(feature = "pipeline")]
 pub use pipeline::Telemetry;
 

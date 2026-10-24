@@ -59,8 +59,11 @@ pub const MIGRATIONS: &[Migration] = &[Migration::new(
     "application",
     include_str!("migrations/0001_application.sql"),
 )];
+/// Every statement the store runs, registered with `merezha-postgres`
+/// (TE §1.3): `app.*` names, the append `app.events.append`.
+pub const STATEMENTS: &[merezha_postgres::Statement] = sql::STATEMENTS;
 /// The registered name of the append statement, TE's `app.events.append`.
-pub const APPEND_STATEMENT: &str = sql::APPEND_NAME;
+pub const APPEND_STATEMENT: &str = sql::APPEND.name;
 /// The `pg_locks.classid` of every run lock (`'MZAP'`, §A.7): operators
 /// find a stuck holder there and end it with `pg_terminate_backend`.
 pub const RUN_LOCK_CLASS: i32 = sql::LOCK_CLASS;
@@ -265,24 +268,27 @@ impl PostgresStore {
             ));
         }
         let application_text = application.as_str().to_owned();
+        let store_db = db.clone();
         db.transaction(deadline, move |tx| {
             Box::pin(async move {
-                tx.execute(sql::INSERT_MANIFEST, &[&application_text])
+                store_db
+                    .execute(tx, &sql::INSERT_MANIFEST, &[&application_text])
                     .await
                     .map_err(|e| read_error(&e))?;
-                let row = tx
-                    .query_one(sql::MANIFEST, &[])
+                let row = store_db
+                    .query_one(tx, &sql::MANIFEST, &[])
                     .await
                     .map_err(|e| read_error(&e))?;
                 if row.get::<_, String>(0) != application_text || row.get::<_, i16>(1) != 1 {
                     return Err(configuration());
                 }
                 for (name, revision, state) in &initial {
-                    tx.execute(sql::INSERT_PROJECTION, &[name, revision, state])
+                    store_db
+                        .execute(tx, &sql::INSERT_PROJECTION, &[name, revision, state])
                         .await
                         .map_err(|e| read_error(&e))?;
-                    let partitioned: bool = tx
-                        .query_one(sql::PROJECTION_PARTITIONED, &[name, revision])
+                    let partitioned: bool = store_db
+                        .query_one(tx, &sql::PROJECTION_PARTITIONED, &[name, revision])
                         .await
                         .map_err(|e| read_error(&e))?
                         .get(0);
@@ -445,8 +451,8 @@ impl DurableStore for PostgresStore {
         let rows = self.block_on(
             deadline,
             self.session(deadline, timeout, async |client| {
-                client
-                    .query(&sql::load(), &[&stream.as_str(), &limit])
+                self.db
+                    .query(client, &sql::LOAD, &[&stream.as_str(), &limit])
                     .await
                     .map_err(|e| read_error(&e))
             }),
@@ -457,8 +463,9 @@ impl DurableStore for PostgresStore {
         let position: i64 = self.block_on(
             deadline,
             self.session(deadline, timeout, async |client| {
-                Ok(client
-                    .query_one(sql::HEAD, &[])
+                Ok(self
+                    .db
+                    .query_one(client, &sql::HEAD, &[])
                     .await
                     .map_err(|e| read_error(&e))?
                     .get(0))
@@ -480,8 +487,8 @@ impl DurableStore for PostgresStore {
         let rows = self.block_on(
             deadline,
             self.session(deadline, timeout, async |client| {
-                client
-                    .query(&sql::read_all(), &[&from, &count])
+                self.db
+                    .query(client, &sql::READ_ALL, &[&from, &count])
                     .await
                     .map_err(|e| read_error(&e))
             }),
@@ -508,9 +515,10 @@ impl DurableStore for PostgresStore {
         let rows = self.block_on(
             deadline,
             self.session(deadline, timeout, async |client| {
-                client
+                self.db
                     .query(
-                        sql::RECEIPT,
+                        client,
+                        &sql::RECEIPT,
                         &[&tag, &tenant, &actor, &key_text, &fingerprint],
                     )
                     .await
@@ -626,9 +634,10 @@ impl DurableStore for PostgresStore {
         let row = self.block_on(
             deadline,
             self.session(deadline, commit_unknown, async |client| {
-                client
+                self.db
                     .query_opt(
-                        sql::COMMIT_PROJECTION,
+                        client,
+                        &sql::COMMIT_PROJECTION,
                         &[&name, &revision, &text, &checkpoint, &row_revision],
                     )
                     .await
@@ -684,7 +693,7 @@ impl PostgresStore {
         let client = self.db.acquire(deadline).await?;
         let statement = match tokio::time::timeout_at(
             deadline.into(),
-            client.prepare_cached(sql::APPEND),
+            self.db.prepare_cached(&client, &sql::APPEND),
         )
         .await
         {
@@ -732,9 +741,20 @@ impl PostgresStore {
         let at = tokio::time::Instant::from_std(deadline);
         let (bounded, result, reset) = tokio::join!(
             biased;
-            tokio::time::timeout_at(at, client.batch_execute(&bound)),
-            tokio::time::timeout_at(at, client.query_one(&statement, &params)),
-            tokio::time::timeout_at(at, client.batch_execute(self.reset_statement)),
+            tokio::time::timeout_at(
+                at,
+                self.db.batch_text(&client, &sql::APPEND_TIMEOUT, &bound)
+            ),
+            tokio::time::timeout_at(
+                at,
+                self.db
+                    .query_one_prepared(&client, &sql::APPEND, &statement, &params)
+            ),
+            tokio::time::timeout_at(
+                at,
+                self.db
+                    .batch_text(&client, &sql::RESET_TIMEOUT, self.reset_statement)
+            ),
         );
         let (bounded, reset) = (
             bounded.ok().and_then(Result::ok),
@@ -784,8 +804,8 @@ impl PostgresStore {
     ) -> Result<(ProjectionState, i64, u64), Failure> {
         let row = self
             .session(deadline, timeout, async |client| {
-                client
-                    .query_opt(sql::PROJECTION, &[&name, &revision])
+                self.db
+                    .query_opt(client, &sql::PROJECTION, &[&name, &revision])
                     .await
                     .map_err(|e| read_error(&e))
             })
@@ -815,8 +835,9 @@ impl PostgresStore {
     pub(crate) async fn head_async(&self, deadline: Instant) -> Result<u64, Failure> {
         let position: i64 = self
             .session(deadline, timeout, async |client| {
-                Ok(client
-                    .query_one(sql::HEAD, &[])
+                Ok(self
+                    .db
+                    .query_one(client, &sql::HEAD, &[])
                     .await
                     .map_err(|e| read_error(&e))?
                     .get(0))
@@ -842,12 +863,13 @@ impl PostgresStore {
         let (name, revision) = self.key_of(projection)?;
         let initial = encode(&projection.initial)?;
         let by = requested_by.map(str::to_owned);
+        let store_db = self.db.clone();
         let target: i64 = self.block_on(
             deadline,
             self.db.transaction(deadline, move |tx| {
                 Box::pin(async move {
-                    if let Some(row) = tx
-                        .query_opt(sql::INSERT_REBUILD, &[&name, &revision, &initial, &by])
+                    if let Some(row) = store_db
+                        .query_opt(tx, &sql::INSERT_REBUILD, &[&name, &revision, &initial, &by])
                         .await
                         .map_err(|e| read_error(&e))?
                     {
@@ -856,8 +878,8 @@ impl PostgresStore {
                     if !resume {
                         return Err(Failure::conflict("rebuild_in_progress"));
                     }
-                    let row = tx
-                        .query_opt(sql::RESUME_REBUILD, &[&name, &revision])
+                    let row = store_db
+                        .query_opt(tx, &sql::RESUME_REBUILD, &[&name, &revision])
                         .await
                         .map_err(|e| read_error(&e))?;
                     // Swapped between the two statements: nothing to resume.
@@ -879,8 +901,8 @@ impl PostgresStore {
     ) -> Result<Option<bool>, Failure> {
         let row = self
             .session(deadline, timeout, async |client| {
-                client
-                    .query_opt(sql::REBUILD_STATUS, &[&name, &revision])
+                self.db
+                    .query_opt(client, &sql::REBUILD_STATUS, &[&name, &revision])
                     .await
                     .map_err(|e| read_error(&e))
             })
@@ -908,8 +930,8 @@ impl PostgresStore {
         self.block_on(
             deadline,
             self.session(deadline, timeout, async |client| {
-                client
-                    .execute(sql::DELETE_REBUILD, &[&name, &revision])
+                self.db
+                    .execute(client, &sql::DELETE_REBUILD, &[&name, &revision])
                     .await
                     .map_err(|e| read_error(&e))
             }),
@@ -936,8 +958,8 @@ impl PostgresStore {
         let deleted = self.block_on(
             deadline,
             self.session(deadline, timeout, async |client| {
-                client
-                    .execute(sql::DELETE_REVISION, &[&text, &revision])
+                self.db
+                    .execute(client, &sql::DELETE_REVISION, &[&text, &revision])
                     .await
                     .map_err(|e| read_error(&e))
             }),
@@ -962,8 +984,12 @@ impl PostgresStore {
             .and_then(|value| value.as_str().map(str::to_owned))
             .ok_or_else(invalid)?;
         self.session(deadline, timeout, async |client| {
-            client
-                .execute(sql::RECORD_FAILURE, &[&name, &revision, &code, &class])
+            self.db
+                .execute(
+                    client,
+                    &sql::RECORD_FAILURE,
+                    &[&name, &revision, &code, &class],
+                )
                 .await
                 .map_err(|e| read_error(&e))
         })
