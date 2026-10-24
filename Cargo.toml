@@ -11,6 +11,7 @@ members = [
     "crates/notifications",
     "crates/blob",
     "crates/telemetry",
+    "crates/identity",
 ]
 resolver = "3"
 
@@ -64,9 +65,24 @@ tracing-opentelemetry = { version = "0.34.0", default-features = false }
 opentelemetry-semantic-conventions = "0.33.1"
 tracing-appender = "0.2.5"
 libc = "0.2.191"
+argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "password-hash", "zeroize"] }
+hmac = "0.13.0"
+subtle = { version = "2.6.1", default-features = false }
+unicode-normalization = "0.1.26"
+idna = "1.1.0"
+secrecy = "0.10.3"
+zeroize = "1.9.1"
+miniz_oxide = "0.9.1"
 
 [profile.dev]
 debug = 0
+
+# Argon2id at its production floor (19 MiB) takes seconds unoptimized; the
+# identity tests hash and verify passwords on every sign-in path.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.test]
 debug = 0
