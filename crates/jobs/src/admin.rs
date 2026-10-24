@@ -265,7 +265,7 @@ impl Default for ReissueTiming {
 const CANDIDATE: &str = "id, queue, kind, contains_secret, idempotency_key, correlation_id,
     causation_id, tenant";
 
-async fn audit(
+pub(crate) async fn audit(
     tx: &mut Tx<'_>,
     principal: Option<&str>,
     action: &str,

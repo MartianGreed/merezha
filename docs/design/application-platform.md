@@ -860,6 +860,10 @@ readiness lag (one row, `ORDER BY run_at LIMIT 1`); and the reissue claim column
 `reissue_claimed_at timestamptz NULL CHECK (reissue_claimed_at IS NULL OR state = 'cancelled')` with
 a partial index (D.1).
 
+Migration 0003 (AP-B3) adds `schedules.last_declared_at timestamptz NOT NULL DEFAULT now()` and
+`retired_at timestamptz NULL` (B.7) and `CREATE INDEX schedules_due ON merezha_jobs.schedules
+(next_run_at) WHERE enabled AND retired_at IS NULL`. `enabled` stays the admin pause flag.
+
 Dead letters stay in `jobs` with `state = 'dead'`, rather than moving to a separate table as in
 Structure. A separate table would free the `(queue, idempotency_key)` slot, so a re-delivery could
 create a duplicate job while the dead one sits unexamined. Partial indexes keep dead rows out of the
@@ -1218,14 +1222,23 @@ gives the next run as a `Zoned`, stored as its `jiff::Timestamp`. Pinning `=` fo
 style (`wasmtime`, `rusqlite`).
 
 Schedules are declared in `merezha.toml` (`[[jobs.schedules]]`, source `config`) and by modules
-(`JobsHandle::schedule`, source = the module name). They are upserted at start by name. A changed
-`definition` digest recomputes `next_run_at` from now. Config-sourced rows missing from the current
-config are set `enabled = false`, never deleted. At most 256 schedules.
+(`JobsHandle::schedule`, source = the module name, for a kind the module registered). They follow
+the subscriptions' rolling-deploy rule (B.3): every instance upserts the schedules it declares at
+start and every `jobs.subscriptions.heartbeat` (`last_declared_at = now()`, `retired_at = NULL`), and
+a schedule nobody declared for `jobs.subscriptions.retire_after` gets `retired_at` (kept, never
+fired), in one transaction under `pg_advisory_xact_lock(MZJB, hashtext('schedules'))`. No instance
+disables a schedule because its own config lacks it, so a schedule a newer version declares survives
+older instances restarting. A changed `definition` digest (cron, zone, queue, kind, payload) or a
+reactivation recomputes `next_run_at` from now. At most 256 schedules per instance. Config
+validation parses every expression and zone, listing every problem (`invalid_cron`,
+`invalid_timezone`, `unknown_timezone`).
 
-The scheduler tick (`jobs.scheduler.interval_ms`, default 10 000) runs on any instance:
+The scheduler tick (`jobs.scheduler.interval_ms`, default 10 000, and once at start) runs on any
+instance, `workers = false` included:
 
 ```sql
 BEGIN;
+SELECT pg_try_advisory_xact_lock(MZJB, hashtext('scheduler'));   -- false: skip this tick
 SELECT * FROM merezha_jobs.schedules WHERE enabled AND next_run_at <= now()
  ORDER BY next_run_at LIMIT 32 FOR UPDATE SKIP LOCKED;
 -- per row: INSERT INTO jobs (..., idempotency_key = 'cron:' || name || ':' || extract(epoch FROM next_run_at)::bigint,
@@ -1236,7 +1249,8 @@ COMMIT;
 ```
 
 Missed runs follow Structure's policy. One job runs for the due occurrence, and the next occurrence
-is computed strictly after `max(scheduled, now)`, so downtime never causes a burst.
+is computed strictly after `max(scheduled, now)`, so downtime never causes a burst. `now` is the
+database clock. The job's correlation id is its key.
 
 ## B.8 Graceful drain
 
@@ -1742,8 +1756,8 @@ permissions (decided in the AP-A3 review); every other write needs `application.
 | `POST jobs/{id}/cancel` | `available` to `cancelled` (a flagged payload is nulled); `409 not_cancellable` when running or terminal |
 | `GET outbox` | `{"pending","oldest_age_s","unrouted","quarantined":[{"id","source","record_kind","quarantine_code","quarantined_at"}]}` (`unrouted`: this instance's count since start; at most 100 quarantined rows, oldest first) |
 | `POST outbox/{id}/requeue` | a quarantined record back to pending once the cause is fixed; `{"id"}`. `409 secret_purged` for a flagged record quarantined as `unroutable`, whose payload is gone (R4a): the owning module issues it again. |
-| `GET schedules` | `{"schedules":[{"name","source","cron","timezone","enabled","next_run_at","last_run_at","last_job_id"}]}` |
-| `POST schedules/{name}/pause`, `/resume`, `/trigger` | `trigger` enqueues a job keyed `cron:{name}:manual:{unix_ms}` |
+| `GET schedules?limit=&after=` | `{"schedules":[{"name","source","cron","timezone","queue","kind","enabled","retired_at","next_run_at","last_run_at","last_job_id"}],"next":cursor?}`, by name; no payload |
+| `POST schedules/{name}/pause`, `/resume`, `/trigger` | pause and resume answer the listing entry; `resume` recomputes `next_run_at` from now for a paused schedule. `trigger` enqueues a job keyed `cron:{name}:manual:{unix_ms}` without moving the cadence: `{"name","job_id","idempotency_key"}` |
 
 Every write appends to `merezha_jobs.admin_actions` and emits the log event `job.admin_action`.
 Replay starts a new trace that links to the stored context (TE §2.3).
@@ -1818,7 +1832,7 @@ backoff_base_ms = 1000
 backoff_max_ms = 86400000    # NT's 24-hour step (R1)
 
 [jobs.subscriptions]
-heartbeat = "5m"             # every instance re-declares its subscriptions
+heartbeat = "5m"             # every instance re-declares its subscriptions and schedules
 retire_after = "1h"          # retire one nobody declared for this long; >= 3 x heartbeat
 
 [jobs.retention]
@@ -2000,7 +2014,7 @@ description (not gated).
 3. Two instances fire one job per occurrence.
 4. Downtime across 5 occurrences gives one job, then the normal cadence.
 5. A changed definition recomputes `next_run_at`, and a config schedule removed from config is
-   disabled.
+   retired once nobody declared it for `retire_after` (never by one restarting old instance).
 
 **C1 tests.**
 

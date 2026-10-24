@@ -245,8 +245,10 @@ fn a_public_listener_without_identity_denies_application_and_hides_the_raw_runti
                 "{name} {path}"
             );
         }
-        let listing = request(address, "GET", "/v1/jobs/admin/queues", "");
-        assert_eq!(listing.status, 401, "{name}: {}", listing.body);
+        for listed in ["/v1/jobs/admin/queues", "/v1/jobs/admin/schedules"] {
+            let listing = request(address, "GET", listed, "");
+            assert_eq!(listing.status, 401, "{name} {listed}: {}", listing.body);
+        }
         host.stop();
     }
 }
@@ -605,6 +607,8 @@ fn sigterm_releases_a_running_job_with_its_attempt_refunded() {
     assert_eq!(queues.status, 200, "{}", queues.body);
     assert_eq!(queues.body["queues"][0]["name"], "default");
     assert_eq!(queues.body["queues"][0]["leased"], 1);
+    let schedules = request(address, "GET", "/v1/jobs/admin/schedules", "");
+    assert_eq!(schedules.status, 200, "{}", schedules.body);
     let signalled = Instant::now();
     draining.stop();
     let took = signalled.elapsed();

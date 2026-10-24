@@ -613,6 +613,104 @@ async fn retention_purges_expired_rows_and_keeps_the_rest() {
         .unwrap();
 }
 
+const DAILY: &str = "[[jobs.schedules]]\nname = \"tasks.daily\"\ncron = \"0 9 * * *\"\nqueue = \"default\"\nkind = \"tasks.remind\"\n";
+
+/// AP-B3: the schedule routes over HTTP. Reads need `jobs.admin.read` and
+/// writes `jobs.admin.write`, both at application scope; an anonymous
+/// caller on a closed policy gets 401; unknown names and actions are 404;
+/// bad query strings are 422 without echoing input.
+#[tokio::test]
+async fn schedule_routes_check_their_permissions_at_application_scope() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let jobs = PgJobs::with_mode(
+        &jobs_config(
+            &test,
+            &format!("[jobs]\nworkers = false\n[jobs.scheduler]\ninterval_ms = 3600000\n{DAILY}"),
+        ),
+        RelayMode::Off,
+    );
+    jobs.ports(&db);
+    jobs.start(context(&db)).await.unwrap();
+    wait_ready(&jobs).await;
+    let reader = admin(&jobs, Arc::new(Only(&["jobs.admin.read"])));
+    let writer = admin(&jobs, Arc::new(Only(&["jobs.admin.write"])));
+    let (status, listed) = get(&reader, "/v1/jobs/admin/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = &listed["schedules"][0];
+    assert_eq!(
+        (
+            &entry["name"],
+            &entry["source"],
+            &entry["cron"],
+            &entry["timezone"],
+            &entry["enabled"]
+        ),
+        (
+            &json!("tasks.daily"),
+            &json!("config"),
+            &json!("0 9 * * *"),
+            &json!("UTC"),
+            &json!(true)
+        )
+    );
+    assert!(entry["next_run_at"].is_string() && entry.get("payload").is_none());
+    let (status, denied) = post(&reader, "/v1/jobs/admin/schedules/tasks.daily/pause", "").await;
+    assert_eq!(
+        (status, code(&denied)),
+        (StatusCode::FORBIDDEN, "unauthorized")
+    );
+    assert_eq!(
+        get(&writer, "/v1/jobs/admin/schedules").await.0,
+        StatusCode::FORBIDDEN
+    );
+    let (status, paused) = post(&writer, "/v1/jobs/admin/schedules/tasks.daily/pause", "").await;
+    assert_eq!(
+        (status, &paused["enabled"]),
+        (StatusCode::OK, &json!(false))
+    );
+    let (status, resumed) = post(&writer, "/v1/jobs/admin/schedules/tasks.daily/resume", "").await;
+    assert_eq!(
+        (status, &resumed["enabled"]),
+        (StatusCode::OK, &json!(true))
+    );
+    let (status, triggered) =
+        post(&writer, "/v1/jobs/admin/schedules/tasks.daily/trigger", "").await;
+    assert_eq!(status, StatusCode::OK);
+    let job = triggered["job_id"].as_i64().unwrap();
+    assert_eq!(state(&db, job).await, "available");
+    for missing in [
+        "/v1/jobs/admin/schedules/tasks.none/pause",
+        "/v1/jobs/admin/schedules/Tasks/trigger",
+        "/v1/jobs/admin/schedules/tasks.daily/delete",
+    ] {
+        let (status, body) = post(&writer, missing, "").await;
+        assert_eq!(
+            (status, code(&body)),
+            (StatusCode::NOT_FOUND, "not_found"),
+            "{missing}"
+        );
+    }
+    let (status, bad) = get(&reader, "/v1/jobs/admin/schedules?limit=0&after=Bad").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(!bad.to_string().contains("Bad"), "details never echo input");
+    let (status, page) = get(
+        &reader,
+        "/v1/jobs/admin/schedules?limit=1&after=tasks.daily",
+    )
+    .await;
+    assert_eq!((status, &page["schedules"]), (StatusCode::OK, &json!([])));
+    let closed = admin(&jobs, Arc::new(DenyAll));
+    let (status, anonymous) = call(&closed, "GET", "/v1/jobs/admin/schedules", "", false).await;
+    assert_eq!(
+        (status, code(&anonymous)),
+        (StatusCode::UNAUTHORIZED, "unauthenticated")
+    );
+    jobs.shutdown(soon()).await;
+}
+
 /// Review item 7: every admin route, with a read-only and a write-only
 /// principal. Reads need `jobs.admin.read` and nothing else; writes need
 /// `jobs.admin.write` and nothing else.
@@ -623,10 +721,12 @@ async fn every_admin_route_checks_exactly_its_permission() {
     };
     let db = database(&test).await;
     let jobs = PgJobs::with_mode(
-        &jobs_config(&test, "[jobs]\nworkers = false"),
+        &jobs_config(&test, &format!("[jobs]\nworkers = false\n{DAILY}")),
         RelayMode::Off,
     );
     jobs.ports(&db);
+    jobs.start(context(&db)).await.unwrap();
+    wait_ready(&jobs).await;
     let id = insert_job(&db, "tasks.unhandled", "tasks:perm", "{}", false).await;
     let before = jiff::Timestamp::now().to_string();
     let routes: Vec<(&str, String, String, bool)> = vec![
@@ -669,8 +769,32 @@ async fn every_admin_route_checks_exactly_its_permission() {
             String::new(),
             true,
         ),
+        (
+            "GET",
+            "/v1/jobs/admin/schedules".into(),
+            String::new(),
+            false,
+        ),
+        (
+            "POST",
+            "/v1/jobs/admin/schedules/tasks.daily/pause".into(),
+            String::new(),
+            true,
+        ),
+        (
+            "POST",
+            "/v1/jobs/admin/schedules/tasks.daily/resume".into(),
+            String::new(),
+            true,
+        ),
+        (
+            "POST",
+            "/v1/jobs/admin/schedules/tasks.daily/trigger".into(),
+            String::new(),
+            true,
+        ),
     ];
-    assert_eq!(routes.len(), 9);
+    assert_eq!(routes.len(), 13);
     let reader = admin(&jobs, Arc::new(Only(&["jobs.admin.read"])));
     let writer = admin(&jobs, Arc::new(Only(&["jobs.admin.write"])));
     for (method, uri, body, write) in &routes {

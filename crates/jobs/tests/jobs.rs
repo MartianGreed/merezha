@@ -936,4 +936,17 @@ async fn without_the_runtime_the_jobs_port_refuses() {
             .code,
         "jobs_unavailable"
     );
+    assert_eq!(
+        jobs.schedule(merezha_platform::ports::ScheduleDeclaration {
+            name: "tasks.daily".into(),
+            cron: "0 9 * * *".into(),
+            timezone: "UTC".into(),
+            queue: id("default"),
+            kind: id("k"),
+            payload: serde_json::json!({}),
+        })
+        .unwrap_err()
+        .code,
+        "jobs_unavailable"
+    );
 }

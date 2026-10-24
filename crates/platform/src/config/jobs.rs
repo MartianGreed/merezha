@@ -189,8 +189,9 @@ pub struct SubscriptionsConfig {
     /// 300 ms to 30 days, default 1 h.
     pub retire_after: Duration,
 }
-/// One `[[jobs.schedules]]` entry. The cron expression and time zone are
-/// checked for shape here; the scheduler parses them when it starts.
+/// One `[[jobs.schedules]]` entry. The cron expression (five fields) and
+/// the IANA time zone are parsed here with [`crate::cron::CronSchedule`],
+/// so every entry that loads also schedules.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobSchedule {
     pub name: String,
@@ -362,20 +363,15 @@ pub(super) fn jobs(layers: &mut Layers, issues: &mut Vec<ConfigIssue>) -> JobsCo
     }
 }
 
-fn valid_cron(cron: &str) -> bool {
-    let fields = cron.split_whitespace().count();
-    cron.len() <= 128
-        && (5..=6).contains(&fields)
-        && cron
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b" */,-?#LW".contains(&b))
-}
-fn valid_timezone(zone: &str) -> bool {
-    (1..=64).contains(&zone.len())
-        && zone.as_bytes()[0].is_ascii_alphabetic()
-        && zone
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_+-/".contains(&b))
+/// Schedule names, as the `merezha_jobs.schedules` column accepts them:
+/// `[a-z][a-z0-9_.-]{0,63}`, such as `tasks.reminders`.
+pub fn valid_schedule_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=64).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_.-".contains(b))
 }
 
 fn read_schedules(
@@ -433,14 +429,32 @@ fn read_schedules(
                 None
             }
         };
-        let name = text("name", &|v| merezha_domain::valid_name(v), "invalid_name");
-        let cron = text("cron", &valid_cron, "invalid_cron");
-        let timezone = match has_timezone {
-            true => text("timezone", &valid_timezone, "invalid_timezone"),
+        let name = text("name", &valid_schedule_name, "invalid_name");
+        // Strings here; their shapes are checked by the parse below.
+        let mut cron = text("cron", &|_| true, "invalid_cron");
+        let mut timezone = match has_timezone {
+            true => text("timezone", &|_| true, "invalid_timezone"),
             false => Some("UTC".to_owned()),
         };
         let queue = text("queue", &valid_queue_name, "invalid_queue_name");
         let kind = text("kind", &valid_queue_name, "invalid_kind");
+        // A bad expression or an unknown zone fails here, with every other
+        // problem, rather than when the scheduler starts.
+        if let (Some(expression), Some(zone)) = (&cron, &timezone)
+            && let Err(problems) = crate::cron::CronSchedule::parse(expression, zone)
+        {
+            for problem in problems {
+                issues.push(ConfigIssue::new(
+                    key(problem.field()),
+                    problem.code(),
+                    origin.clone(),
+                ));
+                match problem.field() {
+                    "cron" => cron = None,
+                    _ => timezone = None,
+                }
+            }
+        }
         let payload = match table.remove("payload") {
             None => Some(serde_json::Value::Object(Default::default())),
             Some(value) => json_payload(value).or_else(|| {
