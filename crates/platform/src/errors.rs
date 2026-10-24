@@ -89,6 +89,7 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("invalid_recipient", 422),
     ErrorCode::new("invalid_source", 422),
     ErrorCode::new("source_not_allowed", 422),
+    ErrorCode::new("source_not_granted", 422),
     ErrorCode::new("invalid_system_principal", 422),
     ErrorCode::new("too_many_ids", 422),
     ErrorCode::new("outbox_unavailable", 422),
@@ -459,7 +460,101 @@ mod tests {
         assert!(FieldError::new("/".repeat(257), "x").is_err());
     }
 
-    /// Every code literal the kernel crates construct outside their tests.
+    /// `text` without the items gated by `#[cfg(test)]`: a `;`- or
+    /// `,`-terminated item, or one whose body is a balanced `{ }` block,
+    /// such as `mod tests { .. }`. Strings and char literals are skipped
+    /// while counting braces.
+    fn strip_test_items(text: &str) -> String {
+        const GATE: &str = "#[cfg(test)]";
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut from = 0;
+        while let Some(found) = text[from..].find(GATE) {
+            let start = from + found;
+            out.push_str(&text[from..start]);
+            let mut index = start + GATE.len();
+            let mut depth = 0usize;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'"' => {
+                        index += 1;
+                        while index < bytes.len() && bytes[index] != b'"' {
+                            if bytes[index] == b'\\' {
+                                index += 1;
+                            }
+                            index += 1;
+                        }
+                    }
+                    b'\'' if bytes.get(index + 2) == Some(&b'\'') => index += 2,
+                    b'{' => depth += 1,
+                    b'}' if depth == 0 => break,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            index += 1;
+                            break;
+                        }
+                    }
+                    b';' | b',' if depth == 0 => {
+                        index += 1;
+                        break;
+                    }
+                    _ => {}
+                }
+                index += 1;
+            }
+            from = index.min(bytes.len());
+        }
+        out.push_str(&text[from..]);
+        out
+    }
+
+    /// Every code literal `text` constructs.
+    fn codes_in(text: &str) -> std::collections::BTreeSet<String> {
+        const CALLS: [&str; 12] = [
+            "Failure::permanent(\"",
+            "Failure::transient(\"",
+            "Failure::conflict(\"",
+            "Failure::new(\"",
+            "MigrationError::at(\"",
+            "StartupError::new(\"",
+            "JobFailure::permanent(\"",
+            "JobFailure::transient(\"",
+            "BlobError::Invalid(\"",
+            "BlobError::Rejected(\"",
+            "BlobError::Unavailable(\"",
+            "failed(\"",
+        ];
+        let mut found = std::collections::BTreeSet::new();
+        // Multi-line calls: collapse whitespace and join the argument onto
+        // the call.
+        let code = text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace("( \"", "(\"");
+        for call in CALLS {
+            for (at, _) in code.match_indices(call) {
+                let rest = &code[at + call.len()..];
+                if let Some(end) = rest.find('"') {
+                    found.insert(rest[..end].to_owned());
+                }
+            }
+        }
+        // `code()` tables of the runtime, the notifier and the edge.
+        for (at, _) in code.match_indices("=> \"") {
+            let rest = &code[at + 4..];
+            if let Some(end) = rest.find('"') {
+                let literal = &rest[..end];
+                if crate::config::valid_module_name(literal) {
+                    found.insert(literal.to_owned());
+                }
+            }
+        }
+        found
+    }
+
+    /// Every code literal the kernel crates construct outside test items.
     fn emitted_codes() -> std::collections::BTreeSet<String> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let mut found = std::collections::BTreeSet::new();
@@ -474,17 +569,6 @@ mod tests {
         .iter()
         .map(|c| root.join(c).join("src"))
         .collect();
-        const CALLS: [&str; 9] = [
-            "Failure::permanent(\"",
-            "Failure::transient(\"",
-            "Failure::conflict(\"",
-            "Failure::new(\"",
-            "MigrationError::at(\"",
-            "BlobError::Invalid(\"",
-            "BlobError::Rejected(\"",
-            "BlobError::Unavailable(\"",
-            "failed(\"",
-        ];
         while let Some(path) = stack.pop() {
             if path.is_dir() {
                 for entry in std::fs::read_dir(&path).unwrap() {
@@ -496,34 +580,40 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
-            let code = text.split("#[cfg(test)]").next().unwrap_or_default();
-            // Multi-line calls: collapse whitespace and join the argument
-            // onto the call.
-            let code = code
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .replace("( \"", "(\"");
-            for call in CALLS {
-                for (at, _) in code.match_indices(call) {
-                    let rest = &code[at + call.len()..];
-                    if let Some(end) = rest.find('"') {
-                        found.insert(rest[..end].to_owned());
-                    }
-                }
-            }
-            // `code()` tables of the runtime, the notifier and the edge.
-            for (at, _) in code.match_indices("=> \"") {
-                let rest = &code[at + 4..];
-                if let Some(end) = rest.find('"') {
-                    let literal = &rest[..end];
-                    if crate::config::valid_module_name(literal) && !literal.contains('.') {
-                        found.insert(literal.to_owned());
-                    }
-                }
-            }
+            found.extend(codes_in(&strip_test_items(&text)));
         }
         found
+    }
+
+    #[test]
+    fn the_scanner_sees_codes_after_early_test_items_and_skips_test_code() {
+        let source = r#"
+#[cfg(test)]
+use std::sync::Mutex;
+struct Slot {
+    #[cfg(test)]
+    waiting: Mutex<usize>,
+    open: bool,
+}
+fn busy() -> Failure {
+    Failure::transient("late_production_code")
+}
+fn start() -> StartupError {
+    StartupError::new(
+        "startup_code",
+    )
+}
+#[cfg(test)]
+mod tests {
+    fn helper() { let _ = Failure::permanent("test_only_code"); let _ = "}"; }
+}
+fn after() -> Failure { Failure::conflict("after_tests") }
+"#;
+        let codes = codes_in(&strip_test_items(source));
+        for expected in ["late_production_code", "startup_code", "after_tests"] {
+            assert!(codes.contains(expected), "{expected} in {codes:?}");
+        }
+        assert!(!codes.contains("test_only_code"), "{codes:?}");
     }
 
     #[test]
