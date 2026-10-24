@@ -269,6 +269,7 @@ async fn the_host_starts_the_block_with_its_migration_source_and_routes() {
             routes: axum::Router::new(),
             authorizer: Arc::new(LoopbackAllowAll::new("127.0.0.1:8080".parse().unwrap()).unwrap()),
             timeouts: Timeouts::default(),
+            jobs: None,
         },
     )
     .await
