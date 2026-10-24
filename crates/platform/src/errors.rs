@@ -31,8 +31,12 @@ impl ErrorCode {
     }
 }
 
-/// The kernel's canonical codes. `rate_limited` and `overloaded` responses
-/// carry `Retry-After`, as does every other 429 and 503.
+/// Every code the kernel emits, with its status: the canonical R8 codes,
+/// the PostgreSQL, application, runtime and port codes, and the startup
+/// codes that never reach HTTP but stay reserved so no module reuses them
+/// with another meaning. A module may list one again with the same status,
+/// never with another. `rate_limited`, `database_busy`, `overloaded` and
+/// every other 429 and 503 response carry `Retry-After`.
 pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("invalid_input", 400),
     ErrorCode::new("unauthenticated", 401),
@@ -42,17 +46,119 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("not_found", 404),
     ErrorCode::new("handler_not_found", 404),
     ErrorCode::new("projection_not_found", 404),
+    ErrorCode::new("unknown_service", 404),
+    ErrorCode::new("blob_not_found", 404),
     ErrorCode::new("method_not_allowed", 405),
     ErrorCode::new("secret_purged", 409),
+    ErrorCode::new("conflict", 409),
+    ErrorCode::new("database_conflict", 409),
+    ErrorCode::new("unique_violation", 409),
+    ErrorCode::new("concurrency_conflict", 409),
+    ErrorCode::new("idempotency_in_flight", 409),
+    ErrorCode::new("idempotency_mismatch", 409),
+    ErrorCode::new("projection_conflict", 409),
+    ErrorCode::new("projection_in_flight", 409),
+    ErrorCode::new("storage_owned", 409),
+    ErrorCode::new("outbox_duplicate", 409),
     ErrorCode::new("revision_conflict", 412),
     ErrorCode::new("body_limit", 413),
     ErrorCode::new("input_limit", 413),
     ErrorCode::new("payload_limit", 413),
+    ErrorCode::new("output_limit", 413),
     ErrorCode::new("unsupported_media_type", 415),
     ErrorCode::new("validation_failed", 422),
+    ErrorCode::new("invalid_number", 422),
+    ErrorCode::new("invalid_response", 422),
+    ErrorCode::new("invariant_violation", 422),
+    ErrorCode::new("protocol_version", 422),
+    ErrorCode::new("serialization_failed", 422),
+    ErrorCode::new("constraint_violation", 422),
+    ErrorCode::new("database_error", 422),
+    ErrorCode::new("event_batch_limit", 422),
+    ErrorCode::new("history_limit", 422),
+    ErrorCode::new("invalid_batch", 422),
+    ErrorCode::new("invalid_event", 422),
+    ErrorCode::new("invalid_event_feed", 422),
+    ErrorCode::new("config_limit", 422),
+    ErrorCode::new("invalid_dedupe_key", 422),
+    ErrorCode::new("invalid_event_id", 422),
+    ErrorCode::new("invalid_error_detail", 422),
+    ErrorCode::new("invalid_job_payload", 422),
+    ErrorCode::new("invalid_locale", 422),
+    ErrorCode::new("invalid_page", 422),
+    ErrorCode::new("invalid_recipient", 422),
+    ErrorCode::new("invalid_source", 422),
+    ErrorCode::new("source_not_allowed", 422),
+    ErrorCode::new("invalid_system_principal", 422),
+    ErrorCode::new("too_many_ids", 422),
+    ErrorCode::new("outbox_unavailable", 422),
+    ErrorCode::new("outbox_batch_limit", 422),
+    ErrorCode::new("outbox_payload_limit", 422),
+    ErrorCode::new("blob_store_unavailable", 422),
+    ErrorCode::new("invalid_blob_key", 422),
+    ErrorCode::new("upstream_body_limit", 422),
+    ErrorCode::new("guest_error", 422),
+    ErrorCode::new("fuel_exhausted", 422),
+    ErrorCode::new("memory_limit", 422),
+    ErrorCode::new("trap", 422),
+    ErrorCode::new("unknown_topic", 422),
+    ErrorCode::new("unknown_template", 422),
+    ErrorCode::new("channel_not_allowed", 422),
+    ErrorCode::new("too_many_recipients", 422),
+    ErrorCode::new("recipient_not_in_tenant", 422),
+    ErrorCode::new("data_too_large", 422),
+    ErrorCode::new("reserved_data_key", 422),
+    ErrorCode::new("render_failed", 422),
+    ErrorCode::new("unknown_event_type", 422),
+    ErrorCode::new("webhooks_disabled", 422),
+    ErrorCode::new("storage_configuration", 422),
+    ErrorCode::new("storage_invalid", 422),
+    ErrorCode::new("storage_lock", 422),
+    ErrorCode::new("storage_open", 422),
+    ErrorCode::new("storage_path", 422),
+    ErrorCode::new("storage_schema", 422),
+    ErrorCode::new("invalid_config", 422),
+    ErrorCode::new("invalid_limits", 422),
+    ErrorCode::new("invalid_routes", 422),
+    ErrorCode::new("invalid_manifest", 422),
+    ErrorCode::new("invalid_application_config", 422),
+    ErrorCode::new("invalid_arguments", 422),
+    ErrorCode::new("invalid_database_config", 422),
+    ErrorCode::new("tls_ca_file", 422),
+    ErrorCode::new("tls_config", 422),
+    ErrorCode::new("invalid_migrations", 422),
+    ErrorCode::new("unknown_applied_migration", 422),
+    ErrorCode::new("migration_checksum_mismatch", 422),
+    ErrorCode::new("migration_name_mismatch", 422),
+    ErrorCode::new("migration_out_of_order", 422),
+    ErrorCode::new("migration_failed", 422),
+    ErrorCode::new("allow_all_requires_loopback", 422),
+    ErrorCode::new("error_code_conflict", 422),
+    ErrorCode::new("http_client_config", 422),
+    ErrorCode::new("module_start_failed", 422),
+    ErrorCode::new("telemetry_initialized", 422),
     ErrorCode::new("rate_limited", 429),
     ErrorCode::new("database_busy", 429),
     ErrorCode::new("overloaded", 503),
+    ErrorCode::new("unavailable", 503),
+    ErrorCode::new("internal", 503),
+    ErrorCode::new("database_unavailable", 503),
+    ErrorCode::new("database_timeout", 503),
+    ErrorCode::new("database_closed", 503),
+    ErrorCode::new("commit_outcome_unknown", 503),
+    ErrorCode::new("upstream_unavailable", 503),
+    ErrorCode::new("random_unavailable", 503),
+    ErrorCode::new("idempotency_capacity", 503),
+    ErrorCode::new("storage_busy", 503),
+    ErrorCode::new("storage_full", 503),
+    ErrorCode::new("storage_reopen_required", 503),
+    ErrorCode::new("storage_sync", 503),
+    ErrorCode::new("storage_unavailable", 503),
+    ErrorCode::new("store_capacity", 503),
+    ErrorCode::new("store_unavailable", 503),
+    ErrorCode::new("migration_lock_timeout", 503),
+    ErrorCode::new("migration_timeout", 503),
+    ErrorCode::new("listener_failed", 503),
     ErrorCode::new("timeout", 504),
     ErrorCode::new("upstream_timeout", 504),
 ];
@@ -351,5 +457,124 @@ mod tests {
             );
         }
         assert!(FieldError::new("/".repeat(257), "x").is_err());
+    }
+
+    /// Every code literal the kernel crates construct outside their tests.
+    fn emitted_codes() -> std::collections::BTreeSet<String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut found = std::collections::BTreeSet::new();
+        let mut stack: Vec<std::path::PathBuf> = [
+            "postgres",
+            "platform",
+            "application",
+            "domain",
+            "cli",
+            "runtime",
+        ]
+        .iter()
+        .map(|c| root.join(c).join("src"))
+        .collect();
+        const CALLS: [&str; 9] = [
+            "Failure::permanent(\"",
+            "Failure::transient(\"",
+            "Failure::conflict(\"",
+            "Failure::new(\"",
+            "MigrationError::at(\"",
+            "BlobError::Invalid(\"",
+            "BlobError::Rejected(\"",
+            "BlobError::Unavailable(\"",
+            "failed(\"",
+        ];
+        while let Some(path) = stack.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(&path).unwrap() {
+                    stack.push(entry.unwrap().path());
+                }
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+            // Multi-line calls: collapse whitespace and join the argument
+            // onto the call.
+            let code = code
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .replace("( \"", "(\"");
+            for call in CALLS {
+                for (at, _) in code.match_indices(call) {
+                    let rest = &code[at + call.len()..];
+                    if let Some(end) = rest.find('"') {
+                        found.insert(rest[..end].to_owned());
+                    }
+                }
+            }
+            // `code()` tables of the runtime, the notifier and the edge.
+            for (at, _) in code.match_indices("=> \"") {
+                let rest = &code[at + 4..];
+                if let Some(end) = rest.find('"') {
+                    let literal = &rest[..end];
+                    if crate::config::valid_module_name(literal) && !literal.contains('.') {
+                        found.insert(literal.to_owned());
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn every_code_the_kernel_emits_is_registered_and_cannot_be_redefined() {
+        let emitted = emitted_codes();
+        assert!(emitted.contains("database_unavailable") && emitted.contains("output_limit"));
+        let registry = ErrorRegistry::kernel();
+        let known_non_codes = [
+            // `=> "..."` literals that are not error codes.
+            "default",
+            "file",
+            "json",
+            "text",
+            "user",
+            "tenant",
+            "application",
+            "email_address",
+            "phone_address",
+            "email",
+            "sms",
+            "push",
+            "inbox",
+            "kernel",
+            "apply",
+            "verify",
+            // Configuration issue codes from `config::failed`, not failures.
+            "config_unreadable",
+            "config_too_large",
+        ];
+        let missing: Vec<_> = emitted
+            .iter()
+            .filter(|c| registry.status_of(c).is_none() && !known_non_codes.contains(&c.as_str()))
+            .collect();
+        assert!(missing.is_empty(), "unregistered kernel codes: {missing:?}");
+        for code in KERNEL_CODES {
+            let other = if code.status == 400 { 418 } else { 400 };
+            let mut module = ErrorRegistry::kernel();
+            let leaked: &'static str = Box::leak(code.code.to_owned().into_boxed_str());
+            let refused = module
+                .register("rogue", &[ErrorCode::new(leaked, other)])
+                .unwrap_err();
+            assert_eq!(refused[0].reason, "error_status_conflict", "{}", code.code);
+            assert!(module.register("polite", &[*code]).is_ok());
+        }
+        assert_eq!(
+            registry.status_of("output_limit"),
+            Some(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+        assert_eq!(
+            registry.status_of("database_unavailable"),
+            Some(StatusCode::SERVICE_UNAVAILABLE)
+        );
     }
 }
