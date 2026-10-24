@@ -52,6 +52,9 @@ fn main() -> std::process::ExitCode {
     if std::env::args().nth(1).as_deref() == Some("notifications") {
         return merezha_cli::notifications::main(std::env::args().skip(2));
     }
+    if std::env::args().nth(1).as_deref() == Some("identity") {
+        return merezha_cli::identity::main(std::env::args().skip(2));
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

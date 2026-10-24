@@ -134,8 +134,9 @@ one type from being accepted where another is expected.
 
 An attacker can register a victim's address with a password and never verify
 it. When the real owner later proves control of that address through a magic
-link, password reset, invitation or trusted OAuth provider, the service
-claims the unverified account. In one transaction it removes every
+link, password reset, invitation, trusted OAuth provider, or a verification
+link opened outside the browser that registered (below), the service claims
+the unverified account. In one transaction it removes every
 credential on it (password, passkeys, OAuth identities), deletes its sessions
 and API keys, marks the email verified, then continues the flow that proved
 ownership. It audits `user.unverified_account_claimed`. Unverified accounts
@@ -143,6 +144,24 @@ cannot sign in while `require_verified_email = true` (the default), so in the
 default configuration only the password is ever present. The TypeScript
 service marked such accounts verified and kept the attacker's password. That
 is the main correctness fix carried over.
+
+The verification link itself is mailed at registration, so the attacker's
+registration sends the victim a "verify your email" link. Registration (and a
+verification resend) therefore sets a binding cookie in the browser that
+asked: `__Host-merezha_verify` (`merezha_verify` with the loopback
+development cookie), 32 random bytes, `HttpOnly`, `SameSite=Lax`, `Secure`,
+`Max-Age` of `email_verification_ttl`; a browser that presents a well-formed
+one keeps it. Its SHA-256 digest is stored on the verification token
+(`one_time_tokens.binding_hash`). A confirmation that carries the matching
+cookie verifies the account as it is: the password stays and the user is
+signed in. Any other confirmation of an unverified account is an ownership
+claim under this rule: the password and every other credential go, every
+session is revoked, the address is verified and the clicker is signed in
+with a session whose answer carries `"password_unset": true` (also visible as
+`user.credentials.password = false`), so the client asks for a password
+(`PUT /me/password` accepts the fresh session as recent). Both paths set the
+cookie, so registration still answers identically for new and existing
+addresses. Non-browser clients send the cookie back on confirmation.
 
 Only while `require_verified_email = true`, the cleanup job deletes
 unverified accounts older than `unverified_account_ttl` (default 7 days)
@@ -263,6 +282,13 @@ CREATE TRIGGER audit_events_no_update
     BEFORE UPDATE ON merezha_identity.audit_events
     FOR EACH ROW EXECUTE FUNCTION merezha_identity.audit_events_immutable();
 ```
+
+PR 1 adds two things to this migration as written: `one_time_tokens.email`
+(the trimmed NFC address the token was sent to, so a magic-link sign-up or
+an email change keeps the address's display form) with a 512-byte bound on
+`return_to`, and the indexes `sessions_absolute_expiry_idx` and
+`one_time_tokens_user_idx` that the cleanup job and the per-user token
+deletes read.
 
 The retention job deletes audit rows by `occurred_at`, so the trigger blocks
 `UPDATE` only. The trigger guards against application bugs, not against a
@@ -721,7 +747,10 @@ Behavior notes:
   PHC parameters differ from configuration, the password is rehashed in the
   same transaction.
 - `email-verifications/confirm` signs the user in. The token proves inbox
-  control, the same proof a magic link gives.
+  control, the same proof a magic link gives. Without the registering
+  browser's binding cookie it claims the unverified account first (section
+  2) and answers `session.password_unset: true`; it clears the binding
+  cookie either way.
 - Magic links and verification links point at application pages configured in
   `links` with the token in the URL fragment, for example
   `https://app.example.com/auth/magic#token=...`. A fragment never reaches
@@ -735,10 +764,23 @@ Behavior notes:
   `registration = "open"` and `magic_links.sign_up = true`, otherwise sends
   nothing. The response is identical either way.
 - `POST /me/email-changes` sends `identity.email_change_confirm` to the new
-  address and `identity.email_change_notice` to the old one. Confirmation
-  checks uniqueness at that moment (`409 email_taken`, which only the owner of
-  the new inbox can see), swaps the address, rotates the current session if
-  the confirming browser holds one, and revokes the user's other sessions.
+  address and `identity.email_change_notice` to the current one, as an
+  explicit `Address` captured at request time. The token is bound to the
+  requesting session (`one_time_tokens.session_id`): only that session,
+  cookie or bearer, confirms. Any other caller gets `401 sign_in_required`,
+  nothing changes and the token stays usable, so someone who receives a link
+  for an address change they did not ask for cannot attach their inbox to
+  another account. Confirmation checks uniqueness at that moment
+  (`409 email_taken`), swaps the address, rotates the requesting session and
+  revokes the user's other sessions.
+- `POST /password-resets`, `POST /email-verifications` and `POST /magic-links`
+  validate the input, charge the rate limits and append one
+  `identity.link_request` job record to the outbox (queue `identity`,
+  `contains_secret = false`: the address, `return_to`, the binding digest,
+  the request id and client address for the audit row), then answer `202`.
+  The job looks the account up, issues the token and requests the
+  notification. The request path runs the same statements for known and
+  unknown addresses (section 7).
 - `DELETE /me` fails with `409 sole_owner` while the user is the only owner
   of any organization. Otherwise it hard-deletes the user (cascade removes
   credentials, sessions, memberships, application role assignments, the
@@ -1253,10 +1295,10 @@ Limits: `max_per_user = 20` passkeys. Removing the last credential fails
 
 | Purpose | TTL default | Subject key | On consumption |
 | --- | --- | --- | --- |
-| `email_verification` | 24 h | normalized email | Marks verified, signs in. |
+| `email_verification` | 24 h | normalized email; bound to the registering browser's binding cookie | Marks verified, signs in. Without the binding cookie, claims an unverified account first (section 2). |
 | `magic_link` | 15 min | normalized email | Signs in, creating the account if allowed. Applies the pre-hijacking rule. |
 | `password_reset` | 30 min | normalized email | Sets the password, deletes all sessions, signs in, marks the email verified, applies the pre-hijacking rule. |
-| `email_change` | 1 h | user id | Swaps the email, revokes other sessions. |
+| `email_change` | 1 h | user id; bound to the requesting session | Only that session confirms (`sign_in_required` otherwise). Swaps the email, revokes other sessions. |
 | invitation | 7 days | (organization, email) in `invitations` | Membership; account creation if none; claims an unverified account (pre-hijacking rule). |
 
 Common lifecycle: 32 random bytes from the OS CSPRNG, base64url in the link,
@@ -1346,7 +1388,16 @@ No row returned means denied. `Retry-After` is
 approach the TypeScript limiter introduced, so naming a victim's email does
 not spend the victim's budget. Peek-then-charge lets attempts already in
 flight pass a nearly empty bucket, at most `hash_concurrency` of them, and
-the arrival-charged `sign_in.ip` policy bounds the rest. The cleanup job
+the arrival-charged `sign_in.ip` policy bounds the rest. PR 1 enforces that
+bound with an admission gate of `hash_concurrency` permits, held from the
+peek (one statement for every policy of the route) through the Argon2id
+verification to the charge; the account lookup runs before it. The gate is
+global, which is the residual trade-off: a flood of failing sign-ins from
+many addresses can push other sign-ins into `503 overloaded` (with
+`Retry-After`) for as long as it lasts, never into another account's outcome.
+`sign_in.ip`, charged on arrival before the gate, bounds what each address
+contributes; an operator facing a distributed flood raises
+`hash_concurrency` or rate-limits in front of the host. The cleanup job
 deletes rows with `tat < now`. `now` comes from the platform `Clock`, which
 keeps tests deterministic.
 
@@ -1381,9 +1432,10 @@ nothing blocks passkey or OAuth sign-in.
 
 | Route | Measure |
 | --- | --- |
-| Registration | Always 202. Existing address gets an "account exists" email instead. Same hash cost on both paths. |
+| Registration | Always 202, with a binding cookie on both paths. Existing address gets an "account exists" email instead. Same hash cost on both paths. Residual: the new-address path writes the user, the credential and the token where the existing-address path only requests a mail, a few statements' difference behind one Argon2id hash; PR 1 accepts it and relies on `registration.ip` and the `email.*` limits. |
 | Sign-in | Same code and same Argon2 cost for unknown email and wrong password. Unverified and disabled are revealed only after the password matched. |
-| Reset, magic link, verification resend, email change | Always 202. |
+| Reset, magic link, verification resend | Always 202. The request path validates, charges the rate limits and queues one `identity.link_request` job, the same statements for every address; the lookup runs in the job. |
+| Email change | Always 202 for a recent session. |
 | Passkey options with email | Indistinguishable ceremony for unknown emails. |
 | Invitation inspect | Requires the 256-bit token. `account_exists` is shown only to the token holder. |
 | Cross-organization ids | 404. |
@@ -1504,13 +1556,14 @@ Identity owns this topic list, and NT predeclares every topic in it (R2):
 | `identity.account_exists` | registration with an address that has an account | `Address` | none |
 | `identity.password_changed` | password changed or reset | `User` | none |
 | `identity.email_change_confirm` | email change requested | `Address` (the new address) | `link` |
-| `identity.email_change_notice` | email change requested | `User` (the old address) | none |
+| `identity.email_change_notice` | email change requested | `Address` (the current address, captured at request time) | none |
 | `identity.invitation` | invitation created | `Address` | `link` |
 | `identity.new_sign_in` | session created, when `notify_new_sign_in = true` (default false) | `User` | none |
 
 Token mail goes to `Address`, the exact address the token was issued for
 (with `user` set when an account exists). Notices go to `User` through the
-`Directory`. `data` holds only non-secret fields (`display_name`,
+`Directory`, except the email change notice, which goes to the address the
+account had when the change was requested. `data` holds only non-secret fields (`display_name`,
 `organization_name`, `expires_at`); the link goes in `secret_data.link`.
 The request's `expires_at` is the token's expiry, and its dedupe key is
 `{topic}:{id}` with the token, invitation or audit event id. The flagged
@@ -1801,6 +1854,19 @@ Decisions and notes:
   `scrypt` (framework.md fixes Argon2id), `tower-sessions` (its store model
   does not fit idle/absolute expiry plus digest-only storage, and the session
   logic is small).
+
+PR 1 (2026-10-24) uses `argon2`, `hmac`, `sha2`, `subtle`, `base64`,
+`uuid`, `jiff`, `secrecy`, `zeroize`, `unicode-normalization`, `idna` and
+`tokio-postgres` (its `with-uuid-1`, `with-jiff-0_2` and `with-serde_json-1`
+features enabled from `merezha-identity`) as listed, with
+`argon2` at `default-features = false` and `alloc`, `password-hash`,
+`zeroize` (salts come from the platform CSPRNG, so no `getrandom` feature).
+It adds `miniz_oxide` 0.9.1 (MIT OR Zlib OR Apache-2.0, already locked
+through `flate2`) to decompress the embedded blocklist. It needs no `url`,
+`ipnet`, `cookie`, `rand` or direct `getrandom`: origin parsing, the IPv6
+/64 key, the cookie header and token bytes are a few lines each on `std`
+and the platform `Random`. HKDF is written on `hmac` (RFC 5869, tested
+against its vector) instead of adding `hkdf`.
 
 Workspace pins follow the repository's existing style (exact pins for
 `wasmtime` and `rusqlite`): exact `=` pins for the crates on the

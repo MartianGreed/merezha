@@ -58,14 +58,32 @@ pub mod application_cli;
 pub mod application_http;
 pub mod application_module;
 pub mod content;
+pub mod identity;
 pub mod notifications;
 pub mod run;
 
 /// The blocks the `merezha` binary registers. Each stays disabled until
-/// its `[modules.<name>]` section is present. The notifications block reads
-/// the facts its cross-section checks need from the same `input`.
+/// its `[modules.<name>]` section is present. The notifications and
+/// identity blocks read the facts their cross-section checks need from the
+/// same `input`.
 pub fn modules(input: &merezha_platform::ConfigInput) -> Vec<Box<dyn merezha_platform::Module>> {
-    blocks(input, merezha_content::ContentModule::new())
+    host_blocks(input).0
+}
+
+/// [`modules`] and the identity block's handle, whose session
+/// authenticator the host installs when `[modules.identity]` is present.
+pub fn host_blocks(
+    input: &merezha_platform::ConfigInput,
+) -> (
+    Vec<Box<dyn merezha_platform::Module>>,
+    merezha_identity::IdentityHandle,
+) {
+    let identity = merezha_identity::IdentityModule::new(merezha_identity::HostFacts::load(input));
+    let handle = identity.handle();
+    (
+        blocks_with(input, merezha_content::ContentModule::new(), identity),
+        handle,
+    )
 }
 
 /// [`modules`] with the given content module, so the caller keeps its
@@ -74,7 +92,17 @@ pub fn blocks(
     input: &merezha_platform::ConfigInput,
     content: merezha_content::ContentModule,
 ) -> Vec<Box<dyn merezha_platform::Module>> {
+    let identity = merezha_identity::IdentityModule::new(merezha_identity::HostFacts::load(input));
+    blocks_with(input, content, identity)
+}
+
+fn blocks_with(
+    input: &merezha_platform::ConfigInput,
+    content: merezha_content::ContentModule,
+    identity: merezha_identity::IdentityModule,
+) -> Vec<Box<dyn merezha_platform::Module>> {
     vec![
+        Box::new(identity),
         Box::new(content),
         Box::new(merezha_notifications::Notifications::new(
             merezha_notifications::HostFacts::load(input),
