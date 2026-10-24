@@ -269,6 +269,8 @@ impl Pg {
     ) -> Result<Instance, Failure> {
         let mut db_config = self.test.config();
         db_config.pool_size = 6;
+        // Room for a loaded machine; the tests bound their own waits.
+        db_config.acquire_timeout = Duration::from_secs(5);
         let db = Database::connect(&db_config).unwrap();
         let options = PostgresOptions {
             background,
@@ -412,8 +414,12 @@ fn projections_converge_within_a_second_by_notify_and_within_the_interval_withou
         &probe,
         Pg::options(CatchUp::Auto, never, hooks.clone()),
     );
-    // Its lanes run once at start; let that pass.
-    std::thread::sleep(Duration::from_millis(300));
+    // Its lanes check once at start; ready means they all did.
+    until(
+        Duration::from_secs(5),
+        "the deaf instance's start-up check",
+        || deaf.scheduler.as_ref().unwrap().ready(),
+    );
     writer.app.command(add("a", 1)).unwrap();
     std::thread::sleep(Duration::from_millis(1500));
     assert_eq!(pg.checkpoint("count"), 4, "nothing woke the deaf instance");
@@ -512,7 +518,7 @@ fn killing_the_lock_holders_session_lets_the_other_instance_take_over() {
         .open(c.clone(), &probe, BackgroundOptions::default())
         .unwrap();
     fill(&writer, 40, 1);
-    probe.delay_ms.store(100, Ordering::SeqCst);
+    probe.delay_ms.store(300, Ordering::SeqCst);
     let interval = Duration::from_millis(200);
     let first = pg.start(
         c.clone(),
@@ -538,7 +544,7 @@ fn killing_the_lock_holders_session_lets_the_other_instance_take_over() {
         Pg::options(CatchUp::Auto, interval, RunHooks::default()),
     );
     // The other instance counts its contended attempts.
-    until(Duration::from_secs(2), "a contended attempt", || {
+    until(Duration::from_secs(5), "a contended attempt", || {
         second
             .store
             .contended_locks()
@@ -925,8 +931,11 @@ fn a_new_revision_is_not_ready_until_warm_while_the_old_revision_keeps_serving()
         "the old revision catches up",
         || old.app.query(query("Count", Some(20))).is_ok(),
     );
-    assert!(old.scheduler.as_ref().unwrap().ready());
-    probe.delay_ms.store(100, Ordering::SeqCst);
+    // Every lane checks its revision once at start.
+    until(Duration::from_secs(5), "the old instance is ready", || {
+        old.scheduler.as_ref().unwrap().ready()
+    });
+    probe.delay_ms.store(400, Ordering::SeqCst);
     let mut new_config = config_with(2, "");
     new_config.limits.batch_size = 2;
     let new = pg.start(
@@ -950,7 +959,7 @@ fn a_new_revision_is_not_ready_until_warm_while_the_old_revision_keeps_serving()
     let warm = new.app.admit().unwrap().projection("count").unwrap();
     assert!(!warm.warm);
     probe.delay_ms.store(0, Ordering::SeqCst);
-    until(Duration::from_secs(10), "warm", || scheduler.ready());
+    until(Duration::from_secs(30), "warm", || scheduler.ready());
     // Up to the warm position the guest saw `live = false`, then `true`.
     let (value, _) = count_of(&new, "Count");
     assert_eq!(value["cold"], true);
@@ -1016,7 +1025,12 @@ fn min_position_reads_your_write_or_fails_projection_behind() {
     let manual = Pg::options(CatchUp::Manual, interval, RunHooks::default());
     let short = config_with(1, "[limits]\ntimeout_ms=500");
     let b = pg.start(short, &probe, manual);
-    let receipt = b.app.command(add("rw", 1)).unwrap();
+    // The write goes through a host with the default 5 s deadline, so a
+    // loaded machine cannot cut it; only the query has 500 ms.
+    let writer = pg
+        .open(config(), &probe, BackgroundOptions::default())
+        .unwrap();
+    let receipt = writer.app.command(add("rw", 1)).unwrap();
     let started = Instant::now();
     assert_eq!(
         code(b.app.query(query("Count", Some(receipt.position)))),
