@@ -202,14 +202,15 @@ pub async fn run(
         raw_runtime = private,
         application = config.application.is_some()
     );
-    // Jobs and the outbox run whenever the host does (R12). Module shutdown
-    // covers the jobs drain: `jobs.drain_timeout_ms`, the 2 s cancel grace
-    // and the release (AP §B.8).
+    // Jobs and the outbox run whenever the host does (R12). The jobs runtime
+    // stops first; the module shutdown budget adds its drain
+    // (`jobs.drain_timeout_ms`, the 2 s cancel grace and the release) to
+    // the default, so the other modules keep theirs (AP §B.8).
     let defaults = Timeouts::default();
     let timeouts = Timeouts {
-        module_shutdown: defaults
-            .module_shutdown
-            .max(config.jobs.drain_timeout + std::time::Duration::from_secs(5)),
+        module_shutdown: defaults.module_shutdown
+            + config.jobs.drain_timeout
+            + std::time::Duration::from_secs(3),
         ..defaults
     };
     let parts = HostParts {

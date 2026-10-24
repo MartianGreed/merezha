@@ -50,6 +50,18 @@ impl Captured {
 fn ok() -> BoxFuture<'static, Result<(), JobFailure>> {
     Box::pin(async { Ok(()) })
 }
+/// Several statements in one transaction.
+async fn batch(db: &Database, sql: &'static str) {
+    db.transaction(soon(), move |tx| {
+        Box::pin(async move {
+            tx.batch_execute(sql)
+                .await
+                .map_err(|e| merezha_postgres::classify(&e))
+        })
+    })
+    .await
+    .unwrap();
+}
 async fn int(db: &Database, sql: &str, id: i64) -> i64 {
     let client = db.acquire(soon()).await.unwrap();
     client.query_one(sql, &[&id]).await.unwrap().get(0)
@@ -886,4 +898,292 @@ async fn backlog_counts_for_readiness_only_with_max_lag() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     strict.shutdown(soon()).await;
+}
+
+/// Review item 3: a lease that completes after the drain began is held
+/// before its dispatcher exits, never run, and released with its attempt
+/// refunded. The lease is held back on the queue's advisory lock until the
+/// stop was sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_racing_the_drain_is_released_with_its_attempt_refunded() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let config = jobs_config(
+        &test,
+        "[jobs]\npoll_interval_ms = 100\n[jobs.queues.default]\nglobal_concurrency = 5",
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let jobs = workers(
+        &db,
+        &config,
+        "racing",
+        vec![(
+            "tasks.race",
+            func(move |_, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                ok()
+            }),
+        )],
+    )
+    .await;
+    let holder = Database::connect(&test.config()).unwrap();
+    let session = holder.detach(soon()).await.unwrap();
+    session
+        .execute(
+            "SELECT pg_advisory_lock(1297762882, hashtext('default'))",
+            &[],
+        )
+        .await
+        .unwrap();
+    let id = insert_job(&db, "tasks.race", "tasks:race", "{}", false).await;
+    // The dispatcher's lease waits on the queue lock.
+    wait_for(
+        &db,
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
+        1,
+        Duration::from_secs(3),
+    )
+    .await;
+    let draining = jobs.clone();
+    let drain = tokio::spawn(async move {
+        draining
+            .shutdown(Instant::now() + Duration::from_secs(10))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    session
+        .execute(
+            "SELECT pg_advisory_unlock(1297762882, hashtext('default'))",
+            &[],
+        )
+        .await
+        .unwrap();
+    drain.await.unwrap();
+    assert_eq!(state(&db, id).await, "available");
+    assert_eq!(
+        int(
+            &db,
+            "SELECT attempts::bigint FROM merezha_jobs.jobs WHERE id = $1",
+            id
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        attempts(&db, id).await,
+        vec![(1, Some("released".into()), None, "racing".into())]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "never run");
+}
+
+/// Review item 4: concurrent lease statements on several instances (one
+/// notification wakes them all; a trigger makes each lease slow) still never
+/// run more than `global_concurrency` jobs. Without the queue's advisory
+/// lock every statement counts zero running jobs and leases its share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn global_concurrency_serialises_concurrent_lease_statements() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    batch(
+        &db,
+        "CREATE FUNCTION public.slow_lease() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             IF OLD.state = 'available' AND NEW.state = 'running' THEN
+                 PERFORM pg_sleep(0.3);
+             END IF;
+             RETURN NEW;
+         END $$;
+         CREATE TRIGGER slow_lease BEFORE UPDATE ON merezha_jobs.jobs
+             FOR EACH ROW EXECUTE FUNCTION public.slow_lease();",
+    )
+    .await;
+    let config = jobs_config(
+        &test,
+        "[jobs]\npoll_interval_ms = 60000\n\
+         [jobs.queues.default]\nconcurrency = 4\nglobal_concurrency = 2",
+    );
+    let current = Arc::new(AtomicUsize::new(0));
+    let highest = Arc::new(AtomicUsize::new(0));
+    let (now, top) = (current.clone(), highest.clone());
+    let handler = func(move |_, _| {
+        let (now, top) = (now.clone(), top.clone());
+        Box::pin(async move {
+            let running = now.fetch_add(1, Ordering::SeqCst) + 1;
+            top.fetch_max(running, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            now.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        })
+    });
+    let mut instances = Vec::new();
+    for name in ["a", "b", "c"] {
+        let pool = Database::connect(&test.config()).unwrap();
+        instances.push(
+            workers_with(
+                PgJobs::with_mode(&config, RelayMode::Listen),
+                &pool,
+                name,
+                vec![("tasks.capped", handler.clone())],
+            )
+            .await,
+        );
+    }
+    wait_for(
+        &db,
+        "SELECT count(*) FROM pg_stat_activity
+          WHERE datname = current_database() AND query = 'LISTEN merezha_jobs;'",
+        3,
+        Duration::from_secs(5),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // One transaction: six jobs and one notification for every dispatcher.
+    batch(
+        &db,
+        "INSERT INTO merezha_jobs.jobs (queue, kind, idempotency_key, payload, payload_digest,
+             max_attempts, correlation_id)
+         SELECT 'default', 'tasks.capped', 'tasks:burst-' || n, '{}', sha256(convert_to('{}', 'UTF8')), 10, 'c'
+           FROM generate_series(1, 6) AS n;
+         SELECT pg_notify('merezha_jobs', 'default');",
+    )
+    .await;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(2500) {
+        let running = scalar(
+            &db,
+            "SELECT count(*) FROM merezha_jobs.jobs WHERE state = 'running'",
+        )
+        .await;
+        assert!(running <= 2, "{running} running");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(highest.load(Ordering::SeqCst) <= 2, "{highest:?}");
+    assert!(highest.load(Ordering::SeqCst) >= 1);
+    for jobs in instances {
+        jobs.shutdown(soon()).await;
+    }
+}
+
+/// Review item 5: when the heartbeat finds the lease gone, the handler's
+/// `cancel` fires and its result is discarded (`job.lease_lost`).
+#[tokio::test]
+async fn a_lost_heartbeat_fires_cancel_and_discards_the_result() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let logs = Captured::default();
+    let _guard = logs.install();
+    let db = database(&test).await;
+    let config = jobs_config(
+        &test,
+        "[jobs]\npoll_interval_ms = 100\nreaper_interval_ms = 600000\n\
+         [jobs.queues.default]\nlease_ms = 1500\ntimeout_ms = 10000",
+    );
+    let seen = Arc::new(Mutex::new(None::<Duration>));
+    let record = seen.clone();
+    let jobs = workers(
+        &db,
+        &config,
+        "losing",
+        vec![(
+            "tasks.watch",
+            func(move |ctx, _| {
+                let record = record.clone();
+                Box::pin(async move {
+                    let started = Instant::now();
+                    let mut cancel = ctx.cancel.clone();
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(5), cancel.wait_for(|c| *c)).await;
+                    if *ctx.cancel.borrow() {
+                        *record.lock().unwrap() = Some(started.elapsed());
+                    }
+                    Err(JobFailure::transient("cancelled", None))
+                })
+            }),
+        )],
+    )
+    .await;
+    let id = insert_job(&db, "tasks.watch", "tasks:watch", "{}", false).await;
+    wait_state(&db, id, "running", Duration::from_secs(2)).await;
+    // Another holder took the lease (a reap and a re-lease elsewhere).
+    execute(
+        &db,
+        &format!("UPDATE merezha_jobs.jobs SET lease_token = gen_random_uuid() WHERE id = {id}"),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !logs.text().contains("job.lease_lost") {
+        assert!(
+            Instant::now() < deadline,
+            "no job.lease_lost: {}",
+            logs.text()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let waited = seen.lock().unwrap().expect("cancel fired");
+    assert!(waited < Duration::from_secs(2), "cancel after {waited:?}");
+    // The failure was fenced out: the other holder's lease is untouched.
+    assert_eq!(state(&db, id).await, "running");
+    assert_eq!(last_error(&db, id).await, (None, None));
+    jobs.shutdown(soon()).await;
+}
+
+/// Review item 6 (design deviation 4): a handler that fails after the drain
+/// cutoff fired `cancel` is released with its attempt refunded, not retried.
+#[tokio::test]
+async fn a_failure_after_the_drain_cutoff_is_released_not_retried() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let config = jobs_config(
+        &test,
+        "[jobs]\npoll_interval_ms = 100\ndrain_timeout_ms = 200",
+    );
+    let jobs = workers(
+        &db,
+        &config,
+        "cut",
+        vec![(
+            "tasks.cut",
+            func(|ctx, _| {
+                Box::pin(async move {
+                    let mut cancel = ctx.cancel.clone();
+                    let _ = cancel.wait_for(|c| *c).await;
+                    Err(JobFailure::transient("cancelled", None))
+                })
+            }),
+        )],
+    )
+    .await;
+    let id = insert_job(&db, "tasks.cut", "tasks:cut", "{}", false).await;
+    wait_state(&db, id, "running", Duration::from_secs(2)).await;
+    let draining = Instant::now();
+    jobs.shutdown(Instant::now() + Duration::from_secs(10))
+        .await;
+    assert!(
+        draining.elapsed() < Duration::from_millis(1500),
+        "the handler returned inside the grace"
+    );
+    assert_eq!(state(&db, id).await, "available");
+    assert_eq!(
+        int(
+            &db,
+            "SELECT attempts::bigint FROM merezha_jobs.jobs WHERE id = $1",
+            id
+        )
+        .await,
+        0
+    );
+    assert_eq!(last_error(&db, id).await, (None, None));
+    assert_eq!(
+        attempts(&db, id).await,
+        vec![(1, Some("released".into()), None, "cut".into())]
+    );
 }

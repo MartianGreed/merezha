@@ -21,7 +21,8 @@ mod validate;
 mod worker;
 
 pub use admin::{
-    AttemptRecord, BulkReplay, DeadFilter, JobDetail, JobFilter, JobPage, JobSummary, Replay,
+    AttemptRecord, BulkReplay, DeadFilter, JobDetail, JobFilter, JobPage, JobSummary,
+    REISSUE_CLAIM_TIMEOUT, REISSUE_DEADLINE, Replay, ReplayProgress,
 };
 pub use outbox::{OUTBOX_CHANNEL, PgOutbox};
 pub use relay::{JOBS_CHANNEL, RelayReport};
@@ -226,7 +227,8 @@ impl PgJobs {
         self
     }
     /// Never extend leases: a test hook for duplicate delivery (AP-B2
-    /// test 1). Call before sharing the runtime.
+    /// test 1), feature `test-hooks`. Call before sharing the runtime.
+    #[cfg(feature = "test-hooks")]
     pub fn without_heartbeat(mut self) -> Self {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.heartbeat = false;

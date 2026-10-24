@@ -36,7 +36,7 @@ const PURGES: [(&str, &str); 5] = [
         "finished",
         "DELETE FROM merezha_jobs.jobs WHERE id IN (
              SELECT id FROM merezha_jobs.jobs
-              WHERE state IN ('succeeded', 'cancelled')
+              WHERE state IN ('succeeded', 'cancelled') AND reissue_claimed_at IS NULL
                 AND finished_at < now() - make_interval(secs => $1::float8)
               ORDER BY finished_at LIMIT $2 FOR UPDATE SKIP LOCKED)",
     ),

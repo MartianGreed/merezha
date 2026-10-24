@@ -171,9 +171,21 @@ WITH released AS (
 )
 SELECT id FROM released ORDER BY id";
 
-const LAG: &str = "
-SELECT coalesce(extract(epoch FROM now() - min(run_at)), 0)::float8
-  FROM merezha_jobs.jobs WHERE state = 'available' AND run_at <= now()";
+/// The oldest due job through `jobs_due`, without scanning the backlog.
+pub(crate) const LAG: &str = "
+SELECT coalesce(extract(epoch FROM now() - (
+           SELECT run_at FROM merezha_jobs.jobs
+            WHERE state = 'available' AND run_at <= now()
+            ORDER BY run_at LIMIT 1)), 0)::float8";
+
+/// Reissue claims cut between claim and hook (a crash) go back to `dead`.
+const REVERT_CLAIMS: &str = "
+UPDATE merezha_jobs.jobs
+   SET state = 'dead', replays = greatest(replays - 1, 0), reissue_claimed_at = NULL,
+       updated_at = now()
+ WHERE id IN (SELECT id FROM merezha_jobs.jobs
+               WHERE reissue_claimed_at < now() - make_interval(secs => $1::float8)
+               ORDER BY reissue_claimed_at LIMIT 100 FOR UPDATE SKIP LOCKED)";
 
 /// A leased job, as the lease statement returns it.
 struct Leased {
@@ -224,6 +236,7 @@ pub(crate) struct Worker {
     lagging: AtomicBool,
     failing: Mutex<HashSet<&'static str>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    dispatchers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -267,6 +280,7 @@ impl Worker {
             lagging: AtomicBool::new(false),
             failing: Mutex::new(HashSet::new()),
             tasks: Mutex::new(Vec::new()),
+            dispatchers: Mutex::new(Vec::new()),
         })
     }
 
@@ -276,8 +290,9 @@ impl Worker {
     pub(crate) fn start(self: &Arc<Self>) {
         let mut tasks = lock(&self.tasks);
         if !self.kinds.is_empty() {
+            let mut dispatchers = lock(&self.dispatchers);
             for lane in &self.lanes {
-                tasks.push(tokio::spawn(dispatch(self.clone(), lane.clone())));
+                dispatchers.push(tokio::spawn(dispatch(self.clone(), lane.clone())));
             }
             if self.config.heartbeat {
                 tasks.push(tokio::spawn(heartbeat(self.clone())));
@@ -404,8 +419,9 @@ impl Worker {
             .count()
     }
 
-    /// Run one leased job to its settlement.
-    async fn run(self: Arc<Self>, lane: Arc<Lane>, job: Leased) {
+    /// Hold a fresh lease: from here the heartbeat extends it and a drain
+    /// releases it. Returns its `cancel` receiver.
+    fn hold(&self, lane: &Lane, job: &Leased) -> watch::Receiver<bool> {
         let (cancel, cancelled) = watch::channel(false);
         self.track(
             &job.token,
@@ -417,6 +433,11 @@ impl Worker {
                 done: false,
             },
         );
+        cancelled
+    }
+
+    /// Run one held job to its settlement.
+    async fn run(self: Arc<Self>, lane: Arc<Lane>, job: Leased, cancelled: watch::Receiver<bool>) {
         tracing::debug!(
             event = "job.leased",
             job_id = job.id,
@@ -539,6 +560,15 @@ impl Worker {
     pub(crate) async fn drain(&self, until: Instant) {
         self.stop.send_replace(true);
         let release_by = until.checked_sub(RELEASE_MARGIN).unwrap_or(until);
+        // A lease in flight when the stop came is held before its
+        // dispatcher exits, so the release below covers it.
+        let dispatchers: Vec<_> = std::mem::take(&mut *lock(&self.dispatchers));
+        for mut dispatcher in dispatchers {
+            let at = tokio::time::Instant::from_std(release_by);
+            if tokio::time::timeout_at(at, &mut dispatcher).await.is_err() {
+                dispatcher.abort();
+            }
+        }
         let wait_until = (Instant::now() + self.config.drain_timeout)
             .min(release_by.checked_sub(DRAIN_GRACE).unwrap_or(release_by));
         self.wait_idle(wait_until).await;
@@ -684,6 +714,21 @@ impl Worker {
                 break;
             }
         }
+        let client = self.database.acquire(deadline()).await?;
+        let at = tokio::time::Instant::from_std(deadline());
+        let claim_timeout = crate::admin::REISSUE_CLAIM_TIMEOUT.as_secs_f64();
+        let reverted =
+            tokio::time::timeout_at(at, client.execute(REVERT_CLAIMS, &[&claim_timeout]))
+                .await
+                .map_err(|_| Failure::transient("database_timeout"))?
+                .map_err(|e| classify(&e))?;
+        if reverted > 0 {
+            tracing::info!(
+                event = "job.admin_action",
+                action = "reissue_reverted",
+                count = reverted
+            );
+        }
         Ok(total)
     }
 
@@ -749,15 +794,26 @@ async fn dispatch(worker: Arc<Worker>, lane: Arc<Lane>) {
                     Ok(jobs) => {
                         worker.recovered("lease");
                         full = jobs.len() == free;
+                        let stopping = *stop.borrow();
                         for job in jobs {
+                            let cancelled = worker.hold(&lane, &job);
+                            if stopping {
+                                // Leased as the drain began: never run,
+                                // released with the attempt refunded.
+                                worker.park(&job.token);
+                                continue;
+                            }
                             let Some(permit) = permits.split(1) else {
-                                break;
+                                // Never happens: one permit per leased job.
+                                // Unheld, the lease expires to the reaper.
+                                worker.untrack(&job.token);
+                                continue;
                             };
                             let worker = worker.clone();
                             let lane = lane.clone();
                             tokio::spawn(async move {
                                 let wake = lane.clone();
-                                worker.run(lane, job).await;
+                                worker.run(lane, job, cancelled).await;
                                 drop(permit);
                                 wake.wake.notify_one();
                             });

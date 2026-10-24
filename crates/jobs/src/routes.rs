@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
     body::to_bytes,
     extract::{Path, Request, State},
-    http::{Uri, request::Parts},
+    http::{StatusCode, Uri, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -27,6 +27,9 @@ use merezha_platform::{
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
+/// How long `POST dead/replay` waits for its detached run before it
+/// answers `202` with the counts so far.
+const BULK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Largest admin request body.
 const MAX_BODY: usize = 8 * 1024;
 const READ: &str = "jobs.admin.read";
@@ -156,8 +159,8 @@ async fn queues(State(admin): State<Admin>, request: Request) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
         admin.allow(&parts, &[READ])?;
-        let status = admin.jobs.status().await.map_err(failure)?;
-        ok(json!({ "queues": status.queues }))
+        let queues = admin.jobs.queue_summaries().await.map_err(failure)?;
+        ok(json!({ "queues": queues }))
     };
     respond(run.await)
 }
@@ -166,8 +169,8 @@ async fn outbox(State(admin): State<Admin>, request: Request) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
         admin.allow(&parts, &[READ])?;
-        let status = admin.jobs.status().await.map_err(failure)?;
-        ok(json!(status.outbox))
+        let outbox = admin.jobs.outbox_summary().await.map_err(failure)?;
+        ok(json!(outbox))
     };
     respond(run.await)
 }
@@ -368,12 +371,32 @@ async fn replay_dead(State(admin): State<Admin>, request: Request) -> Response {
             dead_before,
             limit,
         };
-        let replayed = admin
-            .jobs
-            .replay_dead(&filter, principal.as_deref())
-            .await
-            .map_err(failure)?;
-        ok(json!(replayed))
+        // Detached from this request: a disconnect or the HTTP drain cannot
+        // cut a reissue between claim and hook.
+        let (progress, handle) = admin.jobs.spawn_replay_dead(filter, principal);
+        match tokio::time::timeout(BULK_WAIT, handle).await {
+            Ok(Ok(Ok(replayed))) => ok(json!({
+                "replayed": replayed.replayed,
+                "reissued": replayed.reissued,
+                "refused": replayed.refused,
+                "complete": true,
+            })),
+            Ok(Ok(Err(refused))) => Err(failure(refused)),
+            Ok(Err(_)) => Err(failure(Failure::transient("internal"))),
+            Err(_) => {
+                let so_far = progress.snapshot();
+                Ok((
+                    StatusCode::ACCEPTED,
+                    Json(json!({
+                        "replayed": so_far.replayed,
+                        "reissued": so_far.reissued,
+                        "refused": so_far.refused,
+                        "complete": false,
+                    })),
+                )
+                    .into_response())
+            }
+        }
     };
     respond(run.await)
 }

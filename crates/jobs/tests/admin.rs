@@ -192,7 +192,10 @@ async fn the_admin_api_lists_replays_purges_and_cancels_with_audit_rows() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{bulk}");
-    assert_eq!(bulk, json!({"replayed": 1, "reissued": 0, "refused": 0}));
+    assert_eq!(
+        bulk,
+        json!({"replayed": 1, "reissued": 0, "refused": 0, "complete": true})
+    );
     assert_eq!(state(&db, dead[1]).await, "available");
     let before = jiff::Timestamp::now()
         .saturating_add(jiff::SignedDuration::from_hours(1))
@@ -608,4 +611,78 @@ async fn retention_purges_expired_rows_and_keeps_the_rest() {
         })
         .await
         .unwrap();
+}
+
+/// Review item 7: every admin route, with a read-only and a write-only
+/// principal. Reads need `jobs.admin.read` and nothing else; writes need
+/// `jobs.admin.write` and nothing else.
+#[tokio::test]
+async fn every_admin_route_checks_exactly_its_permission() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let jobs = PgJobs::with_mode(
+        &jobs_config(&test, "[jobs]\nworkers = false"),
+        RelayMode::Off,
+    );
+    jobs.ports(&db);
+    let id = insert_job(&db, "tasks.unhandled", "tasks:perm", "{}", false).await;
+    let before = jiff::Timestamp::now().to_string();
+    let routes: Vec<(&str, String, String, bool)> = vec![
+        ("GET", "/v1/jobs/admin/queues".into(), String::new(), false),
+        ("GET", "/v1/jobs/admin/jobs".into(), String::new(), false),
+        (
+            "GET",
+            format!("/v1/jobs/admin/jobs/{id}"),
+            String::new(),
+            false,
+        ),
+        ("GET", "/v1/jobs/admin/outbox".into(), String::new(), false),
+        (
+            "POST",
+            format!("/v1/jobs/admin/jobs/{id}/replay"),
+            String::new(),
+            true,
+        ),
+        (
+            "POST",
+            format!("/v1/jobs/admin/jobs/{id}/cancel"),
+            String::new(),
+            true,
+        ),
+        (
+            "POST",
+            "/v1/jobs/admin/dead/replay".into(),
+            r#"{"queue":"default"}"#.into(),
+            true,
+        ),
+        (
+            "POST",
+            "/v1/jobs/admin/dead/purge".into(),
+            json!({"queue": "default", "before": before}).to_string(),
+            true,
+        ),
+        (
+            "POST",
+            "/v1/jobs/admin/outbox/1/requeue".into(),
+            String::new(),
+            true,
+        ),
+    ];
+    assert_eq!(routes.len(), 9);
+    let reader = admin(&jobs, Arc::new(Only(&["jobs.admin.read"])));
+    let writer = admin(&jobs, Arc::new(Only(&["jobs.admin.write"])));
+    for (method, uri, body, write) in &routes {
+        let (as_reader, _) = call(&reader, method, uri, body, true).await;
+        let (as_writer, _) = call(&writer, method, uri, body, true).await;
+        let denied = StatusCode::FORBIDDEN;
+        if *write {
+            assert_eq!(as_reader, denied, "{method} {uri} as reader");
+            assert_ne!(as_writer, denied, "{method} {uri} as writer");
+        } else {
+            assert_ne!(as_reader, denied, "{method} {uri} as reader");
+            assert_eq!(as_writer, denied, "{method} {uri} as writer");
+        }
+    }
 }

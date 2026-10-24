@@ -1620,6 +1620,7 @@ dependencies = [
  "jiff",
  "merezha-application",
  "merezha-domain",
+ "merezha-jobs",
  "merezha-platform",
  "merezha-postgres",
  "serde",

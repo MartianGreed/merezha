@@ -995,37 +995,51 @@ state, and the R10 trace columns.
   2 s, then releases what is left in one fenced statement: `available`
   now with the attempt refunded, the attempts row `released`, logged as
   `job.drain_abandoned` with the ids. A handler that fails after the
-  cutoff is released, not retried; one that succeeds is settled. `merezha
-  run` sets the module shutdown budget to at least `drain_timeout_ms` plus
-  5 s.
+  cutoff is released, not retried; one that succeeds is settled. A lease
+  that completes after the drain began is held before its dispatcher
+  exits, never run, and released the same way. `merezha run` sets the
+  module shutdown budget to the 10 s default plus `drain_timeout_ms` plus
+  3 s, so the modules after the jobs runtime keep their 10 s.
 - **Secrets (R3).** A flagged job's payload is nulled by the same
   statement that makes it terminal: success, dead letter (handler or
   reaper), cancel. The admin API never returns a flagged payload.
 - **Retention.** At start and hourly, any instance purges in batches of
   1000 under `pg_try_advisory_xact_lock(MZJB, hashtext('retention'))`:
-  succeeded and cancelled jobs after `jobs.retention.succeeded`, dead jobs
+  succeeded and cancelled jobs after `jobs.retention.succeeded` (never a
+  job with an open reissue claim), dead jobs
   after `jobs.retention.dead` (with an `admin_actions` row
   `retention_purge`), relayed outbox rows after `jobs.retention.outbox`,
   quarantined ones after `jobs.retention.dead`, admin actions after
   `jobs.retention.audit`. `PgJobs::purge_expired` runs one pass.
 - **Readiness.** Ready once the subscriptions synced and the workers
   started. With `jobs.readiness.max_lag_ms`, the reaper loop also measures
-  the age of the oldest due `available` job and readiness fails while it is
+  the age of the oldest due `available` job (one row through `jobs_due`)
+  and readiness fails while it is
   older; unset, backlog is no readiness input (R10).
 - **Admin API** under `/v1/jobs/admin/` (AP §D.1), each route checked at
   `ResourceScope::Application` through the host's policy before anything
   else: `jobs.admin.read` for reads, `jobs.admin.write` for writes, and
   `jobs.admin.payload` as well for `?payload=true`. Without the identity
   block, a loopback listener allows them and a public one answers 401.
-  `GET queues` and `GET outbox` serve `JobsHandle::queue_status()`;
+  `GET queues` and `GET outbox` each serve their half of
+  `JobsHandle::queue_status()`, every count through a partial index;
   `GET jobs?queue=&state=&kind=&limit=&after=` lists by id (limit 1 to
   200, default 50, `next` cursor), without payloads; `GET jobs/{id}` adds
   `attempt_history`; `POST jobs/{id}/replay`, `POST dead/replay` (at most
   1000), `POST dead/purge`, `POST jobs/{id}/cancel` and `POST
   outbox/{id}/requeue` write an `admin_actions` row with the principal and
   log `job.admin_action`. Replaying a flagged dead job calls its kind's
-  `reissue` hook (`"state":"reissued"`, the dead row closed as `cancelled`
-  with `replays + 1`) or fails `409 secret_purged`. Bad bodies and query
+  `reissue` hook (`"state":"reissued"`) or fails `409 secret_purged`.
+  Reissues go one job at a time: a claim transaction closes the dead row
+  as `cancelled` with `replays + 1` and `reissue_claimed_at`, and writes
+  the audit row; the hook runs within 10 s; success clears the claim, and
+  a failure or timeout returns the job to `dead` (the hook's code for a
+  single replay, `refused` in a bulk count). The reaper returns a claim
+  older than 60 s (a crash between claim and hook) to `dead`. Replays run
+  in a task detached from the request, so a disconnect or the HTTP drain
+  cannot cut one; `POST dead/replay` answers `200` with
+  `"complete":true`, or `202` with the counts so far and
+  `"complete":false` when the run outlasts 30 s. Bad bodies and query
   strings fail `invalid_input` (400) or `validation_failed` (422) with
   `details` that never echo input.
 
@@ -1034,13 +1048,16 @@ Error codes it registers: `invalid_topic`, `invalid_queue`,
 `kind_already_registered`, `kind_not_registered`, `too_many_kinds` and
 `jobs_started` (422), `not_quarantined`, `not_dead` and `not_cancellable`
 (409), `jobs_not_ready` (503). Migration 0002 adds the `outbox_quarantined`
-index the admin listing and retention read.
+index the admin listing, the outbox count and retention read, the
+`jobs_due` index the readiness lag reads, and the `reissue_claimed_at`
+claim column (only on `cancelled` rows) with its index.
 
 Process tests hold the relay with `MEREZHA_JOBS_TEST_RELAY=off` (or
 `interval`, no `LISTEN`), and `MEREZHA_JOBS_TEST_HANDLER=<ms>` registers a
 `test.sleep` kind on queue `default` whose handler sleeps that long,
 ignoring `cancel`. Only builds with the `test-hooks` feature read
-them. `merezha-cli`'s dev-dependency enables it, and Cargo unifies that into
+them; the feature also adds `PgJobs::without_heartbeat`, and
+`merezha-jobs`' own tests enable it through a self dev-dependency. `merezha-cli`'s dev-dependency enables it, and Cargo unifies that into
 every build that compiles the dev-dependencies: the `merezha` binary built
 by `cargo test` or `--all-targets` reads the variable. Builds without them,
 such as `cargo build --release -p merezha-cli` or `cargo build
@@ -1079,8 +1096,8 @@ itself.
 - Modules start even when migrations are pending in verify mode; readiness
   stays false. A module that needs its tables at start should check them.
 - `Timeouts` (migrate 300 s, module start 10 s, drain 30 s, module shutdown
-  10 s) are code defaults, not configuration yet; `merezha run` raises the
-  module shutdown budget to cover `jobs.drain_timeout_ms` plus 5 s.
+  10 s) are code defaults, not configuration yet; `merezha run` adds
+  `jobs.drain_timeout_ms` plus 3 s to the module shutdown budget.
 - There is no request deadline at the edge yet; handlers bound their own
   work.
 - `Host::start` installs no `Authenticator` yet, so the edge never
