@@ -1577,11 +1577,15 @@ Migration 0004 (TE-T5) adds `jobs.replay_trace_parent` and
 **Telemetry** (TE §1.2, §1.3, §2.3; TE-T5). Spans and stored trace context:
 
 - `PgOutbox::append` opens one `send {queue}` (job record) or
-  `send {topic}` (event record) PRODUCER span per record, a child of the
-  caller's span, and stores its context in the row's `trace_parent` and
-  `trace_state`, sampled or not, so the sampling decision travels.
-  `JobsHandle::enqueue` does the same for the job it writes. The relay
-  copies a record's context into every job it fans out to.
+  `send {topic}` (event record) PRODUCER span per inserted record, a child
+  of the caller's span, and stores its context in the row's `trace_parent`
+  and `trace_state`, sampled or not, so the sampling decision travels. The
+  contexts are written by a second statement in the same transaction, run
+  only when a recording layer gives them; duplicates get no span.
+  `JobsHandle::enqueue` does the same for a new job, not for an existing
+  one. A `tracestate` over 512 bytes or 32 members is dropped (the parent
+  is kept) rather than failing the write. The relay copies a record's
+  context into every job it fans out to.
 - Each non-empty relay batch runs in a root `relay outbox` span; an empty
   pass opens none (the batch is locked by a first statement, so an idle
   wake-up costs one statement as before).
@@ -1591,14 +1595,18 @@ Migration 0004 (TE-T5) adds `jobs.replay_trace_parent` and
   `job.max_attempts`, `messaging.message.id` and, at the end, `job.outcome`
   (`succeeded`, `retry`, `dead_lettered`, `lease_lost`, `released`),
   `job.code` and `job.classification`. Its status is `Error` for transient
-  failures, timeouts, panics and lost leases only. The handler runs inside
+  failures, timeouts, panics and lost leases only; `job.dead_lettered` is
+  logged outside the span, since an error event inside it would mark it
+  `Error` for a domain rejection. The handler runs inside
   it, so what it issues joins the trace. A job without a stored context
   (cron, rows written before TE-T5) starts a root.
 - A dead-letter replay (`PgJobs::replay`, `replay_dead`, the admin routes)
   runs in `admin job.replay`, a child of the caller's span. It moves the
   job's context to `replay_trace_parent`/`replay_trace_state` and stores its
   own: the next attempts are its children and link to the trace the job
-  died in (`merezha.link.reason = replay`).
+  died in (`merezha.link.reason = replay`). A reissued (flagged) job's hook
+  runs in a replay span that links to that trace too; a bulk replay opens
+  one child `admin job.replay` per reissue.
 
 Instruments, built from `names.rs` on the meter `PgJobs::with_telemetry`
 receives (`merezha run` passes `telemetry.meter("jobs")` when metrics are

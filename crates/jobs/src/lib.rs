@@ -51,7 +51,6 @@ use std::{
     time::{Duration, Instant},
 };
 use telemetry::{Metrics, spawn};
-use tracing::Instrument;
 use worker::{QueuePlan, Worker, WorkerConfig};
 
 /// Codes this runtime returns, registered at startup (R8).
@@ -1167,10 +1166,6 @@ impl Jobs for PgJobs {
             let kind = job.kind.as_str().to_owned();
             let secret = job.contains_secret;
             let priority = job.priority;
-            // The PRODUCER span of the job, a child of the caller's span;
-            // its context is the parent of every attempt (TE §2.3).
-            let send = telemetry::send_span(&queue, Some(&queue), Some(&kind));
-            let (trace_parent, trace_state) = telemetry::columns(telemetry::stored(&send).as_ref());
             let metrics = self.inner.metrics.clone();
             let enqueued = self
                 .database()?
@@ -1180,10 +1175,9 @@ impl Jobs for PgJobs {
                             .query_opt(
                                 "INSERT INTO merezha_jobs.jobs (queue, kind, idempotency_key, payload,
                                      payload_digest, contains_secret, priority, run_at, max_attempts,
-                                     correlation_id, causation_id, tenant, trace_parent, trace_state)
+                                     correlation_id, causation_id, tenant)
                                  VALUES ($1, $2, $3, $4::text::json, sha256(convert_to($4::text, 'UTF8')),
-                                     $5, $6, coalesce($7::text::timestamptz, now()), $8, $9, $10, $11,
-                                     $12, $13)
+                                     $5, $6, coalesce($7::text::timestamptz, now()), $8, $9, $10, $11)
                                  ON CONFLICT (queue, idempotency_key) DO NOTHING
                                  RETURNING id",
                                 &[
@@ -1198,21 +1192,34 @@ impl Jobs for PgJobs {
                                     &correlation,
                                     &causation,
                                     &tenant,
-                                    &trace_parent,
-                                    &trace_state,
                                 ],
                             )
                             .await
                             .map_err(|e| classify(&e))?;
                         if let Some(row) = inserted {
+                            let id: i64 = row.get(0);
+                            // The PRODUCER span of the new job, a child of
+                            // the caller's span; its context is the parent of
+                            // every attempt (TE §2.3). An existing job gets
+                            // none.
+                            let send = telemetry::send_span(&queue, Some(&queue), Some(&kind));
+                            if let (Some(parent), state) =
+                                telemetry::columns(telemetry::stored(&send).as_ref())
+                            {
+                                tx.execute(
+                                    "UPDATE merezha_jobs.jobs SET trace_parent = $2, trace_state = $3
+                                      WHERE id = $1",
+                                    &[&id, &parent, &state],
+                                )
+                                .await
+                                .map_err(|e| classify(&e))?;
+                            }
+                            drop(send);
                             // Wake the queue's dispatchers (AP-B2), on commit.
                             tx.execute("SELECT pg_notify('merezha_jobs', $1)", &[&queue])
                                 .await
                                 .map_err(|e| classify(&e))?;
-                            return Ok(Enqueued {
-                                id: row.get(0),
-                                existed: false,
-                            });
+                            return Ok(Enqueued { id, existed: false });
                         }
                         // A new statement sees a conflicting row another
                         // transaction committed meanwhile.
@@ -1234,7 +1241,6 @@ impl Jobs for PgJobs {
                         }
                     })
                 })
-                .instrument(send)
                 .await?;
             if !enqueued.existed {
                 metrics.enqueued(job.queue.as_str(), job.kind.as_str(), 1);

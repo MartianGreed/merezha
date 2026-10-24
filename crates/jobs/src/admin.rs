@@ -244,6 +244,8 @@ struct Claimed {
     request: ReissueRequest,
     /// `reissue_claimed_at` in microseconds: the fence of every settle.
     at: i64,
+    /// The trace the job died in, linked from the span the hook runs in.
+    died_in: Option<merezha_telemetry::propagation::StoredContext>,
 }
 
 /// How long reissues wait (AP §D.1); [`PgJobs::with_reissue_timing`] in
@@ -320,6 +322,7 @@ impl PgJobs {
         Some(Claimed {
             id,
             at: 0,
+            died_in: None,
             hook,
             request: ReissueRequest {
                 job_id: id,
@@ -350,7 +353,7 @@ impl PgJobs {
                     let Some(row) = tx
                         .query_opt(
                             &format!(
-                                "SELECT {CANDIDATE} FROM merezha_jobs.jobs
+                                "SELECT {CANDIDATE}, trace_parent, trace_state FROM merezha_jobs.jobs
                                   WHERE id = $1 AND state = 'dead' AND contains_secret FOR UPDATE"
                             ),
                             &[&id],
@@ -363,6 +366,7 @@ impl PgJobs {
                     let Some(mut claim) = jobs.claimable(&row) else {
                         return Ok(None);
                     };
+                    claim.died_in = telemetry::parse(row.get(8), row.get(9));
                     claim.at = tx
                         .query_one(
                             "UPDATE merezha_jobs.jobs
@@ -582,6 +586,9 @@ impl PgJobs {
             .claim(id, principal)
             .await?
             .ok_or_else(|| Failure::conflict("not_dead"))?;
+        // The hook runs in this replay's span, which links to the trace
+        // the job died in, as a replayed attempt does (TE §2.3).
+        telemetry::link_replay(&tracing::Span::current(), claim.died_in.as_ref());
         self.reissue(claim).await?;
         self.inner.metrics.replayed(&queue, 1);
         Ok(Replay::Reissued)
@@ -708,7 +715,13 @@ impl PgJobs {
                 Ok(None) | Err(_) => None,
             };
             let reissued = match claimed {
-                Some(claim) => self.reissue(claim).await.is_ok(),
+                // One `admin job.replay` span per reissue, a child of the
+                // bulk replay's, so each links to its own dead trace.
+                Some(claim) => {
+                    let span = telemetry::replay_span(Some(claim.id), Some(&queue));
+                    telemetry::link_replay(&span, claim.died_in.as_ref());
+                    self.reissue(claim).instrument(span).await.is_ok()
+                }
                 None => false,
             };
             if reissued {

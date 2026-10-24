@@ -541,7 +541,13 @@ transport id. They are linked, not merged.
   `replay_trace_parent`/`replay_trace_state` (`merezha_jobs` migration
   0004, TE-T5, same formats) and stores the `admin job.replay` span's
   context, so the attempts after a replay are children of the replay span
-  and every one of them links back to the trace the job died in.
+  and every one of them links back to the trace the job died in. A
+  reissued flagged job (no payload, R3) runs its hook in a replay span with
+  the same link: the single replay's span, or one child `admin job.replay`
+  per reissue in a bulk replay.
+- Only inserted records and new jobs get a `send` span; duplicates write
+  nothing and get none. A `tracestate` the columns would refuse is dropped,
+  keeping the parent.
 - Cron runs have no producer: each is a root with the ratio sampler and a
   host-minted correlation id. Commands issued by jobs follow §2.2 and are
   children of the job span.

@@ -10,7 +10,7 @@ use merezha_telemetry::{
         jobs::{self as names, Classification, Outcome, RecordKind, State, attr},
         metric,
     },
-    propagation::StoredContext,
+    propagation::{MAX_TRACE_STATE, MAX_TRACE_STATE_MEMBERS, StoredContext},
 };
 use opentelemetry::{
     metrics::{Counter, Histogram, Meter, MeterProvider, ObservableGauge},
@@ -290,12 +290,21 @@ pub(crate) fn stored(span: &Span) -> Option<StoredContext> {
         .then(|| StoredContext::from_span_context(span_context))
 }
 
-/// The `trace_parent` and `trace_state` column values of `context`.
+/// The `trace_parent` and `trace_state` column values of `context`. A
+/// `tracestate` the columns would refuse (over [`MAX_TRACE_STATE`] bytes or
+/// [`MAX_TRACE_STATE_MEMBERS`] members) is dropped, never failing the write:
+/// the parent alone keeps the trace.
 pub(crate) fn columns(context: Option<&StoredContext>) -> (Option<String>, Option<String>) {
     match context {
         Some(context) => (
             Some(context.trace_parent().to_owned()),
-            context.trace_state().map(str::to_owned),
+            context
+                .trace_state()
+                .filter(|state| {
+                    state.len() <= MAX_TRACE_STATE
+                        && state.split(',').count() <= MAX_TRACE_STATE_MEMBERS
+                })
+                .map(str::to_owned),
         ),
         None => (None, None),
     }
@@ -361,9 +370,7 @@ pub(crate) fn process_span(
         let context = opentelemetry::Context::new().with_remote_span_context(parent.span_context());
         let _ = span.set_parent(context);
     }
-    if let Some(link) = replayed_from {
-        span.add_link_with_attributes(link.span_context(), vec![attr::replay_link()]);
-    }
+    link_replay(&span, replayed_from);
     span
 }
 
@@ -399,6 +406,14 @@ pub(crate) fn relay_span() -> Span {
         otel.name = names::RELAY_SPAN,
         messaging.system = names::MESSAGING_SYSTEM,
     )
+}
+
+/// Link `span` to the trace a replayed job died in
+/// (`merezha.link.reason = replay`).
+pub(crate) fn link_replay(span: &Span, died_in: Option<&StoredContext>) {
+    if let Some(context) = died_in {
+        span.add_link_with_attributes(context.span_context(), vec![attr::replay_link()]);
+    }
 }
 
 /// Mark a span `Error` for a systemic failure.
@@ -460,6 +475,31 @@ mod tests {
             .map(|kv| kv.key.to_string())
             .collect();
         assert_eq!(keys, metric::OUTBOX_QUARANTINED.attributes);
+    }
+
+    /// Review item 7: an oversized `tracestate` is dropped, the parent kept.
+    #[test]
+    fn oversized_trace_state_is_dropped_not_stored() {
+        use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState};
+        let context = |state: TraceState| {
+            StoredContext::from_span_context(&SpanContext::new(
+                TraceId::from_bytes([1; 16]),
+                SpanId::from_bytes([2; 8]),
+                TraceFlags::SAMPLED,
+                false,
+                state,
+            ))
+        };
+        let long =
+            TraceState::from_key_value((0..4).map(|i| (format!("v{i}"), "x".repeat(200)))).unwrap();
+        let (parent, state) = columns(Some(&context(long)));
+        assert_eq!(parent.unwrap().len(), 55);
+        assert_eq!(state, None);
+        let fine = TraceState::from_key_value([("vendor", "abc")]).unwrap();
+        assert_eq!(
+            columns(Some(&context(fine))).1.as_deref(),
+            Some("vendor=abc")
+        );
     }
 
     #[test]

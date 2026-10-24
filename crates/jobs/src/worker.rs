@@ -980,7 +980,10 @@ fn log_settled(job: &Leased, queue: &str, settlement: &Settlement) {
             code = code.as_str(),
             classification = *class
         ),
+        // Outside the attempt span: an error event would mark it `Error`,
+        // and a permanent failure is not a host failure (TE §1.1).
         Settlement::Dead { code, class } => event!(
+            parent: None,
             ERROR,
             "job.dead_lettered",
             job_id = job.id,

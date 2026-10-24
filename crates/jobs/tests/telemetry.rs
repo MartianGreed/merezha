@@ -588,6 +588,20 @@ async fn the_dead_letter_counter_counts_each_dead_job_exactly_once() {
         attempts.value(&[("job.outcome", "dead_lettered")]),
         Some(4.0)
     );
+    // A domain rejection is not a host failure: status Unset (TE §1.1).
+    let permanent: Vec<_> = wait_spans(&harness, "process default", 5)
+        .await
+        .into_iter()
+        .filter(|span| attribute(span, "job.code").as_deref() == Some("bad_address"))
+        .collect();
+    assert_eq!(permanent.len(), 3);
+    for span in &permanent {
+        assert_eq!(
+            attribute(span, "job.outcome").as_deref(),
+            Some("dead_lettered")
+        );
+        assert_eq!(span.status, Status::Unset);
+    }
     assert_eq!(attempts.value(&[("job.outcome", "succeeded")]), Some(1.0));
     assert_eq!(attempts.value(&[("job.outcome", "retry")]), None);
     jobs.shutdown(Instant::now() + Duration::from_secs(10))
@@ -840,10 +854,18 @@ async fn fired_schedules_are_counted_and_their_attempts_are_roots() {
     })
     .await
     .unwrap();
-    let report = jobs.schedule_now().await.unwrap();
-    assert_eq!(report.fired, 1);
+    // The start tick may fire the backdated occurrence first (review item
+    // 1): tick until its job exists, whoever fires it, then count.
+    let cron_jobs = "SELECT count(*) FROM merezha_jobs.jobs WHERE schedule_name = 'tasks.digest'";
+    let deadline = Instant::now() + PATIENCE;
+    while scalar(&db, cron_jobs).await == 0 {
+        assert!(Instant::now() < deadline, "the occurrence never fired");
+        let _ = jobs.schedule_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     // The same occurrence again is a duplicate, not a second run.
     assert_eq!(jobs.schedule_now().await.unwrap().fired, 0);
+    assert_eq!(scalar(&db, cron_jobs).await, 1);
     assert_eq!(
         harness
             .metric("merezha.job.schedule.fired")
@@ -862,6 +884,380 @@ async fn fired_schedules_are_counted_and_their_attempts_are_roots() {
         opentelemetry::trace::SpanId::INVALID
     );
     assert!(attempt.links.links.is_empty());
+    jobs.shutdown(Instant::now() + Duration::from_secs(10))
+        .await;
+    harness.assert_catalogued();
+}
+
+/// Review item 4 (M3): on the handler path, a dead letter counts only once
+/// its fenced settle wrote it. Attempt 1 outlives its lease (no
+/// heartbeat), the reaper re-offers the job, attempt 2 succeeds, and
+/// attempt 1's late permanent failure is fenced out: no dead letter, one
+/// `lease_lost` attempt.
+#[tokio::test]
+async fn a_fenced_out_permanent_failure_is_not_a_dead_letter() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let harness = Harness::new();
+    let db = database(&test).await;
+    let config = jobs_config(
+        &test,
+        "[jobs]\npoll_interval_ms = 100\nreaper_interval_ms = 100\n\
+         [jobs.queues.default]\nconcurrency = 2\nlease_ms = 1000\nmax_attempts = 3\n\
+         backoff_base_ms = 10\nbackoff_max_ms = 20",
+    );
+    let jobs = PgJobs::with_mode(&config, RelayMode::Listen)
+        .without_heartbeat()
+        .with_telemetry(
+            &harness.telemetry().meter("jobs"),
+            Duration::from_millis(50),
+        );
+    jobs.ports(&db);
+    handle(&jobs, "tasks")
+        .register(
+            "tasks.remind",
+            "default",
+            func(|ctx, _| {
+                Box::pin(async move {
+                    if ctx.attempt == 1 {
+                        tokio::time::sleep(Duration::from_millis(2_500)).await;
+                        return Err(JobFailure::permanent("bad_address"));
+                    }
+                    Ok(())
+                })
+            }),
+            Default::default(),
+        )
+        .unwrap();
+    jobs.start(context(&db)).await.unwrap();
+    wait_ready(&jobs).await;
+    let outbox = metered(&jobs, &db);
+    append(
+        &db,
+        &outbox,
+        vec![job_record("late", "default", json!({}))],
+        OnDuplicate::Fail,
+    )
+    .await
+    .unwrap();
+    let id = wait_for_job(&db).await;
+    wait_state(&db, id, "succeeded", PATIENCE).await;
+    let deadline = Instant::now() + PATIENCE;
+    while harness
+        .metric("merezha.job.duration")
+        .value(&[("job.outcome", "lease_lost")])
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "attempt 1 never ended");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(state(&db, id).await, "succeeded");
+    assert!(
+        harness
+            .metric("merezha.job.dead_lettered")
+            .points()
+            .is_empty(),
+        "a fenced settle wrote nothing"
+    );
+    assert_eq!(
+        harness
+            .metric("merezha.job.lease_expired")
+            .value(&[("job.queue", "default")]),
+        Some(1.0)
+    );
+    let lost = wait_spans(&harness, "process default", 2)
+        .await
+        .into_iter()
+        .find(|span| attribute(span, "job.outcome").as_deref() == Some("lease_lost"))
+        .expect("attempt 1's span");
+    assert!(matches!(lost.status, Status::Error { .. }));
+    jobs.shutdown(Instant::now() + Duration::from_secs(10))
+        .await;
+    harness.assert_catalogued();
+}
+
+/// Review items 4 (M4) and 8: duplicates are neither counted as appended
+/// nor given a `send` span, for outbox records and for enqueues; every
+/// inserted row stores its own span's context.
+#[tokio::test]
+async fn duplicates_are_not_counted_and_get_no_send_span() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let harness = Harness::new();
+    let db = database(&test).await;
+    let config = jobs_config(&test, "[jobs]\nworkers = false");
+    let jobs = instrumented(&harness, &db, &config, RelayMode::Off, None).await;
+    let outbox = metered(&jobs, &db);
+    let record = |key: &str| job_record(key, "default", json!({}));
+    append(
+        &db,
+        &outbox,
+        vec![record("a"), record("b")],
+        OnDuplicate::Fail,
+    )
+    .await
+    .unwrap();
+    let again = append(
+        &db,
+        &outbox,
+        vec![record("a"), record("b"), record("c")],
+        OnDuplicate::Ignore,
+    )
+    .await
+    .unwrap();
+    assert_eq!((again.inserted, again.duplicates), (1, 2));
+    assert!(
+        append(&db, &outbox, vec![record("c")], OnDuplicate::Fail)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        harness
+            .metric("merezha.outbox.appended")
+            .value(&[("merezha.module", "tasks"), ("job.record_kind", "job")]),
+        Some(3.0)
+    );
+    let sends = named(&harness, "send default");
+    assert_eq!(sends.len(), 3, "one per inserted record");
+    let client = db.acquire(soon()).await.unwrap();
+    let stored: Vec<String> = client
+        .query(
+            "SELECT trace_parent FROM merezha_jobs.outbox ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(stored.len(), 3);
+    for parent in &stored {
+        let span_id = StoredContext::parse(parent, None)
+            .unwrap()
+            .span_context()
+            .span_id();
+        assert!(sends.iter().any(|s| s.span_context.span_id() == span_id));
+    }
+    let tasks = handle(&jobs, "tasks");
+    let job = || NewJob {
+        queue: id("other"),
+        kind: id("tasks.remind"),
+        idempotency_key: merezha_platform::ports::DedupeKey::new("once").unwrap(),
+        payload: json!({}),
+        contains_secret: false,
+        run_at: None,
+        priority: 0,
+        context: message(),
+    };
+    assert!(!tasks.enqueue(job()).await.unwrap().existed);
+    assert!(tasks.enqueue(job()).await.unwrap().existed);
+    assert_eq!(named(&harness, "send other").len(), 1);
+    assert_eq!(
+        harness
+            .metric("merezha.job.enqueued")
+            .value(&[("job.queue", "other")]),
+        Some(1.0)
+    );
+    jobs.shutdown(Instant::now() + Duration::from_secs(10))
+        .await;
+    harness.assert_catalogued();
+}
+
+/// Review item 4 (M5, M8): a sample that cannot finish within
+/// `SAMPLE_DEADLINE` fails fast (well before the pool's 5 s statement
+/// timeout), logs `job.worker_failed` with `task = sampler`, and the gauges
+/// keep the last sample.
+#[tokio::test]
+async fn a_failing_sample_keeps_the_last_values_within_its_deadline() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let harness = Harness::new();
+    let db = database(&test).await;
+    let config = jobs_config(&test, "[jobs]\nworkers = false\n[jobs.queues.default]\n");
+    let jobs = instrumented(&harness, &db, &config, RelayMode::Off, None).await;
+    insert_job(&db, "tasks.remind", "tasks:ready", "{}", false).await;
+    let ready = [("job.queue", "default"), ("job.state", "ready")];
+    let deadline = Instant::now() + PATIENCE;
+    while harness.metric("merezha.job.count").value(&ready) != Some(1.0) {
+        assert!(Instant::now() < deadline, "the sampler never reported");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Block every read of the jobs table.
+    let locker = db.acquire(soon()).await.unwrap();
+    locker
+        .batch_execute("BEGIN; LOCK TABLE merezha_jobs.jobs IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let locked = Instant::now();
+    let failed = |harness: &Harness| {
+        harness
+            .stderr_lines()
+            .iter()
+            .any(|line| line["event"] == "job.worker_failed" && line["task"] == "sampler")
+    };
+    while !failed(&harness) {
+        assert!(
+            Instant::now() < locked + PATIENCE,
+            "the sample never failed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let took = locked.elapsed();
+    assert!(
+        took < merezha_jobs::SAMPLE_DEADLINE + Duration::from_secs(2),
+        "the sample waited {took:?}"
+    );
+    assert_eq!(harness.metric("merezha.job.count").value(&ready), Some(1.0));
+    locker.batch_execute("ROLLBACK").await.unwrap();
+    drop(locker);
+    jobs.shutdown(Instant::now() + Duration::from_secs(10))
+        .await;
+    harness.assert_catalogued();
+}
+
+/// Review item 4 (M6): the relay's batch lock skips rows another relay
+/// holds instead of waiting for them.
+#[tokio::test]
+async fn the_relay_skips_records_another_relay_holds() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let harness = Harness::new();
+    let db = database(&test).await;
+    let config = jobs_config(&test, "[jobs]\nworkers = false");
+    let jobs = instrumented(&harness, &db, &config, RelayMode::Off, None).await;
+    let outbox = metered(&jobs, &db);
+    append(
+        &db,
+        &outbox,
+        (0..3)
+            .map(|n| job_record(&format!("k{n}"), "default", json!({})))
+            .collect(),
+        OnDuplicate::Fail,
+    )
+    .await
+    .unwrap();
+    // Another relay's batch: the first record, locked.
+    let other = db.acquire(soon()).await.unwrap();
+    other
+        .batch_execute("BEGIN; SELECT id FROM merezha_jobs.outbox ORDER BY id LIMIT 1 FOR UPDATE")
+        .await
+        .unwrap();
+    let started = Instant::now();
+    let report = jobs.relay_now().await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the relay waited"
+    );
+    assert_eq!(report.relayed, 2);
+    other.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(jobs.relay_now().await.unwrap().relayed, 1);
+    assert_eq!(
+        harness
+            .metric("merezha.outbox.relayed")
+            .value(&[("merezha.module", "tasks")]),
+        Some(3.0)
+    );
+    drop(other);
+    jobs.shutdown(Instant::now() + Duration::from_secs(10))
+        .await;
+}
+
+/// A reissue hook that succeeds.
+struct Reissues;
+impl merezha_platform::ports::Reissue for Reissues {
+    fn reissue(
+        &self,
+        _: merezha_platform::ports::ReissueRequest,
+    ) -> merezha_platform::BoxFuture<'_, Result<(), merezha_domain::Failure>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Review item 6: a reissued replay (a flagged dead job) links to the trace
+/// the job died in, single (on `admin job.replay`) and bulk (on one child
+/// `admin job.replay` per reissue).
+#[tokio::test]
+async fn reissued_replays_link_to_the_trace_the_job_died_in() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let harness = Harness::new();
+    let db = database(&test).await;
+    let config = jobs_config(&test, "[jobs]\nworkers = false");
+    let jobs = PgJobs::with_mode(&config, RelayMode::Off).with_telemetry(
+        &harness.telemetry().meter("jobs"),
+        Duration::from_millis(50),
+    );
+    jobs.ports(&db);
+    handle(&jobs, "tasks")
+        .register(
+            "tasks.remind",
+            "default",
+            func(|_, _| Box::pin(async { Ok(()) })),
+            merezha_platform::ports::KindOptions {
+                reissue: Some(Arc::new(Reissues)),
+            },
+        )
+        .unwrap();
+    jobs.start(context(&db)).await.unwrap();
+    wait_ready(&jobs).await;
+    let trace_a = TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap();
+    let mut dead = Vec::new();
+    for key in ["tasks:s1", "tasks:s2"] {
+        let id = insert_job(&db, "tasks.remind", key, "{}", true).await;
+        execute(
+            &db,
+            &format!(
+                "UPDATE merezha_jobs.jobs SET state = 'dead', finished_at = now(), payload = NULL,
+                        trace_parent = '{TRACE_A}' WHERE id = {id}"
+            ),
+        )
+        .await
+        .unwrap();
+        dead.push(id);
+    }
+    let replayed = jobs.replay(dead[0], Some("operator")).await.unwrap();
+    assert_eq!(replayed.state(), "reissued");
+    let bulk = jobs
+        .replay_dead(
+            &merezha_jobs::DeadFilter {
+                queue: "default".into(),
+                kind: None,
+                code: None,
+                dead_after: None,
+                dead_before: None,
+                limit: 10,
+            },
+            Some("operator"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bulk.reissued, 1);
+    let replays = named(&harness, "admin job.replay");
+    for id in &dead {
+        let span = replays
+            .iter()
+            .find(|span| attribute(span, "job.id") == Some(id.to_string()))
+            .unwrap_or_else(|| panic!("a replay span for job {id}"));
+        let link = span.links.links.first().expect("a replay link");
+        assert_eq!(link.span_context.trace_id(), trace_a);
+        assert!(
+            link.attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == "merezha.link.reason"
+                    && kv.value.to_string() == "replay")
+        );
+    }
+    assert_eq!(
+        harness
+            .metric("merezha.job.replayed")
+            .value(&[("job.queue", "default")]),
+        Some(2.0)
+    );
     jobs.shutdown(Instant::now() + Duration::from_secs(10))
         .await;
     harness.assert_catalogued();
