@@ -172,7 +172,7 @@ headers are `content-type`, `authorization`, `x-request-id` and
 | `acquire_timeout_ms` | duration | `2000` | no | 10 ms to 60 s; wait for a pooled connection |
 | `statement_timeout_ms` | duration | `5000` | no | 10 ms to 300 s; session default and ceiling for transactions |
 | `migrate` | boolean | `false` | no | apply pending migrations at startup instead of verifying |
-| `max_detached` | integer | `8` | no | 1 to 64 sessions detached from the pool at once (`Database::detach`, the migration run included); the server sees at most `pool_size + max_detached` connections from this host, plus listeners blocks open |
+| `max_detached` | integer | `8` | no | 1 to 64 sessions detached from the pool at once (`Database::detach`, the migration run included); the server sees at most `pool_size + max_detached` connections from this host, plus listeners blocks open. With `[application]`, it must be at least `application.background.max_concurrent + 1`, so one session stays free for migrations and explicit catch-ups (`detached_sessions_exhausted`, reported on both keys) |
 | `tls` | `disable` or `require` | `disable` | no | `require` verifies the chain and host name; decides over the URL's `sslmode` |
 | `tls_ca_file` | path | none | no | extra PEM roots, at most 1 MiB; only with `tls = "require"` |
 
@@ -209,7 +209,7 @@ The PostgreSQL application core's tables (AP §D.2), all *reserved*:
 | `[application.reactors]` | `interval_ms` | duration | `5000` | 100 ms to 10 min |
 | | `retry_base_ms` | duration | `1000` | 100 ms to 10 min; at most `retry_max_ms` (`retry_base_exceeds_max`) |
 | | `retry_max_ms` | duration | `300000` | 1 s to 1 day |
-| `[application.background]` | `max_concurrent` | integer | `2` | 1 to 16, shared by projection, rebuild and reactor runs |
+| `[application.background]` | `max_concurrent` | integer | `2` | 1 to 16, shared by projection, rebuild and reactor runs; at most `database.max_detached - 1` |
 | `[application.append]` | `lock_timeout_max_ms` | duration | `5000` | 10 ms to 30 s |
 
 ### `[jobs]`
@@ -302,7 +302,7 @@ secrets with the kernel rules.
 `invalid_kind`, `invalid_payload`, `duplicate_name`, `invalid_endpoint`,
 `invalid_header_name`, `invalid_signal`, `duplicate_signal`, `invalid_label`,
 `invalid_resource_attribute`, `batch_exceeds_queue`, `invalid_host`,
-`plaintext_headers_refused`.
+`plaintext_headers_refused`, `detached_sessions_exhausted`.
 
 ## The HTTP edge
 
@@ -377,7 +377,10 @@ registers:
 | 504 | `timeout`, `upstream_timeout` |
 
 `errors::KERNEL_CODES` is the complete list. A unit test scans the kernel
-crates' sources for every code they construct and fails when one is missing,
+crates' sources, minus the items gated by `#[cfg(test)]`, for every code they
+construct (`Failure::*`, `StartupError::new`, `MigrationError::at`,
+`JobFailure::*`, `BlobError::*` and the `code()` tables) and fails when one is
+missing,
 so no module can register a kernel code, `database_unavailable` say, with
 another status.
 
@@ -415,6 +418,7 @@ dot, `<area>.<noun>_<verb>`.
 `migration.invalid_index_dropped`, `module.started`, `module.start_failed`,
 `module.stopped`, `module.shutdown_timeout`, `listener.ready`,
 `listener.draining`, `listener.drain_timeout`, `listener.stopped`,
+`module.source_refused`,
 `http.request.completed`, `health.ready`, `health.not_ready`,
 `notification.captured`.
 
@@ -436,6 +440,7 @@ its own `invocation.completed` and `registry.*` JSON lines.
 | `configure(&ModuleSection)` | validate and keep `[modules.<name>]`; return every issue at once. Default: only an empty section. |
 | `migrations()` | ordered forward-only `Migration::new(version, name, sql)` or `Migration::non_transactional(..)` for its own schema |
 | `errors()` | `ErrorCode { code, status }` it returns, registered at startup; default none |
+| `extra_sources()` | kernel sources it writes as besides its name; only `api` for `notifications` is granted |
 | `events()` | `ModuleEvents { publishes, consumes }`, logged at start |
 | `start(AppContext)` | start background work within the start timeout |
 | `routes(&AppContext)` | an axum `Router` nested under `/v1/<name>` |
@@ -470,8 +475,14 @@ register blocks.
   a context bound to its own name, in `start` and `routes`; such a context
   binds handles for that name only (`source_not_allowed` otherwise), so blocks
   cannot write in each other's dedupe namespace or claim identity's
-  membership exemption. Only the host's own context binds the kernel sources
-  `api` and `application`, which are also reserved module names.
+  membership exemption. The kernel sources `api` and `application` are also
+  reserved module names. A module may claim more through
+  `Module::extra_sources()`, and the host grants only the pairs in
+  `context::GRANTABLE_SOURCES`: `notifications` may claim `api` for its HTTP
+  send route (NT §3.1). Any other claim stops startup with
+  `source_not_granted`, before the pool opens, and logs
+  `module.source_refused`. `application` is never granted: only the host's
+  own context binds it.
 - `directory()`, `authenticator()`, `authorizer()`, `blobs()`: the ports below.
 
 `AppContext::builder` starts from the disabled-block fallbacks; blocks replace
