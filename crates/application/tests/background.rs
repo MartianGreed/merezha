@@ -117,6 +117,8 @@ fn until(within: Duration, what: &str, mut ready: impl FnMut() -> bool) -> Durat
 struct Probe {
     /// Positions of every project call, per projection, in call order.
     seen: Mutex<Vec<(String, Vec<u64>)>>,
+    /// The `live` flag of every project call of `count`, with its positions.
+    lives: Mutex<Vec<(Vec<u64>, bool)>>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
     delay_ms: AtomicU64,
@@ -190,6 +192,9 @@ impl GuestSession for Fake {
                     .lock()
                     .unwrap()
                     .push((projection.as_str().to_owned(), positions.clone()));
+                if projection.as_str() == "count" {
+                    probe.lives.lock().unwrap().push((positions.clone(), live));
+                }
                 let delay = probe.delay_ms.load(Ordering::SeqCst);
                 if delay > 0 {
                     std::thread::sleep(Duration::from_millis(delay));
@@ -999,6 +1004,20 @@ fn a_new_revision_is_not_ready_until_warm_while_the_old_revision_keeps_serving()
         code(new.app.admit().unwrap().delete_revision("count", 1)),
         "projection_not_found"
     );
+    // Rows of a projection no longer configured can be cleaned up.
+    pg.execute(
+        "INSERT INTO merezha_app.projections (name, revision, partitioned, state, warm_position) \
+         VALUES ('removed', 1, false, '0', 0)",
+    );
+    new.app
+        .admit()
+        .unwrap()
+        .delete_revision("removed", 1)
+        .unwrap();
+    assert_eq!(
+        code(new.app.admit().unwrap().delete_revision("removed", 1)),
+        "projection_not_found"
+    );
     pg.stop(&new);
 }
 
@@ -1220,4 +1239,217 @@ fn status_and_overview_report_lag_warmth_and_failures() {
     );
     assert_eq!(status.projections[0].lag_seconds, 0.0);
     pg.stop(&a);
+}
+
+/// Review finding 1: while another host holds the lock, local commits do
+/// not open a lock session each. After a contended attempt the lane waits
+/// the holder's linger (1 s) before trying again.
+#[test]
+fn local_commits_on_a_host_that_does_not_hold_the_lock_open_few_lock_sessions() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let mut c = config();
+    c.limits.batch_size = 1;
+    let interval = Duration::from_secs(600);
+    let writer = pg
+        .open(c.clone(), &probe, BackgroundOptions::default())
+        .unwrap();
+    fill(&writer, 30, 1);
+    // The holder takes 30 batches of 200 ms: a run of about 5 s.
+    probe.delay_ms.store(200, Ordering::SeqCst);
+    let holder = pg.start(
+        c.clone(),
+        &probe,
+        Pg::options(CatchUp::Auto, interval, RunHooks::default()),
+    );
+    until(Duration::from_secs(5), "the holder runs", || {
+        pg.lock_holders()
+            .iter()
+            .any(|(_, n)| n == "merezha p:count:1")
+    });
+    let other = pg.start(
+        c,
+        &probe,
+        Pg::options(CatchUp::Auto, interval, RunHooks::default()),
+    );
+    let contended = || -> u64 {
+        other
+            .store
+            .contended_locks()
+            .iter()
+            .filter(|(name, ..)| name == "count")
+            .map(|(_, _, live, _)| *live)
+            .sum()
+    };
+    let started = Instant::now();
+    // 100 local commits over about 2 s, each a wake of the lane.
+    for i in 0..100 {
+        other.app.command(add(&format!("o{}", i % 4), 1)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let elapsed = started.elapsed();
+    let attempts = contended();
+    // One attempt at start plus at most one per second of commits.
+    let bound = 2 + elapsed.as_secs();
+    eprintln!("{attempts} contended attempts during {elapsed:?} of commits");
+    assert!(attempts <= bound, "{attempts} lock attempts in {elapsed:?}");
+    pg.stop(&holder);
+    pg.stop(&other);
+}
+
+/// Review finding 3: events up to the revision's `warm_position` reach the
+/// guest with `live = false`, later ones with `live = true`, and no batch
+/// mixes the two, even when the warm position splits a batch.
+#[test]
+fn events_after_the_warm_position_are_delivered_live() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let writer = pg
+        .open(config(), &probe, BackgroundOptions::default())
+        .unwrap();
+    fill(&writer, 7, 1);
+    let mut c = config_with(2, "");
+    c.limits.batch_size = 4;
+    // The new revision's row warms from position 7; five more events
+    // follow before its scheduler starts, so one batch would span it.
+    let mut instance = pg
+        .open(
+            c,
+            &probe,
+            Pg::options(CatchUp::Auto, Duration::from_secs(600), RunHooks::default()),
+        )
+        .unwrap();
+    fill(&writer, 5, 1);
+    {
+        let _guard = pg.runtime.enter();
+        instance.scheduler = Some(Scheduler::start(&instance.app).unwrap());
+    }
+    // Queries fail `projection_warming` until the warm-up is done.
+    until(Duration::from_secs(10), "caught up", || {
+        instance
+            .app
+            .query(query("Count", None))
+            .is_ok_and(|result| result.checkpoint == 12)
+    });
+    let lives = probe.lives.lock().unwrap().clone();
+    for (positions, live) in &lives {
+        assert!(
+            positions.iter().all(|p| (*p > 7) == *live),
+            "{positions:?} live={live}: {lives:?}"
+        );
+    }
+    let delivered: Vec<u64> = lives.iter().flat_map(|(p, _)| p.clone()).collect();
+    assert_eq!(delivered, (1..=12).collect::<Vec<_>>());
+    pg.stop(&instance);
+}
+
+/// Review finding 4: an explicit catch-up whose lock session dies well
+/// before its deadline fails with the session's failure, not `timeout`.
+#[test]
+fn an_explicit_catch_up_losing_its_session_early_reports_the_real_failure() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let mut c = config_with(1, "[limits]\ntimeout_ms=20000");
+    c.limits.batch_size = 1;
+    let options = Pg::options(
+        CatchUp::Manual,
+        Duration::from_secs(600),
+        RunHooks::default(),
+    );
+    let instance = pg.open(c, &probe, options).unwrap();
+    fill(&instance, 10, 1);
+    probe.delay_ms.store(300, Ordering::SeqCst);
+    let started = Instant::now();
+    let result = std::thread::scope(|scope| {
+        let running = scope.spawn(|| instance.app.catch_up("count"));
+        until(
+            Duration::from_secs(5),
+            "the catch-up holds the lock",
+            || {
+                pg.lock_holders()
+                    .iter()
+                    .any(|(_, n)| n == "merezha p:count:1")
+            },
+        );
+        pg.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE application_name = 'merezha p:count:1' AND datname = current_database()",
+        );
+        running.join().unwrap()
+    });
+    assert_eq!(code(result), "database_unavailable");
+    assert!(started.elapsed() < Duration::from_secs(15));
+}
+
+/// Review finding 5: a run that took its slot just as the scheduler shuts
+/// down sees the cancellation at its first step and publishes nothing.
+#[test]
+fn a_run_starting_during_shutdown_is_cancelled_before_it_publishes() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let writer = pg
+        .open(config(), &probe, BackgroundOptions::default())
+        .unwrap();
+    fill(&writer, 4, 1);
+    let pause = Arc::new(Pause::default());
+    pause.arm("count", Duration::from_millis(800));
+    let hooks = RunHooks {
+        before_run: Some(pause.clone()),
+        ..RunHooks::default()
+    };
+    let instance = pg.start(
+        config(),
+        &probe,
+        Pg::options(CatchUp::Auto, Duration::from_secs(600), hooks),
+    );
+    until(Duration::from_secs(5), "a run holds its slot", || {
+        pause.entered()
+    });
+    pg.stop(&instance);
+    assert_eq!(pg.checkpoint("count"), 0, "the cancelled run published");
+    assert!(
+        probe.calls("count").is_empty(),
+        "the cancelled run called the guest"
+    );
+    pg.assert_no_pooled_lock();
+}
+
+/// Review finding 6: a `LISTEN` reconnect wakes every live lane, since
+/// notifications may have been lost while disconnected.
+#[test]
+fn a_listen_reconnect_wakes_every_live_lane() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let instance = pg.start(
+        config(),
+        &probe,
+        Pg::options(CatchUp::Auto, Duration::from_secs(600), RunHooks::default()),
+    );
+    until(Duration::from_secs(5), "the listener connects", || {
+        instance.app.status().unwrap().listener == Some("connected")
+    });
+    // An event committed without a notification, as one lost meanwhile.
+    pg.execute(
+        "BEGIN; \
+         UPDATE merezha_app.head SET position = 1 WHERE id = 1; \
+         INSERT INTO merezha_app.streams (stream, version, first_position, last_position) \
+              VALUES ('Counter/silent', 1, 1, 1); \
+         INSERT INTO merezha_app.events (position, stream, version, tag, schema_version, payload, \
+                                         metadata, accepted_unix_ms) \
+              VALUES (1, 'Counter/silent', 1, 'Added', 1, '{}', \
+                      '{\"message_id\":\"m\",\"correlation_id\":\"c\"}', 0); \
+         COMMIT",
+    );
+    std::thread::sleep(Duration::from_millis(1000));
+    assert_eq!(pg.checkpoint("count"), 0, "nothing woke the lanes yet");
+    pg.execute(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE query LIKE 'LISTEN merezha_app_events%' AND datname = current_database()",
+    );
+    until(
+        Duration::from_secs(3),
+        "the reconnect wakes both lanes",
+        || pg.checkpoint("count") == 1 && pg.checkpoint("other") == 1,
+    );
+    pg.stop(&instance);
 }

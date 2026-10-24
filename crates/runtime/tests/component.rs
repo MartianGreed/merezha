@@ -120,6 +120,35 @@ fn add_replace_remove_and_failed_reload_preserve_snapshots() {
     assert!(rt.catalog().unwrap().services.is_empty());
 }
 #[test]
+fn a_reload_below_the_required_concurrency_is_refused_and_keeps_the_generation() {
+    let f = Fixture::new(&echo(), HEADER, "");
+    let rt = f.runtime();
+    assert_eq!(rt.require_concurrency(9).unwrap_err(), Error::Overloaded);
+    rt.require_concurrency(6).unwrap();
+    let lower = HEADER.replace(
+        "max_concurrent_invocations = 8",
+        "max_concurrent_invocations = 5",
+    );
+    std::fs::write(
+        &f.path,
+        format!("{lower}[[services]]\nid = \"echo\"\npath = \"echo.wasm\"\n"),
+    )
+    .unwrap();
+    assert!(rt.reload().is_err());
+    assert_eq!(rt.catalog().unwrap().generation, 1);
+    assert_eq!(rt.limits().unwrap().max_concurrent_invocations, 8);
+    let enough = HEADER.replace(
+        "max_concurrent_invocations = 8",
+        "max_concurrent_invocations = 6",
+    );
+    std::fs::write(
+        &f.path,
+        format!("{enough}[[services]]\nid = \"echo\"\npath = \"echo.wasm\"\n"),
+    )
+    .unwrap();
+    assert_eq!(rt.reload().unwrap(), 2);
+}
+#[test]
 fn concurrent_reloads_have_distinct_monotonic_generations() {
     let f = Fixture::new(&echo(), HEADER, "");
     let rt = f.runtime();

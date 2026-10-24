@@ -498,6 +498,14 @@ fn positions_stay_contiguous_under_load_from_two_instances_and_a_reader_never_se
     }
     let distinct: std::collections::BTreeSet<u64> = seen.iter().map(|e| e.position).collect();
     assert_eq!(distinct, (1..=head).collect());
+    let read_timeouts = read_timeouts.into_inner();
+    if read_timeouts == 0 {
+        // No catch-up was cut, so none was handed a batch twice.
+        assert_eq!(
+            seen.iter().map(|e| e.position).collect::<Vec<_>>(),
+            (1..=head).collect::<Vec<_>>()
+        );
+    }
     let now: BTreeMap<i64, (String, i64, String)> = pg
         .rows("SELECT position, stream, version, payload::text FROM merezha_app.events")
         .iter()
@@ -521,7 +529,7 @@ fn positions_stay_contiguous_under_load_from_two_instances_and_a_reader_never_se
         "load: {head} commits in {load:?} from {} writers, {reads} catch-ups; \
          {busy} commands timed out, {unknown} unknown, {} catch-ups timed out",
         2 * THREADS,
-        read_timeouts.into_inner()
+        read_timeouts
     );
 }
 
