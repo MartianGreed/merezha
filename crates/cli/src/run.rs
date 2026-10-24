@@ -202,11 +202,21 @@ pub async fn run(
         raw_runtime = private,
         application = config.application.is_some()
     );
-    // Jobs and the outbox run whenever the host does (R12).
+    // Jobs and the outbox run whenever the host does (R12). The jobs runtime
+    // stops first; the module shutdown budget adds its drain
+    // (`jobs.drain_timeout_ms`, the 2 s cancel grace and the release) to
+    // the default, so the other modules keep theirs (AP §B.8).
+    let defaults = Timeouts::default();
+    let timeouts = Timeouts {
+        module_shutdown: defaults.module_shutdown
+            + config.jobs.drain_timeout
+            + std::time::Duration::from_secs(3),
+        ..defaults
+    };
     let parts = HostParts {
         routes,
         authorizer,
-        timeouts: Timeouts::default(),
+        timeouts,
         jobs: Some(Arc::new(merezha_jobs::PgJobs::new(&config.jobs))),
     };
     let host = match Host::start(config, modules, parts).await {

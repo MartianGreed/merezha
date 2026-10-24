@@ -853,6 +853,13 @@ CREATE TABLE merezha_jobs.admin_actions (
     target text NOT NULL, count integer NOT NULL);
 ```
 
+Migration 0002 (AP-B2) adds `CREATE INDEX outbox_quarantined ON merezha_jobs.outbox
+(quarantined_at, id) WHERE quarantined_at IS NOT NULL` for the admin listing, the outbox count and
+retention; `CREATE INDEX jobs_due ON merezha_jobs.jobs (run_at) WHERE state = 'available'` for the
+readiness lag (one row, `ORDER BY run_at LIMIT 1`); and the reissue claim column
+`reissue_claimed_at timestamptz NULL CHECK (reissue_claimed_at IS NULL OR state = 'cancelled')` with
+a partial index (D.1).
+
 Dead letters stay in `jobs` with `state = 'dead'`, rather than moving to a separate table as in
 Structure. A separate table would free the `(queue, idempotency_key)` slot, so a re-delivery could
 create a duplicate job while the dead one sits unexamined. Partial indexes keep dead rows out of the
@@ -1116,6 +1123,9 @@ UPDATE merezha_jobs.attempts
  WHERE lease_token = $2 AND EXISTS (SELECT 1 FROM settled);
 ```
 
+The implementation also requires `state = 'running'` in the settle's `WHERE`, so a released job
+is never settled either.
+
 - **Heartbeat:** every `lease_ms / 3`, one statement for all of the instance's in-flight jobs:
 
   ```sql
@@ -1151,7 +1161,9 @@ UPDATE merezha_jobs.attempts
     FROM expired e WHERE a.lease_token = e.lease_token;
   ```
 
-An expired lease counts as a failed attempt, because the attempt was already counted at lease time.
+`$1` and `$2` are the job's queue's `backoff_base` and `backoff_max` (the defaults for an
+unconfigured queue), joined in the `expired` CTE, and the cap applies before `make_interval`. An
+expired lease counts as a failed attempt, because the attempt was already counted at lease time.
 Backoff on reap has no jitter, which is enough to stop a job that crashes its process from looping
 hot.
 
@@ -1248,7 +1260,11 @@ The platform calls `shutdown()` after readiness turns false and HTTP stops accep
     WHERE lease_token = ANY($1);
    ```
 
-   Late handler writes are fenced out. The error log `job.drain_abandoned` lists the job ids.
+   Late handler writes are fenced out. The error log `job.drain_abandoned` lists the job ids. A
+   handler that returns a failure after step 3 is released here, not retried; one that succeeds is
+   settled. The implementation refunds with `greatest(attempts - 1, 0)` on `running` rows only.
+   Step 1 waits for the dispatchers to exit, and a lease that completes after the stop is held,
+   never run, and released here.
 5. Close the listener subscription.
 
 Releasing refunds the attempt, so deploys never push jobs toward a dead letter.
@@ -1262,7 +1278,7 @@ A.7). Quarantined outbox rows follow `jobs.retention.dead`:
 | Kept rows | Default | Key |
 | --- | --- | --- |
 | Succeeded and cancelled jobs | 7 days | `jobs.retention.succeeded` |
-| Dead jobs | 30 days (only when not replayed) | `jobs.retention.dead` |
+| Dead jobs | 30 days (only when not replayed); each purge batch writes an `admin_actions` row `retention_purge` | `jobs.retention.dead` |
 | Relayed outbox rows | 7 days | `jobs.retention.outbox` |
 | Admin actions | 365 days | `jobs.retention.audit` |
 
@@ -1716,9 +1732,9 @@ only on loopback (`AllowAll`). Durations are in seconds (R9).
 | --- | --- |
 | `GET queues` | `{"queues":[{"name","ready","delayed","leased","dead","oldest_ready_age_s","concurrency","global_concurrency"}]}`, TE's state names |
 | `GET jobs?queue=&state=&kind=&limit=&after=` | `{"jobs":[{"id","queue","kind","state","attempts","max_attempts","run_at","last_error_code","last_error_class","contains_secret","created_at","finished_at","replays"}],"next":cursor?}`. Payloads are never listed. |
-| `GET jobs/{id}` | as above plus `"attempts":[{"attempt","started_at","finished_at","outcome","error_code"}]`. `?payload=true` adds `payload` and needs `jobs.admin.payload`; a flagged job's payload is never returned. |
-| `POST jobs/{id}/replay` | dead to `available`: `attempts = 0`, `run_at = now()`, `replays += 1`, error fields kept; `{"id","state"}`. A flagged dead job has no payload (R3): the kind's `reissue` hook asks the owning module to issue it again (`"state":"reissued"`), else `409 secret_purged`. `409 not_dead` otherwise. |
-| `POST dead/replay` | body `{"queue", "kind"?, "code"?, "dead_after"?, "dead_before"?, "limit": ≤1000}`; `{"replayed":N,"reissued":R,"refused":M}` |
+| `GET jobs/{id}` | as above plus `"attempt_history":[{"attempt","started_at","finished_at","outcome","error_code"}]` (named apart from the `attempts` count). `?payload=true` adds `payload` and needs `jobs.admin.payload`; a flagged job's payload is never returned, whatever its state. |
+| `POST jobs/{id}/replay` | dead to `available`: `attempts = 0`, `run_at = now()`, `replays += 1`, error fields kept; `{"id","state"}`. A flagged dead job has no payload (R3): the kind's `reissue` hook asks the owning module to issue it again (`"state":"reissued"`), else `409 secret_purged`. `409 not_dead` otherwise. A reissue claims the row in its own transaction (`cancelled`, `replays + 1`, `reissue_claimed_at = now()`, the audit row), runs the hook within 10 s, then clears the claim, or returns the job to `dead` on failure or timeout, both fenced on the claim's own `reissue_claimed_at` (a settle that matches nothing logs `job.reissue_claim_lost` and fails `409 reissue_claim_lost`); the reaper returns a claim older than 60 s to `dead`, and retention never purges a claimed row. The replay runs in a task detached from the request. |
+| `POST dead/replay` | body `{"queue", "kind"?, "code"?, "dead_after"?, "dead_before"?, "limit": ≤1000}`; `{"replayed":N,"reissued":R,"refused":M,"complete":true}`. Unflagged jobs replay in one transaction; flagged ones are claimed and reissued one at a time, as for a single replay, in a task detached from the request; after 30 s the route answers `202` with the counts so far and `"complete":false` while the run continues. |
 | `POST dead/purge` | body `{"queue", "before"}`; `{"purged":N}` |
 | `POST jobs/{id}/cancel` | `available` to `cancelled` (a flagged payload is nulled); `409 not_cancellable` when running or terminal |
 | `GET outbox` | `{"pending","oldest_age_s","unrouted","quarantined":[{"id","source","record_kind","quarantine_code","quarantined_at"}]}` (`unrouted`: this instance's count since start; at most 100 quarantined rows, oldest first) |

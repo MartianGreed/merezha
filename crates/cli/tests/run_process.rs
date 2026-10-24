@@ -364,6 +364,8 @@ fn a_public_listener_without_identity_denies_application_and_hides_the_raw_runti
                 401,
                 "unauthenticated",
             ),
+            // The jobs admin API (AP-B2) is a permission check too.
+            ("/v1/jobs/admin/dead/purge", "{}", 401, "unauthenticated"),
         ] {
             let denied = request(address, "POST", path, body);
             assert_eq!(
@@ -375,6 +377,8 @@ fn a_public_listener_without_identity_denies_application_and_hides_the_raw_runti
                 "{name} {path}"
             );
         }
+        let listing = request(address, "GET", "/v1/jobs/admin/queues", "");
+        assert_eq!(listing.status, 401, "{name}: {}", listing.body);
         host.stop();
     }
 }
@@ -572,4 +576,213 @@ fn outbox_records_committed_before_a_crash_are_relayed_exactly_once_after_restar
         0
     );
     restarted.stop();
+}
+
+/// Runs `sql` returning one `bigint` or text cell on a fresh connection.
+fn query_cell<T: for<'a> merezha_postgres::tokio_postgres::types::FromSql<'a>>(
+    runtime: &tokio::runtime::Runtime,
+    db: &Database,
+    sql: &str,
+) -> T {
+    runtime.block_on(async {
+        let client = db
+            .acquire(Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap();
+        client.query_one(sql, &[]).await.unwrap().get(0)
+    })
+}
+fn wait_cell(runtime: &tokio::runtime::Runtime, db: &Database, sql: &str, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let now: String = query_cell(runtime, db, sql);
+        if now == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "`{sql}` stayed {now}, never {expected}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+/// One `test.sleep` job (the `MEREZHA_JOBS_TEST_HANDLER` kind); its id.
+fn insert_sleep_job(runtime: &tokio::runtime::Runtime, db: &Database) -> i64 {
+    query_cell(
+        runtime,
+        db,
+        "INSERT INTO merezha_jobs.jobs (queue, kind, idempotency_key, payload, payload_digest,
+             max_attempts, correlation_id)
+         VALUES ('default', 'test.sleep', 'jobs:sleep-1', '{}', sha256(convert_to('{}', 'UTF8')), 5, 'c1')
+         RETURNING id",
+    )
+}
+fn current_thread() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+/// `outcome` of every lease of job `id`, oldest first, comma-separated.
+fn outcomes(runtime: &tokio::runtime::Runtime, db: &Database, id: i64) -> String {
+    query_cell(
+        runtime,
+        db,
+        &format!(
+            "SELECT string_agg(coalesce(outcome, 'open'), ',' ORDER BY started_at)
+               FROM merezha_jobs.attempts WHERE job_id = {id}"
+        ),
+    )
+}
+
+/// AP-B2 test 3, process crash mid-job: kill -9 while the handler runs. The
+/// reaper re-offers the job after the lease expires, the lost attempt is
+/// counted, and the job runs to success exactly once more.
+#[test]
+fn a_job_whose_host_is_killed_mid_run_is_reaped_and_runs_once_more() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let config = project(
+        dir.path(),
+        "[jobs]\npoll_interval_ms = 100\nreaper_interval_ms = 200\n\
+         [jobs.queues.default]\nlease_ms = 2000\nbackoff_base_ms = 50",
+    );
+    let mut killed = Host::spawn(
+        &config,
+        &[
+            (DATABASE_ENV, test.url()),
+            (merezha_jobs::TEST_HANDLER_ENV, "60000"),
+        ],
+        "killed",
+    );
+    let address = killed.ready();
+    wait_for_ready_status(address, 200);
+    let runtime = current_thread();
+    let db = Database::connect(&test.config()).unwrap();
+    let id = insert_sleep_job(&runtime, &db);
+    let state = format!("SELECT state FROM merezha_jobs.jobs WHERE id = {id}");
+    wait_cell(&runtime, &db, &state, "running");
+    // kill -9: no drain, no release; the lease is left to expire.
+    killed.child.kill().unwrap();
+    killed.child.wait().unwrap();
+    assert_eq!(query_cell::<String>(&runtime, &db, &state), "running");
+
+    let mut fresh = Host::spawn(
+        &config,
+        &[
+            (DATABASE_ENV, test.url()),
+            (merezha_jobs::TEST_HANDLER_ENV, "50"),
+        ],
+        "fresh",
+    );
+    fresh.ready();
+    wait_cell(&runtime, &db, &state, "succeeded");
+    assert_eq!(
+        query_cell::<i32>(
+            &runtime,
+            &db,
+            &format!("SELECT attempts FROM merezha_jobs.jobs WHERE id = {id}")
+        ),
+        2,
+        "the lost attempt counts"
+    );
+    assert_eq!(outcomes(&runtime, &db, id), "lease_expired,succeeded");
+    assert_eq!(
+        query_cell::<String>(
+            &runtime,
+            &db,
+            &format!("SELECT last_error_code FROM merezha_jobs.jobs WHERE id = {id}")
+        ),
+        "lease_expired"
+    );
+    assert!(
+        fresh
+            .events()
+            .iter()
+            .any(|e| e["event"] == "job.retry_scheduled" && e["code"] == "lease_expired"),
+        "the reaper logged the reclaim"
+    );
+    fresh.stop();
+}
+
+/// AP-B2 test 5, drain: SIGTERM with a 10 s handler and
+/// `drain_timeout_ms = 1000` releases the job with its attempt refunded, the
+/// host exits cleanly, and a fresh host runs the job.
+#[test]
+fn sigterm_releases_a_running_job_with_its_attempt_refunded() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let config = project(
+        dir.path(),
+        "[jobs]\npoll_interval_ms = 100\ndrain_timeout_ms = 1000",
+    );
+    let mut draining = Host::spawn(
+        &config,
+        &[
+            (DATABASE_ENV, test.url()),
+            (merezha_jobs::TEST_HANDLER_ENV, "10000"),
+        ],
+        "draining",
+    );
+    let address = draining.ready();
+    wait_for_ready_status(address, 200);
+    let runtime = current_thread();
+    let db = Database::connect(&test.config()).unwrap();
+    let id = insert_sleep_job(&runtime, &db);
+    let state = format!("SELECT state FROM merezha_jobs.jobs WHERE id = {id}");
+    wait_cell(&runtime, &db, &state, "running");
+    // The jobs admin API is mounted under /v1/jobs/admin on loopback.
+    let queues = request(address, "GET", "/v1/jobs/admin/queues", "");
+    assert_eq!(queues.status, 200, "{}", queues.body);
+    assert_eq!(queues.body["queues"][0]["name"], "default");
+    assert_eq!(queues.body["queues"][0]["leased"], 1);
+    let signalled = Instant::now();
+    draining.stop();
+    let took = signalled.elapsed();
+    assert!(
+        took < Duration::from_secs(8),
+        "the drain stops at its timeout plus the grace: {took:?}"
+    );
+    assert_eq!(query_cell::<String>(&runtime, &db, &state), "available");
+    assert_eq!(
+        query_cell::<i32>(
+            &runtime,
+            &db,
+            &format!("SELECT attempts FROM merezha_jobs.jobs WHERE id = {id}")
+        ),
+        0,
+        "the attempt is refunded"
+    );
+    assert_eq!(outcomes(&runtime, &db, id), "released");
+    let abandoned = draining
+        .events()
+        .into_iter()
+        .find(|e| e["event"] == "job.drain_abandoned")
+        .expect("job.drain_abandoned");
+    assert_eq!(abandoned["count"], 1);
+
+    let mut fresh = Host::spawn(
+        &config,
+        &[
+            (DATABASE_ENV, test.url()),
+            (merezha_jobs::TEST_HANDLER_ENV, "50"),
+        ],
+        "fresh",
+    );
+    fresh.ready();
+    wait_cell(&runtime, &db, &state, "succeeded");
+    assert_eq!(outcomes(&runtime, &db, id), "released,succeeded");
+    assert_eq!(
+        query_cell::<i32>(
+            &runtime,
+            &db,
+            &format!("SELECT attempts FROM merezha_jobs.jobs WHERE id = {id}")
+        ),
+        1
+    );
+    fresh.stop();
 }

@@ -1618,11 +1618,15 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "jiff",
+ "merezha-application",
  "merezha-domain",
+ "merezha-jobs",
  "merezha-platform",
  "merezha-postgres",
+ "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

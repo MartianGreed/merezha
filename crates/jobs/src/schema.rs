@@ -133,4 +133,23 @@ CREATE TABLE merezha_jobs.admin_actions (
     count integer NOT NULL);
 "#;
 
-pub(crate) const MIGRATIONS: [Migration; 1] = [Migration::new(1, "initial", INITIAL)];
+/// AP-B2. Quarantined outbox rows are listed oldest first by the admin
+/// API and purged by retention, outside the pending index; the oldest due
+/// job (readiness lag) is read from `jobs_due`. A reissue claim marks a
+/// flagged dead job closed for its hook (`cancelled`), so the reaper can
+/// return a claim cut by a crash to `dead`.
+const WORKERS: &str = "
+CREATE INDEX outbox_quarantined ON merezha_jobs.outbox (quarantined_at, id)
+    WHERE quarantined_at IS NOT NULL;
+CREATE INDEX jobs_due ON merezha_jobs.jobs (run_at) WHERE state = 'available';
+ALTER TABLE merezha_jobs.jobs
+    ADD COLUMN reissue_claimed_at timestamptz NULL,
+    ADD CONSTRAINT jobs_reissue_claim CHECK (reissue_claimed_at IS NULL OR state = 'cancelled');
+CREATE INDEX jobs_reissuing ON merezha_jobs.jobs (reissue_claimed_at)
+    WHERE reissue_claimed_at IS NOT NULL;
+";
+
+pub(crate) const MIGRATIONS: [Migration; 2] = [
+    Migration::new(1, "initial", INITIAL),
+    Migration::new(2, "workers", WORKERS),
+];
