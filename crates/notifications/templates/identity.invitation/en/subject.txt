@@ -1,0 +1,1 @@
+You are invited to join {% if organization_name is defined %}{{ organization_name }}{% else %}an organization{% endif %} on {{ app.name }}

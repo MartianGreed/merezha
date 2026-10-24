@@ -1,0 +1,4 @@
+description = "A password reset link"
+
+[preview.secret]
+link = "https://app.example.com/reset?token=preview"

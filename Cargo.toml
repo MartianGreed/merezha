@@ -8,6 +8,7 @@ members = [
     "crates/platform",
     "crates/content",
     "crates/jobs",
+    "crates/notifications",
 ]
 resolver = "3"
 

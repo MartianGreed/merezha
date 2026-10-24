@@ -1,0 +1,3 @@
+title = "Un point de terminaison webhook a été désactivé"
+body = "Le point de terminaison webhook {{ endpoint_id }} échouait de façon répétée et a été désactivé. Corrigez le récepteur, puis réactivez-le."
+link = "{% if links.app %}{{ links.app }}{% endif %}"

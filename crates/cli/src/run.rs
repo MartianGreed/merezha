@@ -80,7 +80,8 @@ pub async fn main(args: impl IntoIterator<Item = String>) -> ExitCode {
             .collect(),
         overrides: arguments.overrides,
     };
-    run(input, Vec::new(), host::shutdown_signal()).await
+    let modules = crate::modules(&input);
+    run(input, modules, host::shutdown_signal()).await
 }
 
 /// Run the host with `modules` until `shutdown` resolves. Startup failures

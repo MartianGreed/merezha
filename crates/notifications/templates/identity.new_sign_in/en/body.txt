@@ -1,0 +1,7 @@
+Hello{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+Your {{ app.name }} account was signed in to{% if signed_in_at is defined %} on {{ signed_in_at | datetime("%Y-%m-%d at %H:%M %Z") }}{% endif %}.
+
+If this was you, there is nothing to do. If not, reset your password now.{% if links.unsubscribe %}
+
+Unsubscribe: {{ links.unsubscribe }}{% endif %}

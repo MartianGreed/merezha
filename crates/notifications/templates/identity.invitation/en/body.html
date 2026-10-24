@@ -1,0 +1,7 @@
+{% extends "_layouts/email.html" %}
+{% block content %}
+<p>Hello{% if recipient.name %} {{ recipient.name }}{% endif %},</p>
+<p>You are invited to join {% if organization_name is defined %}{{ organization_name }}{% else %}an organization{% endif %} on {{ app.name }}. Open this link to accept:</p>
+<p><a href="{{ secret.link | url }}" style="display:inline-block;padding:10px 16px;background:#1c1917;color:#ffffff;border-radius:6px;text-decoration:none">Accept the invitation</a></p>
+<p>If you were not expecting this invitation, you can ignore this email.</p>
+{% endblock %}

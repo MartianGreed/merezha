@@ -646,8 +646,10 @@ fn valid_origin(origin: &str) -> bool {
 
 /// Split a flag key on `.`, keeping a double-quoted segment whole, as TOML
 /// does: `jobs.queues."notify.email".concurrency`. `None` for an unclosed
-/// quote or a quote inside a segment.
-fn flag_path(key: &str) -> Option<Vec<String>> {
+/// quote or a quote inside a segment. Public so blocks that read the layers
+/// themselves (the notifications block's host facts) split flags exactly as
+/// the kernel does.
+pub fn flag_path(key: &str) -> Option<Vec<String>> {
     let mut path = Vec::new();
     let mut rest = key;
     loop {

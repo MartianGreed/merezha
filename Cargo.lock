@@ -1453,6 +1453,7 @@ dependencies = [
  "merezha-application",
  "merezha-domain",
  "merezha-jobs",
+ "merezha-notifications",
  "merezha-platform",
  "merezha-postgres",
  "merezha-runtime",
@@ -1501,6 +1502,29 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "merezha-notifications"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.23.1",
+ "jiff",
+ "merezha-application",
+ "merezha-domain",
+ "merezha-platform",
+ "merezha-postgres",
+ "minijinja",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -1562,6 +1586,15 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+
+[[package]]
+name = "minijinja"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90086695417a271bc96e6cb50618555614ca48fa3bb0d9aa96e3468b0f84431e"
+dependencies = [
+ "percent-encoding",
+]
 
 [[package]]
 name = "mio"

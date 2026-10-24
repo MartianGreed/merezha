@@ -1,0 +1,7 @@
+{
+  "email": {
+    "html": "<!doctype html>\n<html lang=\"fr\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Tasks</title>\n</head>\n<body style=\"margin:0;padding:24px;background:#f5f5f4;font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;color:#1c1917;line-height:1.5\">\n<div style=\"max-width:560px;margin:0 auto;background:#ffffff;border-radius:8px;padding:32px\">\n\n<p>Bonjour Ada Lovelace,</p>\n<p>Ouvrez ce lien pour vous connecter à Tasks. Il ne fonctionne qu’une fois et expire bientôt.</p>\n<p><a href=\"https:&#x2f;&#x2f;app.example.com&#x2f;magic?token=preview\" style=\"display:inline-block;padding:10px 16px;background:#1c1917;color:#ffffff;border-radius:6px;text-decoration:none\">Me connecter</a></p>\n<p>Si vous n’avez pas demandé à vous connecter, ignorez cet e-mail.</p>\n\n</div>\n<p style=\"max-width:560px;margin:16px auto 0;font-size:12px;color:#78716c\">Tasks</p>\n</body>\n</html>",
+    "subject": "Votre lien de connexion à Tasks",
+    "text": "Bonjour Ada Lovelace,\n\nOuvrez ce lien pour vous connecter à Tasks. Il ne fonctionne qu’une fois et expire bientôt.\nhttps://app.example.com/magic?token=preview\n\nSi vous n’avez pas demandé à vous connecter, ignorez cet e-mail."
+  }
+}

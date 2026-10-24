@@ -1,0 +1,7 @@
+Bonjour{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+Le mot de passe de votre compte {{ app.name }} vient d’être modifié.
+
+Si vous n’êtes pas à l’origine de ce changement, réinitialisez votre mot de passe et vérifiez votre compte.{% if links.unsubscribe %}
+
+Se désabonner : {{ links.unsubscribe }}{% endif %}

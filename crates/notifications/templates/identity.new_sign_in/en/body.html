@@ -1,0 +1,6 @@
+{% extends "_layouts/email.html" %}
+{% block content %}
+<p>Hello{% if recipient.name %} {{ recipient.name }}{% endif %},</p>
+<p>Your {{ app.name }} account was signed in to{% if signed_in_at is defined %} on {{ signed_in_at | datetime("%Y-%m-%d at %H:%M %Z") }}{% endif %}.</p>
+<p>If this was you, there is nothing to do. If not, reset your password now.</p>
+{% endblock %}

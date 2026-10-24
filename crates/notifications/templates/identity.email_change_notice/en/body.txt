@@ -1,0 +1,7 @@
+Hello{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+Someone asked to change the email address of your {{ app.name }} account. The change takes effect once the new address is confirmed.
+
+If you did not ask for this, reset your password now and review your account.{% if links.unsubscribe %}
+
+Unsubscribe: {{ links.unsubscribe }}{% endif %}

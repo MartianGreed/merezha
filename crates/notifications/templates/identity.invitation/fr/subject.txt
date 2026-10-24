@@ -1,0 +1,1 @@
+Vous êtes invité à rejoindre {% if organization_name is defined %}{{ organization_name }}{% else %}une organisation{% endif %} sur {{ app.name }}

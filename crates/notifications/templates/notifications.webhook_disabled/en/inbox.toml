@@ -1,0 +1,3 @@
+title = "A webhook endpoint was disabled"
+body = "The webhook endpoint {{ endpoint_id }} kept failing and was disabled. Fix the receiver, then enable it again."
+link = "{% if links.app %}{{ links.app }}{% endif %}"

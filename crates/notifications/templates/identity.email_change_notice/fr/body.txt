@@ -1,0 +1,7 @@
+Bonjour{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+Un changement de l’adresse e-mail de votre compte {{ app.name }} a été demandé. Il prend effet dès que la nouvelle adresse est confirmée.
+
+Si vous n’êtes pas à l’origine de cette demande, réinitialisez votre mot de passe et vérifiez votre compte.{% if links.unsubscribe %}
+
+Se désabonner : {{ links.unsubscribe }}{% endif %}
