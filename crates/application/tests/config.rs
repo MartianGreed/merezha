@@ -138,6 +138,9 @@ fn unsupported_documents() -> Vec<(&'static str, String)> {
                 "{ROUTES}[[reactors]]\nname = \"task-notifier\"\nservice = \"task-notifier\"\n"
             ),
         ),
+        // Writing the key at all is version 2, even as an empty list.
+        ("empty permissions", format!("permissions = []\n{ROUTES}")),
+        ("empty reactors", format!("reactors = []\n{ROUTES}")),
     ]
 }
 
@@ -217,7 +220,7 @@ on_error = "halt"
     assert_eq!(code(text), "unsupported_in_this_build");
     // The syntax itself decodes into the typed fields later slices enforce.
     let config: Config = toml::from_str(text).unwrap();
-    assert_eq!(config.permissions.len(), 2);
+    assert_eq!(config.permissions.as_ref().unwrap().len(), 2);
     assert_eq!(config.commands[0].scope, Some(RouteScope::Tenant));
     assert_eq!(
         config.commands[0].resource.as_ref().unwrap().as_str(),
@@ -225,7 +228,10 @@ on_error = "halt"
     );
     assert_eq!(config.queries[0].access, None);
     assert_eq!(config.projections[0].partition, Some(Partition::Tenant));
-    assert_eq!(config.reactors[0].commands[0].as_str(), "ArchiveTask");
+    assert_eq!(
+        config.reactors.as_ref().unwrap()[0].commands[0].as_str(),
+        "ArchiveTask"
+    );
     let public: Config = toml::from_str(
         "version = 2\n[[commands]]\ntag = \"A\"\nservice = \"s\"\naggregate = \"X\"\naccess = \"public\"\n",
     )
@@ -272,4 +278,47 @@ fn version_1_configuration_encodes_without_any_version_2_key() {
         assert!(encoded["commands"][0].get(route).is_none(), "{route}");
     }
     assert!(encoded["projections"][0].get("partition").is_none());
+}
+
+/// The design leaves these bounds open (PR #20, deviation 7): at most 256
+/// permissions with descriptions of at most 256 bytes, and 32 reactors. At
+/// the bound the document passes validation and reaches the refusal; one
+/// over fails `invalid_config`.
+#[test]
+fn permission_and_reactor_counts_and_description_length_are_bounded() {
+    let permissions = |count: usize, description: usize| {
+        let mut text = format!("version = 2\n{ROUTES}");
+        for i in 0..count {
+            text.push_str(&format!(
+                "[[permissions]]\nname = \"tasks.p{i}\"\ndescription = \"{}\"\n",
+                "d".repeat(description)
+            ));
+        }
+        text
+    };
+    let reactors = |count: usize| {
+        let mut text = format!("version = 2\n{ROUTES}");
+        for i in 0..count {
+            text.push_str(&format!(
+                "[[reactors]]\nname = \"r{i}\"\nservice = \"task-view\"\n"
+            ));
+        }
+        text
+    };
+    for (name, at, over) in [
+        ("permission count", permissions(256, 1), permissions(257, 1)),
+        (
+            "description length",
+            permissions(1, 256),
+            permissions(1, 257),
+        ),
+        ("reactor count", reactors(32), reactors(33)),
+    ] {
+        assert_eq!(
+            code(&at),
+            "unsupported_in_this_build",
+            "{name} at the bound"
+        );
+        assert_eq!(code(&over), "invalid_config", "{name} over the bound");
+    }
 }

@@ -2386,4 +2386,45 @@ initial=0
         );
         drop(open_store(&path, false));
     }
+    #[test]
+    fn a_tenant_commit_needs_the_tenant_as_its_stream_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let (store, _) = open_store(&path, true);
+        let tenant = id("org-1");
+        let commit = |stream: &Identity, tenant: &Identity| {
+            DurableStore::commit_command(
+                &store,
+                CommitCommand {
+                    stream,
+                    tenant: Some(tenant),
+                    expected: 0,
+                    events: vec![event()],
+                    metadata: &metadata(),
+                    claim: None,
+                },
+                deadline(),
+            )
+        };
+        for (stream, tenant) in [
+            (id("Counter/one"), tenant.clone()),
+            (id("org-2:Counter/one"), tenant.clone()),
+            // A tenant that is only a prefix of the stream's tenant.
+            (id("org-1:Counter/one"), id("org")),
+            (id("org-1Counter/one"), tenant.clone()),
+        ] {
+            let refused = commit(&stream, &tenant).unwrap_err();
+            assert_eq!(
+                (refused.code.as_str(), refused.classification),
+                (
+                    "constraint_violation",
+                    merezha_domain::Classification::Permanent
+                ),
+                "{stream:?} for {tenant:?}"
+            );
+        }
+        assert_eq!(store.head(deadline()).unwrap(), 0);
+        let receipt = commit(&id("org-1:Counter/one"), &tenant).unwrap();
+        assert_eq!((receipt.position, receipt.version), (1, 1));
+    }
 }

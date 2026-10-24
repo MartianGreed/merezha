@@ -345,12 +345,13 @@ pub struct Config {
     pub queries: Vec<QueryRoute>,
     #[serde(default)]
     pub projections: Vec<Projection>,
-    /// Version 2, from AP-C2.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub permissions: Vec<Permission>,
-    /// Version 2, from AP-C3.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reactors: Vec<Reactor>,
+    /// Version 2, from AP-C2. `Some` whenever the document wrote the key,
+    /// even as an empty list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<Vec<Permission>>,
+    /// Version 2, from AP-C3. `Some` whenever the document wrote the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reactors: Option<Vec<Reactor>>,
     #[serde(default)]
     pub storage: StorageConfig,
 }
@@ -374,9 +375,13 @@ impl Config {
         if self.commands.len() > 64
             || self.queries.len() > 64
             || self.projections.len() > 32
-            || self.permissions.len() > 256
-            || self.reactors.len() > 32
-            || self.permissions.iter().any(|p| p.description.len() > 256)
+            || self.permissions.as_ref().is_some_and(|p| p.len() > 256)
+            || self.reactors.as_ref().is_some_and(|r| r.len() > 32)
+            || self
+                .permissions
+                .iter()
+                .flatten()
+                .any(|p| p.description.len() > 256)
         {
             return Err(Failure::permanent("invalid_config"));
         }
@@ -413,8 +418,8 @@ impl Config {
     /// reactors (AP-C3). Accepting them unenforced would silently open
     /// routes that declare a permission.
     fn unsupported_keys(&self) -> bool {
-        !self.permissions.is_empty()
-            || !self.reactors.is_empty()
+        self.permissions.is_some()
+            || self.reactors.is_some()
             || self.commands.iter().any(CommandRoute::access_keys)
             || self.queries.iter().any(QueryRoute::access_keys)
             || self.projections.iter().any(|p| p.partition.is_some())
