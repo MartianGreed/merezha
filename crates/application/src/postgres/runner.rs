@@ -88,6 +88,8 @@ impl Default for BackgroundOptions {
 pub const INTERVAL: (Duration, Duration) = (Duration::from_millis(100), Duration::from_secs(600));
 pub const RUN_TIMEOUT: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(300));
 pub const MAX_CONCURRENT: (usize, usize) = (1, 16);
+/// A `database_timeout` this close to the run's deadline is the deadline.
+const DEADLINE_SLACK: Duration = Duration::from_millis(50);
 /// A background run's statements end this long after `run_timeout`.
 const HARD_MARGIN: Duration = Duration::from_secs(5);
 impl BackgroundOptions {
@@ -329,7 +331,7 @@ impl PostgresStore {
         let at = tokio::time::Instant::from_std(bounds.hard);
         let cut = bounds.cut();
         let mut cancel = bounds.cancel.clone();
-        self.handle.block_on(async move {
+        let result = self.handle.block_on(async move {
             let bounded = async move {
                 tokio::time::timeout_at(at, work)
                     .await
@@ -343,7 +345,20 @@ impl PostgresStore {
                 },
                 None => bounded.await,
             }
-        })
+        });
+        // The kernel's transaction helper, the session statement timeout and
+        // the pool wait share the run's deadline and answer
+        // `database_timeout` or `database_busy` when they reach it first:
+        // that is the run's own cut.
+        match result {
+            Err(failure)
+                if matches!(failure.code.as_str(), "database_timeout" | "database_busy")
+                    && Instant::now() + DEADLINE_SLACK >= bounds.hard =>
+            {
+                Err(bounds.cut())
+            }
+            other => other,
+        }
     }
     /// Detach a session, name it `merezha {key}` and try the run lock.
     /// `None` when another session holds it.
@@ -871,7 +886,7 @@ impl PostgresStore {
         let mut published = self.shared.published.subscribe();
         let mut next_try = Instant::now();
         loop {
-            let (pair, _, _) = self.served(projection, deadline)?;
+            let (pair, _, _) = at_deadline(self.served(projection, deadline), deadline, timed_out)?;
             if pair.checkpoint >= target {
                 return Ok(pair);
             }
@@ -884,7 +899,7 @@ impl PostgresStore {
                     }
                 }
             }
-            self.wait_published(&mut published, deadline, || Failure::transient("timeout"))?;
+            self.wait_published(&mut published, deadline, timed_out)?;
         }
     }
     /// Synchronous rebuild on PostgreSQL, for embedding callers and
@@ -902,7 +917,11 @@ impl PostgresStore {
         let mut published = self.shared.published.subscribe();
         let mut next_try = Instant::now();
         loop {
-            match self.rebuild_status(projection, deadline)? {
+            match at_deadline(
+                self.rebuild_status(projection, deadline),
+                deadline,
+                timed_out,
+            )? {
                 None => return Ok(self.served(projection, deadline)?.0),
                 Some(false) => return Err(Failure::conflict("rebuild_failed")),
                 Some(true) => {}
@@ -917,7 +936,29 @@ impl PostgresStore {
                     }
                 }
             }
-            self.wait_published(&mut published, deadline, || Failure::transient("timeout"))?;
+            self.wait_published(&mut published, deadline, timed_out)?;
         }
+    }
+}
+fn timed_out() -> Failure {
+    Failure::transient("timeout")
+}
+/// A read that failed because the request's deadline came (the pool wait
+/// or the statement bound reaching it) is the request's `expired()`.
+pub(crate) fn at_deadline<T>(
+    result: Result<T, Failure>,
+    deadline: Instant,
+    expired: fn() -> Failure,
+) -> Result<T, Failure> {
+    match result {
+        Err(failure)
+            if matches!(
+                failure.code.as_str(),
+                "timeout" | "database_timeout" | "database_busy"
+            ) && Instant::now() + DEADLINE_SLACK >= deadline =>
+        {
+            Err(expired())
+        }
+        other => other,
     }
 }

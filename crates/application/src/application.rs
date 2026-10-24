@@ -720,7 +720,13 @@ impl Admission {
             .ok_or_else(|| Failure::permanent("storage_configuration"))?;
         let mut published = store.shared().published.subscribe();
         loop {
-            let (pair, _, warm) = store.served(projection, self.deadline)?;
+            let read = store.served(projection, self.deadline);
+            let (pair, _, warm) = match min_position {
+                Some(_) => crate::postgres::at_deadline(read, self.deadline, || {
+                    Failure::transient("projection_behind")
+                })?,
+                None => read?,
+            };
             if pair.checkpoint < warm {
                 return Err(Failure::transient("projection_warming"));
             }

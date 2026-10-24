@@ -25,6 +25,7 @@ mod sql;
 mod tests;
 mod verify;
 
+pub(crate) use runner::at_deadline;
 pub use runner::{BackgroundOptions, CatchUp, INTERVAL, MAX_CONCURRENT, RUN_TIMEOUT};
 #[doc(hidden)]
 pub use runner::{Pause, RunHooks};
