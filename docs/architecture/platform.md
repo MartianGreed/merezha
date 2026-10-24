@@ -1752,11 +1752,19 @@ rebuild still pending, its transaction marks any pending rebuild
 current host's jobs runtime runs it in the background, re-materializing
 the `published` rows of every live entry with a published variant, 500
 entries per transaction in id order, each with the model version check,
-the entries locked, a generation bump for the scopes it touched and the
-resume cursor (`content.rebuild_batch`, then `content.rebuild_completed`).
-A run that nears its job deadline or is cancelled appends a continuation
-job; a host that dies mid-batch leaves the cursor at the last commit and
-the retried job resumes there. Until it is done, delivery may serve the
+the rebuild row locked `FOR UPDATE` (two runs never repeat a batch), the
+entries locked `FOR SHARE` (saves are not blocked), a generation bump for
+the scopes it touched and the resume cursor (`content.rebuild_batch`,
+then `content.rebuild_completed`). The job's payload names its version;
+a superseded or finished rebuild's job succeeds without work. Each run
+does at least one batch; one that nears its job deadline or is cancelled
+appends a continuation job (`rebuild:<version>:after:<job id>`, a
+duplicate from a retried run ignored). A host that dies mid-batch leaves
+the cursor at the last commit and the retried job resumes there. A
+module start enqueues a pending rebuild of its model again
+(`rebuild:<version>:resume:<cursor>`) when no job of the kind is
+available or running and no record of it awaits the relay, so a
+dead-lettered rebuild is retried by the next deploy. Until it is done, delivery may serve the
 previous materialization for the affected locales, as in a rolling
 deploy. `merezha content diff` prints `content_rebuild_pending version <n>
 after <entry id or start>` while one is pending. A first activation has

@@ -362,20 +362,28 @@ impl Work {
         }
         // `require_published`, against the rows this transaction wrote.
         let mut problems: Vec<(usize, FieldError)> = Vec::new();
-        for need in &required {
-            let target = need.target.hyphenated().to_string();
-            // Share-lock the target first: an unpublish or delete of it
-            // (`FOR UPDATE`) in flight is waited for and then seen, and
-            // one arriving later waits for this commit. Two publishes that
-            // each require the other may deadlock; PostgreSQL aborts one
-            // with `database_conflict` (409, conflict, retryable).
+        // Share-lock the targets first, in id order: an unpublish or
+        // delete of one (`FOR UPDATE`) in flight is waited for and then
+        // seen, and one arriving later waits for this commit. Two publishes
+        // that each require the other may still deadlock; PostgreSQL aborts
+        // one with `database_conflict` (409, conflict, retryable).
+        let mut targets: Vec<(Uuid, &str)> = required
+            .iter()
+            .map(|n| (n.target, n.scope.as_str()))
+            .collect();
+        targets.sort();
+        targets.dedup();
+        for (target, scope) in targets {
             tx.query_opt(
                 "SELECT 1 FROM merezha_content.entries \
                   WHERE id = $1::text::uuid AND (scope = $2 OR scope = 'app') FOR SHARE",
-                &[&target, &need.scope],
+                &[&target.hyphenated().to_string(), &scope],
             )
             .await
             .map_err(|e| sql(&e))?;
+        }
+        for need in &required {
+            let target = need.target.hyphenated().to_string();
             let found = tx
                 .query_opt(
                     "SELECT 1 FROM merezha_content.published \

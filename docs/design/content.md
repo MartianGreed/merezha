@@ -352,11 +352,18 @@ changes a fallback, or when an older rebuild is still pending (that one
 turns `superseded`: the new one covers every entry), and appends the
 content job `content.published_rebuild`, registered through
 `guard_jobs`. Any current host runs it: batches of 500 live entries with
-a published variant, in id order, each re-materializing its entries,
-bumping the generations it touched and persisting the cursor, logged as
-`content.rebuild_batch` and `content.rebuild_completed`. A run stopped by
-its deadline or a cancel appends a continuation job; a host dying
-mid-batch leaves the committed cursor for the retried job. Until it is
+a published variant, in id order and share-locked (saves and their
+reference locks pass; publishes and deletes wait), each re-materializing
+its entries, bumping the generations it touched and persisting the
+cursor under the rebuild row's `FOR UPDATE`, so two runs never repeat a
+batch; logged as `content.rebuild_batch` and `content.rebuild_completed`.
+The job's payload names its version: a run of a superseded or finished
+rebuild succeeds without work. A run does at least one batch, and one
+stopped by its deadline or a cancel appends a continuation job keyed by
+its job id (a retried run finds it there and goes on). A host dying
+mid-batch leaves the committed cursor for the retried job, and a module
+start enqueues a pending rebuild of its model that has no live job (a
+dead-lettered one, say), keyed by the cursor. Until it is
 done, delivery may serve the previous materialization for the affected
 locales, eventually consistent like the mixed state of a rolling deploy.
 `merezha content diff` reports a pending rebuild as
@@ -624,6 +631,25 @@ number never reaches it. `refs`, `assets` and `blobs` statements filter on
 `scope`; only the `if_unreferenced` and `asset_in_use` checks count referrers
 in every scope, without returning them. C3 ships these predicates with the
 first write path; C9 adds organization types without changing a statement.
+
+### Lock order
+
+Content transactions take their locks in this order, so they wait on each
+other rather than deadlock:
+
+1. The loaded model's `models` row, `FOR SHARE` (the version check).
+2. Entries: the entry a save or delete addresses (`FOR SHARE` for a save,
+   `FOR UPDATE` for publish, unpublish and deletes), a batch's entries
+   first, in id order. The rebuild takes the rebuild row `FOR UPDATE`,
+   then its batch's entries `FOR SHARE` in id order.
+3. The default variant `FOR SHARE` (a non-default save), then the
+   addressed variant (`FOR UPDATE`, or its compare-and-swap update).
+4. Reference targets, `FOR KEY SHARE` in id order, then
+   `require_published` targets `FOR SHARE` in id order.
+
+Steps 2 and 4 can still cross (a publish of A requiring B while a publish
+of B requires A); PostgreSQL then aborts one transaction, which answers
+`database_conflict` (409, conflict, retryable).
 
 ### Optimistic concurrency
 

@@ -1328,6 +1328,18 @@ impl Work {
         ))
     }
 
+    /// [`Work::append`], skipping records whose dedupe key exists.
+    pub(crate) async fn append_ignoring(
+        &self,
+        tx: &mut Tx<'_>,
+        records: Vec<OutboxRecord>,
+    ) -> Result<(), Rejection> {
+        for chunk in records.chunks(MAX_RECORDS_PER_APPEND) {
+            self.outbox.append(tx, chunk, OnDuplicate::Ignore).await?;
+        }
+        Ok(())
+    }
+
     /// Append `records` in the transaction, in chunks the outbox accepts.
     pub(crate) async fn append(
         &self,

@@ -220,8 +220,9 @@ async fn a_newer_activation_carries_a_pending_rebuild_forward() {
         .await,
         ["rebuild:2,rebuild:3"]
     );
-    // A current host runs both jobs: version 2's finds nothing of its own
-    // to do, version 3's rebuilds every entry with `v2`'s locales.
+    // A current host runs both jobs: version 2's job (its payload names
+    // version 2) finds its rebuild superseded and succeeds without work,
+    // version 3's rebuilds every entry with `v2`'s locales.
     let worker = start(&test, "", &v3()).await;
     wait_for(&worker.db, REBUILD_STATES, "2:superseded,3:done").await;
     wait_for(
@@ -233,4 +234,300 @@ async fn a_newer_activation_carries_a_pending_rebuild_forward() {
     .await;
     assert_eq!(page_rows(&worker.db, "de").await, 30);
     assert_eq!(page_rows(&worker.db, "fr-BE").await, 30);
+}
+
+/// A session holding advisory lock `key`, and its backend pid.
+struct Gate {
+    client: merezha_postgres::PooledClient,
+    pid: i32,
+    key: i64,
+}
+async fn hold(db: &merezha_platform::Database, key: i64) -> Gate {
+    let client = db.acquire(soon()).await.unwrap();
+    client
+        .execute("SELECT pg_advisory_lock($1)", &[&key])
+        .await
+        .unwrap();
+    let pid = client
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    Gate { client, pid, key }
+}
+impl Gate {
+    async fn open(self) {
+        self.client
+            .execute("SELECT pg_advisory_unlock($1)", &[&self.key])
+            .await
+            .unwrap();
+    }
+}
+
+/// The smallest page id, the first entry of the first batch.
+async fn first_page(db: &merezha_platform::Database) -> String {
+    strings(
+        db,
+        "SELECT min(id::text) FROM merezha_content.entries WHERE content_type = 'page'",
+    )
+    .await
+    .remove(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_save_referencing_an_entry_of_the_batch_never_waits_for_the_rebuild() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let old = start_with(&test, NO_WORKERS, "", CHAIN_MODEL).await;
+    // Two published entries, the referenced author sorting first.
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let author = id_of(
+            &old.create("author", json!({"fields": {"name": "Ada"}}))
+                .await,
+        );
+        old.publish("author", &author, "en", 1).await;
+        ids.push(author);
+    }
+    ids.sort();
+    // The saved article sorts after its target (UUIDv7, created later).
+    let target = ids[0].clone();
+    let article = id_of(
+        &old.create("article", json!({"fields": {"title": "A"}}))
+            .await,
+    );
+    old.publish("article", &article, "en", 1).await;
+    let pending = start_with(&test, NO_WORKERS, "", &v2()).await;
+    // A save holds its own entry (`FOR SHARE`) and its target (`FOR KEY
+    // SHARE`), stopped as it writes the ref.
+    execute(
+        &old.db,
+        &format!(
+            "CREATE FUNCTION public.hold_save() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               IF NEW.target_id = '{target}' THEN PERFORM pg_advisory_xact_lock(71); END IF;
+               RETURN NEW;
+             END $$;
+             CREATE TRIGGER hold_save BEFORE INSERT ON merezha_content.refs
+               FOR EACH ROW EXECUTE FUNCTION public.hold_save();"
+        ),
+    )
+    .await;
+    let gate = hold(&old.db, 71).await;
+    let client = pending.client.clone();
+    let path = variant("article", &article, "en");
+    let id = target.clone();
+    let save = tokio::spawn(async move {
+        client
+            .put(&path)
+            .if_match(1)
+            .json(&json!({"fields": {"title": "A", "related": [], "author": {"id": id}}}))
+            .send()
+            .await
+    });
+    wait_blocked_by(&old.db, gate.pid).await;
+    // The rebuild batch locks every entry `FOR SHARE` and finishes while
+    // the save is still open.
+    let worker = start(&test, "", &v2()).await;
+    wait_for(&worker.db, REBUILD_STATES, "2:done").await;
+    gate.open().await;
+    let saved = save.await.unwrap();
+    assert_eq!(saved.status, StatusCode::OK, "{:?}", saved.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_runs_of_one_rebuild_never_repeat_a_batch() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let old = start_with(&test, NO_WORKERS, "", CHAIN_MODEL).await;
+    seed_pages(&old.db, 1100).await;
+    let first = first_page(&old.db).await;
+    execute(
+        &old.db,
+        &format!(
+            "CREATE TABLE public.materialized (entry_id uuid, locale text);
+             CREATE TABLE public.cursors (n serial, after_entry uuid);
+             CREATE FUNCTION public.log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               IF NEW.entry_id = '{first}' THEN PERFORM pg_advisory_xact_lock(72); END IF;
+               INSERT INTO public.materialized VALUES (NEW.entry_id, NEW.locale);
+               RETURN NEW;
+             END $$;
+             CREATE TRIGGER log_row BEFORE INSERT ON merezha_content.published
+               FOR EACH ROW EXECUTE FUNCTION public.log_row();
+             CREATE FUNCTION public.log_cursor() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO public.cursors (after_entry) VALUES (NEW.after_entry); RETURN NEW; END $$;
+             CREATE TRIGGER log_cursor BEFORE UPDATE ON merezha_content.rebuilds
+               FOR EACH ROW EXECUTE FUNCTION public.log_cursor();"
+        ),
+    )
+    .await;
+    let gate = hold(&old.db, 72).await;
+    // The activation's job starts the first batch and stops at the gate.
+    let worker = start(&test, "", &v2()).await;
+    let running = wait_blocked_by(&worker.db, gate.pid).await;
+    // A second run of the same rebuild waits on the cursor row.
+    execute(
+        &worker.db,
+        "INSERT INTO merezha_jobs.jobs (queue, kind, idempotency_key, payload, payload_digest, \
+             max_attempts, correlation_id) \
+         VALUES ('content', 'content.published_rebuild', 'content:test-second', \
+                 '{\"version\":2}'::json, sha256('{\"version\":2}'::bytea), 3, 'c2')",
+    )
+    .await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let on_cursor = scalar(
+            &worker.db,
+            &format!(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE {running} = ANY(pg_blocking_pids(pid)) \
+                    AND query LIKE '%merezha_content.rebuilds%'"
+            ),
+        )
+        .await;
+        if on_cursor > 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second run never waited on the cursor row"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    gate.open().await;
+    wait_for(&worker.db, REBUILD_STATES, "2:done").await;
+    wait_for(
+        &worker.db,
+        "SELECT string_agg(state, ',' ORDER BY id) FROM merezha_jobs.jobs \
+          WHERE kind = 'content.published_rebuild'",
+        "succeeded,succeeded",
+    )
+    .await;
+    // Every row materialized once, the cursor only moving forward.
+    assert_eq!(
+        scalar(
+            &worker.db,
+            "SELECT count(*) FROM (SELECT 1 FROM public.materialized \
+              GROUP BY entry_id, locale HAVING count(*) > 1) d"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(&worker.db, "SELECT count(*) FROM public.materialized").await,
+        1100 * 4
+    );
+    let cursors = strings(
+        &worker.db,
+        "SELECT after_entry::text FROM public.cursors ORDER BY n",
+    )
+    .await;
+    assert_eq!(cursors.len(), 3, "{cursors:?}");
+    assert!(cursors.windows(2).all(|w| w[0] < w[1]), "{cursors:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retried_run_finds_its_continuation_and_succeeds() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let old = start_with(&test, NO_WORKERS, "", CHAIN_MODEL).await;
+    seed_pages(&old.db, 1100).await;
+    // A job timeout no longer than `limits.query_timeout`: every run does
+    // one batch, then appends its continuation.
+    let tight = "[jobs.queues.content]\ntimeout_ms = 5000\n";
+    let worker = start_with(&test, tight, "", &v2()).await;
+    wait_for(&worker.db, REBUILD_STATES, "2:done").await;
+    let continuations = strings(
+        &worker.db,
+        "SELECT string_agg(dedupe_key, ',' ORDER BY id) FROM merezha_jobs.outbox \
+          WHERE record_kind = 'job' AND dedupe_key LIKE 'rebuild:2:after:%'",
+    )
+    .await;
+    let keys: Vec<&str> = continuations[0].split(',').collect();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    // The first job runs again, as after a reaped lease: its continuation
+    // is already there, and the run still succeeds.
+    let original: i64 = scalar(
+        &worker.db,
+        "SELECT id FROM merezha_jobs.jobs WHERE idempotency_key = 'content:rebuild:2'",
+    )
+    .await;
+    assert_eq!(keys[0], format!("rebuild:2:after:{original}"));
+    execute(
+        &worker.db,
+        &format!(
+            "UPDATE merezha_content.rebuilds SET state = 'pending', after_entry = NULL;
+             UPDATE merezha_jobs.jobs SET state = 'available', run_at = now(), finished_at = NULL \
+              WHERE id = {original}"
+        ),
+    )
+    .await;
+    wait_for(
+        &worker.db,
+        &format!(
+            "SELECT string_agg(a.outcome, ',' ORDER BY a.started_at) FROM merezha_jobs.attempts a \
+              WHERE a.job_id = {original}"
+        ),
+        "succeeded,succeeded",
+    )
+    .await;
+    assert_eq!(
+        scalar(
+            &worker.db,
+            &format!(
+                "SELECT count(*) FROM merezha_jobs.outbox WHERE dedupe_key = 'rebuild:2:after:{original}'"
+            )
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pending_rebuild_without_a_live_job_is_enqueued_again_at_start() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let old = start_with(&test, NO_WORKERS, "", CHAIN_MODEL).await;
+    seed_pages(&old.db, 30).await;
+    let pending = start_with(&test, NO_WORKERS, "", &v2()).await;
+    // Stop both runtimes, then lose the job: its record relayed, any job
+    // dead.
+    old.jobs.shutdown(soon()).await;
+    pending.jobs.shutdown(soon()).await;
+    execute(
+        &old.db,
+        "UPDATE merezha_jobs.outbox SET relayed_at = now() \
+          WHERE record_kind = 'job' AND relayed_at IS NULL;
+         UPDATE merezha_jobs.jobs SET state = 'dead', finished_at = now() \
+          WHERE kind = 'content.published_rebuild'",
+    )
+    .await;
+    assert_eq!(strings(&old.db, REBUILD_STATES).await, ["2:pending"]);
+    // The next host of the model enqueues it again, keyed by the cursor.
+    let worker = start(&test, "", &v2()).await;
+    wait_for(&worker.db, REBUILD_STATES, "2:done").await;
+    assert_eq!(page_rows(&worker.db, "de").await, 30);
+    assert_eq!(
+        strings(
+            &worker.db,
+            "SELECT state FROM merezha_jobs.jobs WHERE idempotency_key = 'content:rebuild:2:resume:start'"
+        )
+        .await,
+        ["succeeded"]
+    );
+    // A start with nothing pending enqueues nothing.
+    start(&test, "", &v2()).await;
+    assert_eq!(
+        scalar(
+            &worker.db,
+            "SELECT count(*) FROM merezha_jobs.jobs WHERE idempotency_key LIKE 'content:rebuild:2:resume:%'"
+        )
+        .await,
+        1
+    );
 }

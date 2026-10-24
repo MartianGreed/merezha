@@ -310,6 +310,26 @@ impl ContentModule {
             .state()
             .ok_or_else(|| Failure::permanent("content_not_configured"))
     }
+    /// Enqueue a pending rebuild of this host's model that has no live job
+    /// (dead-lettered, or its outbox record lost). Best effort: a transient
+    /// failure leaves it to the next start; the diff still reports it.
+    async fn resume_rebuild(
+        &self,
+        ctx: &AppContext,
+        state: &Arc<ContentState>,
+    ) -> Result<(), Failure> {
+        if state.is_outdated() {
+            return Ok(());
+        }
+        let store = Store::new(state.clone(), ctx.clone(), ctx.outbox(NAME)?);
+        match store.resume_rebuild(&ctx.jobs(NAME)?).await {
+            Ok(_) => Ok(()),
+            Err(failure) if failure.classification == merezha_domain::Classification::Permanent => {
+                Err(failure)
+            }
+            Err(_) => Ok(()),
+        }
+    }
     /// Register the content job kinds, each through
     /// [`ContentState::guard_jobs`], and their schedules (C4):
     /// `content.trash_purge` on the `content` queue, declared as the cron
@@ -515,7 +535,8 @@ impl Module for ContentModule {
                     }
                     Err(error) => return Err(error.failure),
                 }
-                self.register_jobs(&ctx, &state)
+                self.register_jobs(&ctx, &state)?;
+                self.resume_rebuild(&ctx, &state).await
             } else {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let client = match ctx.database().acquire(deadline).await {
@@ -538,7 +559,8 @@ impl Module for ContentModule {
                     }
                     Err(_) => {}
                 }
-                self.register_jobs(&ctx, &state)
+                self.register_jobs(&ctx, &state)?;
+                self.resume_rebuild(&ctx, &state).await
             }
         })
     }

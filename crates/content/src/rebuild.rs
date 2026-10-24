@@ -22,7 +22,8 @@ use merezha_domain::{Failure, Identity};
 use merezha_platform::{
     BoxFuture,
     ports::{
-        DedupeKey, JobContext, JobFailure, JobHandler, MessageContext, OutboxRecord, OutboxTarget,
+        DedupeKey, JobContext, JobFailure, JobHandler, JobsHandle, MessageContext, NewJob,
+        OutboxRecord, OutboxTarget,
     },
 };
 use serde_json::{Value, json};
@@ -108,14 +109,21 @@ enum Batch {
 }
 
 impl Store {
-    /// One rebuild transaction for this host's model; see the module docs.
-    async fn rebuild_batch(&self) -> Result<Batch, Rejection> {
+    /// One rebuild transaction of the rebuild of model `version`; see the
+    /// module docs. A rebuild of another version than this host's model
+    /// (superseded, done, or a newer model's) is [`Batch::Nothing`]: a
+    /// newer active model fails the version check, which gives the job
+    /// back for a current host.
+    async fn rebuild_batch(&self, version: u32) -> Result<Batch, Rejection> {
         let work = self.work();
         crate::store::transaction(self.database(), self.deadline(), move |tx| {
             Box::pin(async move {
                 work.state.check_writable(tx).await?;
-                let version = i32::try_from(work.model.version())
-                    .map_err(|_| Failure::permanent("invalid_input"))?;
+                if version != work.model.version() {
+                    return Ok(Batch::Nothing);
+                }
+                let version =
+                    i32::try_from(version).map_err(|_| Failure::permanent("invalid_input"))?;
                 let Some(cursor) = tx
                     .query_opt(
                         "SELECT after_entry::text FROM merezha_content.rebuilds \
@@ -137,7 +145,7 @@ impl Store {
                                          WHERE v.entry_id = e.id AND v.scope = e.scope \
                                            AND v.content_type = e.content_type \
                                            AND NOT v.deleted AND v.published_revision IS NOT NULL) \
-                          ORDER BY e.id LIMIT $2 FOR UPDATE OF e",
+                          ORDER BY e.id LIMIT $2 FOR SHARE OF e",
                         &[&after, &REBUILD_BATCH],
                     )
                     .await
@@ -172,6 +180,64 @@ impl Store {
         .await
     }
 
+    /// Enqueue the rebuild of this host's model again when one is pending
+    /// without a live job (a module start): a job that dead-lettered, or an
+    /// outbox record lost, would otherwise leave it pending for good. The
+    /// key names the cursor, so starts at the same position enqueue once;
+    /// a run racing another waits on the cursor row and never repeats a
+    /// batch.
+    pub(crate) async fn resume_rebuild(&self, jobs: &JobsHandle) -> Result<bool, Failure> {
+        let client = self
+            .database()
+            .acquire(std::time::Instant::now() + self.state().settings().limits.query_timeout)
+            .await?;
+        let Some(pending) = pending_rebuild(&**client).await? else {
+            return Ok(false);
+        };
+        if pending.version != self.model().version() {
+            return Ok(false);
+        }
+        // A job still to run, or a record the relay has not turned into one
+        // yet, is live. Read-only, from the jobs runtime's tables.
+        let live: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM merezha_jobs.jobs \
+                                 WHERE kind = $1 AND state IN ('available', 'running')) \
+                     OR EXISTS (SELECT 1 FROM merezha_jobs.outbox \
+                                 WHERE source = 'content' AND record_kind = 'job' \
+                                   AND job_kind = $1 AND relayed_at IS NULL)",
+                &[&REBUILD_JOB],
+            )
+            .await
+            .map_err(|e| merezha_postgres::classify(&e))?
+            .get(0);
+        drop(client);
+        if live {
+            return Ok(false);
+        }
+        let key = format!(
+            "rebuild:{}:resume:{}",
+            pending.version,
+            pending.after_entry.as_deref().unwrap_or("start")
+        );
+        jobs.enqueue(NewJob {
+            queue: Identity::new(QUEUE)?,
+            kind: Identity::new(REBUILD_JOB)?,
+            idempotency_key: DedupeKey::new(key.clone())?,
+            payload: json!({ "version": pending.version }),
+            contains_secret: false,
+            run_at: None,
+            priority: 0,
+            context: MessageContext {
+                correlation_id: Identity::new(key)?,
+                causation_id: None,
+                tenant: None,
+            },
+        })
+        .await?;
+        Ok(true)
+    }
+
     /// Append the continuation of the stopped job `job`.
     async fn continue_rebuild(&self, job: i64) -> Result<(), Rejection> {
         let work = self.work();
@@ -179,7 +245,9 @@ impl Store {
         crate::store::transaction(self.database(), self.deadline(), move |tx| {
             Box::pin(async move {
                 work.state.check_writable(tx).await?;
-                work.append(tx, vec![record]).await
+                // A retried run of the same job (its lease reaped after it
+                // appended) finds the continuation there already.
+                work.append_ignoring(tx, vec![record]).await
             })
         })
         .await
@@ -196,23 +264,38 @@ impl JobHandler for RebuildPublished {
     fn handle<'a>(
         &'a self,
         ctx: JobContext,
-        _payload: Value,
+        payload: Value,
     ) -> BoxFuture<'a, Result<(), JobFailure>> {
         Box::pin(async move {
-            let version = self.store.model().version();
+            // The rebuild the job was enqueued for; a superseded or finished
+            // one leaves nothing to do.
+            let Some(version) = payload
+                .get("version")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+            else {
+                return Err(JobFailure::permanent("invalid_payload"));
+            };
             let margin = self.store.state().settings().limits.query_timeout;
             let mut entries = 0u64;
+            let mut first = true;
             loop {
-                if *ctx.cancel.borrow() || tokio::time::Instant::now() + margin >= ctx.deadline {
+                // At least one batch per run, so a tight job timeout still
+                // makes progress.
+                if !first
+                    && (*ctx.cancel.borrow()
+                        || tokio::time::Instant::now() + margin >= ctx.deadline)
+                {
                     self.store
                         .continue_rebuild(ctx.id)
                         .await
                         .map_err(|r| JobFailure::from(r.failure))?;
                     return Ok(());
                 }
+                first = false;
                 match self
                     .store
-                    .rebuild_batch()
+                    .rebuild_batch(version)
                     .await
                     .map_err(|r| JobFailure::from(r.failure))?
                 {
