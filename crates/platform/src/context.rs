@@ -152,10 +152,29 @@ pub struct AppContext {
     /// The module this context was handed to, which fixes the sources it
     /// may write as. `None` for the host's own context.
     module: Option<Source>,
+    /// Kernel sources the host granted this module besides its own name.
+    granted: Vec<Source>,
 }
-/// Sources only the host's own context can bind: HTTP routes of the
-/// kernel (`api`) and reactions (`application`).
+/// Sources only the host's own context binds: HTTP-supplied requests
+/// (`api`) and reactions (`application`).
 pub const KERNEL_SOURCES: [&str; 2] = ["api", "application"];
+/// The only `(source, module)` grants a module may claim through
+/// [`crate::Module::extra_sources`]: the notifications block's HTTP send
+/// route writes as `api` (NT §3.1). `application` is never granted.
+pub const GRANTABLE_SOURCES: [(&str, &str); 1] = [("api", "notifications")];
+
+/// Check that module `name` may claim `extra` sources; fails permanent
+/// `source_not_granted` otherwise.
+pub fn check_source_grants(name: &str, extra: &[&str]) -> Result<(), Failure> {
+    if extra
+        .iter()
+        .all(|source| GRANTABLE_SOURCES.contains(&(source, name)))
+    {
+        Ok(())
+    } else {
+        Err(Failure::permanent("source_not_granted"))
+    }
+}
 struct Inner {
     app_id: String,
     instance_id: String,
@@ -227,21 +246,29 @@ impl AppContext {
     }
     /// This context as handed to module `name`: its handles can only be
     /// bound to `name`. The host binds each module's context at start.
-    pub(crate) fn for_module(&self, name: &str) -> Result<Self, Failure> {
+    pub(crate) fn for_module(&self, name: &str, extra: &[&str]) -> Result<Self, Failure> {
+        check_source_grants(name, extra)?;
         Ok(Self {
             inner: self.inner.clone(),
             module: Some(Source::new(name)?),
+            granted: extra
+                .iter()
+                .map(|source| Source::new(source))
+                .collect::<Result<_, _>>()?,
         })
     }
     /// The source a handle may be bound to: a module's context binds its
-    /// own name only, so blocks cannot write in each other's dedupe
-    /// namespace or claim identity's membership exemption; the host's
+    /// own name and the kernel sources the host granted it
+    /// ([`GRANTABLE_SOURCES`]), so blocks cannot write in each other's
+    /// dedupe namespace or claim identity's membership exemption; the host's
     /// context binds any source, [`KERNEL_SOURCES`] included. Fails
     /// permanent `invalid_source` or `source_not_allowed`.
     fn source(&self, source: &str) -> Result<Source, Failure> {
         let source = Source::new(source)?;
         match &self.module {
-            Some(own) if *own != source => Err(Failure::permanent("source_not_allowed")),
+            Some(own) if *own != source && !self.granted.contains(&source) => {
+                Err(Failure::permanent("source_not_allowed"))
+            }
             _ => Ok(source),
         }
     }
@@ -336,6 +363,7 @@ impl AppContextBuilder {
         };
         Ok(AppContext {
             module: None,
+            granted: Vec::new(),
             inner: Arc::new(Inner {
                 app_id: self.app_id,
                 instance_id: self.instance_id,
@@ -454,7 +482,7 @@ mod tests {
         for source in ["identity", "api", "application"] {
             assert!(host.outbox(source).is_ok() && host.notifier(source).is_ok());
         }
-        let content = host.for_module("content").unwrap();
+        let content = host.for_module("content", &[]).unwrap();
         assert_eq!(content.module(), Some("content"));
         assert_eq!(
             content.outbox("content").unwrap().source().as_str(),
@@ -472,5 +500,42 @@ mod tests {
             );
         }
         assert_eq!(content.outbox("Bad").unwrap_err().code, "invalid_source");
+    }
+
+    #[test]
+    fn only_notifications_is_granted_the_api_source() {
+        let db = merezha_postgres::Database::connect(&merezha_postgres::DatabaseConfig::new(
+            merezha_postgres::Secret::new("postgres://127.0.0.1:1/none"),
+        ))
+        .unwrap();
+        let host = AppContext::builder("tasks", db, Arc::new(crate::ports::DenyAll))
+            .build()
+            .unwrap();
+        let notifications = host.for_module("notifications", &["api"]).unwrap();
+        for source in ["notifications", "api"] {
+            assert!(notifications.outbox(source).is_ok(), "{source}");
+            assert!(notifications.notifier(source).is_ok(), "{source}");
+        }
+        for spoof in ["application", "identity"] {
+            assert_eq!(
+                notifications.notifier(spoof).err().map(|f| f.code),
+                Some("source_not_allowed".into())
+            );
+        }
+        // Without the claim, even notifications binds only its own name.
+        let plain = host.for_module("notifications", &[]).unwrap();
+        assert_eq!(plain.outbox("api").unwrap_err().code, "source_not_allowed");
+        for (module, extra) in [
+            ("content", "api"),
+            ("identity", "api"),
+            ("notifications", "application"),
+            ("content", "application"),
+        ] {
+            assert_eq!(
+                host.for_module(module, &[extra]).unwrap_err().code,
+                "source_not_granted",
+                "{module} {extra}"
+            );
+        }
     }
 }

@@ -192,6 +192,22 @@ impl Host {
         let errors = Arc::new(error_registry(
             &modules.iter().map(|m| m.as_ref()).collect::<Vec<_>>(),
         )?);
+        for module in &modules {
+            if let Err(failure) =
+                crate::context::check_source_grants(module.name(), module.extra_sources())
+            {
+                tracing::error!(
+                    event = "module.source_refused",
+                    module = module.name(),
+                    sources = ?module.extra_sources()
+                );
+                return Err(StartupError {
+                    failure,
+                    migration: None,
+                    module: Some(module.name()),
+                });
+            }
+        }
         let database = Database::connect(&config.database).map_err(|failure| StartupError {
             failure,
             migration: None,
@@ -274,7 +290,7 @@ impl Host {
         for module in &modules {
             let at = tokio::time::Instant::from_std(Instant::now() + parts.timeouts.module_start);
             let own = ctx
-                .for_module(module.name())
+                .for_module(module.name(), module.extra_sources())
                 .map_err(|failure| StartupError {
                     failure,
                     migration: None,
@@ -307,7 +323,7 @@ impl Host {
         let mut router = health::router(readiness.clone());
         for module in &modules {
             let own = ctx
-                .for_module(module.name())
+                .for_module(module.name(), module.extra_sources())
                 .map_err(|failure| StartupError {
                     failure,
                     migration: None,

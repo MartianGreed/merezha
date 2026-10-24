@@ -776,3 +776,78 @@ async fn modules_cannot_bind_handles_for_another_source() {
     assert_eq!(refused.len(), 6, "{refused:?}");
     assert!(refused.iter().all(|r| r.ends_with(":source_not_allowed")));
 }
+
+/// Claims the `api` source for an HTTP send route, as notifications does.
+struct Sender {
+    name: &'static str,
+    bound: Arc<std::sync::Mutex<Vec<String>>>,
+}
+impl Module for Sender {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn extra_sources(&self) -> &[&'static str] {
+        &["api"]
+    }
+    fn start(&self, ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
+        Box::pin(async move {
+            let mut bound = self.bound.lock().unwrap();
+            for source in ["api", "application", "notifications"] {
+                let outcome = match ctx.notifier(source) {
+                    Ok(_) => "ok".to_owned(),
+                    Err(failure) => failure.code,
+                };
+                bound.push(format!("{source}:{outcome}"));
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn only_the_notifications_module_is_granted_the_api_source() {
+    let bound = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // A claim by any other module stops startup before the pool opens.
+    let config = ProjectConfig::parse(
+        "[app]\nid = \"notes-app\"\n[database]\nurl = { env = \"NOTES_DATABASE_URL\" }\n[runtime]\nmanifest = \"runtime.toml\"\n",
+        std::env::temp_dir(),
+        &[("NOTES_DATABASE_URL".into(), "postgres://127.0.0.1:1/none".into())],
+        &[],
+    )
+    .unwrap();
+    let error = Host::start(
+        config,
+        vec![Box::new(Sender {
+            name: "content",
+            bound: bound.clone(),
+        })],
+        parts(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        (error.failure.code.as_str(), error.module),
+        ("source_not_granted", Some("content"))
+    );
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    Host::start(
+        config_with(&test, true, "", &[]),
+        vec![Box::new(Sender {
+            name: "notifications",
+            bound: bound.clone(),
+        })],
+        parts(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *bound.lock().unwrap(),
+        vec![
+            "api:ok".to_owned(),
+            "application:source_not_allowed".to_owned(),
+            "notifications:ok".to_owned()
+        ]
+    );
+}

@@ -57,6 +57,13 @@ pub trait Module: Send + Sync + 'static {
     fn migrations(&self) -> &[Migration] {
         &[]
     }
+    /// Kernel sources this module writes as besides its own name. The host
+    /// grants only the pairs in [`crate::context::GRANTABLE_SOURCES`] (the
+    /// notifications block may claim `api` for its HTTP send route) and
+    /// refuses any other claim at startup with `source_not_granted`.
+    fn extra_sources(&self) -> &[&'static str] {
+        &[]
+    }
     /// Error codes this module returns with their HTTP statuses, registered
     /// at startup (R8). A code another module or the kernel registered with
     /// a different status stops startup with `error_code_conflict`.
