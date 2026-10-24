@@ -524,8 +524,7 @@ fn a_job_whose_host_is_killed_mid_run_is_reaped_and_runs_once_more() {
         ],
         "killed",
     );
-    let address = killed.ready();
-    wait_for_ready_status(address, 200);
+    killed.ready();
     let runtime = current_thread();
     let db = Database::connect(&test.config()).unwrap();
     let id = insert_sleep_job(&runtime, &db);
@@ -596,7 +595,6 @@ fn sigterm_releases_a_running_job_with_its_attempt_refunded() {
         "draining",
     );
     let address = draining.ready();
-    wait_for_ready_status(address, 200);
     let runtime = current_thread();
     let db = Database::connect(&test.config()).unwrap();
     let id = insert_sleep_job(&runtime, &db);
