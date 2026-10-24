@@ -83,6 +83,16 @@ initial = { tasks = {} }
 cargo run --locked -p merezha-cli -- serve --manifest runtime.toml --application application.toml --listen 127.0.0.1:0
 ```
 
+`version = 1` is the original format and stays accepted. `version = 2` adds
+`[limits] max_stream_events` (below) and the keys of the application platform's
+later slices: `[[permissions]]`, route `permission`, `access`, `scope` and
+`resource` (commands only), projection `partition` and `[[reactors]]`
+([design](../design/application-platform.md) §C.4, §C.5). This build parses
+those keys and refuses them at startup with `unsupported_in_this_build`, because
+accepting a route permission it does not enforce would silently open the route.
+A version 1 file using any version 2 key fails `invalid_config`, as an unknown
+key did before.
+
 Read the ephemeral port from stderr's `listener.ready`. POST JSON to
 `/v1/application/commands` with `tag`, `stream`, `payload`, `metadata`, optional
 `idempotency_key` and optional `expected_version`. The host namespaces the stream
@@ -154,6 +164,15 @@ owns sizing and adapter selection. No setting makes the host a native OS sandbox
 | `batch_size` | 16 | 64 |
 | `max_concurrent` | 16 | 64 |
 | `timeout_ms` | 5000 | 30000 |
+| `max_stream_events` (version 2) | 4096 | 4096 |
+
+`max_stream_events` bounds one stream's history, which goes whole to the guest on
+every decision: a command whose stream holds more events fails `history_limit`
+(422) before the guest decides, on every backend, and a keyed retry is not left
+in flight. Memory and SQLite also stop at `max_events`, whichever is lower.
+The host records which `[limits]` keys the file wrote. PostgreSQL storage (a later
+slice) has no total capacity and will refuse a written `max_events`,
+`max_streams`, `max_store_bytes` or `max_idempotency` with `invalid_limits`.
 
 Every limit must be positive. Registries allow at most 64 command tags, 64
 query tags and 32 projections. Command/query tags must be disjoint and unique;
@@ -234,7 +253,9 @@ It stores application identity, canonical configuration, fingerprint format 1,
 checks schema drift, `quick_check`, event/stream numbering, payloads, retained
 capacities, receipt bindings and projection pairs before readiness. Changed
 application identity, routes, limits, initial states or projection revisions
-fail with `storage_configuration`. Every projection has a positive `revision`
+fail with `storage_configuration`. The stored text is the configuration at
+version 1, so changing only `version = 1` to `version = 2` keeps a store
+opening; a `max_stream_events` other than its default is part of the text. Every projection has a positive `revision`
 field, default 1, owned by the application. Change it when guest projection
 semantics change. Runtime reload cannot determine semantic compatibility;
 operators must keep replacement guests compatible with persisted events/models.
@@ -341,7 +362,16 @@ cargo test --locked -p merezha-application
 cargo test --locked -p merezha-cli --test sqlite_process -- --nocapture
 ```
 
-The first covers reopen, receipt/event rollback, recovered-data bounds,
+`tests/store_contract.rs` holds the portable store contract: reopen, scoped
+canonical replay, zero-event receipts, pending keys and racing writes, two
+independent instances rechecking stream, key and projection row revision, failed
+catch-up and rebuild, the state and history limits, multi-event batches and
+statement-failure rollback. It runs on SQLite (`sqlite::contract_*`); the
+PostgreSQL store will run the same functions. The second instance comes from the
+test-only `test-support` feature, which shares the owner lock because the owner
+gate forbids two hosts on one file.
+
+The first command covers reopen, receipt/event rollback, recovered-data bounds,
 independent-connection CAS, forced transaction/rebuild interruption and failure
 recovery. The second starts real no-import CLI hosts over ephemeral loopback
 HTTP, checks owner exclusion, restart, raw service behavior and closed restore.

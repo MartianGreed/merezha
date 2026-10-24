@@ -119,7 +119,7 @@ such as the `[jobs.retention]` ones, take strings only. A malformed value is
 `expected_duration`.
 
 Every key below validates at startup. Keys marked *reserved* have no effect
-yet: the jobs runtime (AP-B1 onward), the PostgreSQL application core (AP-A1
+yet: the jobs runtime (AP-B1 onward), the PostgreSQL application core (AP-A2
 onward) and the telemetry block (TE-T1 onward) give them their behaviour.
 Configuring them now fails early on typos instead of being ignored.
 
