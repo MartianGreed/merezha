@@ -434,7 +434,13 @@ async fn random_filters_and_sorts_match_an_in_memory_evaluation() {
                     return order;
                 }
             }
-            a["__id"].as_str().cmp(&b["__id"].as_str())
+            // `entry_id` follows the last key's direction.
+            let tie = a["__id"].as_str().cmp(&b["__id"].as_str());
+            if keys.last().is_some_and(|(_, desc)| *desc) {
+                tie.reverse()
+            } else {
+                tie
+            }
         });
         let expected: Vec<&str> = expected
             .iter()
@@ -618,4 +624,182 @@ async fn list_queries_report_bad_filters_sorts_and_cursors() {
         .await;
     assert_eq!(recent.body["items"].as_array().unwrap().len(), 3);
     assert_eq!(recent.body["page"]["limit"], 25);
+}
+
+#[tokio::test]
+async fn the_default_order_follows_the_last_save_not_creation() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let fx = start(&test, "", MODEL).await;
+    let a = fx
+        .create("article", json!({"fields": {"title": "A"}}))
+        .await
+        .body["sys"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let b = fx
+        .create("article", json!({"fields": {"title": "B"}}))
+        .await
+        .body["sys"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let saved = fx
+        .put(&http::variant("article", &a, "en"))
+        .if_match(1)
+        .json(&json!({"fields": {"title": "A2"}}))
+        .send()
+        .await;
+    assert_eq!(saved.status, StatusCode::OK);
+    let list = fx.get("/v1/content/manage/entries/article").send().await;
+    let ids: Vec<&str> = list.body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["sys"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![a.as_str(), b.as_str()]);
+}
+
+/// Replace the first sort value of `cursor` with `value`.
+fn forge(cursor: &str, value: &str) -> String {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut body: Value = serde_json::from_slice(&engine.decode(cursor).unwrap()).unwrap();
+    body["k"][0] = json!(value);
+    engine.encode(body.to_string())
+}
+
+#[tokio::test]
+async fn forged_cursor_values_are_invalid_cursor_and_never_database_errors() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let fx = start(&test, "", MODEL).await;
+    for (title, weight) in [("A", 1.5), ("B", 2.5)] {
+        fx.create(
+            "article",
+            json!({"fields": {"title": title, "weight": weight}}),
+        )
+        .await;
+    }
+    for (sort, forged) in [
+        (
+            "",
+            vec![
+                "+002026-10-24T09:00:00Z",
+                "-000001-01-01T00:00:00Z",
+                "2026-10-24T09Z",
+                "2026-10-24T09:00Z",
+                "2026-10-24T24:00:00Z",
+                "2026-10-24T09:00:00.123456789Z",
+                "2026-10-24T09:00:00,5Z",
+                "20261024T090000Z",
+                "9999-12-31T23:59:59Z",
+                // The exact form, but a year PostgreSQL refuses (SQLSTATE
+                // class 22): mapped, not a database error.
+                "0000-01-01T00:00:00.000000Z",
+            ],
+        ),
+        (
+            "&sort=weight",
+            vec!["1e-400", "1e400", "NaN", "Infinity", "+1", "1E5"],
+        ),
+    ] {
+        let first = fx.get(&format!("{LIST}?limit=1{sort}")).send().await;
+        let cursor = first.body["page"]["next_cursor"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let next = fx
+            .get(&format!("{LIST}?limit=1{sort}&cursor={cursor}"))
+            .send()
+            .await;
+        assert_eq!(next.status, StatusCode::OK, "{:?}", next.body);
+        for value in forged {
+            let reply = fx
+                .get(&format!(
+                    "{LIST}?limit=1{sort}&cursor={}",
+                    forge(&cursor, value)
+                ))
+                .send()
+                .await;
+            assert_eq!(
+                (reply.status, reply.code()),
+                (StatusCode::BAD_REQUEST, "invalid_cursor"),
+                "{value}: {:?}",
+                reply.body
+            );
+            assert_eq!(
+                reply.details(),
+                vec![("/cursor".to_owned(), "invalid_value".to_owned())]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn sorts_in_either_direction_scan_their_index() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let fx = start(&test, "", MODEL).await;
+    execute(
+        &fx.db,
+        "WITH e AS (
+           INSERT INTO merezha_content.entries (id, scope, content_type, created_at, created_by)
+           SELECT gen_random_uuid(), 'app', 'article', now(), 'sys_test'
+             FROM generate_series(1, 3000) RETURNING id
+         ), v AS (
+           INSERT INTO merezha_content.variants
+               (entry_id, locale, scope, content_type, draft_revision, draft_data,
+                draft_updated_at, draft_updated_by)
+           SELECT id, 'en', 'app', 'article', 1,
+                  jsonb_build_object('title', md5(id::text),
+                                     'reading_minutes', (random() * 599)::int + 1),
+                  now() - random() * interval '30 days', 'sys_test'
+             FROM e RETURNING entry_id, draft_data
+         )
+         INSERT INTO merezha_content.revisions
+             (entry_id, locale, revision, model_version, kind, data, created_at, created_by)
+         SELECT entry_id, 'en', 1, 1, 'create', draft_data, now(), 'sys_test' FROM v;
+         ANALYZE merezha_content.entries;
+         ANALYZE merezha_content.variants;
+         ANALYZE merezha_content.revisions;",
+    )
+    .await;
+    let state = fx.handle.state().unwrap();
+    let index = |purpose: merezha_content::IndexPurpose| {
+        merezha_content::derived_indexes(state.model())
+            .into_iter()
+            .find(|i| {
+                i.field == "reading_minutes"
+                    && i.table == merezha_content::IndexTable::Variants
+                    && i.purpose == purpose
+            })
+            .unwrap()
+            .name
+    };
+    for (query, expected) in [
+        (
+            "sort=reading_minutes",
+            index(merezha_content::IndexPurpose::Sort),
+        ),
+        (
+            "sort=-reading_minutes",
+            index(merezha_content::IndexPurpose::SortDescending),
+        ),
+        ("", "variants_by_update".to_owned()),
+        ("sort=sys.updated_at", "variants_by_update".to_owned()),
+    ] {
+        let plan = state.explain_list("article", query).await.unwrap();
+        assert!(
+            plan.contains(&format!("Index Scan using {expected}"))
+                || plan.contains(&format!("Index Scan Backward using {expected}")),
+            "{query}: {plan}"
+        );
+        assert!(!plan.contains("Sort Key"), "{query} sorts: {plan}");
+    }
 }

@@ -102,8 +102,29 @@ async fn a_superseded_host_refuses_every_write_and_reports_outdated() {
         "content_model_outdated"
     );
     assert!(!old.host.readiness().check().await);
-    // Its content job kinds stop leasing.
+    // Its content job kinds stop leasing, and a job it still holds is
+    // given back, attempt refunded, without running.
     assert!(!guarded.accepts_leases());
+    let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+    let job = JobContext {
+        id: 1,
+        kind: merezha_domain::Identity::new("content.test_job").unwrap(),
+        attempt: 1,
+        max_attempts: 3,
+        idempotency_key: "content:t".into(),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+        cancel: cancelled,
+        correlation_id: merezha_domain::Identity::new("c1").unwrap(),
+        causation_id: None,
+        tenant: None,
+    };
+    assert!(
+        guarded
+            .handle(job, json!({}))
+            .await
+            .unwrap_err()
+            .is_release()
+    );
     // Reads keep the loaded model; the current host writes.
     assert_eq!(old.get(&path).send().await.status, StatusCode::OK);
     let saved = new.put(&path).if_match(1).json(&body).send().await;
@@ -303,4 +324,183 @@ async fn restore_lists_what_the_current_model_no_longer_accepts() {
     );
     assert_eq!(snapshot(&new.db).await, before);
     assert!(!taker.is_empty());
+}
+
+/// A job instance (`instance`) whose `content` module registered
+/// `content.test_job` through `handler`.
+async fn job_instance(
+    db: &merezha_platform::Database,
+    url: &str,
+    instance: &str,
+    handler: Arc<dyn JobHandler>,
+) -> merezha_jobs::PgJobs {
+    use merezha_platform::{JobsRuntime, Module};
+    let config = merezha_platform::ProjectConfig::parse(
+        "[app]\nid = \"site\"\n[database]\nurl = { env = \"DB\" }\n[runtime]\nmanifest = \"r.toml\"\n\
+         [jobs]\npoll_interval_ms = 100\n",
+        std::env::temp_dir(),
+        &[("DB".into(), url.into())],
+        &[],
+    )
+    .unwrap();
+    let jobs = merezha_jobs::PgJobs::with_mode(&config.jobs, merezha_jobs::RelayMode::Interval);
+    jobs.ports(db);
+    merezha_platform::ports::JobsHandle::new(
+        merezha_platform::ports::Source::new("content").unwrap(),
+        Arc::new(jobs.clone()),
+    )
+    .register("content.test_job", "default", handler, Default::default())
+    .unwrap();
+    let policy = Arc::new(FixturePolicy);
+    let ctx = merezha_platform::AppContext::builder("site", db.clone(), policy)
+        .instance_id(instance)
+        .build()
+        .unwrap();
+    jobs.start(ctx).await.unwrap();
+    jobs
+}
+
+/// `(attempt, outcome, lease_owner)` of every lease of job `id`.
+async fn job_attempts(
+    db: &merezha_platform::Database,
+    id: i64,
+) -> Vec<(i32, Option<String>, String)> {
+    let client = db.acquire(soon()).await.unwrap();
+    client
+        .query(
+            "SELECT attempt, outcome, lease_owner FROM merezha_jobs.attempts \
+              WHERE job_id = $1 ORDER BY started_at",
+            &[&id],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect()
+}
+
+/// Runs the content write check when told to, as a content job would.
+struct Writes {
+    state: Arc<merezha_content::ContentState>,
+    db: merezha_platform::Database,
+    started: Arc<tokio::sync::Notify>,
+    proceed: Arc<tokio::sync::Notify>,
+}
+impl JobHandler for Writes {
+    fn handle<'a>(&'a self, _: JobContext, _: Value) -> BoxFuture<'a, Result<(), JobFailure>> {
+        Box::pin(async move {
+            self.started.notify_one();
+            self.proceed.notified().await;
+            let state = self.state.clone();
+            self.db
+                .transaction(soon(), move |tx| {
+                    Box::pin(async move { state.check_writable(tx).await })
+                })
+                .await
+                .map_err(JobFailure::from)
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_job_leased_before_the_host_turns_outdated_is_released_and_runs_on_a_current_host() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let old = start(&test, "", MODEL).await;
+    let old_state = old.handle.state().unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let proceed = Arc::new(tokio::sync::Notify::new());
+    let old_jobs = job_instance(
+        &old.db,
+        test.url(),
+        "old",
+        old_state.guard_jobs(Arc::new(Writes {
+            state: old_state.clone(),
+            db: old.db.clone(),
+            started: started.clone(),
+            proceed: proceed.clone(),
+        })),
+    )
+    .await;
+    let id: i64 = old
+        .db
+        .acquire(soon())
+        .await
+        .unwrap()
+        .query_one(
+            "INSERT INTO merezha_jobs.jobs (queue, kind, idempotency_key, payload, payload_digest, \
+                 max_attempts, correlation_id) \
+             VALUES ('default', 'content.test_job', 'content:t1', '{}'::json, \
+                     sha256('{}'::bytea), 3, 'c1') RETURNING id",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    // Leased and running on the v1 host when v2 activates.
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("the old instance leased the job");
+    let new = start(&test, "", &v2()).await;
+    proceed.notify_one();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while job_attempts(&old.db, id)
+        .await
+        .first()
+        .and_then(|a| a.1.clone())
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "the job was never settled");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(old_state.is_outdated());
+    assert_eq!(
+        job_attempts(&old.db, id).await,
+        vec![(1, Some("released".into()), "old".into())]
+    );
+    assert_eq!(
+        scalar(
+            &old.db,
+            &format!("SELECT attempts::int8 FROM merezha_jobs.jobs WHERE id = {id}")
+        )
+        .await,
+        0
+    );
+    // The outdated instance leases it no more; a current one runs it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(job_attempts(&old.db, id).await.len(), 1);
+    let new_state = new.handle.state().unwrap();
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let go = Arc::new(tokio::sync::Notify::new());
+    go.notify_one();
+    let new_jobs = job_instance(
+        &new.db,
+        test.url(),
+        "new",
+        new_state.guard_jobs(Arc::new(Writes {
+            state: new_state.clone(),
+            db: new.db.clone(),
+            started: ready,
+            proceed: go,
+        })),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while job_attempts(&old.db, id).await.len() < 2
+        || job_attempts(&old.db, id).await[1].1.is_none()
+    {
+        assert!(Instant::now() < deadline, "the current host never ran it");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        job_attempts(&old.db, id).await,
+        vec![
+            (1, Some("released".into()), "old".into()),
+            (1, Some("succeeded".into()), "new".into())
+        ]
+    );
+    use merezha_platform::Module;
+    old_jobs.shutdown(soon()).await;
+    new_jobs.shutdown(soon()).await;
 }

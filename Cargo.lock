@@ -1667,6 +1667,7 @@ dependencies = [
  "merezha-jobs",
  "merezha-platform",
  "merezha-postgres",
+ "merezha-telemetry",
  "regex",
  "rust_decimal",
  "serde",
@@ -1676,7 +1677,6 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
- "tracing",
  "uuid",
 ]
 

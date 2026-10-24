@@ -48,6 +48,7 @@ fields = [
   { name = "category", type = "enum", values = ["news", "guide", "release"], filterable = true },
   { name = "reading_minutes", type = "integer", min = 1, max = 600, sortable = true },
   { name = "score", type = "decimal", precision = 10, scale = 2, sortable = true },
+  { name = "weight", type = "float", sortable = true },
   { name = "featured", type = "boolean", filterable = true },
   { name = "published_on", type = "date", sortable = true },
   { name = "legacy_code", type = "string", unique = true },
@@ -118,6 +119,16 @@ pub fn principal(name: &str) -> Principal {
         "article_writer" => GrantSnapshot::empty().with_application_resource(
             id("content_type"),
             id("article"),
+            set(&EDITOR),
+        ),
+        "publisher" => GrantSnapshot::empty().with_application(Grants::new(
+            vec![id("publisher")],
+            set(&["content.entries.publish"]),
+        )),
+        // Read and write on another type only.
+        "author_writer" => GrantSnapshot::empty().with_application_resource(
+            id("content_type"),
+            id("author"),
             set(&EDITOR),
         ),
         // Tenant grants never satisfy application-scoped types.

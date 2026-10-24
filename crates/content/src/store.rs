@@ -791,7 +791,18 @@ impl Store {
                     .iter()
                     .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                     .collect();
-                let rows = tx.query(&statement, &refs).await.map_err(|e| sql(&e))?;
+                // A data exception (class 22) can only come from a cursor
+                // value cast back to its key's type.
+                let rows = tx.query(&statement, &refs).await.map_err(|e| {
+                    if e.code().is_some_and(|c| c.code().starts_with("22")) {
+                        Rejection {
+                            failure: Failure::permanent("invalid_cursor"),
+                            details: vec![crate::query::detail("/cursor", "invalid_value")],
+                        }
+                    } else {
+                        sql(&e)
+                    }
+                })?;
                 let mut items = Vec::with_capacity(rows.len());
                 let mut last_keys = Vec::new();
                 for (index, row) in rows.iter().enumerate() {

@@ -523,11 +523,29 @@ checksums, one transaction each). Nothing here or in the derived indexes needs
 more than PostgreSQL 14, the platform floor; CI runs 16 (R14). Operators can
 set `lz4` compression on `revisions.data` where the server supports it.
 
+Migration 2 (C3) is a declared non-transactional step (R15) for the
+default management list, `-sys.updated_at`, and its reverse:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS variants_by_update ON merezha_content.variants
+  (scope, content_type, locale, draft_updated_at DESC, entry_id DESC) WHERE NOT deleted
+```
+
+`variants_list` stays from migration 1, unused by C3's lists. Sorts that
+remain without a matching index: `sys.created_at` (an `entries` column),
+and every sort of two or more keys, which reads the first key's index
+order and sorts the rest. Delivery lists over `published` (C5) choose
+their tie-breaker the same way.
+
 ### Derived indexes
 
 The model decides which indexes exist beyond the static ones. For every
-`sortable` field the host derives a partial B-tree index on both `variants`
-and `published`:
+`sortable` field the host derives two partial B-tree indexes on both
+`variants` and `published`, one per sort direction: the ascending one
+below, and one with `<value> DESC, entry_id DESC` (the `IS NULL` column
+stays ascending, so nulls are last both ways). The list's `entry_id`
+tie-breaker follows the last sort key's direction, so a one-key sort in
+either direction is one index scan (C3):
 
 ```sql
 CREATE INDEX CONCURRENTLY IF NOT EXISTS content_ix_3f9a0c1d2e4b5a69
@@ -858,7 +876,25 @@ their singleton forms); the rest arrive with C4, C5 and C7. As built:
   and `sys.updated_at` take `eq` and the range operators.
 - Revisions, referrers and lists page with the cursor shape of section 5;
   each cursor is bound to its listing (the variant, or the entry and
-  stage).
+  stage). Sort values travel in the exact text the list selects
+  (timestamps `YYYY-MM-DDTHH:MM:SS.ffffffZ`, PostgreSQL's float8 and
+  numeric output); any other form, or a value PostgreSQL refuses (SQLSTATE
+  class 22), is `invalid_cursor`.
+- A type the model lacks and an organization type the principal has no
+  tenant for are both checked at `Application` scope first, so a caller
+  without that grant gets the same refusal for both; past it they are
+  `content_type_not_found` and `tenant_required`.
+- Content job kinds register through `ContentState::guard_jobs`: an
+  outdated host stops leasing them, and a job it still holds, or one that
+  meets `content_model_superseded` mid-run, is given back with
+  `JobFailure::release()` (available at once, attempt refunded).
+- For C9: two checks look past the caller's scope by design. A client id
+  taken in any scope is `entry_exists` (ids are a global key), and a
+  reference to a live entry of a scope the entry cannot reference is
+  `reference_scope` rather than `reference_not_found`. Both reveal only
+  that a UUIDv7 exists, never its type or data; C9 decides whether
+  organization callers keep them or get `reference_not_found` and a fresh
+  id.
 - Referrers list the refs recorded in the target's scope; `title` comes
   from the referring variant's draft, or its `published` row for
   `stage=published`.

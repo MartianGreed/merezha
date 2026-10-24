@@ -241,7 +241,7 @@ fn content_errors_register_with_the_kernel_codes() {
         ContentModule::new().start_timeout(),
         Some(Duration::from_secs(310))
     );
-    assert_eq!(ContentModule::new().migrations().len(), 1);
+    assert_eq!(ContentModule::new().migrations().len(), 2);
 }
 
 fn parts(config: &merezha_platform::ProjectConfig) -> HostParts {

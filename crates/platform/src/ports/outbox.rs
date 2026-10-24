@@ -329,7 +329,27 @@ impl JobFailure {
     pub fn is_retryable(&self) -> bool {
         self.classification != Classification::Permanent
     }
+    /// Give the job back without counting the attempt: the worker settles
+    /// it as a drain release does (back to `available` now, attempt
+    /// refunded, fenced on the lease token), so another instance runs it.
+    /// For a handler that finds this instance unable to do the work, such as
+    /// content on a host whose model a newer one superseded (CT §2).
+    pub fn release() -> Self {
+        Self {
+            code: RELEASE_CODE.to_owned(),
+            classification: Classification::Transient,
+            retry_after: None,
+        }
+    }
+    /// Whether this is [`JobFailure::release`].
+    pub fn is_release(&self) -> bool {
+        self.code == RELEASE_CODE && self.classification == Classification::Transient
+    }
 }
+
+/// The reserved code of [`JobFailure::release`]; handlers never use it for
+/// a failure of their own.
+pub const RELEASE_CODE: &str = "job_released";
 impl From<Failure> for JobFailure {
     fn from(failure: Failure) -> Self {
         Self {

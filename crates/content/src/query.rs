@@ -391,9 +391,38 @@ pub(crate) fn decode_cursor(
 /// Whether `text` parses under `cast` exactly as PostgreSQL will cast it,
 /// so a forged cursor never reaches the database as a cast error.
 fn castable(cast: &str, text: &str) -> bool {
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
     match cast {
-        "bigint" => text.parse::<i64>().is_ok(),
-        "float8" => text.parse::<f64>().is_ok_and(f64::is_finite),
+        "bigint" => {
+            let unsigned = text.strip_prefix('-').unwrap_or(text);
+            digits(unsigned) && unsigned.len() <= 19 && text.parse::<i64>().is_ok()
+        }
+        // PostgreSQL's float8 output: `-?d+(.d+)?(e[+-]d+)?`. A mantissa
+        // that is not zero but parses to 0 underflows, which PostgreSQL
+        // refuses where Rust rounds.
+        "float8" => {
+            let unsigned = text.strip_prefix('-').unwrap_or(text);
+            let (mantissa, exponent) = match unsigned.split_once('e') {
+                Some((m, e)) => (m, Some(e)),
+                None => (unsigned, None),
+            };
+            let (whole, fraction) = match mantissa.split_once('.') {
+                Some((w, f)) => (w, Some(f)),
+                None => (mantissa, None),
+            };
+            let shaped = digits(whole)
+                && fraction.is_none_or(digits)
+                && exponent.is_none_or(|e| {
+                    e.strip_prefix(['+', '-'])
+                        .is_some_and(|d| digits(d) && d.len() <= 3)
+                });
+            let zero_mantissa = mantissa.bytes().all(|b| b == b'0' || b == b'.');
+            shaped
+                && text.len() <= 32
+                && text
+                    .parse::<f64>()
+                    .is_ok_and(|v| v.is_finite() && (v != 0.0 || zero_mantissa))
+        }
         "numeric" => {
             let digits = text.strip_prefix('-').unwrap_or(text);
             let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
@@ -404,7 +433,21 @@ fn castable(cast: &str, text: &str) -> bool {
                 && fraction.bytes().all(|b| b.is_ascii_digit())
                 && (!digits.contains('.') || !fraction.is_empty())
         }
-        "timestamptz" => text.ends_with('Z') && text.parse::<jiff::Timestamp>().is_ok(),
+        // Exactly the `to_char` form the list selects:
+        // `YYYY-MM-DDTHH:MM:SS.ffffffZ`.
+        "timestamptz" => {
+            let b = text.as_bytes();
+            let shape = b.len() == 27
+                && b.iter().enumerate().all(|(i, c)| match i {
+                    4 | 7 => *c == b'-',
+                    10 => *c == b'T',
+                    13 | 16 => *c == b':',
+                    19 => *c == b'.',
+                    26 => *c == b'Z',
+                    _ => c.is_ascii_digit(),
+                });
+            shape && text.parse::<jiff::Timestamp>().is_ok()
+        }
         _ => !text.contains('\0'),
     }
 }
@@ -522,7 +565,10 @@ pub(crate) fn parse_list(
 
     let mut params = Params(Vec::new());
     let scope_param = params.push(scope.to_owned());
-    let type_param = params.push(content_type.name.clone());
+    // A literal, not a parameter: the derived indexes are partial on
+    // `content_type = '<type>'`, which a generic plan could not prove from
+    // a parameter. Type names are `[a-z][a-z0-9_]*`.
+    let type_literal = format!("'{}'", content_type.name.replace('\'', "''"));
     let locale_param = params.push(locale.clone());
     let mut conditions = String::new();
     let mut canonical: Vec<String> = Vec::new();
@@ -613,11 +659,18 @@ pub(crate) fn parse_list(
         );
         let _ = write!(texts, ", {}", key.text);
     }
-    order.push_str("v.entry_id ASC");
+    // `entry_id` follows the last key's direction, as in the derived
+    // indexes and `variants_by_update`, so either direction is one scan.
+    let tie_desc = keys.last().is_some_and(|k| k.desc);
+    order.push_str(if tie_desc {
+        "v.entry_id DESC"
+    } else {
+        "v.entry_id ASC"
+    });
     let fetch = params.push(i64::from(limit) + 1);
     let statement = format!(
         "SELECT {}{texts} FROM {VARIANT_FROM} \
-          WHERE v.scope = {scope_param} AND v.content_type = {type_param} \
+          WHERE v.scope = {scope_param} AND v.content_type = {type_literal} \
             AND v.locale = {locale_param} AND NOT v.deleted AND e.deleted_at IS NULL\
             {}{conditions}{after} \
           ORDER BY {order} LIMIT {fetch}",
@@ -680,7 +733,12 @@ fn after_condition(keys: &[SortKey], cursor: &Cursor, params: &mut Params) -> St
         }
     }
     let id = params.push(cursor.id.clone());
-    terms.push(joined(&prefix, format!("v.entry_id > {id}::text::uuid")));
+    let op = if keys.last().is_some_and(|k| k.desc) {
+        "<"
+    } else {
+        ">"
+    };
+    terms.push(joined(&prefix, format!("v.entry_id {op} {id}::text::uuid")));
     format!(
         " AND ({})",
         terms
@@ -865,6 +923,53 @@ fn system_filter(
     }
 }
 
+impl crate::module::ContentState {
+    /// `EXPLAIN (COSTS OFF)` of the application-scope management list of
+    /// `content_type` for `query`, with its parameters bound: the plan the
+    /// route runs, for index tests and operators. Not a route.
+    #[doc(hidden)]
+    pub async fn explain_list(&self, content_type: &str, query: &str) -> Result<String, Rejection> {
+        let model = self.model().clone();
+        let declared = model
+            .content_type(content_type)
+            .ok_or_else(|| Rejection::from(Failure::permanent("content_type_not_found")))?;
+        let parsed = parse_list(
+            &model,
+            declared,
+            "app",
+            Some(query),
+            &self.settings().limits,
+        )?;
+        let database = self
+            .database()
+            .ok_or_else(|| Rejection::from(Failure::transient("content_model_pending")))?;
+        let statement = format!("EXPLAIN (COSTS OFF) {}", parsed.statement);
+        let params = parsed.params;
+        crate::store::transaction(
+            database,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            move |tx| {
+                Box::pin(async move {
+                    let refs: Vec<&(dyn ToSql + Sync)> = params
+                        .iter()
+                        .map(|p| p.as_ref() as &(dyn ToSql + Sync))
+                        .collect();
+                    let rows = tx
+                        .query(&statement, &refs)
+                        .await
+                        .map_err(|e| Rejection::from(merezha_postgres::classify(&e)))?;
+                    Ok(rows
+                        .iter()
+                        .map(|r| r.get::<_, String>(0))
+                        .collect::<Vec<_>>()
+                        .join("\n"))
+                })
+            },
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,5 +1013,29 @@ mod tests {
         assert!(castable("timestamptz", "2026-10-24T09:00:00.123456Z"));
         assert!(!castable("timestamptz", "yesterday"));
         assert!(!castable("float8", "NaN"));
+        for good in ["1.5", "-0", "0", "1e+100", "2.5e-05", "-12"] {
+            assert!(castable("float8", good), "{good}");
+        }
+        for bad in [
+            "1e-400", "1e400", "+1", "1E5", "1.", ".5", "Infinity", "1e5",
+        ] {
+            assert!(!castable("float8", bad), "{bad}");
+        }
+        for bad in [
+            "+002026-10-24T09:00:00Z",
+            "-000001-01-01T00:00:00Z",
+            "2026-10-24T09Z",
+            "2026-10-24T09:00Z",
+            "2026-10-24T24:00:00.000000Z",
+            "2026-10-24T09:00:00.123456789Z",
+            "2026-10-24T09:00:00,5Z",
+            "20261024T090000Z",
+            "9999-12-31T23:59:59Z",
+            "2026-10-24T09:00:00.123456+00:00",
+        ] {
+            assert!(!castable("timestamptz", bad), "{bad}");
+        }
+        assert!(!castable("bigint", "+5"));
+        assert!(!castable("bigint", "99999999999999999999"));
     }
 }

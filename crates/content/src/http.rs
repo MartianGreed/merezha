@@ -176,29 +176,10 @@ impl Manage {
                 .map(|_| ())
                 .map_err(|denied| Rejection::new(denied.failure()))
         };
-        let Some(content_type) = model.content_type(type_name) else {
-            check(&ResourceScope::Application)?;
-            return Err(Failure::permanent("content_type_not_found").into());
-        };
-        let (scope, tenant) = match content_type.scope {
-            Scope::Application => ("app".to_owned(), None),
-            Scope::Organization => {
-                let Some(principal) = principal.as_deref() else {
-                    check(&ResourceScope::Application)?;
-                    return Err(Failure::permanent("unauthenticated").into());
-                };
-                let tenant = principal
-                    .tenant
-                    .clone()
-                    .ok_or_else(|| Rejection::new(Failure::permanent("tenant_required")))?;
-                (format!("org:{}", tenant.as_str()), Some(tenant))
-            }
-        };
-        check(&ResourceScope::Resource {
-            tenant: tenant.clone(),
-            kind: Identity::new(RESOURCE_KIND)?,
-            id: Identity::new(content_type.name.clone())?,
-        })?;
+        let content_type = model.content_type(type_name);
+        let (scope, tenant) = resolve_scope(content_type, principal.as_deref(), &check)?;
+        let content_type = content_type
+            .ok_or_else(|| Rejection::new(Failure::permanent("content_type_not_found")))?;
         Ok((
             Target {
                 content_type: content_type.name.clone(),
@@ -235,6 +216,40 @@ impl Manage {
         };
         Ok((target, content_type, id, locale))
     }
+}
+
+/// The scope of `content_type` for `principal`, after its permission
+/// check (`check`) passed there. A type the model lacks, and an
+/// organization type the principal has no tenant for, are both checked at
+/// `Application` scope first, so a caller without that grant gets the same
+/// answer for either and cannot enumerate type names. Past that check the
+/// first is `content_type_not_found` (the caller's `None`), the second
+/// `tenant_required`.
+fn resolve_scope(
+    content_type: Option<&ContentType>,
+    principal: Option<&Principal>,
+    check: &dyn Fn(&ResourceScope) -> Result<(), Rejection>,
+) -> Result<(String, Option<Identity>), Rejection> {
+    let Some(content_type) = content_type else {
+        check(&ResourceScope::Application)?;
+        return Ok((String::new(), None));
+    };
+    let (scope, tenant) = match content_type.scope {
+        Scope::Application => ("app".to_owned(), None),
+        Scope::Organization => match principal.and_then(|p| p.tenant.clone()) {
+            Some(tenant) => (format!("org:{}", tenant.as_str()), Some(tenant)),
+            None => {
+                check(&ResourceScope::Application)?;
+                return Err(Failure::permanent("tenant_required").into());
+            }
+        },
+    };
+    check(&ResourceScope::Resource {
+        tenant: tenant.clone(),
+        kind: Identity::new(RESOURCE_KIND)?,
+        id: Identity::new(content_type.name.clone())?,
+    })?;
+    Ok((scope, tenant))
 }
 
 /// An entry id from a path: a hyphenated UUID, anything else is absent.
@@ -944,4 +959,63 @@ async fn referrers(
         Ok(json(StatusCode::OK, page_json(items, next, limit)))
     };
     respond(run.await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CONTENT_PERMISSIONS, ContentModel, ModelOptions};
+    use merezha_platform::ports::{AccessDenied, DenyReason};
+
+    #[test]
+    fn unknown_and_tenantless_organization_types_answer_alike() {
+        let model = ContentModel::parse(
+            "version = 1\nlocales = [{ code = \"en\", default = true }]\n\
+             [types.help]\nscope = \"organization\"\naccess = \"public\"\n\
+             fields = [{ name = \"title\", type = \"string\" }]\n",
+            &ModelOptions {
+                permissions: &CONTENT_PERMISSIONS,
+                media: false,
+                organizations: true,
+            },
+        )
+        .unwrap();
+        let help = model.content_type("help");
+        let deny = |_: &ResourceScope| -> Result<(), Rejection> {
+            Err(Rejection::new(
+                AccessDenied::new(DenyReason::NoGrant).failure(),
+            ))
+        };
+        let allow = |_: &ResourceScope| -> Result<(), Rejection> { Ok(()) };
+        // Without the application grant: the same refusal for both.
+        assert_eq!(
+            resolve_scope(None, None, &deny).unwrap_err(),
+            resolve_scope(help, None, &deny).unwrap_err()
+        );
+        // With it, each is told apart.
+        assert_eq!(resolve_scope(None, None, &allow).unwrap().0, "");
+        assert_eq!(
+            resolve_scope(help, None, &allow).unwrap_err().failure.code,
+            "tenant_required"
+        );
+        // A principal with a tenant is checked in its resource scope.
+        let mut principal = Principal::system("t", Default::default()).unwrap();
+        principal.tenant = Some(Identity::new("acme").unwrap());
+        let seen = std::sync::Mutex::new(Vec::new());
+        let record = |scope: &ResourceScope| -> Result<(), Rejection> {
+            seen.lock().unwrap().push(scope.clone());
+            Ok(())
+        };
+        let (scope, tenant) = resolve_scope(help, Some(&principal), &record).unwrap();
+        assert_eq!(scope, "org:acme");
+        assert_eq!(tenant.unwrap().as_str(), "acme");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [ResourceScope::Resource {
+                tenant: Some(Identity::new("acme").unwrap()),
+                kind: Identity::new(RESOURCE_KIND).unwrap(),
+                id: Identity::new("help").unwrap(),
+            }]
+        );
+    }
 }

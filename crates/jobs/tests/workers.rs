@@ -663,6 +663,84 @@ async fn a_kind_whose_handler_refuses_leases_stays_available() {
     jobs.shutdown(soon()).await;
 }
 
+/// Gives every job back once, then stops leasing, like content on a host
+/// whose model a newer one superseded mid-run.
+struct GivesBack {
+    open: Arc<std::sync::atomic::AtomicBool>,
+}
+impl merezha_platform::ports::JobHandler for GivesBack {
+    fn handle<'a>(
+        &'a self,
+        _: merezha_platform::ports::JobContext,
+        _: serde_json::Value,
+    ) -> BoxFuture<'a, Result<(), JobFailure>> {
+        self.open.store(false, Ordering::SeqCst);
+        Box::pin(async { Err(JobFailure::release()) })
+    }
+    fn accepts_leases(&self) -> bool {
+        self.open.load(Ordering::SeqCst)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_released_job_refunds_its_attempt_and_runs_on_another_instance() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let config = jobs_config(&test, "[jobs]\npoll_interval_ms = 100");
+    let open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let old = workers(
+        &db,
+        &config,
+        "old",
+        vec![("tasks.gated", Arc::new(GivesBack { open: open.clone() }))],
+    )
+    .await;
+    let id = insert_job(&db, "tasks.gated", "tasks:gated", "{}", false).await;
+    let started = Instant::now();
+    while attempts(&db, id)
+        .await
+        .first()
+        .and_then(|a| a.1.clone())
+        .is_none()
+    {
+        assert!(started.elapsed() < Duration::from_secs(5), "never released");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(state(&db, id).await, "available");
+    assert_eq!(
+        int(
+            &db,
+            "SELECT attempts::int8 FROM merezha_jobs.jobs WHERE id = $1",
+            id
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        attempts(&db, id).await,
+        vec![(1, Some("released".into()), None, "old".into())]
+    );
+    let new = workers(
+        &db,
+        &config,
+        "new",
+        vec![("tasks.gated", func(|_, _| ok()))],
+    )
+    .await;
+    wait_state(&db, id, "succeeded", Duration::from_secs(2)).await;
+    assert_eq!(
+        attempts(&db, id).await,
+        vec![
+            (1, Some("released".into()), None, "old".into()),
+            (1, Some("succeeded".into()), None, "new".into())
+        ]
+    );
+    old.shutdown(soon()).await;
+    new.shutdown(soon()).await;
+}
+
 /// Records what the reissue hook was asked.
 #[derive(Default)]
 struct Reissued(Mutex<Vec<ReissueRequest>>);

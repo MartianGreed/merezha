@@ -8,7 +8,7 @@ use http::*;
 use merezha_platform::ports::DenyAll;
 use merezha_postgres::TestDatabase;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 fn id_of(reply: &Reply) -> String {
     reply.body["sys"]["id"].as_str().unwrap().to_owned()
@@ -1061,26 +1061,38 @@ async fn patch_merges_and_restore_writes_a_new_revision() {
     assert_eq!(unknown.code(), "invalid_query");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn shared_values_stay_in_step_with_concurrent_variant_saves() {
+/// The default variant's `FOR SHARE`, deterministically: a variant save
+/// waits for an in-flight default save and copies its committed value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_variant_save_waits_for_an_in_flight_default_save() {
     let Some(test) = TestDatabase::create() else {
         return;
     };
     let fx = start(&test, "", MODEL).await;
-    let mut authors = Vec::new();
-    for name in ["Ada", "Bob"] {
-        authors.push(id_of(
-            &fx.create("author", json!({"fields": {"name": name}})).await,
-        ));
-    }
-    let id = id_of(
-        &fx.create(
+    let ada = fx
+        .create("author", json!({"fields": {"name": "Ada"}}))
+        .await
+        .body["sys"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bob = fx
+        .create("author", json!({"fields": {"name": "Bob"}}))
+        .await
+        .body["sys"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let id = fx
+        .create(
             "article",
-            json!({"fields": {"title": "T", "author": {"id": authors[0]}}}),
+            json!({"fields": {"title": "T", "author": {"id": ada}}}),
         )
-        .await,
-    );
-    let en = variant("article", &id, "en");
+        .await
+        .body["sys"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let fr = variant("article", &id, "fr");
     let created = fx
         .put(&fr)
@@ -1089,39 +1101,278 @@ async fn shared_values_stay_in_step_with_concurrent_variant_saves() {
         .send()
         .await;
     assert_eq!(created.status, StatusCode::CREATED);
-    for round in 0..40i64 {
-        let default = {
-            let client = fx.client.clone();
-            let en = en.clone();
-            // Alternate the shared author on every default save.
-            let author = authors[((round + 1) % 2) as usize].clone();
-            tokio::spawn(async move {
-                client
-                    .put(&en)
-                    .if_match(round + 1)
-                    .json(&json!({"fields": {"title": "T", "author": {"id": author}}}))
-                    .send()
-                    .await
-                    .status
-            })
-        };
-        let french = {
-            let client = fx.client.clone();
-            let fr = fr.clone();
-            tokio::spawn(async move {
-                client
-                    .patch(&fr)
-                    .if_match(round + 1)
-                    .json(&json!({"fields": {"title": format!("F{round}")}}))
-                    .send()
-                    .await
-                    .status
-            })
-        };
-        assert_eq!(default.await.unwrap(), StatusCode::OK);
-        assert_eq!(french.await.unwrap(), StatusCode::OK);
-        let en_author = fx.get(&en).send().await.body["fields"]["author"].clone();
-        let fr_author = fx.get(&fr).send().await.body["fields"]["author"].clone();
-        assert_eq!(en_author, fr_author, "round {round}");
+
+    // An in-flight default save: the default row and its copy into `fr`,
+    // uncommitted, exactly what Store::save writes for `en`.
+    let holder = fx.db.acquire(soon()).await.unwrap();
+    let value = json!({"id": bob, "type": "author"}).to_string();
+    holder
+        .batch_execute(&format!(
+            "BEGIN; \
+             UPDATE merezha_content.variants \
+                SET draft_data = jsonb_set(draft_data, '{{author}}', '{value}'::jsonb), \
+                    draft_revision = draft_revision + 1 \
+              WHERE entry_id = '{id}' AND locale = 'en'; \
+             UPDATE merezha_content.variants \
+                SET draft_data = jsonb_set(draft_data, '{{author}}', '{value}'::jsonb) \
+              WHERE entry_id = '{id}' AND locale = 'fr';"
+        ))
+        .await
+        .unwrap();
+    let pid: i32 = holder
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+
+    let save = {
+        let client = fx.client.clone();
+        let fr = fr.clone();
+        tokio::spawn(async move {
+            client
+                .patch(&fr)
+                .if_match(1)
+                .json(&json!({"fields": {"title": "F2"}}))
+                .send()
+                .await
+        })
+    };
+    // Wait until the save blocks on a row lock the holder owns (at the
+    // FOR SHARE with the lock, at its own UPDATE without it).
+    let watcher = fx.db.acquire(soon()).await.unwrap();
+    let mut blocked = false;
+    for _ in 0..200 {
+        let n: i64 = watcher
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))",
+                &[&pid],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if n > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    assert!(blocked, "the variant save never waited on the holder");
+    holder.batch_execute("COMMIT").await.unwrap();
+    let reply = save.await.unwrap();
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    let fr_author = fx.get(&fr).send().await.body["fields"]["author"]["id"].clone();
+    assert_eq!(fr_author, json!(bob), "fr kept a stale shared value");
+}
+
+/// The entry-size bound on the fields as sent comes before field rules.
+#[tokio::test]
+async fn an_oversized_body_is_body_limit_before_field_rules() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let fx = start(&test, "", MODEL).await;
+    let tags: Vec<String> = (0..20).map(|_| "x".repeat(40)).collect();
+    let big = "y".repeat(300_000);
+    let reply = fx
+        .post("/v1/content/manage/entries/article")
+        .json(&json!({"fields": {"title": "T", "reading_minutes": 0, "legacy_code": big, "tags": tags}}))
+        .send()
+        .await;
+    assert_eq!(reply.code(), "body_limit", "{:?}", reply.body);
+}
+
+/// Every management route with the permission class it needs.
+const MANAGEMENT_ROUTES: [(&str, &str, bool, &str, &str); 16] = [
+    ("GET", "/entries/article", false, "", ""),
+    (
+        "POST",
+        "/entries/article",
+        true,
+        "",
+        r#"{"fields":{"title":"New"}}"#,
+    ),
+    ("GET", "/entries/article/{id}", false, "", ""),
+    ("GET", "/entries/article/{id}/referrers", false, "", ""),
+    ("GET", "/entries/article/{id}/en", false, "", ""),
+    (
+        "PUT",
+        "/entries/article/{id}/en",
+        true,
+        "if-match",
+        r#"{"fields":{"title":"x"}}"#,
+    ),
+    (
+        "PATCH",
+        "/entries/article/{id}/en",
+        true,
+        "if-match",
+        r#"{"fields":{"title":"x"}}"#,
+    ),
+    ("GET", "/entries/article/{id}/en/revisions", false, "", ""),
+    ("GET", "/entries/article/{id}/en/revisions/1", false, "", ""),
+    (
+        "POST",
+        "/entries/article/{id}/en/revisions/1/restore",
+        true,
+        "if-match",
+        "",
+    ),
+    ("GET", "/singletons/site_settings/en", false, "", ""),
+    (
+        "PUT",
+        "/singletons/site_settings/fr",
+        true,
+        "if-none-match",
+        r#"{"fields":{"site_name":"S"}}"#,
+    ),
+    (
+        "PATCH",
+        "/singletons/site_settings/en",
+        true,
+        "if-match",
+        r#"{"fields":{"site_name":"x"}}"#,
+    ),
+    (
+        "GET",
+        "/singletons/site_settings/en/revisions",
+        false,
+        "",
+        "",
+    ),
+    (
+        "GET",
+        "/singletons/site_settings/en/revisions/1",
+        false,
+        "",
+        "",
+    ),
+    (
+        "POST",
+        "/singletons/site_settings/en/revisions/1/restore",
+        true,
+        "if-match",
+        "",
+    ),
+];
+
+#[tokio::test]
+async fn every_management_route_checks_its_own_permission() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let fx = start(&test, "", MODEL).await;
+    let id = id_of(
+        &fx.create("article", json!({"fields": {"title": "A"}}))
+            .await,
+    );
+    let settings = fx
+        .put("/v1/content/manage/singletons/site_settings/en")
+        .header("if-none-match", "*")
+        .json(&json!({"fields": {"site_name": "S"}}))
+        .send()
+        .await;
+    assert_eq!(settings.status, StatusCode::CREATED);
+    let before = snapshot(&fx.db).await;
+    for (method, path, writes, condition, body) in MANAGEMENT_ROUTES {
+        let uri = format!("/v1/content/manage{}", path.replace("{id}", &id));
+        for principal in [
+            None,
+            Some("reader"),
+            Some("publisher"),
+            Some("author_writer"),
+        ] {
+            let allowed = principal == Some("reader") && !writes;
+            if allowed {
+                continue;
+            }
+            let mut call = fx
+                .call(Method::from_bytes(method.as_bytes()).unwrap(), &uri)
+                .by(principal);
+            if method == "PATCH" {
+                call = call.header("content-type", "application/merge-patch+json");
+            }
+            match condition {
+                "if-match" => call = call.if_match(1),
+                "if-none-match" => call = call.header("if-none-match", "*"),
+                _ => {}
+            }
+            let reply = call.raw(body.as_bytes()).send().await;
+            let expected = match principal {
+                None => (StatusCode::UNAUTHORIZED, "unauthenticated"),
+                Some(_) => (StatusCode::FORBIDDEN, "unauthorized"),
+            };
+            assert_eq!(
+                (reply.status, reply.code()),
+                expected,
+                "{principal:?} {method} {uri}"
+            );
+        }
+        assert_eq!(snapshot(&fx.db).await, before, "{method} {path}");
+    }
+    // The reader passes every read route, the editor every route.
+    for (method, path, writes, condition, body) in MANAGEMENT_ROUTES {
+        let uri = format!("/v1/content/manage{}", path.replace("{id}", &id));
+        let principal = if writes { "editor" } else { "reader" };
+        let mut call = fx
+            .call(Method::from_bytes(method.as_bytes()).unwrap(), &uri)
+            .by(Some(principal));
+        if method == "PATCH" {
+            call = call.header("content-type", "application/merge-patch+json");
+        }
+        match condition {
+            "if-match" => call = call.header("if-match", "\"r999\""),
+            "if-none-match" => call = call.header("if-none-match", "*"),
+            _ => {}
+        }
+        let reply = call.raw(body.as_bytes()).send().await;
+        assert!(
+            reply.status.is_success() || reply.code() == "revision_conflict",
+            "{principal} {method} {uri}: {:?}",
+            reply.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn referrers_never_cross_scope() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let fx = start(&test, "", MODEL).await;
+    let ada = id_of(
+        &fx.create("author", json!({"fields": {"name": "Ada"}}))
+            .await,
+    );
+    let own = id_of(
+        &fx.create(
+            "article",
+            json!({"fields": {"title": "Mine", "author": {"id": ada}}}),
+        )
+        .await,
+    );
+    // An organization's entry pointing at the application author.
+    let foreign = seed_row(&fx.db, "org:acme", "article", r#"{"title":"Theirs"}"#).await;
+    execute(
+        &fx.db,
+        &format!(
+            "INSERT INTO merezha_content.refs \
+                 (scope, from_entry, from_locale, stage, path, target_kind, target_id) \
+             VALUES ('org:acme', '{foreign}', 'en', 'draft', '/fields/author', 'entry', '{ada}')"
+        ),
+    )
+    .await;
+    let reply = fx
+        .get(&format!(
+            "/v1/content/manage/entries/author/{ada}/referrers"
+        ))
+        .send()
+        .await;
+    let ids: Vec<&str> = reply.body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![own.as_str()]);
 }

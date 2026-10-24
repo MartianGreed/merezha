@@ -84,13 +84,18 @@ impl ContentState {
     pub fn settings(&self) -> &ContentSettings {
         &self.settings
     }
+    /// The pool, once [`Module::start`] ran.
+    pub(crate) fn database(&self) -> Option<&Database> {
+        self.database.get()
+    }
     /// Wrap a content job handler so this host stops leasing its kind once
     /// a newer model is active (section 2, mixed model versions): the
     /// wrapper's [`JobHandler::accepts_leases`] turns `false` with
-    /// [`ContentState::is_outdated`], and a job leased just before fails
-    /// transient `content_model_superseded` without running, so a current
-    /// host retries it. C4's trash purge and C7's blob cleanup register
-    /// through it.
+    /// [`ContentState::is_outdated`]. A job leased just before, or one whose
+    /// handler meets `content_model_superseded` mid-run, is given back with
+    /// [`JobFailure::release`]: available again at once with its attempt
+    /// refunded, for a current host. C4's trash purge and C7's blob cleanup
+    /// register through it.
     pub fn guard_jobs(self: &Arc<Self>, handler: Arc<dyn JobHandler>) -> Arc<dyn JobHandler> {
         Arc::new(GuardedHandler {
             state: self.clone(),
@@ -189,15 +194,17 @@ impl JobHandler for GuardedHandler {
         ctx: JobContext,
         payload: serde_json::Value,
     ) -> BoxFuture<'a, Result<(), JobFailure>> {
-        if self.state.is_outdated() {
-            return Box::pin(async {
-                Err(JobFailure::transient(
-                    SUPERSEDED,
-                    Some(Duration::from_secs(1)),
-                ))
-            });
-        }
-        self.handler.handle(ctx, payload)
+        Box::pin(async move {
+            if self.state.is_outdated() {
+                return Err(JobFailure::release());
+            }
+            match self.handler.handle(ctx, payload).await {
+                // The write check found a newer model mid-run: give the job
+                // back for a current host, attempt refunded.
+                Err(failure) if failure.code == SUPERSEDED => Err(JobFailure::release()),
+                other => other,
+            }
+        })
     }
     fn accepts_leases(&self) -> bool {
         !self.state.is_outdated() && self.handler.accepts_leases()
@@ -455,8 +462,9 @@ impl Module for ContentModule {
         Box::pin(async move {
             let state = self.state()?;
             let model = state.model.clone();
-            tracing::info!(
-                event = "content.model_loaded",
+            merezha_telemetry::event!(
+                INFO,
+                "content.model_loaded",
                 version = model.version(),
                 fingerprint = model.fingerprint(),
                 types = model.types().len(),

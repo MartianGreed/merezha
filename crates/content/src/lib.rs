@@ -67,7 +67,7 @@ pub use parse::{
 };
 pub use query::{MAX_CURSOR_BYTES, MAX_FILTER_VALUES, MAX_QUERY_BYTES};
 pub use rich_text::{MAX_HREF_BYTES, MAX_MARK_DEFS, MAX_SPAN_MARKS, MAX_SPANS};
-pub use schema::{MIGRATION_1, MIGRATIONS};
+pub use schema::{MIGRATION_1, MIGRATION_2, MIGRATIONS};
 pub use settings::{ContentSettings, Limits};
 pub use slug::slugify;
 pub use store::{

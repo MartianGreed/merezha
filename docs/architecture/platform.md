@@ -1148,6 +1148,12 @@ state, and the R10 trace columns.
   exits, never run, and released the same way. `merezha run` sets the
   module shutdown budget to the 10 s default plus `drain_timeout_ms` plus
   3 s, so the modules after the jobs runtime keep their 10 s.
+- **Give back.** A handler that cannot do the work on this instance returns
+  `JobFailure::release()` (reserved code `job_released`): the worker
+  releases that lease at once with the drain's fenced statement
+  (`available` now, attempt refunded, attempts row `released`) and logs
+  `job.released`. `JobHandler::accepts_leases()` (default `true`) is read
+  before every lease; the worker leases only kinds whose handler accepts.
 - **Secrets (R3).** A flagged job's payload is nulled by the same
   statement that makes it terminal: success, dead letter (handler or
   reaper), cancel. The admin API never returns a flagged payload.
@@ -1341,9 +1347,10 @@ Once a host is outdated its content job kinds stop leasing: content
 registers its handlers through `ContentState::guard_jobs`, whose
 `JobHandler::accepts_leases` turns false, and the jobs worker leases only
 kinds whose handler accepts (a kind that refuses stays `available` for the
-other instances). A job leased in the instant before fails transient
-`content_model_superseded` without running and retries elsewhere under
-the queue's backoff.
+other instances). A job leased in the instant before, or one whose
+handler meets `content_model_superseded` mid-run, is given back with
+`JobFailure::release()`: available again at once with its attempt
+refunded, for a current host to run.
 
 ### Content management routes
 
@@ -1379,6 +1386,14 @@ Codes added by C3: `entry_not_found`, `revision_not_found` (404),
 `invalid_cursor` (400), `variant_exists` (412), `precondition_required`
 (428), `entry_exists`, `singleton_exists` (409). Every save appends
 `content.entry_draft_saved` to the outbox in its transaction.
+
+A cursor carries its sort values in the exact form the list selects
+(timestamps `YYYY-MM-DDTHH:MM:SS.ffffffZ`, PostgreSQL's float8 and
+numeric text); anything else, and any value PostgreSQL then refuses
+(SQLSTATE class 22), is `invalid_cursor`. Migration 2 of
+`merezha_content` is a declared non-transactional step building
+`variants_by_update` (`draft_updated_at DESC, entry_id DESC`), the index
+of the default `-sys.updated_at` list and its reverse.
 
 ## Dependencies
 
