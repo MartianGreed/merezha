@@ -41,6 +41,9 @@ use tracing::{Instrument, field::Empty};
 pub const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 pub const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
 pub const TRACESTATE: HeaderName = HeaderName::from_static("tracestate");
+/// The CSRF token cookie-authenticated unsafe requests carry (identity
+/// section 4); CORS allows it so a cross-origin front end can send it.
+pub const CSRF_TOKEN: HeaderName = HeaderName::from_static("x-csrf-token");
 const FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
@@ -454,6 +457,7 @@ fn cors(config: &CorsConfig) -> Option<tower_http::cors::CorsLayer> {
                 REQUEST_ID,
                 TRACEPARENT,
                 TRACESTATE,
+                CSRF_TOKEN,
             ])
             .expose_headers([REQUEST_ID])
             .allow_credentials(config.allow_credentials)
@@ -904,7 +908,13 @@ async fn authenticate(State(state): State<EdgeState>, request: Request, next: Ne
             parts.extensions.insert(Authenticated(principal));
             next.run(Request::from_parts(parts, body)).await
         }
-        Err(failure) => error_response(&failure),
+        Err(failure) => {
+            let mut response = error_response(&failure);
+            for (name, value) in &authenticator.rejection_headers(&parts, &failure) {
+                response.headers_mut().append(name, value.clone());
+            }
+            response
+        }
     }
 }
 
