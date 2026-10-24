@@ -1761,10 +1761,11 @@ does at least one batch; one that nears its job deadline or is cancelled
 appends a continuation job (`rebuild:<version>:after:<job id>`, a
 duplicate from a retried run ignored). A host that dies mid-batch leaves
 the cursor at the last commit and the retried job resumes there. A
-module start enqueues a pending rebuild of its model again
-(`rebuild:<version>:resume:<cursor>`) when no job of the kind is
-available or running and no record of it awaits the relay, so a
-dead-lettered rebuild is retried by the next deploy. Until it is done, delivery may serve the
+module start that did not just enqueue it enqueues a pending rebuild of
+its model again (`rebuild:<version>:resume:<cursor>`, a key the runtime
+already holds ignored), so a dead-lettered rebuild is retried by the next
+deploy. A run alongside a live one waits on the cursor row and never
+repeats a batch; content never reads the jobs runtime's tables. Until it is done, delivery may serve the
 previous materialization for the affected locales, as in a rolling
 deploy. `merezha content diff` prints `content_rebuild_pending version <n>
 after <entry id or start>` while one is pending. A first activation has

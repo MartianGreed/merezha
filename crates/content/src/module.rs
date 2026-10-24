@@ -310,8 +310,10 @@ impl ContentModule {
             .state()
             .ok_or_else(|| Failure::permanent("content_not_configured"))
     }
-    /// Enqueue a pending rebuild of this host's model that has no live job
-    /// (dead-lettered, or its outbox record lost). Best effort: a transient
+    /// Enqueue a pending rebuild of this host's model again, keyed by its
+    /// cursor, so a dead-lettered or lost job does not leave it pending for
+    /// good. A run alongside a live one is harmless: the cursor row
+    /// serializes runs and only moves forward. Best effort: a transient
     /// failure leaves it to the next start; the diff still reports it.
     async fn resume_rebuild(
         &self,
@@ -525,17 +527,25 @@ impl Module for ContentModule {
             let _ = state.database.set(ctx.database().clone());
             if ctx.migrate() {
                 let outbox = ctx.outbox(NAME)?;
-                match activate(ctx.database(), &outbox, ctx.random(), &model, &self.options).await {
-                    Ok(report) => {
-                        if report.plan.status == crate::Status::Outdated {
-                            state.mark_outdated();
-                        } else {
-                            state.current.store(true, Ordering::SeqCst);
+                let enqueued =
+                    match activate(ctx.database(), &outbox, ctx.random(), &model, &self.options)
+                        .await
+                    {
+                        Ok(report) => {
+                            if report.plan.status == crate::Status::Outdated {
+                                state.mark_outdated();
+                            } else {
+                                state.current.store(true, Ordering::SeqCst);
+                            }
+                            report.rebuild_enqueued
                         }
-                    }
-                    Err(error) => return Err(error.failure),
-                }
+                        Err(error) => return Err(error.failure),
+                    };
                 self.register_jobs(&ctx, &state)?;
+                // This activation just enqueued its rebuild.
+                if enqueued {
+                    return Ok(());
+                }
                 self.resume_rebuild(&ctx, &state).await
             } else {
                 let deadline = Instant::now() + Duration::from_secs(10);

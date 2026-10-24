@@ -184,16 +184,24 @@ async fn a_host_killed_mid_rebuild_leaves_it_for_another_to_finish() {
         cursors.windows(2).all(|w| w[0] < w[1]),
         "the cursor only moves forward: {cursors:?}"
     );
-    assert_eq!(
-        strings(
-            &second.db,
-            "SELECT string_agg(a.outcome, ',' ORDER BY a.started_at) FROM merezha_jobs.attempts a \
-               JOIN merezha_jobs.jobs j ON j.id = a.job_id \
-              WHERE j.kind = 'content.published_rebuild'"
-        )
-        .await,
-        ["failed,succeeded"]
-    );
+    // The killed run's job is retried and succeeds; the second host's
+    // start also enqueued a resume after the committed cursor, which
+    // succeeds too. Either may run the remaining batches.
+    wait_for(
+        &second.db,
+        "SELECT string_agg(a.outcome, ',' ORDER BY a.started_at) FROM merezha_jobs.attempts a \
+           JOIN merezha_jobs.jobs j ON j.id = a.job_id \
+          WHERE j.idempotency_key = 'content:rebuild:2'",
+        "failed,succeeded",
+    )
+    .await;
+    wait_for(
+        &second.db,
+        "SELECT string_agg(state, ',') FROM merezha_jobs.jobs \
+          WHERE idempotency_key LIKE 'content:rebuild:2:resume:%'",
+        "succeeded",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -225,11 +233,13 @@ async fn a_newer_activation_carries_a_pending_rebuild_forward() {
     // version 3's rebuilds every entry with `v2`'s locales.
     let worker = start(&test, "", &v3()).await;
     wait_for(&worker.db, REBUILD_STATES, "2:superseded,3:done").await;
+    // Its start also enqueued the resume of the pending version 3 rebuild.
     wait_for(
         &worker.db,
-        "SELECT string_agg(state, ',' ORDER BY id) FROM merezha_jobs.jobs \
-          WHERE kind = 'content.published_rebuild'",
-        "succeeded,succeeded",
+        "SELECT string_agg(idempotency_key || '=' || state, ',' ORDER BY idempotency_key) \
+           FROM merezha_jobs.jobs WHERE kind = 'content.published_rebuild'",
+        "content:rebuild:2=succeeded,content:rebuild:3=succeeded,\
+         content:rebuild:3:resume:start=succeeded",
     )
     .await;
     assert_eq!(page_rows(&worker.db, "de").await, 30);
@@ -530,4 +540,69 @@ async fn a_pending_rebuild_without_a_live_job_is_enqueued_again_at_start() {
         .await,
         1
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_beside_a_live_rebuild_job_never_repeats_a_batch() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let old = start_with(&test, NO_WORKERS, "", CHAIN_MODEL).await;
+    seed_pages(&old.db, 1100).await;
+    execute(
+        &old.db,
+        "CREATE TABLE public.materialized (entry_id uuid, locale text);
+         CREATE TABLE public.cursors (n serial, after_entry uuid);
+         CREATE FUNCTION public.log_row() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN INSERT INTO public.materialized VALUES (NEW.entry_id, NEW.locale); RETURN NEW; END $$;
+         CREATE TRIGGER log_row BEFORE INSERT ON merezha_content.published
+           FOR EACH ROW EXECUTE FUNCTION public.log_row();
+         CREATE FUNCTION public.log_cursor() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN INSERT INTO public.cursors (after_entry) VALUES (NEW.after_entry); RETURN NEW; END $$;
+         CREATE TRIGGER log_cursor BEFORE UPDATE ON merezha_content.rebuilds
+           FOR EACH ROW EXECUTE FUNCTION public.log_cursor();",
+    )
+    .await;
+    // The activation's job waits, unrun, for a host with workers.
+    start_with(&test, NO_WORKERS, "", &v2()).await;
+    // This start finds the rebuild pending and enqueues its resume job
+    // beside the live one: two runs of one rebuild.
+    let worker = start(&test, "", &v2()).await;
+    wait_for(&worker.db, REBUILD_STATES, "2:done").await;
+    wait_for(
+        &worker.db,
+        "SELECT string_agg(state, ',' ORDER BY id) FROM merezha_jobs.jobs \
+          WHERE kind = 'content.published_rebuild'",
+        "succeeded,succeeded",
+    )
+    .await;
+    assert_eq!(
+        strings(
+            &worker.db,
+            "SELECT string_agg(idempotency_key, ',' ORDER BY idempotency_key) FROM merezha_jobs.jobs \
+              WHERE kind = 'content.published_rebuild'"
+        )
+        .await,
+        ["content:rebuild:2,content:rebuild:2:resume:start"]
+    );
+    assert_eq!(
+        scalar(
+            &worker.db,
+            "SELECT count(*) FROM (SELECT 1 FROM public.materialized \
+              GROUP BY entry_id, locale HAVING count(*) > 1) d"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(&worker.db, "SELECT count(*) FROM public.materialized").await,
+        1100 * 4
+    );
+    let cursors = strings(
+        &worker.db,
+        "SELECT after_entry::text FROM public.cursors ORDER BY n",
+    )
+    .await;
+    assert_eq!(cursors.len(), 3, "{cursors:?}");
+    assert!(cursors.windows(2).all(|w| w[0] < w[1]), "{cursors:?}");
 }

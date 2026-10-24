@@ -181,11 +181,12 @@ impl Store {
     }
 
     /// Enqueue the rebuild of this host's model again when one is pending
-    /// without a live job (a module start): a job that dead-lettered, or an
-    /// outbox record lost, would otherwise leave it pending for good. The
-    /// key names the cursor, so starts at the same position enqueue once;
-    /// a run racing another waits on the cursor row and never repeats a
-    /// batch.
+    /// (a module start): a job that dead-lettered, or an outbox record
+    /// lost, would otherwise leave it pending for good. The key names the
+    /// cursor, so starts at the same position enqueue once (the jobs
+    /// runtime ignores a key it holds); a run alongside a live one waits on
+    /// the cursor row and never repeats a batch. Content never reads the
+    /// jobs runtime's tables.
     pub(crate) async fn resume_rebuild(&self, jobs: &JobsHandle) -> Result<bool, Failure> {
         let client = self
             .database()
@@ -197,24 +198,7 @@ impl Store {
         if pending.version != self.model().version() {
             return Ok(false);
         }
-        // A job still to run, or a record the relay has not turned into one
-        // yet, is live. Read-only, from the jobs runtime's tables.
-        let live: bool = client
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM merezha_jobs.jobs \
-                                 WHERE kind = $1 AND state IN ('available', 'running')) \
-                     OR EXISTS (SELECT 1 FROM merezha_jobs.outbox \
-                                 WHERE source = 'content' AND record_kind = 'job' \
-                                   AND job_kind = $1 AND relayed_at IS NULL)",
-                &[&REBUILD_JOB],
-            )
-            .await
-            .map_err(|e| merezha_postgres::classify(&e))?
-            .get(0);
         drop(client);
-        if live {
-            return Ok(false);
-        }
         let key = format!(
             "rebuild:{}:resume:{}",
             pending.version,

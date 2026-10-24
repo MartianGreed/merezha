@@ -362,8 +362,9 @@ rebuild succeeds without work. A run does at least one batch, and one
 stopped by its deadline or a cancel appends a continuation job keyed by
 its job id (a retried run finds it there and goes on). A host dying
 mid-batch leaves the committed cursor for the retried job, and a module
-start enqueues a pending rebuild of its model that has no live job (a
-dead-lettered one, say), keyed by the cursor. Until it is
+start enqueues a pending rebuild of its model again, keyed by the cursor
+(a dead-lettered job, say; a duplicate beside a live one is harmless,
+since runs serialize on the cursor row). Until it is
 done, delivery may serve the previous materialization for the affected
 locales, eventually consistent like the mixed state of a rolling deploy.
 `merezha content diff` reports a pending rebuild as
