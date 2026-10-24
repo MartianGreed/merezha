@@ -80,12 +80,13 @@ when `http.public` is false, `http.listen` is a loopback address and
 elsewhere even on loopback. A private listener keeps the explicit allow-all
 policy and the raw runtime endpoints, as `serve` does. Any other listener gets
 the deny-all policy, and the raw runtime endpoints are not mounted. Every
-application command, query, projection catch-up and rebuild then fails
-`403 unauthorized`. Catch-up and rebuild are checked through the policy as
-the permissions `application.projections.catch_up` and
-`application.projections.rebuild` at `ResourceScope::Application`, for the
-principal the edge authenticated (none until the identity block is enabled).
-A deployment exposes nothing unauthenticated by accident.
+application command and query then fails `403 unauthorized`. Catch-up and
+rebuild are checked through the policy as the permissions
+`application.projections.catch_up` and `application.projections.rebuild` at
+`ResourceScope::Application`, for the principal the edge authenticated: none
+until the identity block is enabled, so they fail `401 unauthenticated`, and
+`403 unauthorized` for a principal without the grant. A deployment exposes
+nothing unauthenticated by accident.
 
 ## Configuration reference
 
@@ -98,7 +99,8 @@ manifest.
 Environment variables use `__` between segments: `MEREZHA_HTTP__LISTEN`,
 `MEREZHA_HTTP__CORS__ALLOWED_ORIGINS`, `MEREZHA_JOBS__QUEUES__DEFAULT__CONCURRENCY`,
 `MEREZHA_MODULES__GREETER__GREETING`. Segments are lowercased, so a queue
-whose name contains a dot (`notify.email`) can only be set in the file.
+whose name contains a dot (`notify.email`) is set in the file or with a
+quoted flag segment, not from the environment.
 `[[jobs.schedules]]` has no environment or flag form.
 Variables starting with `MEREZHA_` but without `__`, such as
 `MEREZHA_TEST_DATABASE_URL`, are not configuration. Lists are comma
@@ -107,7 +109,8 @@ TOML literals (`"\"hi\""`, `3`, `true`), falling back to a plain string.
 
 Flags: `--listen ADDRESS` sets `http.listen`; `--set SECTION.KEY=VALUE` sets
 any non-secret setting (at most 64), nested ones included
-(`--set jobs.relay.batch=250`).
+(`--set jobs.relay.batch=250`). A double-quoted segment keeps its dots, as in
+TOML: `--set 'jobs.queues."notify.email".concurrency=5'`.
 
 Durations (R12) are a string with one unit, `"500ms"`, `"30s"`, `"15m"`,
 `"2h"` or `"7d"`. Keys ending `_ms` also take integer milliseconds, in the file
@@ -169,6 +172,7 @@ headers are `content-type`, `authorization`, `x-request-id` and
 | `acquire_timeout_ms` | duration | `2000` | no | 10 ms to 60 s; wait for a pooled connection |
 | `statement_timeout_ms` | duration | `5000` | no | 10 ms to 300 s; session default and ceiling for transactions |
 | `migrate` | boolean | `false` | no | apply pending migrations at startup instead of verifying |
+| `max_detached` | integer | `8` | no | 1 to 64 sessions detached from the pool at once (`Database::detach`, the migration run included); the server sees at most `pool_size + max_detached` connections from this host, plus listeners blocks open |
 | `tls` | `disable` or `require` | `disable` | no | `require` verifies the chain and host name; decides over the URL's `sslmode` |
 | `tls_ca_file` | path | none | no | extra PEM roots, at most 1 MiB; only with `tls = "require"` |
 
@@ -361,16 +365,21 @@ registers:
 | 400 | `invalid_input` |
 | 401 | `unauthenticated` |
 | 403 | `unauthorized`, `actor_mismatch`, `tenant_required` |
-| 404 | `not_found`, `handler_not_found`, `projection_not_found` |
+| 404 | `not_found`, `handler_not_found`, `projection_not_found`, `unknown_service`, `blob_not_found` |
 | 405 | `method_not_allowed` |
-| 409 | `secret_purged` (R4a) |
+| 409 | `secret_purged` (R4a), `conflict`, `database_conflict`, `unique_violation`, `concurrency_conflict`, `idempotency_in_flight`, `idempotency_mismatch`, `projection_conflict`, `projection_in_flight`, `storage_owned`, `outbox_duplicate` |
 | 412 | `revision_conflict` |
-| 413 | `body_limit`, `input_limit`, `payload_limit` |
+| 413 | `body_limit`, `input_limit`, `payload_limit`, `output_limit` |
 | 415 | `unsupported_media_type` |
-| 422 | `validation_failed` |
+| 422 | `validation_failed` and every other permanent code the kernel emits (domain, application, port and startup codes) |
 | 429 | `rate_limited`, `database_busy` (with `Retry-After`) |
-| 503 | `overloaded` (with `Retry-After`) |
+| 503 | `overloaded` and every transient code the kernel emits (`database_unavailable`, `database_timeout`, `commit_outcome_unknown`, `internal`, `storage_*`, ...), with `Retry-After` |
 | 504 | `timeout`, `upstream_timeout` |
+
+`errors::KERNEL_CODES` is the complete list. A unit test scans the kernel
+crates' sources for every code they construct and fails when one is missing,
+so no module can register a kernel code, `database_unavailable` say, with
+another status.
 
 An unregistered code maps by classification: permanent 422, conflict 409,
 transient 503. Modules declare `Module::errors() -> &[ErrorCode]`;
@@ -423,7 +432,7 @@ its own `invocation.completed` and `registry.*` JSON lines.
 
 | Method | Contract |
 | --- | --- |
-| `name()` | `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not `application`, `services`, `pipelines`, `reload` or `health`. Names the section, route prefix and migration ledger key; never changes. |
+| `name()` | `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not `application`, `api`, `services`, `pipelines`, `reload` or `health`. Names the section, route prefix and migration ledger key; never changes. |
 | `configure(&ModuleSection)` | validate and keep `[modules.<name>]`; return every issue at once. Default: only an empty section. |
 | `migrations()` | ordered forward-only `Migration::new(version, name, sql)` or `Migration::non_transactional(..)` for its own schema |
 | `errors()` | `ErrorCode { code, status }` it returns, registered at startup; default none |
@@ -453,11 +462,16 @@ register blocks.
   trust store, a 5 s connect timeout, no redirects and no retries. `send`
   takes a deadline and a response size limit and fails `upstream_timeout`,
   `upstream_unavailable` or `upstream_body_limit`.
-- `outbox(source)`: a `SourceOutbox` bound to the caller's source (its module
-  name, `api` or `application`); it validates every append before the
-  implementation runs.
+- `outbox(source)`: a `SourceOutbox` bound to `source`; it validates every
+  append before the implementation runs.
 - `notifier(source)`: a `Notifier` bound to `source`; `notifications_deliver()`
   is `false` while only the capture fallback is installed.
+- `module()`: the module the context belongs to. The host hands each module
+  a context bound to its own name, in `start` and `routes`; such a context
+  binds handles for that name only (`source_not_allowed` otherwise), so blocks
+  cannot write in each other's dedupe namespace or claim identity's
+  membership exemption. Only the host's own context binds the kernel sources
+  `api` and `application`, which are also reserved module names.
 - `directory()`, `authenticator()`, `authorizer()`, `blobs()`: the ports below.
 
 `AppContext::builder` starts from the disabled-block fallbacks; blocks replace
@@ -478,9 +492,9 @@ pass what they learned in (`NotificationRequest::members`).
 | `Principal` | `subject` (`usr_..`, `key_..`, or `sys_<name>` for system principals, `Principal::system`), `kind` (`User`, `ApiKey`, `System`), `user`, `service_account`, `tenant`, `grants: Arc<GrantSnapshot>`, `session: Option<SessionFacts>` | |
 | `GrantSnapshot` | break-glass, application grants, application-level resource grants, tenant grants, resource grants in the tenant and an API key limit; `evaluate` and `Principal::check` decide synchronously in identity's order (ID §5) and return `Allowed::{Grant, BreakGlass}` or `AccessDenied { reason }` | |
 | `ResourceScope` | `Application`, `Tenant(id)`, `Resource { tenant: Option<id>, kind, id }`; a resource without a tenant is application-level (R5). A tenant grant never satisfies an application check | |
-| `Authorizer` | extends the application `Authorizer` with `check(Option<&Principal>, permission, scope) -> Result<Allowed, AccessDenied>`; synchronous and I/O-free. `AccessDenied::failure()` is `unauthenticated` without a principal, else `unauthorized` | `LoopbackAllowAll` on a private listener (constructible only for loopback addresses), `DenyAll` otherwise |
+| `Authorizer` | extends the application `Authorizer` with `check(Option<&Principal>, permission, scope) -> Result<Allowed, AccessDenied>`; synchronous and I/O-free. Without a principal it denies `Unauthenticated` (401), otherwise `unauthorized` (403) | `LoopbackAllowAll` on a private listener (constructible only for loopback addresses), `DenyAll` otherwise (401 anonymous, 403 with a principal) |
 | `Outbox` | `append(tx, source, &[OutboxRecord], OnDuplicate) -> Appended` (AP §B.3); records carry a `DedupeKey` (at most 160 bytes, R4a; `DedupeKey::api(subject, key)` namespaces HTTP keys), an `OutboxTarget` (`Event { topic }` or `Job { queue, kind }`), a JSON payload of at most 64 KiB, `contains_secret`, `run_at`, `priority` and a `MessageContext`; at most 256 records per call. `JobFailure` carries the code, classification and `retry_after` job handlers report | `UnavailableOutbox`: fails `outbox_unavailable`, so the caller's transaction rolls back. The PostgreSQL outbox is AP-B1 |
-| `Notifier` | `validate(&request)` (pure), `request(tx, NotificationRequest)` and `emit_webhook(tx, WebhookEvent)` (NT §3.1). Requests carry topic, 1 to 100 recipients (`User`, `Tenant`, `Application { roles }`, `Address`), channels, template, `data`, `secret_data`, locale, dedupe key, tenant, `members`, `not_before`, `expires_at`, collapse key and correlation. For sources `application` and `api` with a tenant every user recipient must be in `members` (`recipient_not_in_tenant`). `Debug` never shows data, secret data or addresses. `NotifierFactory::bind(source)` hands out bound notifiers | `CaptureNotifications`: validates structurally, logs a redacted `notification.captured` warning, keeps the last 64 redacted records (never `data`, `secret_data` or addresses) and delivers nothing |
+| `Notifier` | `validate(&request)` (pure), `request(tx, NotificationRequest)` and `emit_webhook(tx, WebhookEvent)` (NT §3.1); a webhook's `source_event_id` is an `EventId` of up to 225 bytes, room for `{source}:{dedupe_key}`. Requests carry topic, 1 to 100 recipients (`User`, `Tenant`, `Application { roles }`, `Address`), channels, template, `data`, `secret_data`, locale, dedupe key, tenant, `members`, `not_before`, `expires_at`, collapse key and correlation. For sources `application` and `api` with a tenant every user recipient must be in `members` (`recipient_not_in_tenant`). `Debug` never shows data, secret data or addresses. `NotifierFactory::bind(source)` hands out bound notifiers | `CaptureNotifications`: validates structurally, logs a redacted `notification.captured` warning, keeps the last 64 redacted records (never `data`, `secret_data` or addresses) and delivers nothing |
 | `Directory` | `users(ids)` (at most 100) to verified `Contact`s, `tenant_members(tenant, roles?, PageRequest)` and `application_members(roles?, PageRequest)` (pages of at most 500, keyset by user id), `is_member(user, tenant)` (R7) | `EmptyDirectory`: resolves nothing; nobody is a member |
 | `BlobStore` | `put(key, BlobBody, attrs) -> BlobStat` streaming, `get(key, range?) -> BlobRead` streaming, `head`, idempotent `delete`, `signed_get_url(key, ttl) -> Option<String>` (CT §6); `BlobKey` is 1 to 1024 bytes of `[A-Za-z0-9._-]` segments; `BlobError` maps to classified failures | `UnavailableBlobStore`: fails permanent `blob_store_unavailable` |
 
@@ -500,7 +514,8 @@ first failed use.
   failed or interrupted commit returns `commit_outcome_unknown`. `Tx` is the
   type the in-transaction ports take.
 - `detach(deadline)` takes a connection out of the pool as a
-  `DetachedClient`, for sessions that hold a session advisory lock
+  `DetachedClient`, at most `max_detached` at once (it waits within
+  `acquire_timeout`, then fails `database_busy`), for sessions that hold a session advisory lock
   (projection, reactor and content activation runs). It derefs to the driver
   client for session statements, and `DetachedClient::transaction(deadline,
   work)` has exactly the contract of `Database::transaction`. Dropping it
@@ -555,7 +570,8 @@ const BY_TITLE: Migration = Migration::non_transactional(
 
 - It holds exactly one statement (quotes, dollar quotes and comments are
   skipped when counting), checked with the other declarations
-  (`invalid_migrations`).
+  (`invalid_migrations`). Comments before or between keywords do not hide a
+  concurrent index build from the rules below.
 - It runs outside any transaction, on the same session and under the same
   advisory lock as the rest of the run, and is checksummed like any
   migration.
@@ -646,7 +662,7 @@ Rust 1.98.0.
 | `tower-http` | 0.7.1 | 1.65 | MIT | `cors` only | platform |
 | `http-body-util` | 0.1.5 | 1.61 | MIT | default | platform |
 | `getrandom` | 0.4.3 | 1.85 | MIT OR Apache-2.0 | none | platform |
-| `jiff` | 0.2.38 | 1.70 | Unlicense OR MIT | `std` only (no time zone database) | platform: timestamps in ports (R14) |
+| `jiff` | 0.2.38 | 1.70 | Unlicense OR MIT | `std`, `serde`, `tz-system`, `tzdb-bundle-always` (the R14 workspace pin; pulls `jiff-tzdb` 0.1.9, MSRV 1.70, Unlicense OR MIT) | platform: timestamps in ports (R14) |
 | `uuid` | 1.29.0 | 1.89.0 | Apache-2.0 OR MIT | none | platform: notification and webhook handles |
 | `bytes` | 1.12.1 | 1.57 | MIT | `std` | platform: blob bodies |
 | `futures-core` | 0.3.34 | 1.36 | MIT OR Apache-2.0 | `std` | platform: blob streams |
