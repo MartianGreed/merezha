@@ -462,51 +462,199 @@ mod tests {
 
     /// `text` without the items gated by `#[cfg(test)]`: a `;`- or
     /// `,`-terminated item, or one whose body is a balanced `{ }` block,
-    /// such as `mod tests { .. }`. Strings and char literals are skipped
-    /// while counting braces.
-    fn strip_test_items(text: &str) -> String {
-        const GATE: &str = "#[cfg(test)]";
+    /// such as `mod tests { .. }`. Comments (nested block comments too),
+    /// strings, raw strings and char literals are skipped while counting
+    /// `( [ {` delimiters, and a gate inside them gates nothing.
+    ///
+    /// Misreading a test item must never hide production code, so the
+    /// scan fails instead of guessing: on an unterminated comment or
+    /// literal, a mismatched delimiter, a test item that runs to the end
+    /// of the file, or a file whose delimiters do not balance. A `,`
+    /// inside generics (`<A, B>`) ends a test item early; that leaves test
+    /// code visible, which the guard reports, and hides nothing.
+    fn strip_test_items(text: &str) -> Result<String, String> {
+        const GATE: &[u8] = b"#[cfg(test)]";
         let bytes = text.as_bytes();
         let mut out = String::with_capacity(text.len());
-        let mut from = 0;
-        while let Some(found) = text[from..].find(GATE) {
-            let start = from + found;
-            out.push_str(&text[from..start]);
-            let mut index = start + GATE.len();
-            let mut depth = 0usize;
-            while index < bytes.len() {
-                match bytes[index] {
-                    b'"' => {
-                        index += 1;
-                        while index < bytes.len() && bytes[index] != b'"' {
-                            if bytes[index] == b'\\' {
-                                index += 1;
-                            }
-                            index += 1;
-                        }
-                    }
-                    b'\'' if bytes.get(index + 2) == Some(&b'\'') => index += 2,
-                    b'{' => depth += 1,
-                    b'}' if depth == 0 => break,
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            index += 1;
-                            break;
-                        }
-                    }
-                    b';' | b',' if depth == 0 => {
-                        index += 1;
-                        break;
-                    }
-                    _ => {}
-                }
+        let mut open = Vec::new();
+        let (mut index, mut kept) = (0, 0);
+        while index < bytes.len() {
+            if let Some(end) = skip_opaque(text, index)? {
+                index = end;
+            } else if bytes[index..].starts_with(GATE) {
+                out.push_str(&text[kept..index]);
+                index = test_item_end(text, index + GATE.len())?;
+                kept = index;
+            } else {
+                delimit(text, &mut open, index)?;
                 index += 1;
             }
-            from = index.min(bytes.len());
         }
-        out.push_str(&text[from..]);
-        out
+        if let Some(&at) = open.last() {
+            return Err(format!(
+                "`{}` at line {} is never closed",
+                char::from(bytes[at]),
+                line_of(text, at)
+            ));
+        }
+        out.push_str(&text[kept..]);
+        Ok(out)
+    }
+
+    /// Where the `#[cfg(test)]` item whose tokens start at `from` ends:
+    /// after the `;` or `,` that terminates it, after the `}` that
+    /// balances its body, or before the closer of the item around it,
+    /// such as the `}` after a struct's last field.
+    fn test_item_end(text: &str, from: usize) -> Result<usize, String> {
+        let bytes = text.as_bytes();
+        let mut open = Vec::new();
+        let mut index = from;
+        while index < bytes.len() {
+            if let Some(end) = skip_opaque(text, index)? {
+                index = end;
+                continue;
+            }
+            match bytes[index] {
+                b')' | b']' | b'}' if open.is_empty() => return Ok(index),
+                b';' | b',' if open.is_empty() => return Ok(index + 1),
+                byte => {
+                    delimit(text, &mut open, index)?;
+                    if byte == b'}' && open.is_empty() {
+                        return Ok(index + 1);
+                    }
+                }
+            }
+            index += 1;
+        }
+        Err(format!(
+            "the #[cfg(test)] item at line {} runs to the end of the file",
+            line_of(text, from)
+        ))
+    }
+
+    /// Pushes the opener at `at` onto `open`, or pops the opener the
+    /// closer at `at` matches.
+    fn delimit(text: &str, open: &mut Vec<usize>, at: usize) -> Result<(), String> {
+        let bytes = text.as_bytes();
+        let opener = match bytes[at] {
+            b'(' | b'[' | b'{' => {
+                open.push(at);
+                return Ok(());
+            }
+            b')' => b'(',
+            b']' => b'[',
+            b'}' => b'{',
+            _ => return Ok(()),
+        };
+        let closer = char::from(bytes[at]);
+        match open.pop() {
+            Some(start) if bytes[start] == opener => Ok(()),
+            Some(start) => Err(format!(
+                "`{closer}` at line {} closes `{}` from line {}",
+                line_of(text, at),
+                char::from(bytes[start]),
+                line_of(text, start)
+            )),
+            None => Err(format!(
+                "`{closer}` at line {} closes nothing",
+                line_of(text, at)
+            )),
+        }
+    }
+
+    /// The end of the comment, string, raw string or char literal that
+    /// starts at `at`, or `None` when a token starts there. Lifetimes and
+    /// loop labels such as `'a` are tokens.
+    fn skip_opaque(text: &str, at: usize) -> Result<Option<usize>, String> {
+        let bytes = text.as_bytes();
+        let unterminated =
+            |what: &str| Err(format!("unterminated {what} at line {}", line_of(text, at)));
+        match bytes[at] {
+            b'/' if bytes.get(at + 1) == Some(&b'/') => Ok(Some(
+                text[at..].find('\n').map_or(text.len(), |end| at + end),
+            )),
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                let (mut depth, mut index) = (0usize, at);
+                while index + 1 < bytes.len() {
+                    match &bytes[index..index + 2] {
+                        b"/*" => {
+                            depth += 1;
+                            index += 2;
+                        }
+                        b"*/" => {
+                            depth -= 1;
+                            index += 2;
+                            if depth == 0 {
+                                return Ok(Some(index));
+                            }
+                        }
+                        _ => index += 1,
+                    }
+                }
+                unterminated("block comment")
+            }
+            b'"' => {
+                let mut index = at + 1;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' => index += 2,
+                        b'"' => return Ok(Some(index + 1)),
+                        _ => index += 1,
+                    }
+                }
+                unterminated("string")
+            }
+            // `r"..."`, `r#"..."#`, `br".."`, `cr".."`: no escapes, closed
+            // by a quote and as many hashes as opened it.
+            b'r' | b'b' | b'c'
+                if at == 0 || !(bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') =>
+            {
+                let mut index = at + 1;
+                if bytes[at] != b'r' {
+                    if bytes.get(index) != Some(&b'r') {
+                        return Ok(None);
+                    }
+                    index += 1;
+                }
+                let hashes = bytes[index..].iter().take_while(|&&b| b == b'#').count();
+                index += hashes;
+                if bytes.get(index) != Some(&b'"') {
+                    return Ok(None);
+                }
+                let close = format!("\"{}", "#".repeat(hashes));
+                match text[index + 1..].find(&close) {
+                    Some(end) => Ok(Some(index + 1 + end + close.len())),
+                    None => unterminated("raw string"),
+                }
+            }
+            // An escape such as `'\''` or `'\u{7b}'` runs to the next quote
+            // within the longest escape.
+            b'\'' if bytes.get(at + 1) == Some(&b'\\') => {
+                let body = at + 3;
+                match bytes
+                    .get(body..)
+                    .and_then(|rest| rest.iter().take(9).position(|&b| b == b'\''))
+                {
+                    Some(end) => Ok(Some(body + end + 1)),
+                    None => unterminated("char literal"),
+                }
+            }
+            // `'x'` closes right after one character; `'a` is a lifetime.
+            b'\'' => Ok(text[at + 1..].chars().next().and_then(|c| {
+                let close = at + 1 + c.len_utf8();
+                (bytes.get(close) == Some(&b'\'')).then_some(close + 1)
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    /// The 1-based line of byte `at` in `text`.
+    fn line_of(text: &str, at: usize) -> usize {
+        text.as_bytes()[..at]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+            + 1
     }
 
     /// Every code literal `text` constructs.
@@ -580,7 +728,9 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
-            found.extend(codes_in(&strip_test_items(&text)));
+            let production = strip_test_items(&text)
+                .unwrap_or_else(|reason| panic!("{}: {reason}", path.display()));
+            found.extend(codes_in(&production));
         }
         found
     }
@@ -609,11 +759,147 @@ mod tests {
 }
 fn after() -> Failure { Failure::conflict("after_tests") }
 "#;
-        let codes = codes_in(&strip_test_items(source));
+        let codes = visible_codes(source);
         for expected in ["late_production_code", "startup_code", "after_tests"] {
             assert!(codes.contains(expected), "{expected} in {codes:?}");
         }
         assert!(!codes.contains("test_only_code"), "{codes:?}");
+    }
+
+    /// The codes `source` constructs outside its test items.
+    fn visible_codes(source: &str) -> std::collections::BTreeSet<String> {
+        codes_in(&strip_test_items(source).unwrap())
+    }
+
+    #[test]
+    fn the_scanner_skips_comments_raw_strings_and_char_literals_in_test_items() {
+        let cases = [
+            (
+                "a `{` in a line comment",
+                r#"
+#[cfg(test)]
+mod tests {
+    // opens { but never closes
+    fn helper() { let _ = Failure::permanent("hidden_line_comment"); }
+}
+fn after() -> Failure { Failure::conflict("after_line_comment") }
+"#,
+            ),
+            (
+                "a `}` in a block comment",
+                r#"
+#[cfg(test)]
+mod tests {
+    /* closes } early */
+    fn helper() { let _ = Failure::permanent("hidden_block_comment"); }
+}
+fn after() -> Failure { Failure::conflict("after_block_comment") }
+"#,
+            ),
+            (
+                "nested block comments",
+                r#"
+#[cfg(test)]
+mod tests {
+    /* outer /* inner */ still a comment { */
+    fn helper() { let _ = Failure::permanent("hidden_nested_comment"); }
+}
+fn after() -> Failure { Failure::conflict("after_nested_comment") }
+"#,
+            ),
+            (
+                "a raw string with an embedded quote",
+                r##"
+#[cfg(test)]
+mod tests {
+    fn helper() { let _ = r#"a"b"#; let _ = Failure::permanent("hidden_raw_string"); }
+}
+fn after() -> Failure { Failure::conflict("after_raw_string") }
+"##,
+            ),
+            (
+                "a two-hash raw string holding a one-hash close",
+                r###"
+#[cfg(test)]
+mod tests {
+    fn helper() { let _ = r##"a "# { b"##; let _ = br#"}"#; }
+    fn more() { let _ = Failure::permanent("hidden_two_hash_raw_string"); }
+}
+fn after() -> Failure { Failure::conflict("after_two_hash_raw_string") }
+"###,
+            ),
+            (
+                "escaped char literals and lifetimes",
+                r#"
+#[cfg(test)]
+mod tests {
+    fn helper<'a>(text: &'a str) -> &'static str {
+        let _ = ['\'', '\\', '"', '{', '\u{7b}', b'}', 'é'];
+        'outer: loop { break 'outer; }
+        Failure::permanent("hidden_char_literals").code
+    }
+}
+fn after() -> Failure { Failure::conflict("after_char_literals") }
+"#,
+            ),
+            (
+                "a gate in a production comment",
+                r#"
+// Only a real #[cfg(test)] gates an item.
+fn after() -> Failure { Failure::conflict("after_commented_gate") }
+"#,
+            ),
+            (
+                "a gate in a production string",
+                r##"
+fn after() -> Failure {
+    let _ = "#[cfg(test)]";
+    Failure::conflict("after_quoted_gate")
+}
+"##,
+            ),
+        ];
+        let wrong: Vec<_> = cases
+            .iter()
+            .filter_map(|(case, source)| {
+                let codes = visible_codes(source);
+                let after = codes.iter().filter(|c| c.starts_with("after_")).count();
+                let hidden = codes.iter().filter(|c| c.starts_with("hidden_")).count();
+                (after != 1 || hidden != 0).then(|| format!("{case}: {codes:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "misread test items: {wrong:#?}");
+    }
+
+    #[test]
+    fn the_scanner_refuses_sources_it_cannot_strip_without_hiding_code() {
+        for (source, reason) in [
+            (
+                "#[cfg(test)]\nmod tests {\n    fn helper() {}\n",
+                "the #[cfg(test)] item at line 1 runs to the end of the file",
+            ),
+            (
+                "#[cfg(test)]\nmod tests { /* /* */ }\nfn after() {}\n",
+                "unterminated block comment at line 2",
+            ),
+            (
+                "#[cfg(test)]\nmod tests { r#\"a\"b\"; }\n",
+                "unterminated raw string at line 2",
+            ),
+            ("fn f() { \"open }\n", "unterminated string at line 1"),
+            (
+                "fn f() { '\\u{7b}\n}\n",
+                "unterminated char literal at line 1",
+            ),
+            (
+                "#[cfg(test)]\nmod tests { fn f( } }\n",
+                "`}` at line 2 closes `(` from line 2",
+            ),
+            ("fn f() {\n", "`{` at line 1 is never closed"),
+            ("fn f() {}\n}\n", "`}` at line 2 closes nothing"),
+        ] {
+            assert_eq!(strip_test_items(source), Err(reason.to_owned()), "{source}");
+        }
     }
 
     #[test]
