@@ -231,8 +231,9 @@ names. Other designs reference it instead of defining names:
 - `sha2` 0.11 everywhere (K bumps from 0.10); `hmac` 0.13.
 - One time crate: `jiff`. `croner` is used with its `jiff` feature, so cron
   needs no `chrono`. `chrono` appears only inside the OAuth/OIDC provider
-  adapter, because `oauth2` and `openidconnect` require it, and never in a
-  public type.
+  adapter, because `oauth2` and `openidconnect` require it, and inside
+  `object_store`'s internals in `merezha-blob` (CT-C6), which depends on it
+  unconditionally; never in a public type.
 - Workspace `jiff` pin: `default-features = false`, features `std`, `serde`,
   `tz-system`, `tzdb-bundle-always`, so IANA zones resolve on Linux too.
 - PostgreSQL 14 minimum, CI on 16 (owner answer P2). The Contremaitre

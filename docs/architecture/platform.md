@@ -15,6 +15,13 @@ kernel every block builds on:
 beside them: the PostgreSQL outbox, the jobs port and the relay (see
 [Jobs and the outbox](#jobs-and-the-outbox)).
 
+`merezha-blob` (`crates/blob`, CT-C6) holds the `BlobStore` drivers, local
+filesystem and S3-compatible through `object_store`, so the kernel never
+depends on `object_store`. The content block installs one (CT §6). The
+local root must be mode 0700 (no group or other bits, checked at startup and
+by readiness); it is the access boundary, and blob files and subdirectories
+below it follow the process umask.
+
 `merezha run --config merezha.toml` (`crates/cli/src/run.rs`) puts them
 together with the existing runtime and application layer. `merezha serve`
 is unchanged.
@@ -531,7 +538,7 @@ pass what they learned in (`NotificationRequest::members`).
 | `Jobs` | through `JobsHandle`: `enqueue(NewJob) -> Enqueued` in its own transaction, idempotent on the queue and `{source}:{key}`; `cancel(id)`; `register(kind, queue, Arc<dyn JobHandler>, KindOptions)` and `subscribe(topic, kind)` before the jobs runtime starts. `JobHandler`, `JobContext`, `KindOptions` and `Reissue` are AP §B.3's; `NewJob` hides its payload from `Debug` | `UnavailableJobs`: every call fails `jobs_unavailable` |
 | `Notifier` | `validate(&request)` (pure), `request(tx, NotificationRequest)` and `emit_webhook(tx, WebhookEvent)` (NT §3.1); a webhook's `source_event_id` is an `EventId` of up to 225 bytes, room for `{source}:{dedupe_key}`. Requests carry topic, 1 to 100 recipients (`User`, `Tenant`, `Application { roles }`, `Address`), channels, template, `data`, `secret_data`, locale, dedupe key, tenant, `members`, `not_before`, `expires_at`, collapse key and correlation. For sources `application` and `api` with a tenant every user recipient must be in `members` (`recipient_not_in_tenant`). `Debug` never shows data, secret data or addresses. `NotifierFactory::bind(source)` hands out bound notifiers | `CaptureNotifications`: validates structurally, logs a redacted `notification.captured` warning, keeps the last 64 redacted records (never `data`, `secret_data` or addresses) and delivers nothing |
 | `Directory` | `users(ids)` (at most 100) to verified `Contact`s, `tenant_members(tenant, roles?, PageRequest)` and `application_members(roles?, PageRequest)` (pages of at most 500, keyset by user id), `is_member(user, tenant)` (R7) | `EmptyDirectory`: resolves nothing; nobody is a member |
-| `BlobStore` | `put(key, BlobBody, attrs) -> BlobStat` streaming, `get(key, range?) -> BlobRead` streaming, `head`, idempotent `delete`, `signed_get_url(key, ttl) -> Option<String>` (CT §6); `BlobKey` is 1 to 1024 bytes of `[A-Za-z0-9._-]` segments; `BlobError` maps to classified failures | `UnavailableBlobStore`: fails permanent `blob_store_unavailable` |
+| `BlobStore` | `put(key, BlobBody, attrs) -> BlobStat` streaming, `get(key, range?) -> BlobRead` streaming, `head`, idempotent `delete`, `signed_get_url(key, ttl) -> Option<String>` (CT §6); `BlobKey` is 1 to 1024 bytes of `[A-Za-z0-9._-]` segments; `BlobError` maps to classified failures | `UnavailableBlobStore`: fails permanent `blob_store_unavailable`. `merezha_blob::ObjectBlobStore` is the local and S3 implementation |
 
 ## Notifications block
 

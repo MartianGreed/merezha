@@ -920,9 +920,13 @@ Responses vary on `Authorization` and `Cookie`. Management responses are always
 | `entry_exists`, `entry_referenced`, `asset_in_use`, `default_variant_required`, `singleton_exists` | 409 | conflict | Client id taken; referrers exist with `if_unreferenced`; asset referenced without `force`; default variant deleted alone; second singleton entry. |
 | `body_limit`, `asset_too_large` | 413 | permanent | Body or draft data too large; upload over `media.max_upload_bytes`. |
 | `media_type_rejected` | 415 | permanent | Type not allowed, or the bytes do not match the declared type. |
-| `range_not_satisfiable` | 416 | permanent | |
+| `range_not_satisfiable` | 416 | permanent | A ranged blob read starting at or past the end. |
 | `overloaded` | 503 | transient | `media.max_concurrent_uploads` reached; `Retry-After: 1`. |
 | `blob_unavailable` | 503 | transient | Blob store failure after its bounded retries. |
+| `blob_backend_rejected` | 502 | permanent | The blob store answered 4xx (credentials, bucket, policy). |
+| `blob_body_unreadable` | 503 | transient | The spooled file or body stream failed while it was stored. |
+| `blob_length_mismatch`, `invalid_blob_attributes`, `invalid_blob_range`, `invalid_signed_url_ttl` | 422 | permanent | Blob port input refused before any I/O (internal errors of the caller). |
+| `blob_too_large` | 413 | permanent | A blob body over 5 GiB. |
 | `content_model_superseded` | 503 | transient | Write on a host whose model a newer one replaced; `Retry-After: 1` (section 2). |
 | `timeout` | 504 | transient | Request deadline or statement timeout. |
 | `internal` | 500 | transient | Anything else. Logged with the request id. |
@@ -932,7 +936,9 @@ statuses. Startup and readiness codes: `content_model_invalid`,
 `content_model_version_unchanged`, `content_model_outdated`,
 `content_model_breaking`, `content_model_pending` (the domain term "content
 model", not a module prefix), `identity_required`, `media_config_invalid`,
-`index_build_pending`, `index_build_failed`.
+`index_build_pending`, `index_build_failed`, and the blob driver's
+`blob_config_invalid`, `blob_root_unusable`, `blob_root_insecure`.
+`merezha_blob::ERRORS` lists the blob codes for `Module::errors`.
 
 ## 6. Media
 
@@ -1012,9 +1018,51 @@ the platform's no-retry rule: operations on content-addressed keys are
 idempotent.
 
 The host creates `media.local.root` with mode 0700 if missing and refuses a
-root writable by group or others. Keys never contain user input. The local
+root that grants group or others any permission (mode `& 0o077`), at startup
+and in readiness. That 0700 root is the access boundary: blob files and the
+subdirectories below it follow the process umask. Keys never contain user input. The local
 driver has no signed URLs, so `serve = "redirect"` with `driver = "local"`
 fails startup with `media_config_invalid`.
+
+The drivers live in `merezha-blob` (`crates/blob`, slice C6), so the kernel
+stays free of `object_store`. `ObjectBlobStore::open` takes a
+`DriverConfig` (`LocalConfig` or `S3Config`, the `media.local.*` and
+`media.s3.*` keys) and fails `blob_config_invalid`, `blob_root_unusable` or
+`blob_root_insecure`; it never contacts the bucket. As built:
+
+- Every input is checked before any I/O: the key (with `key_prefix`, at
+  most 1024 bytes), the attributes (1 to 1024 header-safe bytes), the range
+  (`start < end`) and the signed URL lifetime (1 s to 7 days).
+- A body of up to one 5 MiB part is one request. Larger bodies go up in
+  parts of exactly 5 MiB, one part in flight, so a put holds about one part
+  in memory. A declared length that does not match the bytes read fails
+  `blob_length_mismatch`, a body over 5 GiB `blob_too_large`, a failing file
+  or stream `blob_body_unreadable`; each aborts the multipart upload and
+  stores nothing. A put cancelled mid-way leaves an incomplete upload on
+  S3: give the bucket a lifecycle rule that aborts incomplete multipart
+  uploads after a day.
+- The local driver writes through a staging file and a rename, with fsync,
+  so a put is atomic and durable. It stores bytes only: attributes are
+  validated and dropped, because proxy serving takes them from the asset
+  row.
+- S3 requests are bounded by `media.s3.timeout` and retried 3 times within
+  10 s (5xx, 408, 429, timeouts and connection failures). An operation that
+  never gets an answer fails `blob_unavailable` after at most the timeout
+  plus 10 s plus one backoff; a refused connection fails within the
+  timeout. Other 4xx and every 3xx (a wrong region or endpoint) fail
+  `blob_backend_rejected` at once, and so does a write to a missing bucket.
+  Deletes
+  are single `DELETE` requests, not bulk `POST /?delete`.
+- A ranged read past the end fails `range_not_satisfiable` on both drivers;
+  an end past the size is clamped and `BlobRead::range` reports what was
+  served.
+- `ObjectBlobStore::ready(deadline)` is the readiness probe below. On S3 it
+  needs `s3:ListBucket`: without it a missing key answers 403, which reads as
+  not ready. Locally it also fails when the root is gone or its mode no
+  longer refuses group and others (object_store recreates a deleted root
+  with the umask's mode on the next put).
+- `ObjectBlobStore::with_max_bytes` lowers the 5 GiB cap, for declared
+  lengths and for streams of unknown length alike.
 
 ### Keys
 
@@ -1238,7 +1286,10 @@ Queue settings for the `content` queue live under `[jobs.queues.content]`, not
 here (R1). Unknown keys and invalid combinations fail startup with every error
 at once, as the platform requires. The blob store contributes to readiness with a
 `head` of the fixed key `content/readiness/probe`; found or not found both
-count as ready.
+count as ready, provided the bucket exists: on S3 a one-key list of
+`content/readiness/` must also succeed, so a missing bucket (whose `head`
+also answers 404) is not ready. Locally the root must be a directory with
+mode `& 0o077` clear.
 
 ### Telemetry
 
@@ -1280,7 +1331,8 @@ and tested on 1.98.0 in their slice.
 | `tokio-postgres` | 0.7.18 | 1.85 | MIT OR Apache-2.0 | Through `merezha-postgres`; features `with-serde_json-1`, `with-uuid-1`, `with-jiff-0_2`. |
 | `deadpool-postgres` | 0.14.2 | 1.85 | MIT OR Apache-2.0 | Through `merezha-postgres`. |
 | `postgres-types` | 0.2.14 | 1.85 | MIT OR Apache-2.0 | `jsonb` and `uuid` mapping. |
-| `object_store` | 0.14.2 | 1.85 | MIT/Apache-2.0 | Blob drivers; features `fs` (default) and `aws`. |
+| `object_store` | 0.14.2 | 1.85 | MIT/Apache-2.0 | Blob drivers in `merezha-blob`; `default-features = false`, features `fs` and `aws`. It depends on `chrono` 0.4.45 unconditionally, as R14 allows; no `chrono` type appears in `merezha-blob`'s API. |
+| `http` | 1.5.0 | 1.57.0 | MIT OR Apache-2.0 | `merezha-blob`: the `Method` that `object_store`'s signer takes; already locked through reqwest and axum. |
 | `uuid` | 1.29.0 | 1.89.0 | Apache-2.0 OR MIT | UUIDv7 ids; workspace pin with `v4`, `v5`, `v7`, `serde`. |
 | `jiff` | 0.2.38 | 1.70 | Unlicense OR MIT | The workspace's one time crate (R14), pinned with `default-features = false` and `std`, `serde`, `tz-system`, `tzdb-bundle-always`: strict RFC 3339 parsing, UTC normalization. |
 | `rust_decimal` | 1.43.0 | 1.67.1 | MIT | `decimal` precision, scale and range checks (28 digits, hence the precision ceiling). |
@@ -1293,7 +1345,7 @@ and tested on 1.98.0 in their slice.
 | `tempfile` | 3.27.0 (workspace) | | MIT OR Apache-2.0 | Upload spooling. |
 | `bytes` | 1.12.1 | 1.57 | MIT | Blob bodies. |
 | `futures-util` | 0.3.34 | 1.71 | MIT OR Apache-2.0 | `BoxFuture`, `BoxStream`. |
-| `tokio-util` | 0.7.20 | 1.85 | MIT | `ReaderStream` for file bodies. |
+| `tokio-util` | 0.7.20 | 1.85 | MIT | `ReaderStream` for file bodies (C7). C6 reads spooled files with `tokio::fs` instead. |
 | `serde`, `serde_json`, `toml`, `axum`, `tokio` | workspace pins | | | Model parsing, HTTP. |
 
 Not used: `aws-sdk-s3`, `rust-s3` (section 6), `multer` (raw upload bodies),
