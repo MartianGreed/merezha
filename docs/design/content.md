@@ -1,0 +1,1368 @@
+# Content block design
+
+Status: proposed 2026-10-23, aligned 2026-10-24 with
+[the cross-block decisions](cross-block-decisions.md), which win where this
+document differs. Conforms to [the framework architecture](../architecture/framework.md)
+with the amendment recorded there (R15). Needs from other blocks are listed
+under [cross-block dependencies](#cross-block-dependencies).
+
+The content block is a headless CMS API in the Merezha host: content types in
+a TOML file in the project repository, entries with drafts, publishing,
+scheduling, revisions and per-locale variants, and media in a `BlobStore` with
+local and S3-compatible drivers. There is no admin UI. Editors use a frontend
+the project builds on the management API; sites read the delivery API. It
+ships as `merezha-content` (`crates/content`), a platform `Module` with schema
+`merezha_content` and routes under `/v1/content/`.
+
+## What the established CMSs taught us
+
+| System | What we take | What we leave |
+| --- | --- | --- |
+| Contentful | Separate delivery and management APIs. Version-based optimistic locking on every write. Locale fallback chains. Thin webhooks. Scheduled actions. | Field-level localization on every field, environments, a vendor rich text format, the `includes` sidecar for links. |
+| Sanity | Portable Text as an open rich text format. `_key` on every array item so clients can diff and patch lists. Drafts kept apart from the published document. | GROQ, a custom query language, and the content lake. |
+| Strapi v5 | Document-level i18n, where each locale is a full variant with its own draft and published state. Components and dynamic zones. Explicit `populate`, off by default. Batch publish ("releases"). | Database tables per content type, which turn every model change into DDL. |
+| Payload | Schema as code in the project repository. Population depth limits. Revision retention per document. Globals as singletons. | Arbitrary access-control functions in the schema and the Lexical-specific rich text. |
+| Directus | Singletons as a first-class kind. | Database-first modelling, where the SQL schema is the content model. |
+
+The main lesson is cost. Mapping content types to SQL tables makes migrations
+painful, and arbitrary filters over arbitrary fields make queries slow. Here
+entry data is validated JSONB, and only fields declared `filterable` or
+`sortable` can be filtered or sorted, each with a known index.
+
+## 1. Language
+
+| Term | Meaning |
+| --- | --- |
+| Content model | The whole set of content types, components and locales for one application, declared in `content.toml` with an integer `version`. |
+| Content type | A named schema for entries, such as `article`. It has a kind, a tenancy scope, a delivery access rule and an ordered list of fields. |
+| Collection | A content type with any number of entries. |
+| Singleton | A content type with at most one entry per scope, such as `site_settings`. Its routes take no entry id. |
+| Component | A named, reusable group of fields embedded inside entries, such as `seo`. A component has no identity and no lifecycle of its own. |
+| Field | A named, typed slot in a content type or component, with validation rules. |
+| Entry | One content item of a content type, identified by a UUIDv7. It owns one variant per locale. |
+| Locale | A BCP 47 code configured in the model, such as `fr-BE`. Exactly one locale is the default. Each non-default locale may name a fallback locale. |
+| Variant | The per-locale part of an entry: one draft, an optional published revision and its revision history. A non-localized type has only the default-locale variant. |
+| Draft | The current editable data of a variant. Every save of a draft creates a new revision. Drafts may be incomplete: `required` is checked at publish time. |
+| Revision | An immutable, numbered snapshot of a variant's data. Revision numbers start at 1 and increase by one per save, per variant. The draft is always the latest revision. |
+| Published version | The revision of a variant that the delivery API serves. Publishing points the variant at a revision; it does not copy or create a revision. |
+| Status | Derived per variant: `draft` (never published or unpublished), `published` (the published revision is the draft revision), `changed` (published, with a newer draft). |
+| Shared field | A field with `localized = false` in a localized type. The default-locale variant owns its value; other variants read it. |
+| Slug | A URL segment field, lowercase ASCII words joined by hyphens, unique per type, scope and locale. |
+| Reference | A field value pointing at another entry, with cardinality one or many and a list of allowed target types. |
+| Asset | An uploaded file with metadata (filename, content type, size, SHA-256, image dimensions). Its bytes are a blob. |
+| Blob | The stored bytes, addressed by content hash. Two assets with the same bytes in the same scope share one blob. |
+| Scope | The tenancy boundary of an entry or asset, `app` or `org:<organization id>`. |
+| Stage | `published` (delivery default) or `draft` (preview). |
+
+## 2. Content model definition
+
+### File and loading
+
+`merezha.toml` points at the model file:
+
+```toml
+[modules.content]                # the section's presence enables the module
+model = "content.toml"
+```
+
+The path follows the runtime manifest's rules: relative to `merezha.toml`, no
+parent traversal, a regular file inside the project. The host validates the
+model before listening and reports every problem at once with a TOML path, for
+example `content_model_invalid: types.article.fields[2].max_length must be
+between 1 and 4096` or `content_model_invalid: types.article.access is
+required`.
+The canonical JSON form of the model (sorted keys, defaults filled in) hashed
+with SHA-256 is its fingerprint.
+
+### Example
+
+```toml
+version = 3
+
+locales = [
+  { code = "en", default = true },
+  { code = "fr", fallback = "en" },
+  { code = "fr-BE", fallback = "fr" },
+]
+
+[components.seo]
+description = "Search and social metadata"
+fields = [
+  { name = "title", type = "string", max_length = 70 },
+  { name = "description", type = "text", max_length = 160 },
+  { name = "image", type = "asset", accept = ["image/*"] },
+]
+
+[components.quote]
+fields = [
+  { name = "text", type = "text", required = true },
+  { name = "attribution", type = "string" },
+]
+
+[types.author]
+access = "public"
+title_field = "name"
+fields = [
+  { name = "name", type = "string", required = true, sortable = true },
+  { name = "avatar", type = "asset", accept = ["image/png", "image/jpeg", "image/webp"], localized = false },
+]
+
+[types.article]
+kind = "collection"
+scope = "application"
+localized = true
+access = "public"
+title_field = "title"
+fields = [
+  { name = "title", type = "string", required = true, max_length = 200, sortable = true },
+  { name = "slug", type = "slug", from = "title", required = true },
+  { name = "category", type = "enum", values = ["news", "guide", "release"], required = true, filterable = true },
+  { name = "published_on", type = "date", sortable = true },
+  { name = "author", type = "reference", to = ["author"], cardinality = "one", localized = false, filterable = true },
+  { name = "tags", type = "list", of = { type = "string", max_length = 40 }, max_items = 20, filterable = true },
+  { name = "body", type = "rich_text", styles = ["normal", "h2", "h3", "blockquote"], marks = ["strong", "em", "code"], annotations = ["link", "entry_link"], lists = ["bullet", "number"], embeds = ["asset", "quote"] },
+  { name = "sections", type = "blocks", components = ["quote", "seo"], max_items = 30 },
+  { name = "seo", type = "component", component = "seo" },
+  { name = "reading_minutes", type = "integer", min = 1, max = 600, sortable = true },
+]
+
+[types.site_settings]
+kind = "singleton"
+access = "public"
+fields = [
+  { name = "site_name", type = "string", required = true },
+  { name = "price_floor", type = "decimal", precision = 10, scale = 2 },
+]
+
+[types.partner_brief]
+access = { permission = "content.delivery.read" }
+fields = [{ name = "title", type = "string", required = true }]
+```
+
+`fields` is an array because field order is part of the model: it is the
+order of `fields` in API responses and in the model endpoint that a frontend
+uses to build its forms. TOML tables are maps and would lose it. Inline tables
+must fit on one line in TOML 1.0. Long field definitions can use
+`[[types.article.fields]]` array tables instead, which parse to the same model.
+
+### Type-level keys
+
+| Key | Values | Default | Notes |
+| --- | --- | --- | --- |
+| `kind` | `collection`, `singleton` | `collection` | |
+| `scope` | `application`, `organization` | `application` | See section 8. `organization` needs identity with organizations enabled. |
+| `localized` | bool | `true` | `false` means the type has only the default-locale variant. |
+| `access` | `"public"`, `"authenticated"`, `{ permission = "<name>" }` | none, required | Who reads published entries through delivery (owner answer CT1). `public`: anyone, anonymous included. `authenticated`: any principal, and for organization types one whose tenant is the path's organization. A permission: checked in the type's resource scope (section 5); it must exist in the RBAC catalog. A missing or unknown value fails model validation. |
+| `title_field` | field name | none | Must be a `string` field. Used in revision listings, referrer listings and slug generation defaults. |
+| `description` | string, at most 500 chars | none | Documentation only, returned by the model endpoint. |
+| `fields` | array | required | 1 to 100 fields. |
+
+Type and component names match `^[a-z][a-z0-9_]{0,47}$`. The names `manage`,
+`assets`, `model`, `o` and `health` are reserved because they share the
+delivery path namespace. Field names match `^[a-z][a-z0-9_]{0,63}$`; `id`,
+`type`, `locale`, `sys` and anything starting with `_` are reserved.
+
+Model limits: 64 types, 32 components, 32 locales, 100 fields per type or
+component, nesting depth 4, 8 `unique` and 16 `filterable` or `sortable`
+fields per type.
+
+### Common field keys
+
+| Key | Applies to | Default | Meaning |
+| --- | --- | --- | --- |
+| `name` | all | required | Field name. |
+| `type` | all | required | One of the field types below. |
+| `description` | all | none | Documentation only. |
+| `required` | all | `false` | Value must be present and non-empty at publish time. Empty string, empty list and empty rich text count as absent. |
+| `localized` | all | type's `localized` | `false` makes it a shared field owned by the default-locale variant. Only meaningful in a localized type; not allowed inside components (a component inherits the containing field's setting). |
+| `default` | scalar types | none | Value filled in when a new variant is created without the field, and used by `set_default` migrations. |
+| `unique` | `string`, `slug`, `integer`, `enum` | `false`, `true` for `slug` | Unique per type, scope and locale (per type and scope for shared fields), enforced on drafts and on published rows by database indexes. |
+| `filterable` | scalars, `reference`, lists of scalars | `false` | Field may appear in equality, `in` and `has` filters. |
+| `sortable` | `string`, `slug`, `integer`, `float`, `decimal`, `date`, `datetime`, `enum` | `false` | Field may be sorted on and used with range filters. Implies `filterable`. |
+
+`unique`, `filterable` and `sortable` are only allowed on top-level fields of a
+content type. Fields inside components cannot be filtered in v1.
+
+### Field types
+
+| Type | JSON value | Type-specific keys | Rules |
+| --- | --- | --- | --- |
+| `string` | string | `min_length`, `max_length` (default 255, max 4096), `pattern` | Single line: no CR or LF. Length counts Unicode scalar values. |
+| `text` | string | `min_length`, `max_length` (default 10000, max 100000) | Multi-line plain text. |
+| `rich_text` | Portable Text array | `styles`, `marks`, `annotations`, `lists`, `embeds`, `max_blocks` (default 500, max 5000), `max_text_length` (default 100000) | See below. |
+| `integer` | JSON integer | `min`, `max` | Must decode as an integer, so `1.0` is rejected. Range is ±9,007,199,254,740,991, the same safe range as application values. |
+| `float` | JSON number | `min`, `max` | Finite binary64. Decimal lexical precision is not preserved, as in the application JSON policy. |
+| `decimal` | string | `precision` (default 18, max 28), `scale` (default 2, at most `precision`), `min`, `max` as decimal strings | Matches `^-?(0|[1-9][0-9]*)(\.[0-9]+)?$`. Stored normalized to exactly `scale` fractional digits: `"10"` becomes `"10.00"`, more digits than `scale` is an error, not rounding. Use it for money. |
+| `boolean` | `true` or `false` | none | |
+| `datetime` | string | `min`, `max` | RFC 3339 with an offset. At most 3 fractional digits. Stored as UTC `YYYY-MM-DDTHH:MM:SS.sssZ`, so the stored strings sort in time order. |
+| `date` | string | `min`, `max` | `YYYY-MM-DD`, a calendar date with no zone. |
+| `enum` | string | `values` (1 to 200 identifiers matching `^[a-z0-9][a-z0-9_-]{0,63}$`) | |
+| `slug` | string | `from` (a `string` field), `max_length` (default 96, max 200) | Matches `^[a-z0-9]+(?:-[a-z0-9]+)*$`. When a save leaves it absent and `from` is set, the host transliterates the source field with `deunicode`, lowercases it, replaces runs of other characters with `-` and truncates at a word boundary. The host never changes an existing slug. |
+| `reference` | `{"id": "<uuid>", "type": "<type>"}` or an array of them | `to` (1 to 16 types), `cardinality` (`one`, `many`), `min_items`, `max_items` (default 100, max 1000), `require_published` (default `false`) | Writes may omit `type`; the host fills it. The target must exist, not be in the trash, be one of the `to` types, and be in the same scope or in the application scope. With `require_published`, publishing fails while a target has no published variant in the same locale chain. |
+| `asset` | `{"id": "<uuid>", "alt": "..."}` or an array of them | `accept` (MIME types or `image/*` patterns), `cardinality`, `min_items`, `max_items` | `alt` is optional, at most 500 chars. Alt text belongs to the field value, so each entry and locale can describe the same image differently. |
+| `component` | object | `component` | Validated against the component's fields. |
+| `list` | array | `of` (an inline field definition of a scalar type or `component`), `min_items`, `max_items` (default 100, max 1000) | Items of component lists carry `_key`. |
+| `blocks` | array of `{"_type": "<component>", "_key": "...", ...fields}` | `components` (1 to 32), `min_items`, `max_items` | A tagged union of components, the "dynamic zone" for page builders. |
+| `json` | any JSON | `max_bytes` (default 16384, max 262144) | Opaque. Not filterable. Integers outside the safe range are rejected, as everywhere. |
+
+`pattern` uses the linear-time `regex` crate, anchored as `^(?:...)$` and
+compiled at startup with a 64 KiB size limit. Any string containing U+0000 is
+rejected, `json` fields included, because `jsonb` cannot store it. `_key`
+values match `^[A-Za-z0-9_-]{1,32}$`, are unique within their array, and are
+assigned randomly (12 characters) when a write omits them. They identify list
+items across revisions and appear in reference paths.
+
+### Rich text format: Portable Text
+
+`rich_text` stores a [Portable Text](https://github.com/portabletext/portabletext)
+array. I picked it over ProseMirror JSON and Lexical for four reasons:
+
+1. It is a flat array of blocks holding spans, so the host validates it in one
+   pass with a fixed depth bound. ProseMirror documents are trees of any depth.
+2. It does not tie the API to an editor. ProseMirror node names come from each
+   editor's schema (Tiptap and Remirror differ), and Lexical nodes are
+   versioned classes of one editor.
+3. Maintained renderers exist for HTML, React, Vue, Svelte, PHP, Python and Go,
+   plus client-side converters from ProseMirror and HTML.
+4. Its `_key` and `_type` conventions are the ones the `blocks` field uses.
+
+Tables and nested blocks are not in the spec. Tables become an embedded
+component and nested lists use `level`.
+
+Accepted structure, everything else rejected with `rich_text_invalid` and a
+JSON pointer:
+
+```json
+[
+  { "_type": "block", "_key": "a1", "style": "h2", "markDefs": [],
+    "children": [{ "_type": "span", "_key": "a1s", "text": "Release notes", "marks": [] }] },
+  { "_type": "block", "_key": "b2", "style": "normal", "listItem": "bullet", "level": 1,
+    "markDefs": [{ "_type": "link", "_key": "l1", "href": "https://example.com/changelog" },
+                 { "_type": "entry_link", "_key": "l2", "id": "0192f7a0-5d1c-7c3e-9b1a-6f0e2c4d8a11", "type": "article" }],
+    "children": [{ "_type": "span", "_key": "b2a", "text": "See the ", "marks": [] },
+                 { "_type": "span", "_key": "b2b", "text": "changelog", "marks": ["strong", "l1"] }] },
+  { "_type": "asset", "_key": "c3", "id": "0192f7a1-0b44-7aa2-8c55-1d3e9f20a7b4", "alt": "Team photo" },
+  { "_type": "quote", "_key": "d4", "text": "Ship small.", "attribution": "The team" }
+]
+```
+
+- `style` comes from the field's `styles` (`normal`, `h1` to `h6`,
+  `blockquote`). `listItem` comes from `lists` (`bullet`, `number`), with
+  `level` 1 to 6.
+- `marks` holds decorators from the field's `marks` (`strong`, `em`, `code`,
+  `underline`, `strike`) or the `_key` of a `markDefs` entry in the same block.
+- `markDefs` are `link` (`href` with scheme `https`, `http` or `mailto`, at most
+  2048 bytes) or `entry_link` (reference rules, targets limited by
+  `entry_link_to`, default every type).
+- Embedded objects are `asset` or a component listed in `embeds`, with the
+  component's fields at the top level. `max_text_length` bounds total span
+  text and `max_blocks` the block count.
+
+### Write-time and publish-time validation
+
+A draft save checks every rule except `required` and `min_items`, so editors
+can save half-finished work. Publishing checks all of them, plus
+`require_published`. Both report every violation at once:
+
+```json
+{ "error": { "code": "validation_failed", "classification": "permanent", "details": [
+  { "path": "/fields/title", "code": "required" },
+  { "path": "/fields/sections/k7Qa/text", "code": "max_length" },
+  { "path": "/fields/author", "code": "reference_not_found" } ] } }
+```
+
+Paths are JSON pointers built from field names and `_key`s, never from user
+text. Detail codes: `required`, `type_mismatch`, `min_length`, `max_length`,
+`pattern`, `min`, `max`, `precision`, `scale`, `not_in_enum`, `min_items`,
+`max_items`, `unknown_field`, `field_not_localized`, `duplicate_key`,
+`invalid_character`, `datetime_precision`, `reference_not_found`,
+`reference_type`, `reference_scope`, `reference_unpublished`,
+`asset_not_found`, `asset_type`, `rich_text_invalid`, `unique`, `json_too_large`.
+
+### Schema changes
+
+`version` must increase whenever the fingerprint changes, or startup fails
+with `content_model_version_unchanged`. At startup the host diffs the active
+model in the database against the file and classifies every change:
+
+| Change | Class | What happens |
+| --- | --- | --- |
+| New type, component, optional field or locale | additive | Activated directly. |
+| New `required` field | additive | Activated. Existing drafts are unaffected; the next publish of each entry needs the field. `default` covers new variants only; a `set_default` step backfills. |
+| Relaxed rule: higher `max`, lower `min`, wider `pattern`, new enum value, `required` removed, new `to` target, new `accept` type | additive | Activated. |
+| Tightened rule: lower `max_length`, narrower range, `pattern` added, `required` added on an existing field | tightening | Activated. Rules apply at the next write. The host counts drafts and published rows that would fail and logs `content.model_tightened` with counts per field. Published content keeps being served. |
+| `access` changed | access | Activated. Applies to the next request; the generation bump changes every ETag of the scope. |
+| `filterable` or `sortable` added or removed | index | Activated. The host creates or drops derived indexes (section 3). |
+| `unique` added | index | Activated only if no duplicate exists. Otherwise startup fails with `unique_conflict`, listing the field and the number of duplicate values. |
+| Field removed or renamed, field type changed, enum value removed, type removed or renamed, `localized` changed, `scope` changed, `kind` changed, locale removed, default locale changed | breaking | Needs a `[[migrations]]` block. Without one, startup fails with `content_model_breaking`, listing each change. |
+
+A migration block names the target version and ordered steps:
+
+```toml
+[[migrations]]
+to = 4
+steps = [
+  { op = "rename_field", type = "article", from = "summary", to = "excerpt" },
+  { op = "drop_field", type = "article", field = "legacy_id" },
+  { op = "set_default", type = "article", field = "featured", value = false },
+  { op = "map_enum", type = "article", field = "category", map = { release = "news" } },
+  { op = "convert", type = "product", field = "price", to = "decimal" },
+  { op = "rename_type", from = "post", to = "article" },
+  { op = "drop_type", type = "promo" },
+  { op = "retire_locale", code = "fr-BE" },
+]
+```
+
+`convert` covers only well-defined conversions: `integer` to `float` or
+`decimal`, `string` to `text`, `text` to `rich_text` (one block per
+paragraph), `enum` to `string`, `one` to `many` for references and assets, and
+a scalar to a `list` of it. Anything else is `drop_field` plus a new field,
+with data moved through the management API. `retire_locale` hides a locale
+from delivery and keeps its variants readable for export. No step changes
+`localized`, `scope` or `kind`; create a new type and copy entries.
+
+With `database.migrate = true` the host runs a migration under an advisory
+lock. It rewrites `variants.draft_data` and rebuilds `published` in batches of
+500 entries, one transaction each, recording progress on the `models` row so
+a crashed run resumes. Steps are pure functions of the old value, so a rerun
+batch gives the same result. Readiness stays false until the run completes.
+Revisions are not rewritten: each keeps its model version, and restoring one
+replays the stored steps from that version. With `database.migrate = false`,
+a pending model change fails readiness with `content_model_pending`.
+
+A running host keeps its loaded model, so old instances survive a rolling
+deploy of an additive change. A host starting with an older model than the
+active one fails readiness with `content_model_outdated`.
+
+`merezha content diff --config merezha.toml` prints the classified diff
+against the configured database without changing anything, and exits non-zero
+on breaking changes without a migration. Projects run it in CI.
+
+## 3. Storage
+
+### JSONB or columns
+
+Entry field data is `jsonb`. System attributes are real columns: ids, type,
+scope, locale, slug, revision numbers, timestamps, deletion state. A model
+change then never runs DDL on content tables, which is where Directus and
+early Strapi migrations hurt. The host validates every value before writing,
+so the database does not need column types to keep data well-formed. Filters
+and sorts only touch declared fields, each with a derived expression index,
+and equality filters share one GIN index per table. The cost is that ad-hoc
+SQL over content needs JSON operators, which is acceptable because no other
+block reads these tables.
+
+### Migration 1: `merezha_content`
+
+```sql
+CREATE SCHEMA merezha_content;
+SET search_path = merezha_content;
+
+-- Every activated model version; exactly one is active.
+CREATE TABLE models (
+  version integer PRIMARY KEY CHECK (version > 0),
+  fingerprint text NOT NULL UNIQUE,              -- SHA-256 hex of canonical JSON
+  definition jsonb NOT NULL,                     -- canonical normalized model
+  migration jsonb,                               -- steps that led to this version
+  state text NOT NULL CHECK (state IN ('migrating', 'active', 'superseded')),
+  migration_phase text CHECK (migration_phase IN ('drafts', 'published')),
+  migration_after uuid,                          -- resume cursor: last entry id done
+  activated_at timestamptz);
+CREATE UNIQUE INDEX models_one_active ON models ((true)) WHERE state = 'active';
+
+-- Synchronized from the model at activation; rows are never deleted.
+CREATE TABLE locales (
+  code text PRIMARY KEY CHECK (length(code) BETWEEN 2 AND 35),
+  fallback text REFERENCES locales (code),
+  is_default boolean NOT NULL DEFAULT false,
+  retired_at timestamptz);
+CREATE UNIQUE INDEX locales_one_default ON locales ((true)) WHERE is_default;
+
+CREATE TABLE entries (
+  id uuid PRIMARY KEY,                           -- UUIDv7, host generated or client supplied
+  scope text NOT NULL CHECK (scope = 'app' OR scope ~ '^org:[A-Za-z0-9._:/-]{1,128}$'),
+  content_type text NOT NULL,
+  singleton boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL, created_by text NOT NULL,
+  deleted_at timestamptz, deleted_by text);
+CREATE INDEX entries_by_type ON entries (scope, content_type, id) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX entries_one_singleton ON entries (scope, content_type)
+  WHERE singleton AND deleted_at IS NULL;
+CREATE INDEX entries_trash ON entries (deleted_at) WHERE deleted_at IS NOT NULL;
+
+CREATE TABLE variants (
+  entry_id uuid NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+  locale text NOT NULL REFERENCES locales (code),
+  scope text NOT NULL, content_type text NOT NULL,   -- copied from entries for indexes
+  deleted boolean NOT NULL DEFAULT false,
+  draft_revision bigint NOT NULL CHECK (draft_revision > 0),
+  draft_data jsonb NOT NULL,                     -- includes shared fields copied from the default variant
+  draft_slug text,
+  draft_updated_at timestamptz NOT NULL, draft_updated_by text NOT NULL,
+  published_revision bigint CHECK (published_revision <= draft_revision),
+  published_at timestamptz, first_published_at timestamptz,
+  PRIMARY KEY (entry_id, locale));
+CREATE INDEX variants_list ON variants (scope, content_type, locale, draft_updated_at DESC, entry_id)
+  WHERE NOT deleted;
+CREATE INDEX variants_data ON variants USING gin (draft_data jsonb_path_ops) WHERE NOT deleted;
+
+CREATE TABLE revisions (
+  entry_id uuid NOT NULL, locale text NOT NULL,
+  revision bigint NOT NULL CHECK (revision > 0),
+  model_version integer NOT NULL REFERENCES models (version),
+  kind text NOT NULL CHECK (kind IN ('create', 'save', 'restore')),
+  restored_from bigint,
+  data jsonb NOT NULL,                           -- the variant's own fields, without shared fields
+  created_at timestamptz NOT NULL, created_by text NOT NULL,
+  PRIMARY KEY (entry_id, locale, revision),
+  FOREIGN KEY (entry_id, locale) REFERENCES variants ON DELETE CASCADE);
+
+-- Delivery rows, materialized at publish time: one row per entry and per
+-- configured locale whose fallback chain reaches a published variant.
+CREATE TABLE published (
+  entry_id uuid NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+  locale text NOT NULL REFERENCES locales (code),        -- requested locale
+  source_locale text NOT NULL REFERENCES locales (code), -- variant actually served
+  scope text NOT NULL, content_type text NOT NULL,
+  revision bigint NOT NULL,
+  slug text,
+  data jsonb NOT NULL,                           -- source variant data plus shared fields
+  published_at timestamptz NOT NULL, first_published_at timestamptz NOT NULL,
+  PRIMARY KEY (entry_id, locale));
+CREATE INDEX published_list ON published (scope, content_type, locale, published_at DESC, entry_id);
+CREATE INDEX published_slug ON published (scope, content_type, locale, slug) WHERE slug IS NOT NULL;
+CREATE UNIQUE INDEX published_own_slug ON published (scope, content_type, locale, slug)
+  WHERE slug IS NOT NULL AND source_locale = locale;
+CREATE INDEX published_data ON published USING gin (data jsonb_path_ops);
+
+-- Outgoing references from drafts and from published variants.
+CREATE TABLE refs (
+  scope text NOT NULL,
+  from_entry uuid NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+  from_locale text NOT NULL,
+  stage text NOT NULL CHECK (stage IN ('draft', 'published')),
+  path text NOT NULL,                            -- JSON pointer, e.g. /fields/body/c3
+  target_kind text NOT NULL CHECK (target_kind IN ('entry', 'asset')),
+  target_id uuid NOT NULL,
+  PRIMARY KEY (from_entry, from_locale, stage, path, target_id));
+CREATE INDEX refs_by_target ON refs (target_kind, target_id, stage);
+
+CREATE TABLE blobs (
+  scope text NOT NULL,
+  sha256 text NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+  storage_key text NOT NULL UNIQUE,
+  size bigint NOT NULL CHECK (size >= 0),
+  content_type text NOT NULL,
+  state text NOT NULL CHECK (state IN ('pending', 'stored', 'orphaned', 'deleting')),
+  pending_until timestamptz,                     -- upload lease
+  orphaned_at timestamptz, created_at timestamptz NOT NULL,
+  PRIMARY KEY (scope, sha256));
+CREATE INDEX blobs_cleanup ON blobs (state, orphaned_at, pending_until) WHERE state <> 'stored';
+
+CREATE TABLE assets (
+  id uuid PRIMARY KEY,
+  scope text NOT NULL, sha256 text NOT NULL,
+  filename text NOT NULL CHECK (filename ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$'),
+  content_type text NOT NULL, size bigint NOT NULL,
+  width integer, height integer,
+  title text, focal_point jsonb,                 -- {"x": 0..1, "y": 0..1}
+  created_at timestamptz NOT NULL, created_by text NOT NULL,
+  updated_at timestamptz NOT NULL, deleted_at timestamptz,
+  FOREIGN KEY (scope, sha256) REFERENCES blobs (scope, sha256));
+CREATE INDEX assets_list ON assets (scope, created_at DESC, id) WHERE deleted_at IS NULL;
+CREATE INDEX assets_by_blob ON assets (scope, sha256);
+
+CREATE TABLE schedules (
+  id uuid PRIMARY KEY,
+  entry_id uuid NOT NULL, locale text NOT NULL,
+  action text NOT NULL CHECK (action IN ('publish', 'unpublish')),
+  revision bigint,                               -- pinned revision for publish
+  run_at timestamptz NOT NULL,
+  state text NOT NULL CHECK (state IN ('pending', 'done', 'failed', 'cancelled')),
+  failure_code text,
+  created_at timestamptz NOT NULL, created_by text NOT NULL,
+  FOREIGN KEY (entry_id, locale) REFERENCES variants ON DELETE CASCADE);
+CREATE UNIQUE INDEX schedules_one_pending ON schedules (entry_id, locale, action) WHERE state = 'pending';
+CREATE INDEX schedules_due ON schedules (run_at) WHERE state = 'pending';
+
+-- Bumped on every change visible to delivery in a scope; feeds ETags.
+CREATE TABLE generations (scope text PRIMARY KEY, generation bigint NOT NULL);
+```
+
+The module's migrations go through the kernel runner (`merezha.migrations`,
+checksums, one transaction each). Nothing here or in the derived indexes needs
+more than PostgreSQL 14, the platform floor; CI runs 16 (R14). Operators can
+set `lz4` compression on `revisions.data` where the server supports it.
+
+### Derived indexes
+
+The model decides which indexes exist beyond the static ones. For every
+`sortable` field the host derives a partial B-tree index on both `variants`
+and `published`:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS content_ix_3f9a0c1d2e4b5a69
+  ON merezha_content.published
+  (scope, locale, ((data->'reading_minutes') IS NULL), (((data->>'reading_minutes'))::bigint), entry_id)
+  WHERE content_type = 'article';
+```
+
+Casts: `::bigint` for `integer`, `::float8` for `float`, `::numeric` for
+`decimal`, plain text for the rest. `datetime` stays text: a text to
+`timestamptz` cast is not immutable and cannot be indexed, and the fixed-width
+UTC format already sorts in time order. Each `unique` field, slugs included,
+gets a partial unique index on `variants` (not deleted; `locale` in the key,
+or `locale = <default>` in the predicate for shared fields) and on `published`
+(`source_locale = locale`).
+
+`CREATE INDEX CONCURRENTLY` cannot run in a transaction. This is an accepted
+framework amendment (R15): the kernel runner gains a declared
+non-transactional migration step, and content registers its index
+reconciliation as one, run at activation after the transactional migrations
+under the same advisory lock. Each name is `content_ix_` plus 16 hex
+characters of the definition's hash, so the step computes the expected set
+from the model, compares it with `pg_indexes`, drops extra `content_ix_`
+indexes, and rebuilds those a crashed build left invalid
+(`pg_index.indisvalid = false`). Readiness stays false until every expected
+index exists and is valid; with `database.migrate = false`, a missing one
+fails readiness instead of being built. Unique violations map back to their
+field through the index name.
+
+### Optimistic concurrency
+
+Every write to a variant is a compare-and-swap on `draft_revision`:
+
+```sql
+UPDATE merezha_content.variants
+   SET draft_revision = draft_revision + 1, draft_data = $4, draft_slug = $5,
+       draft_updated_at = $6, draft_updated_by = $7
+ WHERE entry_id = $1 AND locale = $2 AND draft_revision = $3 AND NOT deleted
+RETURNING draft_revision;
+```
+
+Zero rows is `revision_conflict` (412). HTTP carries the revision as a strong
+ETag, `"r12"`. `PUT`, `PATCH`, publish, unpublish, restore, schedule and
+variant delete require `If-Match` (missing: `precondition_required`, 428);
+creating a variant uses `If-None-Match: *`. The same transaction writes the
+revision, the variant's `draft` refs, retention pruning, shared-field copies
+and the outbox record of the event (`Outbox::append(tx, ...)`, R1). No network
+or blob call happens inside it.
+
+## 4. Workflow
+
+A variant moves between `draft`, `published` and `changed` as described in
+the language table. Deleting an entry moves it to the trash from any state,
+undelete returns it as drafts, and purge or retention removes it.
+
+### Saving
+
+`POST` creates the entry and its first variant at revision 1. A client may
+supply `id` for imports; an existing id is `entry_exists` (409). `PUT`
+replaces the variant's fields. `PATCH` takes an RFC 7396 merge patch over
+`fields` (`application/merge-patch+json`), which replaces lists whole. Each
+save is one revision, with no autosave coalescing in v1, so autosaving
+frontends should debounce.
+
+### Publishing
+
+`POST .../publish` with `If-Match: "r12"` publishes revision 12 in one
+transaction. The host locks the variant (`FOR UPDATE`), checks the revision,
+migrates the revision's data if it predates the active model and runs
+publish-time validation. It then sets `published_revision`, `published_at` and
+`first_published_at`, rewrites the variant's `published` refs, re-materializes
+the entry's `published` rows for every locale whose chain passes through this
+variant (for the default variant, also the shared fields of every row), bumps
+the scope's generation and appends `content.entry_published`. A body of
+`{"revision": 9}` rolls the published version back without touching the
+draft. Unpublish clears the pointer and refs, re-materializes (a locale that
+fell back to this variant falls back further or disappears) and appends
+`content.entry_unpublished`.
+
+References to unpublished entries do not block publishing; delivery shows them
+as missing unless the field sets `require_published`. Batch publish takes up
+to `limits.max_batch` items and publishes all or none in one transaction,
+which covers coordinated launches without a release object (owner answer
+CT7).
+
+### Scheduling
+
+`POST .../schedule` with `{"action": "publish", "at": "2026-11-02T08:00:00.000Z"}`
+and `If-Match: "r12"` pins revision 12. Later draft edits do not change what
+goes live; reschedule to pick them up. `at` must be in the future and within
+`schedule.max_horizon` (`schedule_invalid`), and one pending schedule per
+variant and action may exist (`schedule_conflict`). The same transaction
+appends a delayed job record (R1, AP §B.3):
+
+```rust
+outbox.append(tx, "content", &[OutboxRecord {
+    dedupe_key: format!("schedule:{id}"),
+    target: OutboxTarget::Job { queue: "content", kind: "content.schedule_run" },
+    run_at: Some(at), ..
+}], OnDuplicate::Fail)
+```
+
+The handler runs as the system principal `sys_content_scheduler` (R13). It
+locks the schedule and returns at once unless it is pending (duplicate
+delivery), publishes the pinned revision or unpublishes through the API code
+path without `If-Match`, and marks it `done`. A permanent failure
+(`validation_failed`, `entry_deleted`) marks it `failed`, appends
+`content.scheduled_action_failed` and returns a permanent `JobFailure`;
+transient errors retry under the `[jobs.queues.content]` backoff.
+
+Authorization happens when the schedule is created; a later role change does
+not cancel it. Retention never prunes a pinned revision. Publish lag is the job
+runner's poll interval, measured by the schedule lag histogram (section 9).
+
+### Revisions and restore
+
+Revision reads return data migrated to the active model, with the original in
+`sys.model_version`. Restore creates a new draft revision (`kind = restore`,
+`restored_from = n`) and never publishes. It runs save-time validation
+against the current model. Data that no longer passes (a value now over
+`max_length`) still restores and the response lists the violations in
+`warnings`; a `unique` conflict fails the restore.
+
+Retention keeps the newest `revisions.retain` revisions per variant (100 by
+default) plus the published and any schedule-pinned revision.
+
+### Localization
+
+- Each variant has its own draft, published state, revisions, slug and
+  schedules. The first `PUT` with `If-None-Match: *` for a locale creates it;
+  the default variant need not exist first.
+- Shared fields (`localized = false`) belong to the default variant. Writing
+  one through another locale fails with `field_not_localized`. The host copies
+  shared values into the other variants' `draft_data` on each default save and
+  into the other `published` rows on each default publish. Until the default
+  variant is published, other locales deliver without shared fields. Their
+  `required` checks run when the default variant publishes.
+- Fallback is per variant, not per field. Every chain implicitly ends at the
+  default locale, and a non-localized type is served in every locale from its
+  default variant. `fr-BE` serves the `fr-BE` variant if published, else `fr`,
+  else `en`, and says which in `sys.source_locale`. `fallback=false` turns it
+  off. Because `published` stores the resolved rows, a delivery query reads
+  one indexed table. A fallback change in the model is additive and rebuilds
+  those rows in batches at activation.
+- `DELETE .../{id}/{locale}` removes a non-default variant with its history.
+  The default variant goes only with the entry (`default_variant_required`).
+- A slug lookup prefers the entry whose own variant has the slug, then fallback
+  rows in chain order. Uniqueness applies to own slugs only.
+
+### Soft delete and purge
+
+Deleting an entry sets `deleted_at`, marks its variants `deleted`, removes its
+`published` rows and refs, cancels pending schedules and frees its unique
+values (unique indexes skip deleted rows). It appends
+`content.entry_unpublished` per live locale and one `content.entry_deleted`.
+With `if_unreferenced=true` it fails with `entry_referenced` while anything
+still points at it. Undelete restores drafts only; a unique value taken
+meanwhile fails it with `unique` details.
+
+The recurring job `content.trash_purge`, declared through
+`JobsHandle::schedule` with `trash.purge_cron` (AP §B.7), hard-deletes entries
+trashed longer than `trash.retention`, 100 per batch, cascading to variants,
+revisions, refs and schedules, and appends `content.entry_purged`.
+`purge=true` with `content.entries.purge` does it at once, for erasure
+requests. Assets follow the same pattern (section 6).
+
+## 5. APIs
+
+### Conventions
+
+- Management lives under `/v1/content/manage/`, delivery under
+  `/v1/content/`, organization delivery under `/v1/content/o/{organization}/`.
+- Bodies are bounded by `limits.max_request_bytes`, draft data by
+  `limits.max_entry_bytes`. Errors use the platform shape
+  `{error: {code, classification, details?}}` (R8); content registers its
+  codes and statuses in the kernel's error registry at startup.
+- The edge `Authenticator` supplies the principal. The `Authorizer` gets
+  `(principal, permission, scope)` with K's `ResourceScope` (R5): `Application`
+  for application-scoped types and assets, `Tenant(org)` for organization
+  ones, and `Resource { tenant, kind: "content_type", id: "<type>" }` for
+  per-type checks.
+- Timestamps are RFC 3339 UTC with milliseconds. Every query sets
+  `statement_timeout` from the request deadline, capped by
+  `limits.query_timeout`.
+
+### Permissions
+
+The content block contributes these permissions to the RBAC catalog:
+
+| Permission | Grants |
+| --- | --- |
+| `content.model.read` | Read the full content model through the management API. |
+| `content.entries.read` | List and read drafts, revisions, referrers, schedules and trash. |
+| `content.entries.write` | Create entries, save and patch drafts, restore revisions, delete a non-default variant. |
+| `content.entries.publish` | Publish, unpublish, batch publish, schedule and cancel schedules. |
+| `content.entries.delete` | Move entries to the trash and undelete them. |
+| `content.entries.purge` | Hard-delete entries immediately. |
+| `content.assets.read` | List assets and read any asset file through the management API. |
+| `content.assets.write` | Upload assets and edit their metadata. |
+| `content.assets.delete` | Delete, undelete and purge assets, including `force` deletes. |
+| `content.delivery.read` | Read published entries of types declaring `access = { permission = "content.delivery.read" }`. A ready-made permission so projects need not declare their own. |
+| `content.preview` | Read drafts through the delivery API with `stage=draft`. |
+
+Entry permissions and permission-based `access` are checked in the type's
+resource scope, `Resource { tenant, kind: "content_type", id: "article" }`.
+An `Application` grant satisfies it for application-scoped types and a
+`Tenant` grant for organization ones, so application-level roles (R5) cover
+whole-app editors and a resource grant lets a role publish `article` only.
+Model reads, assets and preview are checked at `Application` or `Tenant(org)`
+scope. Batch publish checks every item. Without identity, content starts only
+on a loopback listener with the explicit `AllowAll` policy; otherwise startup
+fails with `identity_required`.
+
+### Entry JSON
+
+Management, one variant (`GET .../entries/article/{id}/fr`, `ETag: "r12"`):
+
+```json
+{
+  "sys": {
+    "id": "0192f7a0-5d1c-7c3e-9b1a-6f0e2c4d8a11", "type": "article", "locale": "fr",
+    "status": "changed", "draft_revision": 12, "published_revision": 9, "model_version": 3,
+    "created_at": "2026-10-01T10:00:00.000Z", "created_by": "usr_0192f5c4...",
+    "updated_at": "2026-10-22T16:41:07.512Z", "updated_by": "usr_0192f5c4...",
+    "published_at": "2026-10-20T09:12:44.120Z", "first_published_at": "2026-10-02T08:00:00.000Z",
+    "schedules": [{ "id": "0192...", "action": "publish", "revision": 12, "at": "2026-11-02T08:00:00.000Z" }]
+  },
+  "fields": {
+    "title": "Notes de version 1.4", "slug": "notes-de-version-1-4", "category": "release",
+    "author": { "id": "0192f79f-...", "type": "author" }, "tags": ["release", "api"],
+    "sections": [{ "_type": "quote", "_key": "k7Qa", "text": "Ship small." }],
+    "reading_minutes": 4
+  }
+}
+```
+
+Delivery (`GET /v1/content/article/{id}?locale=fr-BE&populate=author`):
+
+```json
+{
+  "sys": {
+    "id": "0192f7a0-5d1c-7c3e-9b1a-6f0e2c4d8a11", "type": "article", "locale": "fr-BE",
+    "source_locale": "fr", "revision": 9,
+    "published_at": "2026-10-20T09:12:44.120Z", "first_published_at": "2026-10-02T08:00:00.000Z"
+  },
+  "fields": {
+    "title": "Notes de version 1.4",
+    "author": {
+      "id": "0192f79f-...", "type": "author",
+      "entry": { "sys": { "id": "0192f79f-...", "type": "author", "locale": "fr-BE", "source_locale": "en", "revision": 3 },
+                 "fields": { "name": "Ada" } }
+    },
+    "seo": { "image": { "id": "0192f7a1-...", "alt": "Photo d'équipe",
+                        "asset": { "filename": "team.jpg", "content_type": "image/jpeg", "width": 1600, "height": 900, "url": "..." } } }
+  }
+}
+```
+
+`sys` keeps system attributes apart from field names. Delivery always expands
+asset metadata (one batched query). A reference is `{"id", "type"}`, gains
+`entry` when populated, and becomes `{"id", "type", "missing": true}` when the
+target is not visible. `url` is a path, absolute when
+`delivery.public_base_url` is set.
+
+### Management routes
+
+All paths are under `/v1/content/manage`. `{type}` is a content type,
+`{locale}` a configured locale.
+
+| Method and path | Permission | Request | Success |
+| --- | --- | --- | --- |
+| `GET /model` | `content.model.read` | none | 200 `{version, fingerprint, locales, components, types}` in model order. |
+| `GET /entries/{type}` | `content.entries.read` | query: `locale`, `status` (`draft`, `published`, `changed`, `any`), `scheduled`, `filter[...]`, `sort`, `limit`, `cursor`, `fields` | 200 `{items: [variant], page: {next_cursor, limit}}` |
+| `POST /entries/{type}` | `content.entries.write` | `{id?, locale?, fields}` | 201 variant, `ETag: "r1"`, `Location` |
+| `GET /entries/{type}/{id}` | `content.entries.read` | none | 200 `{sys: {id, type, created_at, deleted_at}, variants: [{locale, status, draft_revision, published_revision, updated_at}]}` |
+| `GET /entries/{type}/{id}/{locale}` | `content.entries.read` | `fields`, `populate` (drafts) | 200 variant, `ETag` |
+| `PUT /entries/{type}/{id}/{locale}` | `content.entries.write` | `{fields}`, `If-Match` or `If-None-Match: *` | 200 or 201 variant, new `ETag` |
+| `PATCH /entries/{type}/{id}/{locale}` | `content.entries.write` | merge patch over `{fields}`, `If-Match` | 200 variant |
+| `DELETE /entries/{type}/{id}/{locale}` | `content.entries.write` | `If-Match` | 204 |
+| `POST /entries/{type}/{id}/{locale}/publish` | `content.entries.publish` | `{revision?}`, `If-Match` | 200 variant |
+| `POST /entries/{type}/{id}/{locale}/unpublish` | `content.entries.publish` | `If-Match` | 200 variant |
+| `POST /entries/{type}/{id}/{locale}/schedule` | `content.entries.publish` | `{action, at}`, `If-Match` | 201 schedule |
+| `GET /entries/{type}/{id}/{locale}/revisions` | `content.entries.read` | `limit`, `cursor` | 200 `{items: [{revision, kind, restored_from, model_version, created_at, created_by, title, published}], page}` |
+| `GET /entries/{type}/{id}/{locale}/revisions/{n}` | `content.entries.read` | none | 200 variant shape with that revision's fields |
+| `POST /entries/{type}/{id}/{locale}/revisions/{n}/restore` | `content.entries.write` | `If-Match` | 200 variant plus `warnings` |
+| `GET /entries/{type}/{id}/referrers` | `content.entries.read` | `stage`, `limit`, `cursor` | 200 `{items: [{id, type, locale, stage, path, title}], page}` |
+| `DELETE /entries/{type}/{id}` | `content.entries.delete`, plus `content.entries.purge` with `purge=true` | `if_unreferenced`, `purge` | 204 |
+| `POST /entries/{type}/{id}/undelete` | `content.entries.delete` | none | 200 entry summary |
+| `GET /trash` | `content.entries.read` | `type`, `limit`, `cursor` | 200 `{items: [{id, type, deleted_at, deleted_by, title}], page}` |
+| `GET /singletons/{type}/{locale}` | `content.entries.read` | as variant GET | 200 variant, or 404 `entry_not_found` before first save |
+| `PUT`, `PATCH /singletons/{type}/{locale}` | `content.entries.write` | as above; the first `PUT` with `If-None-Match: *` creates the entry | 200 or 201 |
+| `POST /singletons/{type}/{locale}/publish`, `/unpublish`, `/schedule`; `GET /singletons/{type}/{locale}/revisions[/{n}]`; `POST .../revisions/{n}/restore` | as for entries | as for entries | as for entries |
+| `GET /schedules` | `content.entries.read` | `from`, `to`, `state`, `limit`, `cursor` | 200 `{items: [schedule], page}` |
+| `DELETE /schedules/{id}` | `content.entries.publish` | none | 204, state becomes `cancelled` |
+| `POST /batch/publish` | `content.entries.publish` per item | `{items: [{type, id, locale, revision}]}` | 200 `{items: [variant]}` |
+| `POST /batch/unpublish` | `content.entries.publish` per item | `{items: [{type, id, locale}]}` | 200 `{items: [variant]}` |
+| `POST /assets` | `content.assets.write` | raw body, `Content-Type`, query `filename`, optional `title` | 201 asset |
+| `GET /assets` | `content.assets.read` | `content_type` (exact or `image/*`), `filename_prefix`, `limit`, `cursor` | 200 `{items: [asset], page}` |
+| `GET /assets/{id}` | `content.assets.read` | none | 200 asset with `usage: {draft, published}` counts |
+| `PATCH /assets/{id}` | `content.assets.write` | merge patch over `{title, focal_point}` | 200 asset |
+| `GET /assets/{id}/file` | `content.assets.read` | `Range` | 200 or 206 bytes, any asset state except purged |
+| `DELETE /assets/{id}` | `content.assets.delete` | `force`, `purge` | 204, or 409 `asset_in_use` |
+| `POST /assets/{id}/undelete` | `content.assets.delete` | none | 200 asset |
+
+Batch publish items carry `revision` in place of `If-Match`.
+
+### Delivery routes
+
+| Method and path | Access | Query | Success |
+| --- | --- | --- | --- |
+| `GET /v1/content/model` | anyone; each type filtered by its `access` | none | 200 the model restricted to types the caller can read |
+| `GET /v1/content/{type}` (collection) | the type's `access` | `locale`, `fallback`, `filter[...]`, `sort`, `limit`, `cursor`, `fields`, `populate`, `stage` | 200 `{items: [entry], page: {next_cursor, limit}}` |
+| `GET /v1/content/{type}` (singleton) | same | `locale`, `fallback`, `fields`, `populate`, `stage` | 200 entry, or 404 |
+| `GET /v1/content/{type}/{id}` | same | `locale`, `fallback`, `fields`, `populate`, `stage` | 200 entry |
+| `GET /v1/content/{type}/by-slug/{slug}` | same | same | 200 entry |
+| `GET /v1/content/assets/{id}/{filename}` | asset referenced by a published entry the caller can read | `Range` | 200 or 206 bytes, or 302 in redirect mode |
+| Each of the above under `/v1/content/o/{organization}/...` | for organization-scoped types | same | same |
+
+`stage=draft` needs `content.preview` and reads `variants` with the same
+fallback, filters and population, resolving referenced drafts too. Draft
+fallback is resolved per query (`DISTINCT ON` over the chain), so preview
+lists are slower than delivery lists. Preview responses are
+`private, no-store` without ETag. Delivery never distinguishes unpublished
+from absent: both are `entry_not_found`.
+
+### Filters
+
+Syntax: `filter[<field>][<op>]=<value>`, repeated keys for `in` and `has`.
+System fields use the `sys.` prefix: `sys.id`, `sys.created_at`,
+`sys.updated_at` (management), `sys.published_at` (delivery). Clauses are
+combined with AND; there is no OR in v1. At most `limits.max_filters` clauses
+and 50 values per `in`.
+
+| Operator | Field types | Requires | SQL shape |
+| --- | --- | --- | --- |
+| `eq`, `in` | scalars, single `reference` (by id) | `filterable` | `data @> '{"f": v}'` per value, OR within `in`, GIN index |
+| `has` | `list` of scalars, `reference` with `many` | `filterable` | `data @> '{"f": [v]}'` (references match `{"id": v}`) |
+| `ne` | scalars | `filterable` | `NOT (data @> ...)` after indexed predicates |
+| `exists` (`true`, `false`) | all top-level fields | `filterable` | `data ? 'f'` |
+| `lt`, `lte`, `gt`, `gte` | `integer`, `float`, `decimal`, `date`, `datetime`, `string` | `sortable` | typed expression, B-tree derived index |
+
+Values parse by field type with the write rules (decimals normalize to the
+field's scale). Unknown fields, missing flags and bad values are
+`invalid_filter` with `details`.
+
+### Sorting and pagination
+
+`sort=-reading_minutes,title` takes up to `limits.max_sort_keys` sortable
+fields or `sys.` timestamps; `entry_id` is always the final key. Nulls sort
+last both ways, which is why index expressions start with `IS NULL`. Defaults
+are `-sys.updated_at` (management) and `-sys.published_at` (delivery).
+
+Pagination is keyset only, `limit` 25 by default and 100 at most.
+`next_cursor` (null on the last page) is base64url of
+`{"v":1,"q":"<16 hex of query fingerprint>","k":[last sort values],"id":"..."}`.
+The fingerprint covers type, scope, stage, locale, fallback, filters and sort,
+so a cursor reused on another query is `invalid_cursor`. There are no totals:
+counting a filtered JSONB set on every page is the cost this design avoids.
+
+### Field selection and population
+
+`fields=title,slug,author` limits top-level fields; `sys` is always present.
+`populate=author,body,body.author` expands entry references along dotted paths
+(asset fields never need it), at most `limits.max_populate_depth` segments
+(default 2, ceiling 3), one batched query per level in the same stage and
+locale chain. Rich text populates its `entry_link` annotations. Past
+`limits.max_populated_entries` the request fails with `populate_limit` rather
+than truncating. A target the caller may not read, under its own type's
+`access`, stays a `missing` reference. Populated entries carry all their
+fields.
+
+### Caching
+
+Delivery responses for the published stage carry a weak ETag built without
+running the query:
+
+```text
+W/"<8 hex of model fingerprint>-<scope generation>-<16 hex of SHA-256(canonical query, access class)>"
+```
+
+Every publish, unpublish, delete, rebuild, `access` change or asset metadata
+change bumps the scope's row in `generations` inside the transaction that
+makes the change. An organization response that populates application entries
+includes both generations. On a matching `If-None-Match` the host reads those
+rows and answers 304 without touching entries. The price is one contended row
+update per publish in a scope, which is fine at CMS write rates.
+
+`Cache-Control` is `delivery.cache_control_public` for `access = "public"`
+types read anonymously (default `public, max-age=60, stale-while-revalidate=300`)
+and `delivery.cache_control_private` otherwise (default `private, no-cache`).
+Responses vary on `Authorization` and `Cookie`. Management responses are always
+`private, no-store`, with strong revision ETags on single variants.
+
+### Error codes
+
+| Code | HTTP | Classification | When |
+| --- | --- | --- | --- |
+| `unauthenticated` | 401 | permanent | The type's `access` or the route needs a principal and there is none. |
+| `unauthorized` | 403 | permanent | Principal lacks the permission, or an `authenticated` organization type is read with another tenant. |
+| `tenant_required` | 403 | permanent | Organization-scoped type and the principal has no active organization. |
+| `content_type_not_found`, `entry_not_found`, `revision_not_found`, `asset_not_found`, `schedule_not_found` | 404 | permanent | Absent, pruned, or not visible to this caller in this stage. |
+| `locale_unknown` | 400 | permanent | Locale not configured or retired. |
+| `invalid_query`, `invalid_filter`, `invalid_sort`, `invalid_cursor`, `populate_limit` | 400 | permanent | Query parameter problems, with `details`. |
+| `invalid_json` | 400 | permanent | Body is not JSON, has duplicate keys at the top level, or has unknown top-level keys. |
+| `validation_failed` | 422 | permanent | Field rules, with `details`. |
+| `schedule_invalid` | 422 | permanent | Time in the past or beyond the horizon. |
+| `variant_exists`, `revision_conflict` | 412 | conflict | `If-None-Match: *` on an existing variant; `If-Match` not the draft revision. |
+| `precondition_required` | 428 | permanent | Missing `If-Match`. |
+| `entry_exists`, `entry_referenced`, `asset_in_use`, `schedule_conflict`, `default_variant_required`, `singleton_exists` | 409 | conflict | Client id taken; referrers exist with `if_unreferenced`; asset referenced without `force`; pending schedule exists; default variant deleted alone; second singleton entry. |
+| `body_limit`, `asset_too_large` | 413 | permanent | Body or draft data too large; upload over `media.max_upload_bytes`. |
+| `media_type_rejected` | 415 | permanent | Type not allowed, or the bytes do not match the declared type. |
+| `range_not_satisfiable` | 416 | permanent | |
+| `overloaded` | 503 | transient | `media.max_concurrent_uploads` reached; `Retry-After: 1`. |
+| `blob_unavailable` | 503 | transient | Blob store failure after its bounded retries. |
+| `timeout` | 504 | transient | Request deadline or statement timeout. |
+| `internal` | 500 | transient | Anything else. Logged with the request id. |
+
+Codes are unprefixed (R8); the cross-cutting ones keep their canonical
+statuses. Startup and readiness codes: `content_model_invalid`,
+`content_model_version_unchanged`, `content_model_outdated`,
+`content_model_breaking`, `content_model_pending` (the domain term "content
+model", not a module prefix), `unique_conflict`, `identity_required`,
+`media_config_invalid`, `index_build_pending`.
+
+## 6. Media
+
+### BlobStore port
+
+The framework places `BlobStore` in `merezha-platform`. Content owns its
+shape, and the kernel adopts it in K2 (R13): streaming put and get, `head`,
+idempotent delete, and signed URLs where the backend supports them.
+
+```rust
+use std::{io, ops::Range, path::PathBuf, time::Duration};
+use bytes::Bytes;
+use futures_util::{future::BoxFuture, stream::BoxStream};
+
+pub struct BlobKey(String); // 1..1024 bytes, segments of [A-Za-z0-9._-], no '.' or '..'
+pub enum BlobBody {
+    Bytes(Bytes),
+    File { path: PathBuf, len: u64 },                      // a spooled upload
+    Stream { body: BoxStream<'static, io::Result<Bytes>>, len: Option<u64> },
+}
+pub struct BlobAttributes {
+    pub content_type: String,
+    pub content_disposition: String,
+    pub cache_control: Option<String>,
+}
+pub struct BlobStat { pub size: u64, pub etag: Option<String> }
+pub struct BlobRead {
+    pub stat: BlobStat,
+    pub range: Option<Range<u64>>,
+    pub body: BoxStream<'static, io::Result<Bytes>>,
+}
+pub enum BlobError {
+    NotFound,                  // permanent
+    Invalid(&'static str),     // permanent, never reached the backend
+    Rejected(&'static str),    // permanent, 4xx from the backend
+    Unavailable(&'static str), // transient, after bounded retries
+}
+
+pub trait BlobStore: Send + Sync + 'static {
+    fn put<'a>(&'a self, key: &'a BlobKey, body: BlobBody, attrs: &'a BlobAttributes)
+        -> BoxFuture<'a, Result<BlobStat, BlobError>>;
+    fn get<'a>(&'a self, key: &'a BlobKey, range: Option<Range<u64>>)
+        -> BoxFuture<'a, Result<BlobRead, BlobError>>;
+    fn head<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, Result<BlobStat, BlobError>>;
+    fn delete<'a>(&'a self, key: &'a BlobKey) -> BoxFuture<'a, Result<(), BlobError>>; // idempotent
+    fn signed_get_url<'a>(&'a self, key: &'a BlobKey, ttl: Duration)
+        -> BoxFuture<'a, Result<Option<String>, BlobError>>; // None when unsupported
+}
+```
+
+Boxed futures keep the trait object-safe without the `async-trait` macro.
+Every body is written in parts as it arrives, so no put buffers a whole file.
+Like Structure's `@structure-ai/storage`, the port has validated keys,
+idempotent delete, typed transient and permanent failures, streaming bodies
+and a head-based readiness probe. It drops `list` and per-object metadata,
+because PostgreSQL tracks every blob. The serving policy (attachment by
+default, an inline allowlist, `nosniff` always) sits in the content block's
+serving code, one layer above the port.
+
+### Driver crate: `object_store`
+
+| Option | Version checked | Verdict |
+| --- | --- | --- |
+| `object_store` | 0.14.2, MSRV 1.85, MIT/Apache-2.0 | Chosen. |
+| `aws-sdk-s3` | 1.155.0, MSRV 1.94.1, Apache-2.0 | Rejected. Full AWS SDK runtime (smithy, credential chain, its own HTTP stack), a large dependency tree and compile time, for four operations. |
+| `rust-s3` | 0.38.0, no declared MSRV, MIT | Rejected. Single-maintainer crate with a history of breaking API changes and no declared MSRV. |
+
+`object_store`, maintained by the Apache Arrow project, gives both drivers
+behind one API: `LocalFileSystem`, and `AmazonS3` for AWS, MinIO, R2, Garage
+and other S3-compatible stores. It streams multipart uploads
+(`WriteMultipart`), serves byte ranges, sets type, disposition and cache
+headers through `Attributes`, and signs GET URLs (`Signer`). The `aws` feature
+uses reqwest 0.13 with rustls and pulls `aws-lc-rs`, so the build needs a C
+compiler, as bundled SQLite already does. Its retries are bounded
+(`max_retries = 3`, `retry_timeout = 10s`). That is a deliberate exception to
+the platform's no-retry rule: operations on content-addressed keys are
+idempotent.
+
+The host creates `media.local.root` with mode 0700 if missing and refuses a
+root writable by group or others. Keys never contain user input. The local
+driver has no signed URLs, so `serve = "redirect"` with `driver = "local"`
+fails startup with `media_config_invalid`.
+
+### Keys
+
+Blobs are content-addressed per scope at
+`content/<scope tag>/sha256/<hex[0..2]>/<hex[2..4]>/<hex>`. `<scope tag>` is
+`app`, or `org-` plus 32 hex characters of the organization id's SHA-256,
+keeping ids out of bucket listings. Deduplication stays within a scope; across
+organizations it would reveal that another tenant uploaded a file.
+
+### Upload flow
+
+Direct streaming upload through the host is the only upload path in v1:
+`POST /v1/content/manage/assets?filename=team.jpg&title=Team` with the raw
+bytes as body and `Content-Type: image/jpeg`.
+
+1. Admission: beyond `media.max_concurrent_uploads` the host answers
+   `overloaded` (503, `Retry-After: 1`). A `Content-Length` over
+   `media.max_upload_bytes` fails before reading. The route uses its own body
+   limit instead of the edge's.
+2. The declared type, parameters stripped, must be in `media.allowed_types`.
+   The filename is reduced to `[A-Za-z0-9._-]`, at most 200 bytes, with an
+   extension matching the type.
+3. The body streams into a `tempfile` in `media.spool_dir` while the host
+   counts bytes and feeds SHA-256. Passing the limit aborts with
+   `asset_too_large`.
+4. `infer` sniffs the first 8 KiB. A recognized type must match the declared
+   one (`image/jpg` counts as `image/jpeg`). If nothing is recognized, the
+   declared type must be `text/plain`, `text/csv`, `application/json` or
+   `image/svg+xml`, the file valid UTF-8, and SVG must have an `<svg` root.
+   Otherwise `media_type_rejected`.
+5. `imagesize` reads raster dimensions from the header without decoding
+   pixels. More than 50,000 pixels on a side is rejected as malformed.
+6. Blob claim, own transaction: insert a `pending` blob with
+   `pending_until = now() + upload deadline`, or read the existing row. A
+   `stored` row skips the put (dedupe). An `orphaned` row flips back to
+   `stored` with a guarded update. A `deleting` row is retried for up to 2
+   seconds, then `blob_unavailable`.
+7. `BlobStore::put` from the spool file. Two uploads of the same bytes may
+   both put; the key is the hash, so they write the same object.
+8. One transaction sets the blob `stored`, inserts the asset and appends
+   `content.asset_uploaded`. The response is 201 with the asset.
+
+A crash between 6 and 8 leaves a `pending` row; cleanup removes it and the
+object once the lease expires. The spool file is removed on every exit path,
+and startup clears spool files older than one hour.
+
+Direct upload beats presigned PUT URLs (not in v1, owner answer CT2) because
+the host sees every byte before the asset exists. Size, type sniffing, hashing
+and dimensions use one code path for both drivers, and the bucket needs no
+CORS policy. The cost is that large files pass through the host, hence the
+50 MiB default. The host stores bytes unchanged: no resizing or transcoding
+(CT3; imgproxy or a CDN in front of redirect mode can use the dimensions and
+`focal_point`) and no EXIF or GPS stripping (CT4).
+
+### Asset JSON
+
+```json
+{ "id": "0192f7a1-0b44-7aa2-8c55-1d3e9f20a7b4", "filename": "team.jpg", "content_type": "image/jpeg",
+  "size": 248113, "sha256": "9f2c...e01a", "width": 1600, "height": 900, "title": "Team",
+  "focal_point": { "x": 0.5, "y": 0.35 }, "created_at": "2026-10-22T16:41:07.512Z", "created_by": "usr_0192f5c4...",
+  "updated_at": "2026-10-22T16:41:07.512Z", "deleted_at": null,
+  "url": "/v1/content/assets/0192f7a1-0b44-7aa2-8c55-1d3e9f20a7b4/team.jpg" }
+```
+
+`filename` and bytes are immutable; a new file is a new asset, so asset URLs
+stay stable.
+
+### Serving
+
+Delivery serves an asset only if it is not deleted and a published variant of
+a type the caller can read references it. Draft-only uploads stay unreachable
+even with a guessed id. The filename segment must match, otherwise 404.
+
+Proxy mode (`serve = "proxy"`, default) streams from the blob store with the
+asset's `Content-Type`; `Content-Disposition: inline` only for
+`media.inline_types`, else `attachment; filename="<filename>"` (SVG, HTML and
+PDF are never inline on the API origin); `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: default-src 'none'; sandbox` always; `ETag:
+"<sha256>"`; and `media.asset_cache_control` (`private` when the referencing
+type's `access` is not `public`). It is not `immutable`, because unpublishing
+must take effect. A single byte range gets 206 for video seeking; multiple
+ranges get the full body.
+
+Redirect mode (S3 only) answers 302 to a presigned GET URL valid for
+`media.signed_url_ttl`, with `Cache-Control: private, max-age=<ttl - 30 s>`.
+Type and disposition come from attributes set at put time; a blob is shared
+across assets, so that disposition is `inline` for inline types and a
+filename-less `attachment` otherwise. Use it when the bucket has its own
+domain or CDN, which also keeps user files off the API origin.
+
+Management `GET /assets/{id}/file` always proxies with `attachment`.
+
+### Deletion and orphan cleanup
+
+- `DELETE /assets/{id}` fails with `asset_in_use` while refs point at it,
+  unless `force=true`. Forced deletes leave references in place: delivery
+  shows `"asset": null` and saves report `asset_not_found`.
+- Deletion is soft. After `trash.retention` the purge job deletes the row
+  and, in the same transaction, marks the blob `orphaned` if no other asset
+  uses it.
+- `content.blob_cleanup` (`media.cleanup_cron`, at most 1000 blobs per run)
+  claims orphaned blobs older than `media.orphan_grace` and pending blobs
+  with an expired lease by setting `deleting` (`FOR UPDATE SKIP LOCKED`),
+  commits, calls `BlobStore::delete`, then deletes the row. A failed delete
+  restores the previous state. The guarded state change makes an upload and
+  cleanup racing on the same blob end with exactly one winner.
+
+## 7. Events
+
+Every event is an outbox record appended inside the transaction of the change
+(R1): `OutboxTarget::Event { topic }` with the event type as topic, source
+`content`, and the event id (a UUIDv7 minted once per change) as dedupe key.
+The envelope (event id, type, version, time, correlation) is AP's (R11); the
+trace context travels in the outbox record's columns (R10). `context.tenant`
+is the organization for organization scope and unset for application scope.
+Events carry ids and metadata, never field values or filenames, so no record
+is flagged `contains_secret`; consumers fetch content through the APIs, which
+apply access rules, and personal data stays out of webhook payloads and dead
+letters.
+
+| Event type (version 1) | Payload | Emitted by |
+| --- | --- | --- |
+| `content.entry_draft_saved` | `scope, type, id, locale, revision, actor` | create, save, patch, restore |
+| `content.entry_published` | `scope, type, id, locale, revision, slug, published_at, first_publish, actor, schedule_id?` | publish, batch, schedule |
+| `content.entry_unpublished` | `scope, type, id, locale, actor, reason (unpublish, delete, schedule)` | unpublish, delete, schedule |
+| `content.entry_deleted` | `scope, type, id, actor` | soft delete |
+| `content.entry_undeleted` | `scope, type, id, actor` | undelete |
+| `content.entry_purged` | `scope, type, id` | purge, retention |
+| `content.scheduled_action_failed` | `scope, type, id, locale, schedule_id, action, code` | schedule handler |
+| `content.asset_uploaded` | `scope, id, content_type, size, sha256, actor` | upload |
+| `content.asset_updated` | `scope, id, actor` | metadata patch |
+| `content.asset_deleted` | `scope, id, actor, forced` | delete |
+| `content.model_activated` | `version, fingerprint, previous_version, change_classes` | activation |
+
+`actor` is the principal subject and kind; system work uses its `sys_<name>`
+subject (R13). Fallback rows (a `fr-BE` row now served from `fr`) emit no
+events of their own; consumers that cache by locale invalidate on the entry
+id.
+
+Content never calls URLs and never calls `Notifier::emit_webhook` (R11).
+Notifications subscribes to the `content.*` topics through AP subscriptions
+(`JobsHandle::subscribe`) and delivers signed webhooks with its own retries
+and dead-lettering: organization events to that organization's endpoints,
+application events to application-level endpoints (NT6). A typical project
+points its frontend's revalidation endpoint at `content.entry_published` and
+`content.entry_unpublished`.
+
+## 8. Multi-tenancy
+
+Decision: each content type declares its scope.
+
+- `scope = "application"` (default), stored as `'app'`: the marketing site,
+  docs or app-wide catalog. Most projects use only this.
+- `scope = "organization"`, stored as `'org:<organization id>'`: each
+  organization manages its own entries, such as a help center per customer.
+  Requires identity with organizations.
+
+Management takes the organization from `Principal.tenant`, so a session or API
+key acts in its active organization and cannot name another
+(`tenant_required` without one). Checks then run in `Tenant(org)` or a
+resource scope inside it, so organization roles apply; application-scoped
+types are checked in `Application` scope, so application-level roles and
+application-scoped API keys apply (R5). Delivery puts it in the path,
+`/v1/content/o/{organization}/{type}`, because anonymous readers have no
+tenant. Content never reads identity tables; an unknown organization simply
+has no entries. References and assets may stay within a scope or point from an
+organization to the application scope, never the other way or across
+organizations.
+
+Uniqueness, slugs, singletons, generations and blob deduplication are per
+scope. One database per application means no application column, and the
+multi-application platform keeps that rule, so the layout survives it.
+
+## 9. Configuration and telemetry
+
+### `[modules.content]`
+
+| Key | Type | Default | Range or rule |
+| --- | --- | --- | --- |
+| `model` | path | `"content.toml"` | Relative to `merezha.toml`, inside the project. |
+| `limits.max_request_bytes` | int | 1048576 | 1024 to 8388608. Does not apply to uploads. |
+| `limits.max_entry_bytes` | int | 262144 | 1024 to 1048576, canonical JSON of one variant's fields. |
+| `limits.default_page_size` | int | 25 | 1 to `max_page_size`. |
+| `limits.max_page_size` | int | 100 | 1 to 500. |
+| `limits.max_filters` | int | 10 | 1 to 32. |
+| `limits.max_sort_keys` | int | 2 | 1 to 4. |
+| `limits.max_populate_depth` | int | 2 | 0 to 3. |
+| `limits.max_populated_entries` | int | 500 | 1 to 2000. |
+| `limits.max_batch` | int | 100 | 1 to 500. |
+| `limits.query_timeout` | duration | `"5s"` | 100 ms to 30 s. |
+| `revisions.retain` | int | 100 | 2 to 10000. |
+| `trash.retention` | duration | `"30d"` | 1 day to 3650 days. |
+| `trash.purge_cron` | cron | `"23 3 * * *"` | Validated by AP's cron parser (§B.7). |
+| `schedule.max_horizon` | duration | `"365d"` | 1 day to 365 days, AP's delayed-job ceiling. |
+| `delivery.public_base_url` | URL | none | `https` unless the listener is loopback. Makes asset and `Location` URLs absolute. |
+| `delivery.cache_control_public` | string | `"public, max-age=60, stale-while-revalidate=300"` | Header-safe characters only. |
+| `delivery.cache_control_private` | string | `"private, no-cache"` | |
+| `media` | section | absent | Media is on when `[modules.content.media]` is present; absent rejects `asset` fields in the model. |
+| `media.driver` | `local`, `s3` | `local` | |
+| `media.local.root` | absolute path | required for `local` | Created 0700 if missing. |
+| `media.s3.bucket` | string | required for `s3` | |
+| `media.s3.region` | string | required for `s3` | |
+| `media.s3.endpoint` | URL | AWS | No query or fragment. |
+| `media.s3.path_style` | bool | `true` | Virtual-hosted style when `false`. |
+| `media.s3.allow_http` | bool | `false` | Must be `true` for a plain HTTP MinIO endpoint. |
+| `media.s3.access_key_id` | secret | required for `s3` | `{ env = "..." }` or `{ file = "..." }`. |
+| `media.s3.secret_access_key` | secret | required for `s3` | |
+| `media.s3.timeout` | duration | `"30s"` | 1 s to 300 s, per request. |
+| `media.s3.key_prefix` | string | `""` | Key-safe characters. Prepended to every key. |
+| `media.serve` | `proxy`, `redirect` | `proxy` | `redirect` needs `s3`. |
+| `media.signed_url_ttl` | duration | `"5m"` | 60 s to 3600 s. |
+| `media.max_upload_bytes` | int | 52428800 | 1024 to 5368709120. |
+| `media.max_concurrent_uploads` | int | 4 | 1 to 64. |
+| `media.allowed_types` | string list | png, jpeg, gif, webp, avif, svg+xml, pdf, mp4, webm, mpeg audio, ogg audio, plain text, csv | Bare MIME types. |
+| `media.inline_types` | string list | png, jpeg, gif, webp, avif, plain text | Must be a subset of `allowed_types`. HTML, SVG, XML and PDF are refused. |
+| `media.spool_dir` | absolute path | `<OS temp dir>/merezha-content` | Same filesystem rules as `local.root`. |
+| `media.asset_cache_control` | string | `"public, max-age=3600"` | |
+| `media.orphan_grace` | duration | `"1d"` | 1 hour to 30 days. |
+| `media.cleanup_cron` | cron | `"47 3 * * *"` | |
+
+Durations use K's duration type (R12): `"500ms"`, `"30s"`, `"15m"`, `"7d"`.
+Queue settings for the `content` queue live under `[jobs.queues.content]`, not
+here (R1). Unknown keys and invalid combinations fail startup with every error
+at once, as the platform requires. The blob store contributes to readiness with a
+`head` of the fixed key `content/readiness/probe`; found or not found both
+count as ready.
+
+### Telemetry
+
+TE's `names.rs` is the only catalog of names (R9). The rows below are what
+content needs; TE adds them to the catalog in the slice that ships each
+signal (TE-T6), and the catalog's spelling wins. Durations are in seconds.
+Attributes carry the `content.` prefix so TE's allowlist keeps them:
+`content.type`, `content.locale`, `content.stage`, `content.driver`,
+`content.operation`, `content.outcome`, `content.code`, `content.job`; route
+and status class come from TE's HTTP attributes. HTTP request durations come
+from TE's server instrument, not a content metric. Entry ids appear only in
+traces; tenant ids follow TE's default (on), user ids are off (TE1). Field
+values, filenames, slugs and filter values never appear in any signal.
+
+- Histograms: `merezha.content.populate.entries`, `merezha.content.query.rows`,
+  `merezha.content.schedule.lag` (s, run time minus `run_at`),
+  `merezha.content.upload.bytes`, `merezha.content.blob.duration` (s).
+- Counters: `merezha.content.delivery.not_modified`, `merezha.content.entries.saved`,
+  `merezha.content.entries.published`, `merezha.content.entries.unpublished`,
+  `merezha.content.validation.failures` (by detail code),
+  `merezha.content.revision_conflicts`, `merezha.content.schedule.failures`,
+  `merezha.content.upload.rejected`, `merezha.content.blobs.cleaned`,
+  `merezha.content.migration.rows`. Blob errors are the `failed` series of
+  `merezha.content.blob.duration`.
+- Spans: TE's `content {operation}`, with operations `entry.save`,
+  `entry.publish`, `materialize`, `delivery.query`, `populate`,
+  `asset.upload`, `blob.put`, `blob.get`, `schedule.run`.
+- Log events, in TE's `<area>.<noun>_<verb>` form: `content.model_loaded`,
+  `content.model_activated`, `content.model_tightened`, `content.model_breaking`,
+  `content.migration_batch`, `content.index_created`, `content.index_dropped`,
+  `content.schedule_failed`, `content.blob_cleanup`, `content.spool_cleared`.
+
+## 10. Crates
+
+Versions checked with `cargo info` on 2026-10-23 with Rust 1.98.0. Each is
+pinned in `[workspace.dependencies]`. Crates that declare no MSRV are compiled
+and tested on 1.98.0 in their slice.
+
+| Crate | Version | MSRV | License | Use |
+| --- | --- | --- | --- | --- |
+| `tokio-postgres` | 0.7.18 | 1.85 | MIT OR Apache-2.0 | Through `merezha-postgres`; features `with-serde_json-1`, `with-uuid-1`, `with-jiff-0_2`. |
+| `deadpool-postgres` | 0.14.2 | 1.85 | MIT OR Apache-2.0 | Through `merezha-postgres`. |
+| `postgres-types` | 0.2.14 | 1.85 | MIT OR Apache-2.0 | `jsonb` and `uuid` mapping. |
+| `object_store` | 0.14.2 | 1.85 | MIT/Apache-2.0 | Blob drivers; features `fs` (default) and `aws`. |
+| `uuid` | 1.29.0 | 1.89.0 | Apache-2.0 OR MIT | UUIDv7 ids; workspace pin with `v4`, `v5`, `v7`, `serde`. |
+| `jiff` | 0.2.38 | 1.70 | Unlicense OR MIT | The workspace's one time crate (R14), pinned with `default-features = false` and `std`, `serde`, `tz-system`, `tzdb-bundle-platform`: strict RFC 3339 parsing, UTC normalization, schedule times. |
+| `rust_decimal` | 1.43.0 | 1.67.1 | MIT | `decimal` precision, scale and range checks (28 digits, hence the precision ceiling). |
+| `regex` | 1.13.1 | 1.65 | MIT OR Apache-2.0 | `pattern` validation, linear time with a compiled size limit. |
+| `sha2` | 0.11.1 | 1.88 | MIT OR Apache-2.0 | Blob hashes, model fingerprint, ETags, cursor fingerprints. The workspace version after K2 (R14). |
+| `base64` | 0.23.1 | 1.71.0 | MIT OR Apache-2.0 | URL-safe cursors. |
+| `infer` | 0.22.0 | 1.74 | MIT | Magic-byte type sniffing. |
+| `imagesize` | 0.15.0 | none declared | MIT | Image dimensions from headers; default features off, enable `png`, `jpeg`, `gif`, `webp`, `heif` (covers AVIF). |
+| `deunicode` | 1.6.2 | 1.66 | BSD-3-Clause | Slug transliteration. |
+| `tempfile` | 3.27.0 (workspace) | | MIT OR Apache-2.0 | Upload spooling. |
+| `bytes` | 1.12.1 | 1.57 | MIT | Blob bodies. |
+| `futures-util` | 0.3.34 | 1.71 | MIT OR Apache-2.0 | `BoxFuture`, `BoxStream`. |
+| `tokio-util` | 0.7.20 | 1.85 | MIT | `ReaderStream` for file bodies. |
+| `serde`, `serde_json`, `toml`, `axum`, `tokio` | workspace pins | | | Model parsing, HTTP. |
+
+Not used: `aws-sdk-s3`, `rust-s3` (section 6), `multer` (raw upload bodies),
+`async-trait`, `image` and `img-parts` (no decoding or EXIF work in v1),
+`jsonschema` (typed Rust validation gives better error paths), `chrono`
+(confined to the adapters R14 names).
+
+## 11. Delivery slices
+
+Each slice is one pull request with tests against real PostgreSQL through
+`TestDatabase::create()`, documentation exercised as written, an independent
+review and green CI. CI runs PostgreSQL 16; the SQL stays within 14. S3 tests
+run against a MinIO service container named by `MEREZHA_TEST_S3_ENDPOINT`,
+`MEREZHA_TEST_S3_BUCKET` and credentials, and skip with an explicit message
+when unset. Until ID PR 2 lands, tests use a table-driven fixture `Authorizer`
+over K's scopes.
+
+Dependencies follow the cross-block delivery order. Every write path appends
+outbox records, so only C1 runs without `merezha-jobs`:
+
+- C1: K2 (error `details`). Stage 1, second wave.
+- C2, C3: C1 and AP-B1, because activation and every save append outbox
+  records. C2 also needs the kernel runner's non-transactional step (R15).
+- C4: C3 and AP-B3, for the trash purge cron. C5: C4.
+- C6: K2's `BlobStore` trait. Stage 2 opens with C6, after ID PR 2.
+- C7: C3, C6 and AP-B3, for the blob cleanup cron. C8: C4 and AP-B2, for
+  delayed job dispatch.
+- C9: C5, C7 and ID PR 2's application and tenant scopes. Stage 3.
+
+| Slice | Scope | Acceptance criteria | Test plan |
+| --- | --- | --- | --- |
+| C1 Content model | Crate `merezha-content`: parser, validator, canonical form, fingerprint, field value validators, Portable Text validator, slug generation. No database. | The section 2 example parses. Every rule in the field tables has an accepting and a rejecting case. A broken model reports every problem with its TOML path at once. A type without `access` fails model validation. The fingerprint ignores key order and whitespace and changes on any semantic change. Details carry pointer paths and no user text. | Unit tests per field type: safe-integer bounds, `1.0` refused for integers, decimal normalization, U+0000, datetime precision, each rich text rejection, regex size limit. Golden output for a broken model. A type without `access`, with `access = "private"` or with an unknown permission fails at `types.<name>.access`; each of the three accepted forms parses. |
+| C2 Schema and activation | Migration 1, locale sync, activation, diff classification, derived indexes, `merezha content diff`. | Fresh database activates version 1. Additive change activates on restart. Breaking change without migration fails readiness with each change listed. Same version with a new fingerprint fails. `sortable` added creates the index concurrently; removed drops it. An invalid index from a crashed build is rebuilt. Readiness stays false until every expected index is valid. `unique` over duplicates fails `unique_conflict`. Two hosts starting together activate once. | Real PostgreSQL. Concurrent activation from two tasks. `pg_indexes` and `pg_index.indisvalid` assertions. A build killed mid-way leaves the host not ready, and the next start repairs it. `EXPLAIN` shows a range filter on a sortable field using its derived index. |
+| C3 Drafts and revisions | Create, read, `PUT`, `PATCH`, revisions, restore, retention, singletons, shared-field copying, management list with filters, sort and cursors, unique enforcement, reference validation, referrers. | One revision per save. A stale `If-Match` gives 412 and writes nothing; a missing one gives 428. Retention never prunes the published or a pinned revision. Shared fields written through `fr` fail `field_not_localized` and appear in every variant after a default save. Unique violations name the field. A second singleton fails. | HTTP tests over the axum router and a real database. 50 concurrent saves on one variant: exactly one wins per revision. Cursor walk over 1000 entries with concurrent inserts: no duplicates, no gaps. Property test: random filters and sorts over seeded data match an in-memory evaluation. |
+| C4 Publishing and deletion | Publish, unpublish, publish an older revision, batch, fallback materialization, generations, soft delete, undelete, purge, trash job, outbox events. | Publish makes the revision visible in its locale and in every locale falling back to it, in the transaction that appends `content.entry_published`. Unpublishing `fr` makes `fr-BE` fall back to `en`. Publish enforces `required` and `require_published`. One failing batch item rolls back the batch. Delete removes every delivery row and emits one `content.entry_unpublished` per live locale plus `content.entry_deleted`. Undelete restores drafts only. Purge removes only expired trash. | Fault injection between materialization and commit leaves no rows and no outbox record. Each event lands as an `OutboxTarget::Event` record with the change's dedupe key. A fallback matrix over three locales and every publish state. Event count assertions per operation. |
+| C5 Delivery API | Delivery routes, access modes, preview, `fields`, `populate`, by-slug, ETag and 304, cache headers, model endpoint. | Anonymous reads work on `public` types and get 401 on others. `authenticated` types serve any principal, and for organization types only one whose tenant is the path's organization (403 `unauthorized` otherwise). A permission type gives 403 without the permission, including to a principal granted it only on another type, and serves one granted it at `Application` scope or on that type. Unpublished and missing both give 404. Preview without `content.preview` gives 403. Population respects depth, the entry cap, stage, locale chain and target access. A publish changes the ETag; an unchanged scope answers 304 without reading entries. Preview is `no-store` without ETag. By-slug prefers an own-locale slug. | Seeded entries in three locales. A reference cycle at maximum depth terminates. A statement counter proves the 304 path reads only `generations`. `EXPLAIN` of the default list uses `published_list`. |
+| C6 BlobStore | Platform trait, `object_store` local and S3 drivers, key validation, readiness probe, bounded retries. | Put from bytes, a file and a stream, get, ranged get, head, idempotent delete and attributes behave the same on both drivers. Invalid keys never reach a driver. A stopped MinIO yields `Unavailable` within the configured timeout. Signed URLs work and expire. A group-writable local root is refused. | One scenario suite run on a temp directory and on MinIO. A 20 MiB streamed put keeps memory near one part. |
+| C7 Assets | Upload flow, sniffing, dimensions, dedupe, asset routes, proxy and redirect serving, asset refs, delete and `force`, cleanup job, upload admission, spool hygiene. | PNG bytes declared as JPEG give 415. HTML declared as text is served as `attachment` with `nosniff` and the sandbox CSP. Oversized uploads give 413 and leave no spool file or blob row. Identical bytes give two assets and one object. Delivery refuses a draft-only asset and serves it after publish. `Range` gives a correct 206. A referenced asset deletes only with `force`. | Local and MinIO drivers. Injected crash after put and before commit is cleaned after the lease. Cleanup and an upload of the same bytes run in parallel 200 times; every asset row's blob still exists. |
+| C8 Scheduling and migrations | Schedule routes and job handler; `[[migrations]]` with resumable batches; lazy revision migration. | A schedule publishes the pinned revision after later edits. Duplicate job delivery publishes once. A deleted entry ends the schedule `failed` with `entry_deleted` and emits `content.scheduled_action_failed`. Cancel prevents publication. Each migration op transforms drafts and published rows as specified. A killed run resumes to the same result. A revision two versions old restores as valid data. Readiness is false during a run. | Job runner with a test clock. Migration over 5000 entries killed between batches, compared with an uninterrupted run. |
+| C9 Organization scope | Organization types, tenant-derived management scope, `/o/{organization}` delivery, cross-scope reference rules, per-organization blob tags, docs, a content section in the stage 3 example. | A key of organization A cannot read or write B through any route. B's public delivery shows only B. Organization entries may reference application entries; the reverse is refused. Identical uploads in two organizations create two objects. | A two-organization matrix generated from the route table, so a new route cannot skip it. |
+
+## Cross-block dependencies
+
+Owners and contracts are settled in [cross-block decisions](cross-block-decisions.md).
+
+| Need | Owner | What content assumes |
+| --- | --- | --- |
+| Error registry and optional `details: [{path, code}]` | K2 (R8) | Content registers its codes at startup. Details carry codes and pointer paths, never user text. |
+| `Outbox::append(tx, ...)` with event and job targets, `JobsHandle::schedule`, `[jobs.queues.content]` | AP-B1 to AP-B3 (R1) | Section 3, 4 and 7 records are written inside the change's transaction. |
+| Non-transactional migration step and readiness gate | K2 runner, FW amendment (R15) | Derived index builds run through it (section 3). |
+| `BlobStore` | content owns the shape, K2 adopts it (R13) | The trait in section 6; C6 ships the drivers. |
+| `Application`, `Tenant` and `Resource` scopes, application-level roles and keys | ID PR 2 (R5) | Per-type grants on `Resource { kind: "content_type", id }`, with `tenant` `None` for application-scoped types (ID §5). |
+| Content permissions in the catalog | ID | The table in section 5, plus permissions named in `access`. |
+| Webhooks from `content.*` topics, per tenant and application-level | NT (R11, NT6) | NT subscribes through AP subscriptions; content only appends events. |
+| Telemetry rows, attribute allowlist | TE `names.rs` (R9) | The section 9 rows. |
+| Per-route body limit override for uploads | K edge | The upload route sets its own limit and streams the body. |
+| Duration type, `[modules.content]` presence enables the module | K2 (R12) | Section 9. |
+
+## 12. Decisions
+
+The owner's answers of 2026-10-24 and the internal decisions that affect this
+design, recorded in full in [cross-block decisions](cross-block-decisions.md):
+
+- **CT1** No default delivery access. Every type declares `access`; a type
+  without it fails model validation. `merezha new` writes `access = "public"`
+  on scaffolded site types.
+- **CT2** No presigned uploads in v1. A later presigned PUT needs a confirm
+  call that runs the same sniffing.
+- **CT3** No image transformations in the host. **CT4** No EXIF or GPS
+  stripping in v1; stripping without re-encoding drops the orientation tag.
+- **CT5** Full-text search later: `tsvector` over `searchable` fields with a
+  derived GIN index per type and one text search configuration per locale.
+- **CT6** No guest hooks on entries. Stage 3 reactions to content events cover
+  side effects.
+- **CT7** Batch publish only, no named releases.
+- Error `details` are platform-wide (R8). Per-type permissions use identity's
+  resource scope (R5). Changing `localized` or `scope` on a live type stays
+  unsupported. 100 revisions are kept per variant, with no save coalescing.
+  One `content.toml` per application. `deunicode` (BSD-3-Clause) is accepted.
