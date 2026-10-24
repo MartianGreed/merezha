@@ -7,7 +7,7 @@ use crate::{
     edge,
     errors::ErrorRegistry,
     health::{self, Readiness},
-    module::{Module, RESERVED_NAMES},
+    module::{JobsRuntime, Module, RESERVED_NAMES},
     ports::Authorizer,
 };
 use axum::Router;
@@ -132,6 +132,9 @@ pub struct HostParts {
     /// the identity block.
     pub authorizer: Arc<dyn Authorizer>,
     pub timeouts: Timeouts,
+    /// The jobs runtime and its outbox; `None` keeps the refusing
+    /// fallbacks (`outbox_unavailable`, `jobs_unavailable`).
+    pub jobs: Option<Arc<dyn JobsRuntime>>,
 }
 
 /// The kernel's codes plus every module's, or the first refused module
@@ -189,8 +192,13 @@ impl Host {
         modules: Vec<Box<dyn Module>>,
         parts: HostParts,
     ) -> Result<Self, StartupError> {
+        let jobs = parts.jobs.clone();
         let errors = Arc::new(error_registry(
-            &modules.iter().map(|m| m.as_ref()).collect::<Vec<_>>(),
+            &modules
+                .iter()
+                .map(|m| m.as_ref())
+                .chain(jobs.iter().map(|j| j.as_ref() as &dyn Module))
+                .collect::<Vec<_>>(),
         )?);
         for module in &modules {
             if let Err(failure) =
@@ -223,7 +231,14 @@ impl Host {
             event = "db.connected",
             pool_size = config.database.pool_size
         );
-        let modules: Vec<Arc<dyn Module>> = modules.into_iter().map(Arc::from).collect();
+        // The jobs runtime is the last module: it starts after every block
+        // declared its handlers and stops first.
+        let ports = jobs.as_ref().map(|jobs| jobs.ports(&database));
+        let modules: Vec<Arc<dyn Module>> = modules
+            .into_iter()
+            .map(Arc::from)
+            .chain(jobs.map(|jobs| jobs as Arc<dyn Module>))
+            .collect();
         let declared: Vec<ModuleMigrations<'_>> = modules
             .iter()
             .map(|m| ModuleMigrations {
@@ -278,14 +293,16 @@ impl Host {
                 version = pending.version
             );
         }
-        let ctx = AppContext::builder(&config.app.id, database.clone(), parts.authorizer)
-            .instance_id(&config.app.instance_id)
-            .build()
-            .map_err(|failure| StartupError {
-                failure,
-                migration: None,
-                module: None,
-            })?;
+        let mut builder = AppContext::builder(&config.app.id, database.clone(), parts.authorizer)
+            .instance_id(&config.app.instance_id);
+        if let Some(ports) = ports {
+            builder = builder.outbox(ports.outbox).jobs(ports.jobs);
+        }
+        let ctx = builder.build().map_err(|failure| StartupError {
+            failure,
+            migration: None,
+            module: None,
+        })?;
         let mut started: Vec<Arc<dyn Module>> = Vec::new();
         for module in &modules {
             let at = tokio::time::Instant::from_std(Instant::now() + parts.timeouts.module_start);

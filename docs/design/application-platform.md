@@ -733,7 +733,9 @@ CREATE TABLE merezha_jobs.outbox (
     UNIQUE (source, dedupe_key),
     CHECK ((quarantined_at IS NULL) = (quarantine_code IS NULL)),
     CHECK (relayed_at IS NULL OR quarantined_at IS NULL),
-    CHECK ((payload IS NULL) = (contains_secret AND coalesce(relayed_at, quarantined_at) IS NOT NULL)),
+    -- R3: nulled once relayed or quarantined as unroutable; kept when isolated (B.4)
+    CHECK ((payload IS NULL) = (contains_secret
+        AND (relayed_at IS NOT NULL OR quarantine_code IS NOT DISTINCT FROM 'unroutable'))),
     CHECK ((record_kind = 'event' AND topic IS NOT NULL AND queue IS NULL AND job_kind IS NULL)
         OR (record_kind = 'job' AND topic IS NULL AND queue IS NOT NULL AND job_kind IS NOT NULL)));
 CREATE INDEX outbox_pending ON merezha_jobs.outbox (id) WHERE relayed_at IS NULL AND quarantined_at IS NULL;
@@ -742,6 +744,8 @@ CREATE INDEX outbox_relayed ON merezha_jobs.outbox (relayed_at) WHERE relayed_at
 CREATE TABLE merezha_jobs.subscriptions (
     topic text NOT NULL, job_kind text NOT NULL, queue text NOT NULL, source text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
+    last_declared_at timestamptz NOT NULL DEFAULT now(),   -- refreshed by every declaring instance
+    deactivated_at timestamptz NULL,      -- retired: nobody declared it for retire_after
     PRIMARY KEY (topic, job_kind));
 
 CREATE TABLE merezha_jobs.jobs (
@@ -879,7 +883,7 @@ impl JobsHandle {
     /// Returns the id and whether it already existed. Same key + different payload digest ->
     /// Err(conflict "idempotency_mismatch").
     pub async fn enqueue(&self, job: NewJob) -> Result<Enqueued, Failure>;   // NewJob carries contains_secret
-    pub async fn cancel(&self, id: i64) -> Result<bool, Failure>;   // available -> cancelled
+    pub async fn cancel(&self, id: i64) -> Result<bool, Failure>;   // available -> cancelled, own jobs only
     pub fn register(&self, kind: &str, queue: &str, handler: Arc<dyn JobHandler>, options: KindOptions);
     pub fn subscribe(&self, topic: &str, kind: &str);               // upserts merezha_jobs.subscriptions at start
     pub fn schedule(&self, schedule: ScheduleDeclaration);          // module-declared cron, synced at start
@@ -906,6 +910,20 @@ pub struct JobFailure { pub code: String, pub classification: Classification, pu
 
 NT maps its handler outcomes onto this (R1): `Done` is `Ok(())`, `Retry { after, code }` is
 `transient` with `retry_after = after`, `Permanent { code }` is `permanent`.
+
+`cancel` only cancels a job the calling module owns: its key starts with `{source}:` (enqueued, or
+relayed from the module's own `Job` records) or its kind is one the module registered. Any other id
+returns `false`, whether the job exists or not. `enqueue` notifies `merezha_jobs` with the queue
+inside its transaction, as the relay does. Subscriptions are declared, never deactivated by an instance's own registry, so rolling deploys
+lose no events. Every instance upserts the subscriptions it declares at start and then every
+`jobs.subscriptions.heartbeat` (default 5 min), setting `last_declared_at = now()` and
+`deactivated_at = NULL`. A subscription is retired (`deactivated_at` set, the row kept) only when its
+`last_declared_at` is older than `jobs.subscriptions.retire_after` (default 1 h, at least three
+heartbeats); any instance runs the retirement on its heartbeat under
+`pg_advisory_xact_lock(MZJB, hashtext('subscriptions'))`. The relay routes to every subscription
+with `deactivated_at IS NULL`. During a deploy's grace window a subscription that any live version
+declares keeps receiving events, so a restarting old instance never cuts off a new version's
+subscription, and an instance that declares nothing retires nothing early.
 
 `register` must run before `start`. A job whose kind has no handler on an instance is never leased
 by that instance, because the lease query filters `kind = ANY($registered)`. During a rolling
@@ -978,9 +996,14 @@ payload that `marked` nulls. An event with no subscription is marked relayed and
 job `ON CONFLICT` makes re-relaying harmless.
 
 **Quarantine.** `routable` sets aside a job record the jobs table would refuse, so the rest of the
-batch relays. On any other permanent error the relay re-runs the batch one record at a time and
-quarantines the record that fails alone, with its error code. A flagged record loses its payload
-(R3). Each quarantine counts in `merezha.outbox.quarantined` and logs `outbox.quarantined`;
+batch relays; a flagged record quarantined this way (`unroutable`) loses its payload (R3). Only a
+data error attributable to a record, SQLSTATE classes 22 and 23, re-runs the batch one record at a
+time and quarantines the record that fails alone with its error code (`constraint_violation`,
+`invalid_record_data`). Such a record keeps its payload, flagged or not, so a requeue relays it once
+the cause is fixed; R3 still nulls the resulting job's payload at its terminal state. Any other
+error (a revoked privilege, a failing trigger, a missing table) is systemic: the batch aborts as a
+transient relay failure, logged as `outbox.relay_failed` and retried at the interval, nothing is
+quarantined and no payload is touched. Readiness follows the existing rules. Each quarantine counts in `merezha.outbox.quarantined` and logs `outbox.quarantined`;
 quarantined rows also count in `merezha.outbox.pending` and `merezha.outbox.lag` until requeued
 (D.1).
 
@@ -1201,8 +1224,10 @@ A.7). Quarantined outbox rows follow `jobs.retention.dead`:
 | Admin actions | 365 days | `jobs.retention.audit` |
 
 The dedupe window equals retention. Producers whose keys must stay unique for longer must check
-their own state. Reactions do, through reactor checkpoints (C.5). Secrets do not wait for retention:
-flagged payloads are already NULL once relayed or terminal (R3).
+their own state. Reactions do, through reactor checkpoints (C.5). Most secrets do not wait for
+retention: flagged payloads are NULL once relayed, quarantined as `unroutable` or terminal (R3).
+The exception is a flagged record isolated by its own data error (B.4): it keeps its payload until
+it is requeued and relayed, or until `jobs.retention.dead` purges the quarantined row.
 
 ## B.10 Telemetry, readiness, pool
 
@@ -1654,7 +1679,7 @@ only on loopback (`AllowAll`). Durations are in seconds (R9).
 | `POST dead/purge` | body `{"queue", "before"}`; `{"purged":N}` |
 | `POST jobs/{id}/cancel` | `available` to `cancelled` (a flagged payload is nulled); `409 not_cancellable` when running or terminal |
 | `GET outbox` | `{"pending","oldest_age_s","unrouted","quarantined":[{"id","source","record_kind","quarantine_code","quarantined_at"}]}` (`unrouted`: this instance's count since start; at most 100 quarantined rows, oldest first) |
-| `POST outbox/{id}/requeue` | a quarantined record back to pending once the cause is fixed; `{"id"}`. `409 secret_purged` for a flagged record, whose payload is gone (R4a): the owning module issues it again. |
+| `POST outbox/{id}/requeue` | a quarantined record back to pending once the cause is fixed; `{"id"}`. `409 secret_purged` for a flagged record quarantined as `unroutable`, whose payload is gone (R4a): the owning module issues it again. |
 | `GET schedules` | `{"schedules":[{"name","source","cron","timezone","enabled","next_run_at","last_run_at","last_job_id"}]}` |
 | `POST schedules/{name}/pause`, `/resume`, `/trigger` | `trigger` enqueues a job keyed `cron:{name}:manual:{unix_ms}` |
 
@@ -1729,6 +1754,10 @@ concurrency = 16
 max_attempts = 10
 backoff_base_ms = 1000
 backoff_max_ms = 86400000    # NT's 24-hour step (R1)
+
+[jobs.subscriptions]
+heartbeat = "5m"             # every instance re-declares its subscriptions
+retire_after = "1h"          # retire one nobody declared for this long; >= 3 x heartbeat
 
 [jobs.retention]
 succeeded = "7d"
@@ -1848,6 +1877,9 @@ description (not gated).
 9. *Keys and quarantine.* A 161-byte `dedupe_key` fails `invalid_dedupe_key` at `append`. A batch
    holding one unroutable record (inserted by a test hook) relays the rest and quarantines it;
    `requeue` returns it, or `409 secret_purged` when flagged.
+   A systemic failure (a trigger refusing every job insert) quarantines nothing and leaves every
+   payload intact, and the relay resumes once it is gone; a record isolated by its own data error
+   keeps its payload and relays after a requeue.
 
 **B2 tests.**
 

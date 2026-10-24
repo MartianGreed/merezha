@@ -10,6 +10,7 @@ use std::{
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -473,4 +474,102 @@ fn run_arguments_are_validated() {
     assert_eq!(status.code(), Some(2));
     let text = fs::read_to_string(&log).unwrap();
     assert!(text.contains("invalid_arguments") && text.contains("merezha run --config"));
+}
+
+/// AP-B1 test 3: outbox rows committed while the relay is held (the
+/// `MEREZHA_JOBS_TEST_RELAY=off` hook), then kill -9 and a restart: each
+/// record is relayed exactly once.
+#[test]
+fn outbox_records_committed_before_a_crash_are_relayed_exactly_once_after_restart() {
+    use merezha_platform::ports::{
+        DedupeKey, MessageContext, OnDuplicate, OutboxRecord, OutboxTarget, Source, SourceOutbox,
+    };
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let config = project(dir.path(), "[jobs.relay]\ninterval_ms = 200");
+    let mut held = Host::spawn(
+        &config,
+        &[
+            (DATABASE_ENV, test.url()),
+            (merezha_jobs::TEST_RELAY_ENV, "off"),
+        ],
+        "held",
+    );
+    let address = held.ready();
+    wait_for_ready_status(address, 200);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let db = Database::connect(&test.config()).unwrap();
+    let count = |sql: &'static str| {
+        runtime.block_on(async {
+            let client = db
+                .acquire(Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
+            client.query_one(sql, &[]).await.unwrap().get::<_, i64>(0)
+        })
+    };
+    let outbox = SourceOutbox::new(
+        Source::new("tasks").unwrap(),
+        Arc::new(merezha_jobs::PgOutbox),
+    );
+    let records: Vec<OutboxRecord> = (0..20)
+        .map(|n| OutboxRecord {
+            dedupe_key: DedupeKey::new(format!("reminder:{n}")).unwrap(),
+            target: OutboxTarget::Job {
+                queue: merezha_domain::Identity::new("default").unwrap(),
+                kind: merezha_domain::Identity::new("tasks.remind").unwrap(),
+            },
+            payload: json!({"n": n}),
+            contains_secret: n % 2 == 0,
+            run_at: None,
+            priority: 0,
+            context: MessageContext {
+                correlation_id: merezha_domain::Identity::new("c1").unwrap(),
+                causation_id: None,
+                tenant: None,
+            },
+        })
+        .collect();
+    runtime
+        .block_on(
+            db.transaction(Instant::now() + Duration::from_secs(5), move |tx| {
+                Box::pin(async move { outbox.append(tx, &records, OnDuplicate::Fail).await })
+            }),
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(
+        count("SELECT count(*) FROM merezha_jobs.outbox WHERE relayed_at IS NULL"),
+        20,
+        "the held relay moved nothing"
+    );
+    // kill -9: no drain, no shutdown.
+    held.child.kill().unwrap();
+    held.child.wait().unwrap();
+
+    let mut restarted = Host::spawn(&config, &[(DATABASE_ENV, test.url())], "restarted");
+    restarted.ready();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while count("SELECT count(*) FROM merezha_jobs.outbox WHERE relayed_at IS NULL") > 0 {
+        assert!(Instant::now() < deadline, "records were never relayed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(count("SELECT count(*) FROM merezha_jobs.jobs"), 20);
+    assert_eq!(
+        count("SELECT count(DISTINCT outbox_id) FROM merezha_jobs.jobs"),
+        20,
+        "one job per record"
+    );
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM merezha_jobs.outbox WHERE contains_secret AND payload IS NOT NULL"
+        ),
+        0
+    );
+    restarted.stop();
 }

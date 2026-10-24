@@ -95,6 +95,7 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("outbox_unavailable", 422),
     ErrorCode::new("outbox_batch_limit", 422),
     ErrorCode::new("outbox_payload_limit", 422),
+    ErrorCode::new("jobs_unavailable", 422),
     ErrorCode::new("blob_store_unavailable", 422),
     ErrorCode::new("invalid_blob_key", 422),
     ErrorCode::new("upstream_body_limit", 422),

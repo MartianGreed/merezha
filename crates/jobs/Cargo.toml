@@ -1,0 +1,24 @@
+[package]
+name = "merezha-jobs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# Process-test hooks read from the environment (`MEREZHA_JOBS_TEST_RELAY`).
+# Only merezha-cli's dev-dependency enables it; release builds never do.
+test-hooks = []
+
+[dependencies]
+merezha-domain = { path = "../domain" }
+merezha-platform = { path = "../platform" }
+merezha-postgres = { path = "../postgres" }
+jiff.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tracing-subscriber.workspace = true

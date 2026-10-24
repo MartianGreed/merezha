@@ -3,8 +3,8 @@ use crate::{
     edge::TraceContext,
     ports::{
         Authenticator, Authorizer, BlobStore, CaptureNotifications, Directory, EmptyDirectory,
-        Notifier, NotifierFactory, Outbox, Source, SourceOutbox, UnavailableBlobStore,
-        UnavailableOutbox,
+        Jobs, JobsHandle, Notifier, NotifierFactory, Outbox, Source, SourceOutbox,
+        UnavailableBlobStore, UnavailableJobs, UnavailableOutbox,
     },
 };
 use merezha_domain::Failure;
@@ -183,6 +183,7 @@ struct Inner {
     random: Arc<dyn Random>,
     http: OutboundHttp,
     outbox: Arc<dyn Outbox>,
+    jobs: Arc<dyn Jobs>,
     authenticator: Option<Arc<dyn Authenticator>>,
     authorizer: Arc<dyn Authorizer>,
     notifications: Arc<dyn NotifierFactory>,
@@ -199,8 +200,8 @@ impl std::fmt::Debug for AppContext {
 }
 impl AppContext {
     /// Start from the disabled-block fallbacks: no authenticator, the given
-    /// policy, capture notifications, an empty directory, a refusing outbox
-    /// and blob store.
+    /// policy, capture notifications, an empty directory, a refusing outbox,
+    /// jobs port and blob store.
     pub fn builder(
         app_id: &str,
         database: Database,
@@ -214,6 +215,7 @@ impl AppContext {
             random: Arc::new(OsRandom),
             http: None,
             outbox: Arc::new(UnavailableOutbox),
+            jobs: Arc::new(UnavailableJobs),
             authenticator: None,
             authorizer,
             notifications: Arc::new(CaptureNotifications::default()),
@@ -281,6 +283,14 @@ impl AppContext {
             self.inner.outbox.clone(),
         ))
     }
+    /// The jobs port bound to `source` (AP §B.3), with the same source rule
+    /// as [`AppContext::outbox`].
+    pub fn jobs(&self, source: &str) -> Result<JobsHandle, Failure> {
+        Ok(JobsHandle::new(
+            self.source(source)?,
+            self.inner.jobs.clone(),
+        ))
+    }
     pub fn authenticator(&self) -> Option<&Arc<dyn Authenticator>> {
         self.inner.authenticator.as_ref()
     }
@@ -313,6 +323,7 @@ pub struct AppContextBuilder {
     random: Arc<dyn Random>,
     http: Option<OutboundHttp>,
     outbox: Arc<dyn Outbox>,
+    jobs: Arc<dyn Jobs>,
     authenticator: Option<Arc<dyn Authenticator>>,
     authorizer: Arc<dyn Authorizer>,
     notifications: Arc<dyn NotifierFactory>,
@@ -338,6 +349,10 @@ impl AppContextBuilder {
     }
     pub fn outbox(mut self, outbox: Arc<dyn Outbox>) -> Self {
         self.outbox = outbox;
+        self
+    }
+    pub fn jobs(mut self, jobs: Arc<dyn Jobs>) -> Self {
+        self.jobs = jobs;
         self
     }
     pub fn authenticator(mut self, authenticator: Arc<dyn Authenticator>) -> Self {
@@ -372,6 +387,7 @@ impl AppContextBuilder {
                 random: self.random,
                 http,
                 outbox: self.outbox,
+                jobs: self.jobs,
                 authenticator: self.authenticator,
                 authorizer: self.authorizer,
                 notifications: self.notifications,
@@ -500,6 +516,14 @@ mod tests {
             );
         }
         assert_eq!(content.outbox("Bad").unwrap_err().code, "invalid_source");
+        assert_eq!(
+            content.jobs("content").unwrap().source().as_str(),
+            "content"
+        );
+        assert_eq!(
+            content.jobs("identity").unwrap_err().code,
+            "source_not_allowed"
+        );
     }
 
     #[test]

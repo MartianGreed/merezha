@@ -154,6 +154,7 @@ fn parts() -> HostParts {
             drain: Duration::from_secs(5),
             ..Timeouts::default()
         },
+        jobs: None,
     }
 }
 async fn call(

@@ -2,11 +2,13 @@
 //! pool, deadline-scoped transactions, the module migration runner and a test
 //! harness. Errors are classified [`Failure`] values with stable codes; no
 //! error carries SQL text, server messages or connection strings.
+mod listen;
 mod migrate;
 mod testing;
 mod tls;
 
 pub use deadpool_postgres::Transaction;
+pub use listen::{Listener, MAX_PENDING_NOTIFICATIONS, Notification};
 pub use migrate::{
     MIGRATIONS_LOCK, Migration, MigrationError, MigrationKind, MigrationMode, MigrationReport,
     ModuleMigrations, PendingMigration, checksum, run_migrations,
@@ -185,6 +187,8 @@ pub struct PoolStatus {
 #[derive(Clone)]
 pub struct Database {
     pool: Pool,
+    /// The pool's connection settings and TLS, for [`Database::listen`].
+    session: listen::SessionConfig,
     acquire_timeout: Duration,
     statement_timeout: Duration,
     detached: Arc<tokio::sync::Semaphore>,
@@ -225,15 +229,20 @@ impl Database {
         let manager_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
-        let manager = match config.tls {
+        let (manager, session) = match config.tls {
             TlsMode::Disable => {
                 pg.ssl_mode(tokio_postgres::config::SslMode::Disable);
-                Manager::from_config(pg, tokio_postgres::NoTls, manager_config)
+                let session = listen::SessionConfig::new(pg.clone(), None);
+                (
+                    Manager::from_config(pg, tokio_postgres::NoTls, manager_config),
+                    session,
+                )
             }
             TlsMode::Require => {
                 pg.ssl_mode(tokio_postgres::config::SslMode::Require);
                 let tls = tls::connector(config.tls_ca_file.as_deref())?;
-                Manager::from_config(pg, tls, manager_config)
+                let session = listen::SessionConfig::new(pg.clone(), Some(tls.clone()));
+                (Manager::from_config(pg, tls, manager_config), session)
             }
         };
         let pool = Pool::builder(manager)
@@ -246,6 +255,7 @@ impl Database {
             .map_err(|_| Failure::permanent("invalid_database_config"))?;
         Ok(Self {
             pool,
+            session,
             acquire_timeout: config.acquire_timeout,
             statement_timeout: config.statement_timeout,
             detached: Arc::new(tokio::sync::Semaphore::new(config.max_detached)),
@@ -329,6 +339,17 @@ impl Database {
             statement_timeout: self.statement_timeout,
             _permit: permit,
         })
+    }
+    /// Open a dedicated session outside the pool and the detached budget
+    /// that `LISTEN`s on `channels` (1 to 8 names of `[a-z_][a-z0-9_]*`, at
+    /// most 63 bytes), before `deadline`. Notifications are wake-up signals:
+    /// at most [`MAX_PENDING_NOTIFICATIONS`] wait unread and later ones are
+    /// dropped until the reader catches up, and [`Listener::recv`] returns
+    /// `None` once the session ended, after which the caller reconnects.
+    /// Fails permanent `invalid_input` for bad channel names, else like
+    /// [`Database::ping`].
+    pub async fn listen(&self, channels: &[&str], deadline: Instant) -> Result<Listener, Failure> {
+        listen::open(&self.session, channels, deadline).await
     }
     /// The configured per-statement ceiling.
     pub fn statement_timeout(&self) -> Duration {

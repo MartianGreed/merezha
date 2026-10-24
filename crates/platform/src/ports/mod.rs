@@ -9,12 +9,14 @@
 mod access;
 mod blob;
 mod directory;
+mod jobs;
 mod notifier;
 mod outbox;
 
 pub use access::*;
 pub use blob::*;
 pub use directory::*;
+pub use jobs::*;
 pub use notifier::*;
 pub use outbox::*;
 

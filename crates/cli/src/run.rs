@@ -167,10 +167,12 @@ pub async fn run(
         raw_runtime = private,
         application = config.application.is_some()
     );
+    // Jobs and the outbox run whenever the host does (R12).
     let parts = HostParts {
         routes,
         authorizer,
         timeouts: Timeouts::default(),
+        jobs: Some(Arc::new(merezha_jobs::PgJobs::new(&config.jobs))),
     };
     let host = match Host::start(config, modules, parts).await {
         Ok(host) => host,

@@ -4,22 +4,28 @@ use crate::{
     config::{ConfigIssue, ModuleSection},
     context::AppContext,
     errors::ErrorCode,
+    ports::{Jobs, Outbox},
 };
 use axum::Router;
 use merezha_domain::Failure;
-use merezha_postgres::Migration;
-use std::time::Instant;
+use merezha_postgres::{Database, Migration};
+use std::{sync::Arc, time::Instant};
 
 /// Names of route prefixes owned by the host; modules cannot use them.
 /// `api` and `application` are also the kernel-only outbox and notifier
-/// sources.
-pub const RESERVED_NAMES: [&str; 6] = [
+/// sources; `jobs` is the [`JobsRuntime`]; `outbox` and `cron` prefix the
+/// job keys the relay and the scheduler mint, so no module may write or
+/// cancel under them.
+pub const RESERVED_NAMES: [&str; 9] = [
     "application",
     "api",
     "services",
     "pipelines",
     "reload",
     "health",
+    "jobs",
+    "outbox",
+    "cron",
 ];
 
 /// Integration events a module publishes and consumes through the outbox.
@@ -99,4 +105,25 @@ pub trait Module: Send + Sync + 'static {
         let _ = deadline;
         Box::pin(async {})
     }
+}
+
+/// The ports a [`JobsRuntime`] installs in every [`AppContext`].
+#[derive(Clone)]
+pub struct JobsPorts {
+    pub outbox: Arc<dyn Outbox>,
+    pub jobs: Arc<dyn Jobs>,
+}
+
+/// The jobs runtime (AP §B), installed by the embedding binary through
+/// [`crate::HostParts::jobs`]. It is the module named `jobs`, configured by
+/// the top-level `[jobs]` section rather than `[modules.jobs]`, and runs
+/// whenever the host does. The host registers its errors and migrations
+/// with the other modules', installs its [`JobsPorts`] in every context
+/// before any module starts, starts it after every other module (so their
+/// handler registrations and subscriptions are in), and shuts it down
+/// first.
+pub trait JobsRuntime: Module {
+    /// Bind the runtime to the opened pool and return its ports. Called
+    /// once, after the pool answered and before migrations run.
+    fn ports(&self, database: &Database) -> JobsPorts;
 }

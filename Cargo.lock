@@ -1452,6 +1452,7 @@ dependencies = [
  "axum",
  "merezha-application",
  "merezha-domain",
+ "merezha-jobs",
  "merezha-platform",
  "merezha-postgres",
  "merezha-runtime",
@@ -1485,6 +1486,21 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "merezha-jobs"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "jiff",
+ "merezha-domain",
+ "merezha-platform",
+ "merezha-postgres",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
