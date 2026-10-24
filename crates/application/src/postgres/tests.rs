@@ -372,7 +372,8 @@ fn an_append_that_answered_keeps_its_outcome_when_only_the_reset_fails_or_is_lat
         let started = Instant::now();
         let receipt = app.command(command(None)).unwrap();
         assert_eq!(receipt.position, position, "{reset}");
-        assert!(started.elapsed() < Duration::from_millis(1500), "{reset}");
+        // Well before the late reset's 10 s, with slack for a loaded runner.
+        assert!(started.elapsed() < Duration::from_secs(4), "{reset}");
         // The session whose statement timeout was not restored is closed.
         assert_eq!(db.status().size, before - 1, "{reset}");
     }

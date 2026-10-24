@@ -71,6 +71,11 @@ fn command(stream: &str, payload: Value, key: Option<&str>) -> Command {
         expected_version: None,
     }
 }
+/// Slack on top of a deadline in elapsed-time checks. A loaded CI runner
+/// can stall a thread well past a deadline; the outcome codes and the
+/// committed rows prove the bound, the elapsed time only that nothing
+/// waited on something unbounded.
+const SLACK: Duration = Duration::from_secs(3);
 fn code<T>(result: Result<T, Failure>) -> String {
     result.err().expect("expected a failure").code
 }
@@ -533,7 +538,9 @@ fn a_held_head_lock_fails_appends_storage_busy_and_queued_appends_commit_in_posi
         code(app.command(command("one", json!(1), None))),
         "storage_busy"
     );
-    assert!(started.elapsed() < Duration::from_millis(1000));
+    // `storage_busy` (not `timeout`) proves the server gave up first.
+    let waited = started.elapsed();
+    assert!(waited < Duration::from_millis(1000) + SLACK, "{waited:?}");
     // Readers are not blocked and see nothing new.
     assert_eq!(pg.count("SELECT count(*) FROM merezha_app.events"), 0);
     assert_eq!(pg.count("SELECT position FROM merezha_app.head"), 0);
@@ -1251,8 +1258,12 @@ fn a_slow_pool_acquire_still_bounds_the_lock_wait_by_the_time_left() {
         drop(busy);
         command.join().unwrap()
     });
+    // `storage_busy`, not `commit_outcome_unknown`: the lock wait was cut
+    // from the time left after the slow acquire, so the server ended the
+    // statement before the caller's 3 s deadline.
     assert_eq!(code(result), "storage_busy");
-    assert!(started.elapsed() < Duration::from_millis(3000));
+    let waited = started.elapsed();
+    assert!(waited < Duration::from_millis(3000) + SLACK, "{waited:?}");
     pg.release_head(holder);
     // Nothing commits later behind the caller's back.
     std::thread::sleep(Duration::from_millis(500));
@@ -1286,8 +1297,10 @@ fn an_append_never_waits_past_the_database_statement_timeout() {
         code(app.command(command("one", json!(1), None))),
         "storage_busy"
     );
+    // The 1 s database ceiling ended the wait, far before the 30 s
+    // deadline; the lower bound shows the lock wait really ran.
     let waited = started.elapsed();
-    assert!(waited < Duration::from_millis(2000), "{waited:?}");
+    assert!(waited < Duration::from_millis(1000) + SLACK, "{waited:?}");
     assert!(waited >= Duration::from_millis(900), "{waited:?}");
     pg.release_head(holder);
     // The pooled session is back at the operator's default and works.

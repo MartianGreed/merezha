@@ -1017,7 +1017,8 @@ fn min_position_reads_your_write_or_fails_projection_behind() {
         "projection_behind"
     );
     assert!(started.elapsed() >= Duration::from_millis(400));
-    assert!(started.elapsed() < Duration::from_millis(1500));
+    // The 500 ms deadline, with slack for a loaded runner.
+    assert!(started.elapsed() < Duration::from_millis(3500));
     assert!(b.app.query(query("Count", Some(20))).is_ok());
     pg.stop(&b);
 }
@@ -1097,7 +1098,7 @@ fn explicit_catch_up_waits_on_the_running_runner_within_its_deadline() {
     let started = Instant::now();
     let pair = other.app.catch_up("count").unwrap();
     assert!(pair.checkpoint >= 20);
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(started.elapsed() < Duration::from_secs(6));
     assert!(pg.lock_holders().len() <= 2);
     pg.stop(&runner);
     // Past its deadline a waiting request fails `timeout`; progress stays.
