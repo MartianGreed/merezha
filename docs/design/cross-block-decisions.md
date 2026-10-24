@@ -215,6 +215,10 @@ names. Other designs reference it instead of defining names:
   `append` tables.
 - TE extends K's `[telemetry]` (`log_level`, `format`) instead of adding
   `[telemetry.stderr]`. Logs go to stderr (owner answer P3).
+- OTLP export is opt-in (owner decision, TE-T1 review, 2026-10-24): with no
+  `[telemetry]` endpoint (base or per signal) and no explicit `signals` in
+  any layer, `signals` defaults to `[]` and no exporter starts; configuring
+  an endpoint enables traces, metrics and logs.
 
 ### R13. Principal and blob storage
 

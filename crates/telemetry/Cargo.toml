@@ -1,0 +1,48 @@
+[package]
+name = "merezha-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+propagation = ["dep:tracing-opentelemetry", "opentelemetry/trace"]
+pipeline = [
+    "propagation",
+    "opentelemetry/trace",
+    "opentelemetry/logs",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:merezha-domain",
+    "dep:reqwest",
+    "dep:tracing-subscriber",
+    "dep:tracing-appender",
+    "dep:serde_json",
+    "dep:jiff",
+]
+testing = ["pipeline", "opentelemetry_sdk/testing"]
+
+[dependencies]
+opentelemetry.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+merezha-domain = { path = "../domain", optional = true }
+reqwest = { workspace = true, features = ["blocking"], optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+tracing-appender = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+jiff = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Integration tests run the pipeline and the harness.
+merezha-telemetry = { path = ".", features = ["testing"] }
+axum.workspace = true
+libc.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
+opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }

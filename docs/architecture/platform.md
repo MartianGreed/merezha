@@ -9,7 +9,13 @@ kernel every block builds on:
   transactions, the module migration runner and the `TestDatabase` harness.
 - `merezha-platform` (`crates/platform`): `ProjectConfig` for `merezha.toml`,
   the `Module` trait, `AppContext`, the cross-module ports, the HTTP edge,
-  health endpoints, structured logging and the host lifecycle.
+  health endpoints and the host lifecycle.
+
+Logging and OpenTelemetry export come from `merezha-telemetry`
+(`crates/telemetry`, [telemetry design](../design/telemetry.md), stage TE-T1):
+the name catalog and `event!` macro every crate uses, the `[telemetry]`
+model the kernel parses, and the OTLP pipeline only the `merezha` binary
+links.
 
 `merezha-jobs` (`crates/jobs`, AP-B1 and AP-B2) is the jobs runtime the host
 installs beside them: the PostgreSQL outbox, the jobs port, the relay, the
@@ -58,7 +64,11 @@ and one `startup.failed` event carrying a stable `code`:
 1. Load the configuration. All problems are reported together as
    `{"event":"startup.failed","code":"invalid_config","issues":[{"key","code","origin"}]}`.
    Issues name settings and layers, never values.
-2. Install the log subscriber from `[telemetry]`.
+2. Build the telemetry pipeline from `[telemetry]` and install the log
+   subscriber (`telemetry_initialized`, `invalid_telemetry_ca`,
+   `telemetry_exporter_failed`). Exporters connect lazily, so a collector
+   that is down never fails or delays startup. From here on, startup runs
+   inside the `startup` span.
 3. Load the runtime manifest (`invalid_manifest`).
 4. Read and validate the optional application configuration, then open a
    memory or SQLite application as `serve` does. A PostgreSQL application
@@ -85,8 +95,9 @@ and one `startup.failed` event carrying a stable `code`:
 
 SIGINT or SIGTERM starts a graceful stop: readiness turns false, the listener
 stops accepting, in-flight requests drain for up to 30 s, modules shut down in
-reverse order within 10 s, the pool closes, `listener.stopped` is logged and
-the process exits 0. A serving failure exits 1.
+reverse order within 10 s, the pool closes, `listener.stopped` is logged,
+traces, logs and metrics are flushed within `telemetry.shutdown_timeout_ms`
+and the process exits 0. A serving failure exits 1.
 
 ### Routes
 
@@ -144,9 +155,9 @@ such as the `[jobs.retention]` ones, take strings only. A malformed value is
 `expected_duration`.
 
 Every key below validates at startup. Keys marked *reserved* have no effect
-yet: the jobs runtime (AP-B1 onward), the PostgreSQL application core's
-background work (AP-A3) and the telemetry block (TE-T1 onward) give them their
-behaviour. Configuring them now fails early on typos instead of being ignored.
+yet: the jobs runtime (AP-B1 onward) and the PostgreSQL application core's
+background work (AP-A3) give them their behaviour. Configuring them now
+fails early on typos instead of being ignored.
 
 Secret settings accept `{ env = "NAME" }` or `{ file = "PATH" }` in the file,
 never a literal string (`secret_literal`). A `MEREZHA_` environment variable may
@@ -282,16 +293,29 @@ when it ships.
 
 ### `[telemetry]`
 
-`log_level` and `format` drive the stderr log stream today. The other keys
-are the telemetry block's (TE §3) and are *reserved*: they validate now, and
-no OTLP pipeline runs yet.
+`log_level` and `format` drive the stderr log stream; the other keys drive
+the OTLP pipeline (TE §3). Every value is checked at startup and all
+problems are reported together. `trust_inbound` takes effect with the edge
+spans (TE-T2), `metrics.sample_interval_ms` with the database-backed gauges
+(TE-T3, TE-T5) and `propagation.outbound_hosts` with the outbound client
+(TE-T6); they validate now.
+
+Standard `OTEL_*` variables are never read: `merezha` removes them from its
+environment before any thread starts and logs their names once as
+`telemetry.otel_env_ignored`.
+
+OTLP export is opt-in: unless `endpoint`, a per-signal `endpoint` or
+`signals` is set in the file, the environment or a flag, `signals` is `[]`.
+`ca_file` is read at startup (at most 1 MiB of PEM, `invalid_telemetry_ca`) when any signal is exported. With
+`signals = []` no exporter or SDK thread exists; stderr logs, health and
+status remain.
 
 | Key | Type | Default | Secret | Notes |
 | --- | --- | --- | --- | --- |
 | `log_level` | `error`, `warn`, `info`, `debug`, `trace` | `info` | no | filters the log output only |
 | `format` | `json` or `text` | `json` | no | written to stderr |
 | `log_buffer_lines` | integer | `8192` | no | 64 to 1048576 |
-| `endpoint` | URL | `http://127.0.0.1:4318` | no | `http` or `https`, no userinfo, query or fragment |
+| `endpoint` | URL | `http://127.0.0.1:4318` (used only when `signals` is set explicitly) | no | `http` or `https`, no userinfo, query or fragment. `http/protobuf` appends `/v1/traces`, `/v1/metrics`, `/v1/logs`; `grpc` uses it as the channel URI |
 | `protocol` | `http/protobuf` or `grpc` | `http/protobuf` | no | |
 | `compression` | `gzip` or `none` | `gzip` | no | |
 | `timeout_ms` | duration | `10000` | no | 1 s to 60 s |
@@ -299,12 +323,12 @@ no OTLP pipeline runs yet.
 | `ca_file` | path | none | no | |
 | `allow_plaintext_headers` | boolean | `false` | no | without it, headers with a non-loopback `http://` endpoint fail `plaintext_headers_refused` |
 | `shutdown_timeout_ms` | duration | `5000` | no | 100 ms to 60 s |
-| `signals` | list of `traces`, `metrics`, `logs` | all three | no | `[]` turns OTLP export off |
+| `signals` | list of `traces`, `metrics`, `logs` | all three when an endpoint is configured, else `[]` | no | OTLP export is opt-in: a plain `merezha run` starts no exporter |
 
 | Table | Keys |
 | --- | --- |
 | `[telemetry.resource]` | `service_name` (default `app.id`), `service_version` (default `app.version`), `service_namespace`, `environment`: 1 to 128 printable bytes, `""` for unset; `attributes`: at most 16 strings whose keys start with `cloud.`, `container.`, `deployment.`, `host.`, `k8s.` or `os.` |
-| `[telemetry.traces]` | `sampler` (`parent_based_ratio`, `always_off`), `ratio` (0.0 to 1.0, default 1.0), `trust_inbound` (`trusted_proxies`, `always`, `never`), `endpoint`, `max_queue` (2048), `max_batch` (512, at most `max_queue`), `schedule_delay_ms` (5000) |
+| `[telemetry.traces]` | `sampler` (`parent_based_ratio`, `always_off`), `ratio` (0.0 to 1.0, default 1.0, root decisions only), `trust_inbound` (`trusted_proxies`, `always`, `never`), `endpoint` (used verbatim), `max_queue` (2048 spans queued plus in flight; more are dropped and counted), `max_batch` (512, at most `max_queue`), `schedule_delay_ms` (5000) |
 | `[telemetry.metrics]` | `interval_ms` (30000, at least 1 s), `temporality` (`cumulative`, `delta`), `sample_interval_ms` (15000), `endpoint` |
 | `[telemetry.logs]` | `level` (`info`), `endpoint`, `max_queue`, `max_batch`, `schedule_delay_ms` (1000) |
 | `[telemetry.privacy]` | `record_tenant_id` (`true`), `record_subject_id` (`false`), `record_client_address` (`false`) |
@@ -363,8 +387,8 @@ directory relative paths resolve against (the canonical directory of
   the 2 MiB default of axum's `Bytes` and `Json` extractors.
 - applies CORS and the optional `Authenticator`.
 - logs one `http.request.completed` event with method, matched route, status, duration,
-  request id and trace id. It never logs paths, query strings, headers or
-  bodies.
+  request id and trace id (the line's `trace_id`). It never logs paths,
+  query strings, headers or bodies.
 
 Every error response has one shape (R8):
 
@@ -444,38 +468,74 @@ gets `health.not_ready` with check names on each transition.
 
 ## Logging
 
-`telemetry::init` installs a `tracing` subscriber that writes JSON lines (or
-text) to stderr. Each event has a stable `event` field and allowlisted
-fields only. Names follow the telemetry catalog (TE §1, §4): one area, one
-dot, `<area>.<noun>_<verb>`.
+Events are emitted with `merezha_telemetry::event!(LEVEL, "area.noun_verb",
+field = …)`, whose name and fields must appear in the catalog
+(`crates/telemetry/src/names.rs`, TE §4); `testing::Harness::assert_catalogued`
+fails a suite that emits anything else. The `merezha` binary installs one
+`tracing` registry with three layers:
 
-`startup.failed`, `runtime.loaded`, `error.registration_refused`,
+1. stderr, at `log_level` for Merezha targets and never more verbose than
+   `info` for other crates. `format = "json"` writes one flat line per event
+   with the field names `merezha_cli::emit` used:
+   `timestamp_unix_ms`, `level` (lowercase), `event`, `service` (the
+   service name; `merezha` in raw mode and before the configuration is
+   read), `version` (the host version), `instance` (`app.instance_id`),
+   `trace_id` and `span_id` inside a recording span (or the event's own
+   `trace_id`, as on `http.request.completed`), the scope ids
+   `request_id`, `correlation_id`, `causation_id` and `message_id`, then the
+   event's catalog fields. Strings are cut to 512 bytes. A field named like
+   an envelope key is prefixed with the event's area (`migration_version`).
+   Events from other crates keep only `target`, `level` and
+   `event = "dependency.log"`. The exporter's own crates (`opentelemetry*`,
+   `tonic*`) never reach stderr: with the collector down they would repeat
+   for every batch, and `telemetry.export_failed` reports instead. The HTTP
+   transport crates the server shares with the exporter (`hyper`, `h2`,
+   `tower`, `reqwest`) reach stderr at `warn` and above, except from the
+   exporter's own threads. Writes go through a lossy non-blocking writer of
+   `log_buffer_lines` lines, so a slow pipe drops lines instead of blocking.
+   `format = "text"` uses the stock compact formatter.
+2. the span bridge, for Merezha spans at `info` and above, whatever
+   `log_level` says;
+3. the OTLP log bridge, for catalog events at `telemetry.logs.level`, with
+   attributes mapped through the catalog (`queue` becomes `job.queue`) and
+   the allowlist. Stderr-only events (`telemetry.export_failed`,
+   `identity.dev_link`) and other crates' events are never exported.
+
+`startup.failed` is an error, including the `invalid_config` and
+`invalid_arguments` lines written before the subscriber exists.
+
+Kernel events: `startup.failed`, `runtime.loaded`, `error.registration_refused`,
 `db.connected`, `db.unavailable`, `migration.checked`, `migration.pending`,
 `migration.applied`, `migration.checksum_mismatch`, `migration.refused`,
 `migration.invalid_index_dropped`, `module.started`, `module.start_failed`,
 `module.stopped`, `module.shutdown_timeout`, `listener.ready`,
 `listener.draining`, `listener.drain_timeout`, `listener.stopped`,
-`module.source_refused`,
-`http.request.completed`, `health.ready`, `health.not_ready`,
-`notification.captured`, from the content block `content.model_loaded`,
-`content.model_activated`, `content.model_tightened`,
+`module.source_refused`, `http.request.completed`, `health.ready`,
+`health.not_ready`, `notification.captured`, `telemetry.otel_env_ignored`
+and `telemetry.export_failed` (at most once per signal per minute, with the
+code and the cumulative number of lost items), from the content block
+`content.model_loaded`, `content.model_activated`, `content.model_tightened`,
 `content.model_breaking`, `content.index_created`, `content.index_dropped`
-and `content.index_failed`, and from the jobs runtime `outbox.relayed`,
-`outbox.quarantined`, `outbox.relay_failed`, `job.admin_action`,
-`job.subscription_sync_failed`, `job.leased`, `job.completed`,
+and `content.index_failed`, and from the jobs runtime
+`outbox.relayed`, `outbox.quarantined`, `outbox.relay_failed`,
+`job.admin_action`, `job.subscription_sync_failed`, `job.leased`, `job.completed`,
 `job.retry_scheduled`, `job.dead_lettered`, `job.lease_lost`,
 `job.drain_abandoned`, `job.reissue_claim_lost`, `job.worker_failed` (a lease, settle, heartbeat,
 reaper, retention, lag or release statement failing, once per failure
 streak), `job.queue_unconfigured`, `db.listener_lost`,
 `db.listener_restored`.
 
-K2 renamed `database.connected`, `database.unavailable`,
-`migrations.checked`, `migrations.refused` and `http.request` to the catalog
-names above.
+Exported spans pass the attribute allowlist (TE §1.5): unknown keys are
+dropped and counted in `merezha.telemetry.attributes.dropped`, strings cut to
+256 bytes, at most 64 attributes, 32 events and 8 links per span. Exports
+are accounted exactly: `exported + failed + dropped + pending == emitted`
+per signal, reported by `merezha.telemetry.exported`,
+`merezha.telemetry.dropped` and the status document (`Telemetry::status`;
+the `/v1/admin/status` route is TE-T2).
 
-The telemetry block will pass its OTLP layers as `extra` to `telemetry::init`.
-They see every event regardless of `log_level`. The raw runtime still writes
-its own `invocation.completed` and `registry.*` JSON lines.
+The raw runtime (`merezha serve`) writes the same JSON lines to stderr with
+`service = merezha`, logs at `debug` so each `invocation.completed` appears
+as before, and runs no OTLP pipeline.
 
 ## Module contract
 

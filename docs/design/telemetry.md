@@ -28,10 +28,11 @@ merezha-telemetry  (new crate)
     names.rs       every block's span, metric, attribute and event names (R9), typed
                    attribute constructors (§1.5) and the event! macro (§4)
     blocking.rs    spawn_blocking_in_span: carries Dispatch + Span into blocking threads
+    config.rs      [telemetry] section model and secret headers; the kernel's loader
+                   parses and validates every key into it
   feature "propagation" (adds tracing-opentelemetry; no exporter, no network code)
     propagation.rs traceparent parse/format, trust policy, links, stored context
   feature "pipeline" (the merezha binary only)
-    config.rs      [telemetry] section model, validation, secret headers
     pipeline.rs    providers, guarded processors, exporters, shutdown
     subscriber.rs  tracing registry: JSON writer + span bridge + OTLP log bridge
     json.rs        flat JSON event formatter (stable field names)
@@ -432,10 +433,15 @@ Three walls enforce this:
    applies the table and a 512-byte cap itself.
 3. **Third-party events.** In the JSON stream, events from crates outside
    `merezha*` keep only `target`, `level` and the fixed name
-   `dependency.log`; the message is dropped except for `opentelemetry*`
-   targets (truncated to 512 bytes; the endpoint is validated to carry no
-   userinfo). No third-party event enters the OTLP log bridge, so export
-   errors cannot loop back into the exporter.
+   `dependency.log`; the message is dropped. The exporter's own crates
+   (`opentelemetry*`, `tonic*`) are refused from stderr altogether (T1
+   review: with the collector down they repeated per batch, half at error);
+   the transport crates the server shares with the exporter (`hyper`, `h2`,
+   `tower`, `reqwest`) are kept at `warn` and above, except on the
+   exporter's threads (the SDK's processors and reader, the blocking
+   OTLP/HTTP client, the gRPC runtime); `telemetry.export_failed` reports export
+   failures, at most once per signal per minute. No third-party event enters
+   the OTLP log bridge, so export errors cannot loop back into the exporter.
 
 ## 2. Context propagation
 
@@ -540,6 +546,10 @@ ending `_ms` take K's duration type: integer milliseconds or `"500ms"`,
 SDK option programmatically, which overrides the environment, and logs
 `telemetry.otel_env_ignored` with the variable names when any is present.
 There is no `enabled` key (R12): `signals = []` turns OTLP export off.
+OTLP export is opt-in (owner decision during T1 review, recorded in R12):
+unless `endpoint`, a per-signal `endpoint` or `signals` is set in the file,
+the environment or a flag, `signals` defaults to `[]`, so a plain
+`merezha run` starts no exporter; configuring an endpoint enables all three.
 
 ```toml
 [telemetry]
@@ -554,7 +564,7 @@ headers = { authorization = { env = "OTLP_AUTHORIZATION" } }  # every value is a
 ca_file = "/etc/ssl/private-ca.pem" # optional extra trust root for https endpoints
 allow_plaintext_headers = false     # see validation
 shutdown_timeout_ms = 5000          # total flush budget at shutdown, shared by signals
-signals = ["traces", "metrics", "logs"]  # []: no OTLP pipeline; stderr logs, health and status remain
+signals = ["traces", "metrics", "logs"]  # default when an endpoint is set, else []; []: no OTLP pipeline
 
 [telemetry.resource]
 service_name = "<app.id>"           # default app.id; "merezha" in raw runtime mode
@@ -727,7 +737,7 @@ Block events (AP's former `jobs.*` events are `job.*`):
 | `reactor.halted` (malformed reply, or permanent failure with `on_error = "halt"`) / `reactor.skipped` / `reactor.effect_rejected` | error / info / warn | `reactor`, `position`, `index`, `reason`, `code` |
 | `job.leased` / `job.completed` | debug | `job_id`, `queue`, `kind`, `attempt` |
 | `job.retry_scheduled` / `job.dead_lettered` / `job.lease_lost` | warn / error / warn | `job_id`, `queue`, `kind`, `attempt`, `code`, `classification` |
-| `job.replayed` / `job.cancelled` / `job.admin_action` / `job.drain_abandoned` | info / info / info / warn | `job_id` or `count`, `queue`, `action` / `job_ids` (at most 64) |
+| `job.replayed` / `job.cancelled` / `job.admin_action` / `job.drain_abandoned` | info / info / info / warn | `job_id` or `count`, `queue`, `action` / `count`, `job_ids` (at most 64) |
 | `outbox.relayed` | debug | `relayed`, `unrouted` |
 | `outbox.quarantined` | warn | `outbox_id`, `source`, `code` |
 | `outbox.relay_failed` (a systemic relay failure, once per failure streak; nothing is quarantined) | error | `code`, `classification` |
@@ -1082,12 +1092,12 @@ OpenTelemetry versions, and one rustls crypto provider (`aws-lc-rs`, no
 | `opentelemetry_sdk` | `0.33.1` | `trace`, `metrics`, `logs`, `internal-logs`; dev: `testing` | telemetry | 1.75 |
 | `opentelemetry-otlp` | `0.33.1` | `trace`, `metrics`, `logs`, `internal-logs`, `http-proto`, `reqwest-blocking-client`, `reqwest-rustls`, `gzip-http`, `grpc-tonic`, `tls-aws-lc`, `tls-roots`, `gzip-tonic` | telemetry | 1.75 |
 | `tracing-opentelemetry` | `0.34.0` | none (no `metrics`, no `tracing-log`) | telemetry (`propagation`, `pipeline`) | 1.75 |
-| `opentelemetry-appender-tracing` | `0.33.1` | none | telemetry | 1.75 |
-| `opentelemetry-semantic-conventions` | `0.33.1` (schema 1.42.0) | default (stable only) | telemetry, postgres | 1.75 |
+| `opentelemetry-semantic-conventions` | `0.33.1` (schema 1.42.0) | default (stable only); dev: `semconv_experimental` for the pin test | telemetry, postgres | 1.75 |
 | `tracing` | `0.1.44` | `std`, `attributes`, `release_max_level_debug` (binary only) | all | 1.65 |
-| `tracing-subscriber` | `0.3.23` | `registry`, `fmt`, `std`, `ansi` | telemetry | 1.65 |
+| `tracing-subscriber` | `0.3.23` | the workspace's `registry`, `fmt`, `std`, `json` (no `ansi`: text logs are written without colour) | telemetry | 1.65 |
 | `tracing-appender` | `0.2.5` | default | telemetry | 1.63 |
-| `opentelemetry-proto` | `0.33.1` | dev only: `gen-tonic-messages`, `trace`, `metrics`, `logs` (stub receiver) | telemetry tests | 1.75 |
+| `reqwest` | `0.13.5` | the workspace's `rustls`, plus `blocking` | telemetry (`pipeline`): the OTLP/HTTP client, built with `ca_file` and without redirects | 1.64 |
+| `libc` | `0.2.191` | default; dev only | telemetry tests (`getrusage`, thread counts) | 1.65 |
 
 Transitively: `tonic` 0.14.6 has the highest MSRV in the tree (1.88);
 `reqwest` resolves to 0.13.5 and `prost` to 0.14.4. Platform's outbound
@@ -1109,7 +1119,14 @@ Constraints confirmed in the 0.33.1 sources:
   the export timeout is the exporter's `with_timeout(timeout_ms)`.
 - SDK drop counters are private, hence the guarded processors (§3).
 
-The seven OpenTelemetry crates move in lockstep: one PR bumps them all and
+T1 dropped `opentelemetry-appender-tracing`: it records `tracing` field
+names verbatim, and the catalog maps each short field to its attribute key
+(`queue` to `job.queue`), so the log bridge is a small layer in
+`subscriber.rs` that builds `SdkLogRecord`s itself. The stub receiver of the
+tests answers OTLP/HTTP without decoding, so `opentelemetry-proto` is not a
+dev dependency either.
+
+The six OpenTelemetry crates move in lockstep: one PR bumps them all and
 reruns the `names.rs` semconv pin test.
 
 ## 10. Delivery slices

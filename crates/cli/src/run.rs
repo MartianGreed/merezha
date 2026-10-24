@@ -14,11 +14,12 @@ use merezha_platform::{
     ConfigInput, HostParts, Module, Timeouts,
     host::{self, Host},
     ports::{Authorizer, DenyAll, LoopbackAllowAll},
-    telemetry,
 };
 use merezha_runtime::Runtime;
+use merezha_telemetry::{Service, Telemetry, names, pipeline};
 use serde_json::json;
 use std::{future::Future, path::PathBuf, process::ExitCode, sync::Arc};
+use tracing::Instrument;
 
 pub const USAGE: &str = "merezha run --config PATH [--listen ADDRESS] [--set SECTION.KEY=VALUE]...";
 /// Bound on `--set` overrides.
@@ -66,16 +67,32 @@ pub fn arguments(args: impl IntoIterator<Item = String>) -> Result<RunArguments,
     })
 }
 
-/// Entry point for `merezha run`. Exit codes: 0 after a graceful stop, 1
-/// when serving failed, 2 when startup failed.
-pub async fn main(args: impl IntoIterator<Item = String>) -> ExitCode {
+/// What `startup.failed` carries besides its code.
+enum Detail {
+    None,
+    Usage,
+    Issues(String),
+}
+/// `startup.failed` before the subscriber is installed: JSON to stderr,
+/// unbuffered.
+fn bootstrap_failed(code: &str, detail: Detail) {
+    tracing::dispatcher::with_default(&pipeline::bootstrap(), || match detail {
+        Detail::Issues(issues) => {
+            merezha_telemetry::event!(ERROR, "startup.failed", code, issues = issues.as_str())
+        }
+        Detail::Usage => merezha_telemetry::event!(ERROR, "startup.failed", code, usage = USAGE),
+        Detail::None => merezha_telemetry::event!(ERROR, "startup.failed", code),
+    });
+}
+
+/// Entry point for `merezha run`. `ignored` names the `OTEL_*` variables
+/// `main` removed from the environment. Exit codes: 0 after a graceful
+/// stop, 1 when serving failed, 2 when startup failed.
+pub async fn main(args: impl IntoIterator<Item = String>, ignored: Vec<String>) -> ExitCode {
     let arguments = match arguments(args) {
         Ok(arguments) => arguments,
         Err(failure) => {
-            crate::emit(
-                "startup.failed",
-                json!({"code": failure.code, "usage": USAGE}),
-            );
+            bootstrap_failed(&failure.code, Detail::Usage);
             return ExitCode::from(2);
         }
     };
@@ -88,47 +105,96 @@ pub async fn main(args: impl IntoIterator<Item = String>) -> ExitCode {
         overrides: arguments.overrides,
     };
     let modules = crate::modules(&input);
-    run(input, modules, host::shutdown_signal()).await
+    run(input, modules, host::shutdown_signal(), ignored).await
 }
 
-/// Run the host with `modules` until `shutdown` resolves. Startup failures
-/// are logged as `startup.failed` with a stable code and never with values.
+/// Run the host with `modules` until `shutdown` resolves, then flush
+/// telemetry. Installs the process-wide subscriber, so call it once per
+/// process. Startup failures are logged as `startup.failed` at error with a
+/// stable code and never with values.
 pub async fn run(
     input: ConfigInput,
     modules: Vec<Box<dyn Module>>,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    otel_ignored: Vec<String>,
 ) -> ExitCode {
     let (config, modules) = match host::configure(&input, modules) {
         Ok(configured) => configured,
         Err(errors) => {
             // The subscriber depends on configuration, so this one event
-            // uses the plain JSON emitter. Issues carry keys, codes and
-            // origins only.
+            // goes through the bootstrap dispatcher. Issues carry keys,
+            // codes and origins only.
             let issues: Vec<_> = errors
                 .0
                 .iter()
                 .map(|i| json!({"key": i.key, "code": i.code, "origin": i.origin.to_string()}))
                 .collect();
-            crate::emit(
-                "startup.failed",
-                json!({"code": "invalid_config", "issues": issues}),
+            bootstrap_failed(
+                "invalid_config",
+                Detail::Issues(serde_json::Value::from(issues).to_string()),
             );
             return ExitCode::from(2);
         }
     };
-    if telemetry::init(&config.telemetry, Vec::new()).is_err() {
-        crate::emit("startup.failed", json!({"code": "telemetry_initialized"}));
-        return ExitCode::from(2);
-    }
-    let failed = |code: &str| {
-        tracing::error!(event = "startup.failed", code);
-        ExitCode::from(2)
+    let service = Service::resolve(
+        &config.telemetry.resource,
+        &config.app.id,
+        config.app.version.as_deref(),
+        &config.app.instance_id,
+    );
+    let telemetry = match Telemetry::init(&config.telemetry, &service) {
+        Ok(telemetry) => telemetry,
+        Err(failure) => {
+            bootstrap_failed(&failure.code, Detail::None);
+            return ExitCode::from(2);
+        }
     };
+    if !otel_ignored.is_empty() {
+        merezha_telemetry::event!(
+            INFO,
+            "telemetry.otel_env_ignored",
+            names = otel_ignored.join(",").as_str()
+        );
+    }
+    let code = serve(config, modules, shutdown).await;
+    // Flush traces, logs and metrics within `shutdown_timeout_ms`, then the
+    // stderr writer.
+    let _ = tokio::task::spawn_blocking(move || telemetry.shutdown()).await;
+    code
+}
+
+async fn serve(
+    config: merezha_platform::ProjectConfig,
+    modules: Vec<Box<dyn Module>>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> ExitCode {
+    let started = start(config, modules)
+        .instrument(tracing::info_span!(names::span::STARTUP))
+        .await;
+    let (host, listener) = match started {
+        Ok(started) => started,
+        Err(code) => {
+            merezha_telemetry::event!(ERROR, "startup.failed", code = code.as_str());
+            return ExitCode::from(2);
+        }
+    };
+    match host.serve(listener, shutdown).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_) => ExitCode::from(1),
+    }
+}
+
+/// Everything from the runtime to the bound listener, inside the
+/// `startup` span. Fails with the `startup.failed` code.
+async fn start(
+    config: merezha_platform::ProjectConfig,
+    modules: Vec<Box<dyn Module>>,
+) -> Result<(Host, tokio::net::TcpListener), String> {
     let manifest = config.runtime.manifest.clone();
     let runtime =
         match tokio::task::spawn_blocking(move || Runtime::load(manifest).map_err(|_| ())).await {
             Ok(Ok(runtime)) => runtime,
-            _ => return failed("invalid_manifest"),
+            _ => return Err("invalid_manifest".to_owned()),
         };
     // Without the identity block, only a private loopback listener keeps the
     // explicit allow-all policy and the unauthenticated raw runtime
@@ -152,8 +218,8 @@ pub async fn run(
                 tokio::task::spawn_blocking(move || crate::read_application_config(&path)).await;
             let application = match read {
                 Ok(Ok(application)) => application,
-                Ok(Err(failure)) => return failed(&failure.code),
-                Err(_) => return failed("invalid_application_config"),
+                Ok(Err(failure)) => return Err(failure.code),
+                Err(_) => return Err("invalid_application_config".to_owned()),
             };
             let guest = runtime.clone();
             let policy: Arc<dyn merezha_application::Authorizer> = authorizer.clone();
@@ -178,8 +244,8 @@ pub async fn run(
                 .await
                 {
                     Ok(Ok(application)) => Some(application),
-                    Ok(Err(failure)) => return failed(&failure.code),
-                    Err(_) => return failed("invalid_application_config"),
+                    Ok(Err(failure)) => return Err(failure.code),
+                    Err(_) => return Err("invalid_application_config".to_owned()),
                 }
             }
         }
@@ -197,8 +263,9 @@ pub async fn run(
         }
         (false, None) => axum::Router::new(),
     };
-    tracing::info!(
-        event = "runtime.loaded",
+    merezha_telemetry::event!(
+        INFO,
+        "runtime.loaded",
         raw_runtime = private,
         application = config.application.is_some()
     );
@@ -223,18 +290,12 @@ pub async fn run(
         Ok(host) => host,
         // The application module's own reason, not `module_start_failed`.
         Err(error) => match application_failure.as_ref().and_then(|f| f.get()) {
-            Some(failure) if error.module == Some(MODULE) => return failed(&failure.code),
-            _ => return failed(&error.failure.code),
+            Some(failure) if error.module == Some(MODULE) => return Err(failure.code.clone()),
+            _ => return Err(error.failure.code),
         },
     };
-    let listener = match host.bind(None).await {
-        Ok(listener) => listener,
-        Err(error) => return failed(&error.failure.code),
-    };
-    match host.serve(listener, shutdown).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(_) => ExitCode::from(1),
-    }
+    let listener = host.bind(None).await.map_err(|error| error.failure.code)?;
+    Ok((host, listener))
 }
 
 #[cfg(test)]

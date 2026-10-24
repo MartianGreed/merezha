@@ -482,8 +482,9 @@ impl CaptureNotifier {
         })
     }
     fn keep(&self, record: CapturedNotification) {
-        tracing::warn!(
-            event = "notification.captured",
+        merezha_telemetry::event!(
+            WARN,
+            "notification.captured",
             source = record.source.as_str(),
             kind = record.kind,
             topic = record.name.as_str(),

@@ -9,6 +9,7 @@ license.workspace = true
 merezha-application = { path = "../application" }
 merezha-domain = { path = "../domain" }
 merezha-postgres = { path = "../postgres" }
+merezha-telemetry = { path = "../telemetry" }
 axum = { workspace = true, features = ["matched-path"] }
 bytes.workspace = true
 futures-core.workspace = true
@@ -22,9 +23,10 @@ tokio.workspace = true
 toml.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+merezha-telemetry = { path = "../telemetry", features = ["testing"] }
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 tower.workspace = true

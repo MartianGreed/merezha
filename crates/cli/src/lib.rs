@@ -9,13 +9,13 @@ use axum::{
     routing::{get, post},
 };
 use merezha_runtime::{Error, Invocation, Runtime};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 use tokio::sync::Semaphore;
 
@@ -190,10 +190,43 @@ async fn invoke(
         Ok(o) => ("ok", o.output.len()),
         Err(e) => (e.code(), 0),
     };
-    emit(
-        "invocation.completed",
-        json!({"request_id":request_id,"generation":generation,"duration_ms":started.elapsed().as_millis(),"input_bytes":input_bytes,"output_bytes":output_bytes,"code":code}),
-    );
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let (input_bytes, output_bytes) = (input_bytes as u64, output_bytes as u64);
+    // Debug for successes and client errors, warn for limits, error when
+    // the host broke its own contract (TE §4).
+    match code {
+        "internal" => merezha_telemetry::event!(
+            ERROR,
+            "invocation.completed",
+            request_id,
+            generation,
+            duration_ms,
+            input_bytes,
+            output_bytes,
+            code
+        ),
+        "input_limit" | "output_limit" | "fuel_exhausted" | "memory_limit" | "timeout" | "trap"
+        | "overloaded" => merezha_telemetry::event!(
+            WARN,
+            "invocation.completed",
+            request_id,
+            generation,
+            duration_ms,
+            input_bytes,
+            output_bytes,
+            code
+        ),
+        _ => merezha_telemetry::event!(
+            DEBUG,
+            "invocation.completed",
+            request_id,
+            generation,
+            duration_ms,
+            input_bytes,
+            output_bytes,
+            code
+        ),
+    }
     match result {
         Ok(output) => {
             let mut response = output.output.into_response();
@@ -227,14 +260,11 @@ async fn reload(State(state): State<AppState>, request: Request) -> Response {
     .await;
     match result {
         Ok(Ok(generation)) => {
-            emit(
-                "registry.reloaded",
-                json!({"generation":generation,"code":"ok"}),
-            );
+            merezha_telemetry::event!(INFO, "registry.reloaded", generation, code = "ok");
             Json(json!({"generation":generation})).into_response()
         }
         Ok(Err(_)) => {
-            emit("registry.reload_failed", json!({"code":"invalid_manifest"}));
+            merezha_telemetry::event!(WARN, "registry.reload_failed", code = "invalid_manifest");
             coded(StatusCode::BAD_REQUEST, "invalid_manifest")
         }
         Err(_) => failure(Error::Internal),
@@ -254,21 +284,4 @@ fn failure(error: Error) -> Response {
         _ => StatusCode::UNPROCESSABLE_ENTITY,
     };
     coded(status, error.code())
-}
-/// Emit allowlisted metadata at `info`, or at the `level` the fields carry.
-/// Never pass guest input/output or error text here.
-pub fn emit(event: &str, mut fields: Value) {
-    fields["event"] = json!(event);
-    fields["timestamp_unix_ms"] = json!(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    );
-    if fields.get("level").is_none() {
-        fields["level"] = json!("info");
-    }
-    fields["service"] = json!("merezha");
-    fields["version"] = json!(env!("CARGO_PKG_VERSION"));
-    eprintln!("{fields}");
 }

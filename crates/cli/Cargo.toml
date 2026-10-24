@@ -18,11 +18,13 @@ merezha-jobs = { path = "../jobs" }
 merezha-notifications = { path = "../notifications" }
 merezha-content = { path = "../content" }
 merezha-postgres = { path = "../postgres" }
+merezha-telemetry = { path = "../telemetry", features = ["pipeline"] }
 anyhow.workspace = true
 serde_json.workspace = true
 axum.workspace = true
+rustls.workspace = true
 tokio.workspace = true
-tracing.workspace = true
+tracing = { workspace = true, features = ["release_max_level_debug"] }
 
 [dev-dependencies]
 # The process tests drive the relay through MEREZHA_JOBS_TEST_RELAY.

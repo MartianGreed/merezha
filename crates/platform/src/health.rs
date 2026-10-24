@@ -59,9 +59,9 @@ impl Readiness {
         // Log transitions only, so a polling balancer cannot flood the log.
         if self.reported.swap(ready, Ordering::SeqCst) != ready {
             if ready {
-                tracing::info!(event = "health.ready");
+                merezha_telemetry::event!(INFO, "health.ready");
             } else {
-                tracing::warn!(event = "health.not_ready", checks = ?failed);
+                merezha_telemetry::event!(WARN, "health.not_ready", checks = ?failed);
             }
         }
         *last = Some((Instant::now(), ready));

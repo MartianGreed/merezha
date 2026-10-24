@@ -444,8 +444,9 @@ async fn context(State(state): State<EdgeState>, mut request: Request, next: Nex
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert(REQUEST_ID, value);
     }
-    tracing::info!(
-        event = "http.request.completed",
+    merezha_telemetry::event!(
+        INFO,
+        "http.request.completed",
         method = method.as_str(),
         route = route.as_deref().unwrap_or("unmatched"),
         status = response.status().as_u16(),
