@@ -239,3 +239,185 @@ async fn a_claim_cut_by_a_crash_is_returned_to_dead_by_the_reaper() {
     );
     jobs.shutdown(soon()).await;
 }
+
+/// Everything the log subscriber writes, as text (current-thread tests).
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+/// The first call is slow and fails; every later one succeeds at once.
+#[derive(Default)]
+struct SlowThenFast(AtomicUsize);
+impl Reissue for SlowThenFast {
+    fn reissue(&self, _: ReissueRequest) -> BoxFuture<'_, Result<(), Failure>> {
+        let call = self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            if call == 0 {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                Err(Failure::transient("provider_down"))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
+
+/// Re-review F1: a slow hook A outlives its claim, the reaper reverts it, a
+/// replay B claims and reissues; A's late failure is fenced on its own
+/// claim, so it neither kills B's job nor reports `Reissued`.
+#[tokio::test]
+async fn a_late_settle_of_a_reverted_claim_is_fenced_out() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let logs = Captured::default();
+    let writer = logs.clone();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let db = database(&test).await;
+    let jobs = PgJobs::with_mode(
+        &jobs_config(&test, "[jobs]\nreaper_interval_ms = 100"),
+        RelayMode::Interval,
+    )
+    .with_reissue_timing(
+        Duration::from_secs(5),
+        Duration::from_millis(300),
+        Duration::from_secs(30),
+    );
+    jobs.ports(&db);
+    let hook = Arc::new(SlowThenFast::default());
+    handle(&jobs, "tasks")
+        .register(
+            "tasks.mail",
+            "default",
+            func(|_, _| Box::pin(async { Ok(()) })),
+            KindOptions {
+                reissue: Some(hook.clone()),
+            },
+        )
+        .unwrap();
+    jobs.start(instance_context(&db, "fenced")).await.unwrap();
+    wait_ready(&jobs).await;
+    let id = flagged_dead(&db, "tasks:fenced").await;
+    let first = jobs.clone();
+    let slow = tokio::spawn(async move { first.replay(id, Some("usr_a")).await });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while claim_of(&db, id).await != ("cancelled".into(), 1, true) {
+        assert!(Instant::now() < deadline, "A never claimed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The reaper reverts A's claim once it is 300 ms old.
+    while claim_of(&db, id).await != ("dead".into(), 0, false) {
+        assert!(Instant::now() < deadline, "the claim was never reverted");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        jobs.replay(id, Some("usr_b")).await.unwrap(),
+        merezha_jobs::Replay::Reissued
+    );
+    assert_eq!(claim_of(&db, id).await, ("cancelled".into(), 1, false));
+    let late = slow.await.unwrap().unwrap_err();
+    assert_eq!(
+        (late.code.as_str(), late.classification),
+        (
+            "reissue_claim_lost",
+            merezha_domain::Classification::Conflict
+        )
+    );
+    assert_eq!(
+        claim_of(&db, id).await,
+        ("cancelled".into(), 1, false),
+        "B's reissue stands"
+    );
+    assert_eq!(hook.0.load(Ordering::SeqCst), 2);
+    assert!(
+        logs.text().contains("job.reissue_claim_lost"),
+        "{}",
+        logs.text()
+    );
+    jobs.shutdown(soon()).await;
+}
+
+/// Re-review F2: a bulk replay outlasting the response wait answers `202`
+/// with partial counts, and the detached run finishes every row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bulk_replay_past_the_wait_answers_202_and_finishes_detached() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let db = database(&test).await;
+    let jobs = PgJobs::with_mode(
+        &jobs_config(&test, "[jobs]\nworkers = false"),
+        RelayMode::Off,
+    )
+    .with_reissue_timing(
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        Duration::from_millis(200),
+    );
+    jobs.ports(&db);
+    let hook = Hook::new(Duration::from_millis(150), false);
+    handle(&jobs, "tasks")
+        .register(
+            "tasks.mail",
+            "default",
+            func(|_, _| Box::pin(async { Ok(()) })),
+            KindOptions {
+                reissue: Some(hook.clone()),
+            },
+        )
+        .unwrap();
+    jobs.start(instance_context(&db, "partial")).await.unwrap();
+    wait_ready(&jobs).await;
+    let mut ids = Vec::new();
+    for n in 0..4 {
+        ids.push(flagged_dead(&db, &format!("tasks:partial-{n}")).await);
+    }
+    let policy = Arc::new(LoopbackAllowAll::new("127.0.0.1:1".parse().unwrap()).unwrap());
+    let router = Router::new().nest("/v1/jobs", jobs.admin_router(policy));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/jobs/admin/dead/replay")
+                .body(Body::from(r#"{"queue":"default"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["complete"], false);
+    assert_eq!(body["replayed"], 0);
+    assert!(body["reissued"].as_u64().unwrap() < 4, "{body}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while hook.calls.load(Ordering::SeqCst) < 4 {
+        assert!(Instant::now() < deadline, "the detached run stopped");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for id in ids {
+        assert_eq!(claim_of(&db, id).await, ("cancelled".into(), 1, false));
+    }
+    jobs.shutdown(soon()).await;
+}

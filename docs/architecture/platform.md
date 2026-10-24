@@ -455,7 +455,7 @@ dot, `<area>.<noun>_<verb>`.
 `outbox.quarantined`, `outbox.relay_failed`, `job.admin_action`,
 `job.subscription_sync_failed`, `job.leased`, `job.completed`,
 `job.retry_scheduled`, `job.dead_lettered`, `job.lease_lost`,
-`job.drain_abandoned`, `job.worker_failed` (a lease, settle, heartbeat,
+`job.drain_abandoned`, `job.reissue_claim_lost`, `job.worker_failed` (a lease, settle, heartbeat,
 reaper, retention, lag or release statement failing, once per failure
 streak), `job.queue_unconfigured`, `db.listener_lost`,
 `db.listener_restored`.
@@ -1035,7 +1035,10 @@ state, and the R10 trace columns.
   the audit row; the hook runs within 10 s; success clears the claim, and
   a failure or timeout returns the job to `dead` (the hook's code for a
   single replay, `refused` in a bulk count). The reaper returns a claim
-  older than 60 s (a crash between claim and hook) to `dead`. Replays run
+  older than 60 s (a crash between claim and hook) to `dead`. Both settles
+  are fenced on the claim's own `reissue_claimed_at`: a hook that returns
+  after its claim was reverted (and maybe claimed again) writes nothing,
+  logs `job.reissue_claim_lost` and fails `409 reissue_claim_lost`. Replays run
   in a task detached from the request, so a disconnect or the HTTP drain
   cannot cut one; `POST dead/replay` answers `200` with
   `"complete":true`, or `202` with the counts so far and
@@ -1046,8 +1049,8 @@ state, and the R10 trace columns.
 Error codes it registers: `invalid_topic`, `invalid_queue`,
 `invalid_run_at`, `invalid_event_envelope`, `invalid_record_data`, `job_payload_limit`,
 `kind_already_registered`, `kind_not_registered`, `too_many_kinds` and
-`jobs_started` (422), `not_quarantined`, `not_dead` and `not_cancellable`
-(409), `jobs_not_ready` (503). Migration 0002 adds the `outbox_quarantined`
+`jobs_started` (422), `not_quarantined`, `not_dead`, `not_cancellable` and
+`reissue_claim_lost` (409), `jobs_not_ready` (503). Migration 0002 adds the `outbox_quarantined`
 index the admin listing, the outbox count and retention read, the
 `jobs_due` index the readiness lag reads, and the `reissue_claimed_at`
 claim column (only on `cancelled` rows) with its index.
@@ -1056,7 +1059,9 @@ Process tests hold the relay with `MEREZHA_JOBS_TEST_RELAY=off` (or
 `interval`, no `LISTEN`), and `MEREZHA_JOBS_TEST_HANDLER=<ms>` registers a
 `test.sleep` kind on queue `default` whose handler sleeps that long,
 ignoring `cancel`. Only builds with the `test-hooks` feature read
-them; the feature also adds `PgJobs::without_heartbeat`, and
+them; the feature also adds `PgJobs::without_heartbeat` and
+`PgJobs::with_reissue_timing` (shorter hook deadline, claim timeout and
+`202` wait), and
 `merezha-jobs`' own tests enable it through a self dev-dependency. `merezha-cli`'s dev-dependency enables it, and Cargo unifies that into
 every build that compiles the dev-dependencies: the `merezha` binary built
 by `cargo test` or `--all-targets` reads the variable. Builds without them,

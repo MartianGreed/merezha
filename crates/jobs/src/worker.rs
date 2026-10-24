@@ -59,6 +59,8 @@ pub(crate) struct WorkerConfig {
     pub drain_timeout: Duration,
     pub retention: JobRetention,
     pub heartbeat: bool,
+    /// Reissue claims older than this go back to `dead`.
+    pub claim_timeout: Duration,
     pub listen: bool,
     pub listen_check: Duration,
     pub max_lag: Option<Duration>,
@@ -716,7 +718,7 @@ impl Worker {
         }
         let client = self.database.acquire(deadline()).await?;
         let at = tokio::time::Instant::from_std(deadline());
-        let claim_timeout = crate::admin::REISSUE_CLAIM_TIMEOUT.as_secs_f64();
+        let claim_timeout = self.config.claim_timeout.as_secs_f64();
         let reverted =
             tokio::time::timeout_at(at, client.execute(REVERT_CLAIMS, &[&claim_timeout]))
                 .await

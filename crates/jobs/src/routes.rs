@@ -27,9 +27,6 @@ use merezha_platform::{
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
-/// How long `POST dead/replay` waits for its detached run before it
-/// answers `202` with the counts so far.
-const BULK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Largest admin request body.
 const MAX_BODY: usize = 8 * 1024;
 const READ: &str = "jobs.admin.read";
@@ -374,7 +371,7 @@ async fn replay_dead(State(admin): State<Admin>, request: Request) -> Response {
         // Detached from this request: a disconnect or the HTTP drain cannot
         // cut a reissue between claim and hook.
         let (progress, handle) = admin.jobs.spawn_replay_dead(filter, principal);
-        match tokio::time::timeout(BULK_WAIT, handle).await {
+        match tokio::time::timeout(admin.jobs.reissue_timing().bulk_wait, handle).await {
             Ok(Ok(Ok(replayed))) => ok(json!({
                 "replayed": replayed.replayed,
                 "reissued": replayed.reissued,

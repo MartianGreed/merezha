@@ -231,12 +231,35 @@ pub const REISSUE_DEADLINE: Duration = Duration::from_secs(10);
 /// A reissue claim older than this was cut between claim and hook (a
 /// crash); the reaper returns the job to `dead`.
 pub const REISSUE_CLAIM_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long `POST dead/replay` waits for its detached run before it
+/// answers `202` with the counts so far.
+pub const BULK_WAIT: Duration = Duration::from_secs(30);
 
 /// A flagged dead job claimed for its reissue hook.
 struct Claimed {
     id: i64,
     hook: Arc<dyn Reissue>,
     request: ReissueRequest,
+    /// `reissue_claimed_at` in microseconds: the fence of every settle.
+    at: i64,
+}
+
+/// How long reissues wait (AP §D.1); [`PgJobs::with_reissue_timing`] in
+/// tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReissueTiming {
+    pub hook_deadline: Duration,
+    pub claim_timeout: Duration,
+    pub bulk_wait: Duration,
+}
+impl Default for ReissueTiming {
+    fn default() -> Self {
+        Self {
+            hook_deadline: REISSUE_DEADLINE,
+            claim_timeout: REISSUE_CLAIM_TIMEOUT,
+            bulk_wait: BULK_WAIT,
+        }
+    }
 }
 
 const CANDIDATE: &str = "id, queue, kind, contains_secret, idempotency_key, correlation_id,
@@ -290,6 +313,7 @@ impl PgJobs {
         let correlation: String = row.get(5);
         Some(Claimed {
             id,
+            at: 0,
             hook,
             request: ReissueRequest {
                 job_id: id,
@@ -330,18 +354,21 @@ impl PgJobs {
                     else {
                         return Ok(None);
                     };
-                    let Some(claim) = jobs.claimable(&row) else {
+                    let Some(mut claim) = jobs.claimable(&row) else {
                         return Ok(None);
                     };
-                    tx.execute(
-                        "UPDATE merezha_jobs.jobs
-                            SET state = 'cancelled', replays = replays + 1,
-                                reissue_claimed_at = now(), updated_at = now()
-                          WHERE id = $1",
-                        &[&id],
-                    )
-                    .await
-                    .map_err(|e| classify(&e))?;
+                    claim.at = tx
+                        .query_one(
+                            "UPDATE merezha_jobs.jobs
+                                SET state = 'cancelled', replays = replays + 1,
+                                    reissue_claimed_at = now(), updated_at = now()
+                              WHERE id = $1
+                             RETURNING (extract(epoch FROM reissue_claimed_at) * 1000000)::bigint",
+                            &[&id],
+                        )
+                        .await
+                        .map_err(|e| classify(&e))?
+                        .get(0);
                     audit(tx, who.as_deref(), "reissue", &id.to_string(), 1).await?;
                     Ok(Some(claim))
                 })
@@ -353,10 +380,16 @@ impl PgJobs {
     /// claim is cleared; on failure or timeout the job returns to `dead`
     /// and the failure is returned. A crash in between leaves the claim
     /// for the reaper, which returns it to `dead` after
-    /// [`REISSUE_CLAIM_TIMEOUT`].
+    /// [`REISSUE_CLAIM_TIMEOUT`]. Both settles are fenced on this claim's
+    /// `reissue_claimed_at`: when the reaper reverted it (and maybe a later
+    /// replay claimed again) nothing is written, `job.reissue_claim_lost`
+    /// is logged and conflict `reissue_claim_lost` returned.
     async fn reissue(&self, claim: Claimed) -> Result<(), Failure> {
+        let timing = self.reissue_timing();
         let outcome =
-            match tokio::time::timeout(REISSUE_DEADLINE, claim.hook.reissue(claim.request)).await {
+            match tokio::time::timeout(timing.hook_deadline, claim.hook.reissue(claim.request))
+                .await
+            {
                 Ok(result) => result,
                 Err(_) => Err(Failure::transient("reissue_timeout")),
             };
@@ -364,19 +397,33 @@ impl PgJobs {
         let sql = match outcome {
             Ok(()) => {
                 "UPDATE merezha_jobs.jobs SET reissue_claimed_at = NULL, updated_at = now()
-                  WHERE id = $1 AND state = 'cancelled' AND reissue_claimed_at IS NOT NULL"
+                  WHERE id = $1 AND state = 'cancelled'
+                    AND (extract(epoch FROM reissue_claimed_at) * 1000000)::bigint = $2"
             }
             Err(_) => {
                 "UPDATE merezha_jobs.jobs
                     SET state = 'dead', replays = greatest(replays - 1, 0),
                         reissue_claimed_at = NULL, updated_at = now()
-                  WHERE id = $1 AND state = 'cancelled' AND reissue_claimed_at IS NOT NULL"
+                  WHERE id = $1 AND state = 'cancelled'
+                    AND (extract(epoch FROM reissue_claimed_at) * 1000000)::bigint = $2"
             }
         };
-        client
-            .execute(sql, &[&claim.id])
+        let settled = client
+            .execute(sql, &[&claim.id, &claim.at])
             .await
             .map_err(|e| classify(&e))?;
+        if settled == 0 {
+            tracing::warn!(
+                event = "job.reissue_claim_lost",
+                job_id = claim.id,
+                hook = if outcome.is_ok() {
+                    "succeeded"
+                } else {
+                    "failed"
+                }
+            );
+            return Err(Failure::conflict("reissue_claim_lost"));
+        }
         if outcome.is_ok() {
             logged("reissue", 1, Target::Job(claim.id));
         }

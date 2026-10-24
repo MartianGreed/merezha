@@ -942,7 +942,9 @@ async fn a_lease_racing_the_drain_is_released_with_its_attempt_refunded() {
     // The dispatcher's lease waits on the queue lock.
     wait_for(
         &db,
-        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
+        "SELECT count(*) FROM pg_locks
+          WHERE locktype = 'advisory' AND NOT granted
+            AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
         1,
         Duration::from_secs(3),
     )

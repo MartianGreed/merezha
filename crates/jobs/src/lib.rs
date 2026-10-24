@@ -21,7 +21,7 @@ mod validate;
 mod worker;
 
 pub use admin::{
-    AttemptRecord, BulkReplay, DeadFilter, JobDetail, JobFilter, JobPage, JobSummary,
+    AttemptRecord, BULK_WAIT, BulkReplay, DeadFilter, JobDetail, JobFilter, JobPage, JobSummary,
     REISSUE_CLAIM_TIMEOUT, REISSUE_DEADLINE, Replay, ReplayProgress,
 };
 pub use outbox::{OUTBOX_CHANNEL, PgOutbox};
@@ -61,6 +61,7 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("not_quarantined", 409),
     ErrorCode::new("not_dead", 409),
     ErrorCode::new("not_cancellable", 409),
+    ErrorCode::new("reissue_claim_lost", 409),
     ErrorCode::new("jobs_not_ready", 503),
 ];
 /// Per-instance slots of a queue a registered kind names but `[jobs.queues]`
@@ -113,6 +114,7 @@ struct Inner {
     subscriptions: SubscriptionsConfig,
     listen_check: Duration,
     heartbeat: bool,
+    reissue: admin::ReissueTiming,
     mode: RelayMode,
     database: OnceLock<Database>,
     ctx: OnceLock<AppContext>,
@@ -205,6 +207,7 @@ impl PgJobs {
                 subscriptions: config.subscriptions.clone(),
                 listen_check: LISTEN_CHECK_INTERVAL,
                 heartbeat: true,
+                reissue: admin::ReissueTiming::default(),
                 mode,
                 database: OnceLock::new(),
                 ctx: OnceLock::new(),
@@ -234,6 +237,29 @@ impl PgJobs {
             inner.heartbeat = false;
         }
         self
+    }
+    /// Shorter reissue bounds for tests (feature `test-hooks`): the hook
+    /// deadline, the age after which the reaper reverts a claim, and how
+    /// long `POST dead/replay` waits before answering `202`. Call before
+    /// sharing the runtime.
+    #[cfg(feature = "test-hooks")]
+    pub fn with_reissue_timing(
+        mut self,
+        hook_deadline: Duration,
+        claim_timeout: Duration,
+        bulk_wait: Duration,
+    ) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.reissue = admin::ReissueTiming {
+                hook_deadline,
+                claim_timeout,
+                bulk_wait,
+            };
+        }
+        self
+    }
+    pub(crate) fn reissue_timing(&self) -> admin::ReissueTiming {
+        self.inner.reissue
     }
     /// Migrations 0001 and 0002 of `merezha_jobs`, under ledger key `jobs`.
     pub fn migrations() -> &'static [Migration] {
@@ -344,6 +370,7 @@ impl PgJobs {
                 drain_timeout: config.drain_timeout,
                 retention: config.retention.clone(),
                 heartbeat: self.inner.heartbeat,
+                claim_timeout: self.inner.reissue.claim_timeout,
                 listen: self.inner.mode == RelayMode::Listen,
                 listen_check: self.inner.listen_check,
                 max_lag: config.readiness_max_lag,
