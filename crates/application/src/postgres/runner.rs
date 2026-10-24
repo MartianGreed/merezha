@@ -29,7 +29,7 @@ use tokio::sync::{Notify, Semaphore, watch};
 
 /// How long a background run waits for another wake after it caught up,
 /// before it releases its lock (§A.7 step 4).
-const LINGER: Duration = Duration::from_secs(1);
+pub(crate) const LINGER: Duration = Duration::from_secs(1);
 /// Poll interval of a request waiting on another runner's progress (§A.6).
 pub(crate) const POLL: Duration = Duration::from_millis(50);
 /// An explicit request retries the run lock at most this often while
@@ -66,7 +66,7 @@ pub struct BackgroundOptions {
     pub max_concurrent: usize,
     /// `app.instance_id`, reported by [`Application::status`].
     pub instance_id: String,
-    #[cfg(feature = "test-support")]
+    /// Test hooks; production leaves the default (none).
     #[doc(hidden)]
     pub hooks: RunHooks,
 }
@@ -79,7 +79,6 @@ impl Default for BackgroundOptions {
             warm_readiness: true,
             max_concurrent: 2,
             instance_id: String::new(),
-            #[cfg(feature = "test-support")]
             hooks: RunHooks::default(),
         }
     }
@@ -105,10 +104,7 @@ impl BackgroundOptions {
         Ok(())
     }
     pub(crate) fn hooks(&self) -> RunHooks {
-        #[cfg(feature = "test-support")]
-        return self.hooks.clone();
-        #[cfg(not(feature = "test-support"))]
-        RunHooks::default()
+        self.hooks.clone()
     }
 }
 /// Test hooks for the cancellation and lost-CAS tests.
@@ -125,6 +121,9 @@ pub struct RunHooks {
     pub skip_lock: bool,
     /// Start no `LISTEN` session: only local wakes and the interval.
     pub skip_listen: bool,
+    /// A one-shot pause of a background run after it took its slot and
+    /// before its first step.
+    pub before_run: Option<Arc<Pause>>,
 }
 /// See [`RunHooks::pause`].
 #[derive(Debug, Default)]
@@ -261,8 +260,9 @@ pub(crate) struct Bounds {
     pub cancel: Option<watch::Receiver<u64>>,
 }
 impl Bounds {
-    /// A background run started now.
-    pub(crate) fn background(shared: &Shared) -> Self {
+    /// A background run started now, cancelled through `cancel`, which the
+    /// scheduler subscribed before it checked for shutdown.
+    pub(crate) fn background(shared: &Shared, cancel: watch::Receiver<u64>) -> Self {
         let now = Instant::now();
         let mut soft = now + shared.options.run_timeout;
         let mut hard = soft + HARD_MARGIN;
@@ -274,7 +274,7 @@ impl Bounds {
             soft,
             hard,
             background: true,
-            cancel: Some(shared.cancel.subscribe()),
+            cancel: Some(cancel),
         }
     }
     /// A request bounded by its admitted deadline.
@@ -583,6 +583,19 @@ async fn pause_in(
         }
     }
     Ok(())
+}
+
+impl Pause {
+    /// The client-side pause, if armed for `projection`.
+    pub(crate) async fn hold(pause: Option<Arc<Pause>>, projection: &str) {
+        if let Some(pause) = pause
+            && *pause.projection.lock().unwrap_or_else(|e| e.into_inner()) == projection
+            && pause.armed.swap(false, Ordering::SeqCst)
+        {
+            pause.entered.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(pause.millis.load(Ordering::SeqCst))).await;
+        }
+    }
 }
 
 /// Which head a live run works towards.

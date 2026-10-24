@@ -30,6 +30,9 @@ const RETRY: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs
 /// How often an idle `LISTEN` session is probed, since a half-open one
 /// never ends by itself.
 const PROBE: Duration = Duration::from_secs(5);
+/// After a lock attempt found another holder, the lane waits this long
+/// before the next one: the holder's linger.
+const CONTENDED: Duration = runner::LINGER;
 /// Bound on the scheduler's own pooled reads.
 const READ: Duration = Duration::from_secs(5);
 
@@ -60,7 +63,8 @@ impl Scheduler {
     /// runtime, and `invalid_concurrency_budget` when the guest runtime
     /// admits fewer calls than HTTP admission (`limits.max_concurrent`)
     /// plus `background.max_concurrent` (§A.8): background runs would
-    /// otherwise make requests fail `overloaded`.
+    /// otherwise make requests fail `overloaded`. The guest keeps refusing
+    /// reloads below that budget (`Guest::reserve_concurrency`).
     pub fn start(app: &Application) -> Result<Self, Failure> {
         let store = app
             .postgres()
@@ -68,11 +72,8 @@ impl Scheduler {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| Failure::permanent("storage_configuration"))?;
         let options = &store.shared().options;
-        if let Some(available) = app.guest().max_concurrent_invocations()
-            && available < app.config().limits.max_concurrent + options.max_concurrent
-        {
-            return Err(Failure::permanent("invalid_concurrency_budget"));
-        }
+        app.guest()
+            .reserve_concurrency(app.config().limits.max_concurrent + options.max_concurrent)?;
         let (stop, stopped) = watch::channel(false);
         let context = Arc::new(Context {
             app: app.clone(),
@@ -175,12 +176,21 @@ async fn run(
     projection: &Projection,
     work: fn(&Application, &PostgresStore, &Projection, &Bounds) -> Result<Outcome, Failure>,
 ) -> Option<Result<Outcome, Failure>> {
+    // Subscribe first, then check for shutdown: `shutdown` sets `stop`
+    // before it cancels, so a run either sees the stop here or the cancel
+    // at its first step.
+    let shared = context.store.shared();
+    let cancel = shared.cancel.subscribe();
+    if stopped(context) {
+        return None;
+    }
     let mut stop = context.stop.clone();
     let slot = tokio::select! {
         _ = stop.wait_for(|stopped| *stopped) => return None,
         slot = context.gate.clone().acquire_owned() => slot.ok()?,
     };
-    let shared = context.store.shared();
+    // Test hook: the window between taking the slot and the first step.
+    runner::Pause::hold(shared.options.hooks().before_run, projection.name.as_str()).await;
     shared.runs.fetch_add(1, Ordering::SeqCst);
     let (app, store, projection) = (
         context.app.clone(),
@@ -188,7 +198,7 @@ async fn run(
         projection.clone(),
     );
     let result = tokio::task::spawn_blocking(move || {
-        let bounds = Bounds::background(store.shared());
+        let bounds = Bounds::background(store.shared(), cancel);
         work(&app, &store, &projection, &bounds)
     })
     .await;
@@ -258,6 +268,14 @@ async fn live_lane(context: Arc<Context>, projection: Projection) {
                 reported = false;
                 armed = behind;
             }
+            // Another host runs it and lingers up to 1 s after catching up:
+            // wait as long before trying again, so commits on this host do
+            // not open a lock session each. Wakes meanwhile coalesce.
+            Ok(Outcome::Contended) => {
+                if !sleep_until(&context, Instant::now() + CONTENDED).await {
+                    return;
+                }
+            }
             Ok(_) => {}
             Err(failure) if failure.code == "cancelled" => armed = true,
             Err(failure) => {
@@ -326,6 +344,14 @@ async fn rebuild_lane(context: Arc<Context>, projection: Projection) {
             Ok(Outcome::Finished { .. }) => {
                 failures = 0;
                 armed = true;
+            }
+            // Another host runs it and lingers up to 1 s after catching up:
+            // wait as long before trying again, so commits on this host do
+            // not open a lock session each. Wakes meanwhile coalesce.
+            Ok(Outcome::Contended) => {
+                if !sleep_until(&context, Instant::now() + CONTENDED).await {
+                    return;
+                }
             }
             Ok(_) => {}
             Err(failure) if failure.code == "cancelled" => armed = true,

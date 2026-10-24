@@ -43,6 +43,18 @@ pub trait Guest: Send + Sync {
     fn max_concurrent_invocations(&self) -> Option<usize> {
         None
     }
+    /// Require at least `minimum` concurrent guest calls from now on,
+    /// including after a reload: `invalid_concurrency_budget` when the
+    /// guest admits fewer. A guest that can be reloaded refuses later
+    /// generations below it.
+    fn reserve_concurrency(&self, minimum: usize) -> Result<(), Failure> {
+        match self.max_concurrent_invocations() {
+            Some(available) if available < minimum => {
+                Err(Failure::permanent("invalid_concurrency_budget"))
+            }
+            _ => Ok(()),
+        }
+    }
 }
 /// Policy is composed by the embedding host. It is called after typed payload
 /// validation and before every command replay or query. Metadata is untrusted
@@ -85,6 +97,11 @@ impl Guest for merezha_runtime::Runtime {
         merezha_runtime::Runtime::limits(self)
             .ok()
             .map(|limits| limits.max_concurrent_invocations)
+    }
+    /// Also refuses later reloads below `minimum`.
+    fn reserve_concurrency(&self, minimum: usize) -> Result<(), Failure> {
+        self.require_concurrency(minimum)
+            .map_err(|_| Failure::permanent("invalid_concurrency_budget"))
     }
 }
 impl GuestSession for merezha_runtime::Session {

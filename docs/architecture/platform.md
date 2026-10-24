@@ -251,7 +251,7 @@ applications ignore them. `[application.reactors]` is *reserved* until AP-C3:
 | `[application.reactors]` | `interval_ms` | duration | `5000` | 100 ms to 10 min |
 | | `retry_base_ms` | duration | `1000` | 100 ms to 10 min; at most `retry_max_ms` (`retry_base_exceeds_max`) |
 | | `retry_max_ms` | duration | `300000` | 1 s to 1 day |
-| `[application.background]` | `max_concurrent` | integer | `2` | 1 to 16, shared by projection, rebuild and reactor runs; at most `database.max_detached - 1`. It also caps the explicit catch-ups holding their own lock session. The runtime manifest's `max_concurrent_invocations` must be at least `limits.max_concurrent` plus this (`invalid_concurrency_budget` at startup) |
+| `[application.background]` | `max_concurrent` | integer | `2` | 1 to 16, shared by projection, rebuild and reactor runs; at most `database.max_detached - 1`. It also caps the explicit catch-ups holding their own lock session. The runtime manifest's `max_concurrent_invocations` must be at least `limits.max_concurrent` plus this (`invalid_concurrency_budget` at startup), and `/v1/reload` refuses a manifest below it (`invalid_manifest`, the old generation keeps serving) |
 | `[application.append]` | `lock_timeout_max_ms` | duration | `5000` | 10 ms to 30 s; the append waits for the head lock at most `min(remaining deadline - 50 ms, lock_timeout_max_ms)`, then fails `503 storage_busy` |
 
 ### `[jobs]`
@@ -848,9 +848,9 @@ Each host runs a scheduler with one live lane and one rebuild lane per
 configured projection revision, at most `[application.background]
 max_concurrent` runs at once ([design](../design/application-platform.md)
 §A.7). With `catch_up = "auto"` a lane wakes on a commit on this host, on a
-`merezha_app_events` notification (one `LISTEN` session per host,
+`merezha_app_events` notification (the application's own `LISTEN` session,
 reconnected with backoff from 100 ms to 10 s, logging `db.listener_lost` and
-`db.listener_restored`; a reconnect wakes every lane) and every
+`db.listener_restored`; a reconnect wakes every live lane) and every
 `interval_ms`. A run holds the session advisory lock `pg_try_advisory_lock(1297760592,
 hashtext('p:{name}:{revision}'))` (`b:` for a rebuild) on a connection
 detached from the pool and named `merezha p:{name}:{revision}` in
@@ -896,10 +896,14 @@ served pair, `{"resume": true}` resumes it from its persisted candidate and
 | `POST projections/{name}/catch-up` | `application.projections.catch_up` | `{state, checkpoint}` |
 | `POST projections/{name}/rebuild` | `application.projections.rebuild` | `202` as above |
 | `DELETE projections/{name}/rebuild` | `application.admin.write` | `204` |
-| `DELETE projections/{name}/revisions/{revision}` | `application.admin.write` | `204`; `409 revision_active` for the configured revision |
+| `DELETE projections/{name}/revisions/{revision}` | `application.admin.write` | `204`, also for a projection no longer configured; `409 revision_active` for the configured revision |
 
 Connections: each run holds one detached session beside the pool, as do at
-most `max_concurrent` explicit catch-ups, plus one `LISTEN` session. At
+most `max_concurrent` explicit catch-ups, plus the application's `LISTEN`
+session; with the jobs relay's and the job dispatcher's, a host holds three
+`LISTEN` sessions. A lane whose lock attempt found another host holding it
+waits 1 s (the holder's linger) before its next attempt, so commits on a host
+that does not hold the lock open few lock sessions. At
 startup the host logs `db.pool_undersized` (warn, `pool_size`,
 `recommended`) when `database.pool_size` is below `limits.max_concurrent +
 background.max_concurrent + 2 + number of job queues + 2`.

@@ -917,7 +917,8 @@ impl PostgresStore {
         Ok(())
     }
     /// Delete a revision row this instance does not serve (and with it its
-    /// rebuild). `revision_active` for the configured revision,
+    /// rebuild), also of a projection no longer configured.
+    /// `revision_active` for the configured revision,
     /// `projection_not_found` for a row that does not exist.
     pub(crate) fn delete_revision(
         &self,
@@ -925,11 +926,9 @@ impl PostgresStore {
         revision: u32,
         deadline: Instant,
     ) -> Result<(), Failure> {
+        // Rows of projections no longer configured can be cleaned up too.
         if self.projections.contains(&(name.clone(), revision)) {
             return Err(Failure::conflict("revision_active"));
-        }
-        if !self.projections.iter().any(|(n, _)| n == name) {
-            return Err(Failure::permanent("projection_not_found"));
         }
         let text = name.as_str().to_owned();
         let revision =

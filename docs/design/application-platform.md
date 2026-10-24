@@ -1704,8 +1704,9 @@ Errors use FW's shape `{"error":{"code","classification","details"?}}` (R8). Lis
 routes require the named permission at `ResourceScope::Application` (R5); without it, they exist
 only on loopback (`AllowAll`). Durations are in seconds (R9).
 
-**Application** (`/v1/application/`; permissions `application.admin.read` and
-`application.admin.write`):
+**Application** (`/v1/application/`; permissions `application.admin.read`,
+`application.admin.write`, and for catch-up and rebuild `application.projections.catch_up` and
+`application.projections.rebuild`):
 
 | Method and path | Response |
 | --- | --- |
@@ -1723,8 +1724,10 @@ only on loopback (`AllowAll`). Durations are in seconds (R9).
 | `GET status` | `{"application","head","projections":[{"name","checkpoint","lag_events","lag_seconds","status","failure_code"}],"reactors":[{"name","status","lag_events"}],"instance":{"id","background_runs"},"listener"}`, where `listener` is `connected`, `reconnecting` or `off` (no `LISTEN` session, as with manual catch-up) |
 
 `GET status` serves `Application::status()` and `GET queues`/`GET outbox` serve
-`JobsHandle::queue_status()`; TE's `/v1/admin/status` embeds the same documents (R10). Writes need
-`application.admin.write`.
+`JobsHandle::queue_status()`; TE's `/v1/admin/status` embeds the same documents (R10). Reads need
+`application.admin.read`. `POST projections/{name}/catch-up` needs `application.projections.catch_up`
+and `POST projections/{name}/rebuild` needs `application.projections.rebuild`, K's specific
+permissions (decided in the AP-A3 review); every other write needs `application.admin.write`.
 
 **Jobs** (`/v1/jobs/admin/`; permissions `jobs.admin.read` and `jobs.admin.write`):
 
@@ -1928,14 +1931,16 @@ description (not gated).
   `database_unavailable` and never reaches a CAS. A lost CAS is shown by a run without the lock (test
   hook, `Application::project_unlocked`) and by a live run racing a rebuild swap.
 - The application opens its own `LISTEN merezha_app_events` session through `Database::listen`,
-  reconnected by the scheduler; the jobs relay keeps its own, so a host holds two listener sessions.
-  A cross-module fan-out listener can replace both later.
+  reconnected by the scheduler, and a reconnect wakes every live lane. The jobs relay and the job
+  dispatcher keep theirs, so a host holds three `LISTEN` sessions; a cross-module fan-out listener
+  can replace them later.
+- A lane whose lock attempt is contended waits the holder's 1 s linger before trying again.
+- The concurrency budget is reserved on the guest (`Guest::reserve_concurrency`): the runtime then
+  refuses a reload whose `max_concurrent_invocations` falls below it. `DELETE .../revisions/{revision}`
+  also removes rows of projections no longer configured.
 - No metric is emitted until TE's meter lands (TE-T3); the store exposes their sources
   (`PostgresStore::held_locks`, `contended_locks`, the status lag). Logs use TE's names, plus
   `db.pool_undersized` for the A.8 warning.
-- `POST .../catch-up` and `POST .../rebuild` keep K's permissions `application.projections.catch_up`
-  and `application.projections.rebuild`; the new reads need `application.admin.read`, and abandoning a
-  rebuild or deleting a revision `application.admin.write`.
 - `catch_up = "manual"` stops live catch-up only: new revisions still warm up and requested rebuilds
   still run in the background. `Application::rebuild` (the synchronous API) requests or resumes the
   rebuild and runs it to its swap within the call; `{"resume": true}` without a rebuild starts one.

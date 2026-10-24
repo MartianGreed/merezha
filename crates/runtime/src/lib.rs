@@ -83,6 +83,8 @@ struct Inner {
     registry: RwLock<Arc<Registry>>,
     reload: Mutex<()>,
     active: AtomicUsize,
+    /// The least `max_concurrent_invocations` a reload may install.
+    floor: AtomicUsize,
     _ticker: Ticker,
 }
 /// Clones share the current catalog and admission counter.
@@ -167,6 +169,7 @@ impl Runtime {
             registry: RwLock::new(registry),
             reload: Mutex::new(()),
             active: AtomicUsize::new(0),
+            floor: AtomicUsize::new(0),
             _ticker: ticker,
         })))
     }
@@ -184,6 +187,10 @@ impl Runtime {
             .checked_add(1)
             .context("generation overflow")?;
         let candidate = Arc::new(load_registry(&self.0.engine, &self.0.manifest, generation)?);
+        ensure!(
+            candidate.limits.max_concurrent_invocations >= self.0.floor.load(Ordering::SeqCst),
+            "max_concurrent_invocations below the host's concurrency budget"
+        );
         *self
             .0
             .registry
@@ -198,6 +205,17 @@ impl Runtime {
             services: registry.services.keys().cloned().collect(),
             pipelines: registry.pipelines.keys().cloned().collect(),
         })
+    }
+    /// Refuse later reloads whose `max_concurrent_invocations` is below
+    /// `minimum`, as an embedding host that budgets guest calls requires.
+    /// Fails when the active generation is already below it.
+    pub fn require_concurrency(&self, minimum: usize) -> Result<(), Error> {
+        let _load = self.0.reload.lock().map_err(|_| Error::Internal)?;
+        if self.snapshot()?.limits.max_concurrent_invocations < minimum {
+            return Err(Error::Overloaded);
+        }
+        self.0.floor.store(minimum, Ordering::SeqCst);
+        Ok(())
     }
     /// The limits of the active generation. A reload may change them.
     pub fn limits(&self) -> Result<Limits, Error> {
