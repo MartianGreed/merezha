@@ -165,20 +165,12 @@ pub async fn run(
     }
     // Jobs and the outbox run whenever the host does (R12). Their
     // instruments and gauge sampler run when metrics are exported (TE §1.3).
-    let mut jobs =
-        merezha_jobs::PgJobs::new(&config.jobs).with_app_version(config.app.version.clone());
-    if config
-        .telemetry
-        .signals
-        .contains(&merezha_telemetry::Signal::Metrics)
-    {
-        jobs = jobs.with_telemetry(
-            &telemetry.meter("jobs"),
-            config.telemetry.metrics.sample_interval,
-        );
-    }
+    let meters = telemetry.meters();
+    let jobs = merezha_jobs::PgJobs::new(&config.jobs)
+        .with_app_version(config.app.version.clone())
+        .with_telemetry(&meters, config.telemetry.metrics.sample_interval);
     let options = HostOptions {
-        meters: telemetry.meters(),
+        meters,
         status: vec![Arc::new(TelemetrySection(telemetry.status_reader()))],
         ..HostOptions::default()
     };

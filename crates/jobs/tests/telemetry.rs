@@ -49,6 +49,25 @@ fn named(harness: &Harness, name: &str) -> Vec<SpanData> {
     spans.sort_by_key(|span| attribute(span, "job.attempt"));
     spans
 }
+/// Whether `span`'s parent chain reaches `ancestor`.
+fn descends_from(
+    harness: &Harness,
+    span: &SpanData,
+    ancestor: opentelemetry::trace::SpanId,
+) -> bool {
+    let spans = harness.spans();
+    let mut parent = span.parent_span_id;
+    for _ in 0..16 {
+        if parent == ancestor {
+            return true;
+        }
+        match spans.iter().find(|s| s.span_context.span_id() == parent) {
+            Some(next) => parent = next.parent_span_id,
+            None => return false,
+        }
+    }
+    false
+}
 /// Wait until `count` spans named `name` were exported.
 async fn wait_spans(harness: &Harness, name: &str, count: usize) -> Vec<SpanData> {
     let deadline = Instant::now() + PATIENCE;
@@ -87,10 +106,8 @@ async fn instrumented(
     mode: RelayMode,
     handler: Option<Arc<dyn merezha_platform::ports::JobHandler>>,
 ) -> PgJobs {
-    let jobs = PgJobs::with_mode(config, mode).with_telemetry(
-        &harness.telemetry().meter("jobs"),
-        Duration::from_millis(50),
-    );
+    let jobs = PgJobs::with_mode(config, mode)
+        .with_telemetry(&harness.telemetry().meters(), Duration::from_millis(50));
     jobs.ports(db);
     if let Some(handler) = handler {
         handle(&jobs, "tasks")
@@ -193,8 +210,13 @@ async fn outbox_trace_context_flows_to_every_attempt_and_replays_link_back() {
     assert_eq!(send.span_kind, SpanKind::Producer);
     assert_eq!(send.span_context.trace_id(), trace_a);
     assert_eq!(send.span_context.span_id(), outbox_context.span_id());
+    // A descendant of the request span: inside its transaction (TE-T4's
+    // `transaction {module}` span sits in between).
     let edge = harness.span("POST /tasks");
-    assert_eq!(send.parent_span_id, edge.span_context.span_id());
+    assert!(
+        descends_from(&harness, &send, edge.span_context.span_id()),
+        "send is inside request A"
+    );
     assert_eq!(
         attribute(&send, "messaging.destination.name").as_deref(),
         Some("default")
@@ -909,10 +931,7 @@ async fn a_fenced_out_permanent_failure_is_not_a_dead_letter() {
     );
     let jobs = PgJobs::with_mode(&config, RelayMode::Listen)
         .without_heartbeat()
-        .with_telemetry(
-            &harness.telemetry().meter("jobs"),
-            Duration::from_millis(50),
-        );
+        .with_telemetry(&harness.telemetry().meters(), Duration::from_millis(50));
     jobs.ports(&db);
     handle(&jobs, "tasks")
         .register(
@@ -1068,7 +1087,7 @@ async fn duplicates_are_not_counted_and_get_no_send_span() {
 /// Review item 4 (M5, M8): a sample that cannot finish within
 /// `SAMPLE_DEADLINE` fails fast (well before the pool's 5 s statement
 /// timeout), logs `job.worker_failed` with `task = sampler`, and the gauges
-/// keep the last sample.
+/// keep the last sample until `STALE_SAMPLES` consecutive failures.
 #[tokio::test]
 async fn a_failing_sample_keeps_the_last_values_within_its_deadline() {
     let Some(test) = TestDatabase::create() else {
@@ -1111,8 +1130,34 @@ async fn a_failing_sample_keeps_the_last_values_within_its_deadline() {
         "the sample waited {took:?}"
     );
     assert_eq!(harness.metric("merezha.job.count").value(&ready), Some(1.0));
+    // Review item 5: after STALE_SAMPLES consecutive failures the gauges
+    // report nothing rather than stale values, and the failure is logged
+    // once per streak.
+    let deadline = Instant::now() + PATIENCE;
+    while harness.metric("merezha.job.count").value(&ready).is_some() {
+        assert!(Instant::now() < deadline, "stale values kept");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        locked.elapsed() >= merezha_jobs::SAMPLE_DEADLINE * (merezha_jobs::STALE_SAMPLES - 1),
+        "dropped before {} failures",
+        merezha_jobs::STALE_SAMPLES
+    );
+    assert!(harness.metric("merezha.outbox.pending").points().is_empty());
+    let logged = harness
+        .stderr_lines()
+        .iter()
+        .filter(|line| line["event"] == "job.worker_failed" && line["task"] == "sampler")
+        .count();
+    assert_eq!(logged, 1, "once per streak");
     locker.batch_execute("ROLLBACK").await.unwrap();
     drop(locker);
+    // A successful sample reports again.
+    let deadline = Instant::now() + PATIENCE;
+    while harness.metric("merezha.job.count").value(&ready) != Some(1.0) {
+        assert!(Instant::now() < deadline, "the gauges never came back");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     jobs.shutdown(Instant::now() + Duration::from_secs(10))
         .await;
     harness.assert_catalogued();
@@ -1188,10 +1233,8 @@ async fn reissued_replays_link_to_the_trace_the_job_died_in() {
     let harness = Harness::new();
     let db = database(&test).await;
     let config = jobs_config(&test, "[jobs]\nworkers = false");
-    let jobs = PgJobs::with_mode(&config, RelayMode::Off).with_telemetry(
-        &harness.telemetry().meter("jobs"),
-        Duration::from_millis(50),
-    );
+    let jobs = PgJobs::with_mode(&config, RelayMode::Off)
+        .with_telemetry(&harness.telemetry().meters(), Duration::from_millis(50));
     jobs.ports(&db);
     handle(&jobs, "tasks")
         .register(

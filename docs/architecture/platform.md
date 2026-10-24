@@ -1609,8 +1609,9 @@ Migration 0004 (TE-T5) adds `jobs.replay_trace_parent` and
   one child `admin job.replay` per reissue.
 
 Instruments, built from `names.rs` on the meter `PgJobs::with_telemetry`
-receives (`merezha run` passes `telemetry.meter("jobs")` when metrics are
-exported; otherwise they are no-ops):
+receives (`merezha run` passes its `Meters`; the scope is
+`merezha_jobs::SCOPE`, `merezha.jobs`, and with metrics not exported, when
+`Meters::enabled()` is false, the instruments stay no-ops):
 
 - `merezha.job.enqueued` counts every new job: enqueues, relay fan-out,
   fired occurrences and manual triggers. `merezha.job.schedule.fired`
@@ -1634,8 +1635,10 @@ exported; otherwise they are no-ops):
   database-level numbers everywhere): the queue status statements of
   `GET queues` and `GET outbox`, in one transaction with a 1 s statement
   timeout. A failing sample keeps the last one and logs
-  `job.worker_failed` (`task = sampler`) once per streak. The sampler runs
-  only when metrics are exported.
+  `job.worker_failed` (`task = sampler`) once per streak; after 3
+  consecutive failures (`merezha_jobs::STALE_SAMPLES`) the gauges report
+  nothing until a sample succeeds, so dashboards show a gap rather than
+  stale values. The sampler runs only when metrics are exported.
 
 Process tests hold the relay with `MEREZHA_JOBS_TEST_RELAY=off` (or
 `interval`, no `LISTEN`), and `MEREZHA_JOBS_TEST_HANDLER=<ms>` registers a

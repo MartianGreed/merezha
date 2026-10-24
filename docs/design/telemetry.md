@@ -280,7 +280,9 @@ the same database-level numbers; dashboards use
 `max without (service_instance_id)`. The sample runs the same two
 statements as those routes in one transaction, skips their quarantined
 listing, runs only while metrics are exported, and keeps the last values
-when a read fails (`job.worker_failed` with `task = sampler`).
+when a read fails (`job.worker_failed` with `task = sampler`, once per
+streak); after 3 consecutive failed reads the gauges report nothing until a
+read succeeds, so a stuck sampler shows as a gap, not as stale numbers.
 
 Counting rules (TE-T5): `merezha.job.enqueued` counts every new job (enqueue,
 relay fan-out, fired occurrences, manual triggers); `merezha.job.schedule.fired`

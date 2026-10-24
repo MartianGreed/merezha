@@ -86,6 +86,11 @@ const MAX_BATCHES_PER_WAKE: usize = 64;
 const OPERATION_DEADLINE: Duration = Duration::from_secs(10);
 /// Bound on one gauge sample (TE §1.3: a 1 s statement timeout).
 pub const SAMPLE_DEADLINE: Duration = Duration::from_secs(1);
+/// After this many consecutive failed samples the gauges report nothing
+/// rather than stale values, until a sample succeeds.
+pub const STALE_SAMPLES: u32 = 3;
+/// The instrumentation scope of the jobs and outbox instruments.
+pub const SCOPE: &str = "merezha.jobs";
 /// How often an idle `LISTEN` session is probed with `SELECT 1`.
 pub const LISTEN_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// Bound on opening and probing the `LISTEN` session.
@@ -277,19 +282,23 @@ impl PgJobs {
             }),
         }
     }
-    /// Record the jobs and outbox instruments on `meter` (TE §1.3) and,
-    /// every `sample_interval` (`telemetry.metrics.sample_interval_ms`),
-    /// sample the queue status for the `merezha.job.count`,
-    /// `merezha.job.lag`, `merezha.outbox.pending` and `merezha.outbox.lag`
-    /// gauges. Without it the instruments are no-ops and no sampler runs.
-    /// Call before sharing the runtime.
+    /// Record the jobs and outbox instruments on `meters` (scope
+    /// [`SCOPE`], TE §1.3) and, every `sample_interval`
+    /// (`telemetry.metrics.sample_interval_ms`), sample the queue status for
+    /// the `merezha.job.count`, `merezha.job.lag`, `merezha.outbox.pending`
+    /// and `merezha.outbox.lag` gauges. With disabled meters (metrics not
+    /// exported) the instruments stay no-ops and no sampler runs. Call
+    /// before sharing the runtime.
     pub fn with_telemetry(
         mut self,
-        meter: &opentelemetry::metrics::Meter,
+        meters: &merezha_telemetry::Meters,
         sample_interval: Duration,
     ) -> Self {
+        if !meters.enabled() {
+            return self;
+        }
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.metrics = Arc::new(Metrics::new(meter));
+            inner.metrics = Arc::new(Metrics::new(&meters.meter(SCOPE)));
             inner.sample_interval = Some(sample_interval.max(Duration::from_millis(1)));
         }
         self
@@ -860,26 +869,32 @@ async fn schedule_loop(
 
 /// Sample the queue status for the gauges every `interval`, starting now,
 /// until stop: one read under [`SAMPLE_DEADLINE`], cached for the gauge
-/// callbacks (TE §1.3). A failing read keeps the last sample and logs
-/// `job.worker_failed` (task `sampler`) once per streak.
+/// callbacks (TE §1.3). A failing read logs `job.worker_failed` (task
+/// `sampler`) once per streak and keeps the last sample; after
+/// [`STALE_SAMPLES`] consecutive failures the gauges report nothing until
+/// a read succeeds.
 async fn sample_loop(
     jobs: PgJobs,
     database: Database,
     interval: Duration,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut failing = false;
+    let mut failed: u32 = 0;
     loop {
         if *stop.borrow() {
             return;
         }
         match jobs.sample(&database).await {
             Ok(sample) => {
-                jobs.inner.metrics.sampled(sample);
-                failing = false;
+                jobs.inner.metrics.sampled(Some(sample));
+                failed = 0;
             }
             Err(failure) => {
-                if !failing {
+                failed = failed.saturating_add(1);
+                if failed == STALE_SAMPLES {
+                    jobs.inner.metrics.sampled(None);
+                }
+                if failed == 1 {
                     event!(
                         WARN,
                         "job.worker_failed",
@@ -888,7 +903,6 @@ async fn sample_loop(
                         classification = classification(&failure)
                     );
                 }
-                failing = true;
             }
         }
         tokio::select! {

@@ -192,12 +192,12 @@ impl Metrics {
         }
     }
 
-    /// Replace the sample the gauges report.
-    pub(crate) fn sampled(&self, sample: Sample) {
+    /// Replace the sample the gauges report; `None` reports nothing.
+    pub(crate) fn sampled(&self, sample: Option<Sample>) {
         *self
             .cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sample);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = sample;
     }
 
     /// New jobs on `queue` of `kind`: enqueued, relayed, fired or triggered.
