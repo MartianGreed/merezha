@@ -1178,13 +1178,13 @@ Cookie-authenticated state changes need the Origin check and the CSRF token.
 | `POST unsubscribe` | token | form `List-Unsubscribe=One-Click` with `?token=` or JSON `{ token }` | 200 `{}` | 400 `token_invalid` |
 | `GET unsubscribe?token=` | token | none | 303 or 200 HTML | 400 |
 | `GET templates` | `notifications.templates.preview` | none | 200 `[{ name, description, locales, channels }]` | 404 when preview disabled |
-| `POST templates/{name}/preview` | `notifications.templates.preview` | `{ locale?, data?, channels? }` | 200 `{ email: { subject, html, text }, sms: { text, encoding, segments }, push: {…}, inbox: {…} }` | 404; 422 `render_failed`, `details: { channel }` (no template text echoed) |
+| `POST templates/{name}/preview` | `notifications.templates.preview` | `{ locale?, data?, channels? }` | 200 `{ email: { subject, html, text }, sms: { text, encoding, segments }, push: {…}, inbox: {…} }` | 404; 422 `render_failed`, `details: [{ path: "/channels/<channel>", code }]` (no template text echoed) |
 | `GET templates/{name}/preview.html?locale=` | same | none | 200 HTML with sandbox CSP | same |
 | `GET suppressions?channel=&address=&cursor=` | `notifications.suppressions.manage` | none | 200 `{ items, next_cursor }` | none |
 | `POST suppressions` / `DELETE suppressions/{id}` | same | `{ channel, address, topic?, reason: "manual" }` | 201 / 204 | 422; 404 |
 | `GET webhook-event-types` | any authenticated principal | none | 200 `[{ type, description }]` | none |
 | `GET tenants/{tenant_id}/webhooks` | `notifications.webhooks.read` | none | 200 `[Endpoint]` (no secret) | 403 `unauthorized`; 404 |
-| `POST tenants/{tenant_id}/webhooks` | `notifications.webhooks.manage` | `{ url, description?, event_types? }` | 201 `Endpoint + { secret }` | 422 `webhook_url_rejected`, `details: { reason: scheme\|userinfo\|blocked_address\|unresolvable\|too_long }`, `unknown_event_type`; 409 `webhook_endpoint_limit` |
+| `POST tenants/{tenant_id}/webhooks` | `notifications.webhooks.manage` | `{ url, description?, event_types? }` | 201 `Endpoint + { secret }` | 422 `webhook_url_rejected`, `details: [{ path: "/url", code: scheme\|userinfo\|blocked_address\|unresolvable\|too_long }]`, `unknown_event_type`; 409 `webhook_endpoint_limit` |
 | `GET` / `PATCH` / `DELETE tenants/{tenant_id}/webhooks/{id}` | read / manage / manage | PATCH `{ url?, description?, event_types?, revision }` | 200 / 200 / 204 | 404; 412 `revision_conflict` (R8) |
 | `POST tenants/{tenant_id}/webhooks/{id}/rotate-secret` | manage | `{ keep_previous_hours? (0 to 72, default 24) }` | 200 `{ secret, previous_expires_at }` | 404 |
 | `POST tenants/{tenant_id}/webhooks/{id}/enable`, `…/disable` | manage | none | 200 `Endpoint` | 404 |

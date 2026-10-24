@@ -160,7 +160,9 @@ not stored on users in v1 (owner answer ID10); SMS goes to explicit numbers.
   `rate_limited` (429 with `Retry-After`), `overloaded` (503 with
   `Retry-After`).
 - FW's error shape gains optional `details` for field-level validation errors:
-  `{error: {code, classification, details?}}`.
+  `{error: {code, classification, details?}}`. `details` is always a list of
+  `{path, code}`: `path` is a JSON Pointer into the request, `code` a stable
+  lower-snake reason. Details never echo input or user text.
 
 ### R9. Telemetry names
 

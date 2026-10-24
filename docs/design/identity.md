@@ -578,7 +578,7 @@ row is deleted and then rejected, so the same token never gets a second try.
 - Every response carries `Cache-Control: no-store`.
 - Errors use the framework shape `{"error": {"code", "classification",
   "details"?}}` (R8). `validation_failed` fills `details` with one entry per
-  field, such as `{"field": "/email", "code": "invalid"}`, and never echoes
+  field, such as `{"path": "/email", "code": "invalid"}`, and never echoes
   input. `rate_limited` and `overloaded` add `Retry-After` in seconds.
 - Ids in paths use the prefixed form. An id from another organization returns
   `404 not_found`, never `403`, so ids cannot be probed across tenants.
