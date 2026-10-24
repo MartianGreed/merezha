@@ -22,6 +22,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Ceiling on the start bound a module may declare
+/// ([`Module::start_timeout`]).
+pub const MAX_MODULE_START: Duration = Duration::from_secs(3600);
+
 /// Time bounds of the lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timeouts {
@@ -294,7 +298,8 @@ impl Host {
             );
         }
         let mut builder = AppContext::builder(&config.app.id, database.clone(), parts.authorizer)
-            .instance_id(&config.app.instance_id);
+            .instance_id(&config.app.instance_id)
+            .migrate(config.database.migrate);
         if let Some(ports) = ports {
             builder = builder.outbox(ports.outbox).jobs(ports.jobs);
         }
@@ -305,7 +310,15 @@ impl Host {
         })?;
         let mut started: Vec<Arc<dyn Module>> = Vec::new();
         for module in &modules {
-            let at = tokio::time::Instant::from_std(Instant::now() + parts.timeouts.module_start);
+            let budget = module
+                .start_timeout()
+                .unwrap_or(parts.timeouts.module_start)
+                .min(MAX_MODULE_START);
+            let now = Instant::now();
+            let at = tokio::time::Instant::from_std(
+                now.checked_add(budget)
+                    .unwrap_or(now + parts.timeouts.module_start),
+            );
             let own = ctx
                 .for_module(module.name(), module.extra_sources())
                 .map_err(|failure| StartupError {
@@ -315,7 +328,11 @@ impl Host {
                 })?;
             let result = tokio::time::timeout_at(at, module.start(own)).await;
             if !matches!(result, Ok(Ok(()))) {
-                tracing::error!(event = "module.start_failed", module = module.name());
+                let code = match &result {
+                    Ok(Err(failure)) => failure.code.as_str(),
+                    _ => "timeout",
+                };
+                tracing::error!(event = "module.start_failed", module = module.name(), code);
                 stop_modules(&started, parts.timeouts.module_shutdown).await;
                 return Err(StartupError {
                     failure: Failure::permanent("module_start_failed"),

@@ -42,14 +42,14 @@ fn arguments() -> anyhow::Result<(PathBuf, Option<PathBuf>, SocketAddr)> {
 }
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    if std::env::args().nth(1).as_deref() == Some("run") {
-        return merezha_cli::run::main(std::env::args().skip(2)).await;
-    }
-    if std::env::args().nth(1).as_deref() == Some("application") {
-        return merezha_cli::application_cli::main(std::env::args().skip(2)).await;
-    }
-    if std::env::args().nth(1).as_deref() == Some("notifications") {
-        return merezha_cli::notifications::main(std::env::args().skip(2));
+    match std::env::args().nth(1).as_deref() {
+        Some("run") => return merezha_cli::run::main(std::env::args().skip(2)).await,
+        Some("application") => {
+            return merezha_cli::application_cli::main(std::env::args().skip(2)).await;
+        }
+        Some("content") => return merezha_cli::content::main(std::env::args().skip(2)).await,
+        Some("notifications") => return merezha_cli::notifications::main(std::env::args().skip(2)),
+        _ => {}
     }
     let (manifest, application, address) = match arguments() {
         Ok(args) => args,

@@ -745,8 +745,9 @@ Block events (AP's former `jobs.*` events are `job.*`):
 | `notification.provider_event_applied` / `notification.provider_event_uncorrelated` / `notification.provider_event_rejected` | debug / info / warn | `provider`, `channel`, `event`, `code` |
 | `notification.webhook_endpoint_disabled` / `notification.egress_blocked` / `notification.push_subscription_removed` | warn / warn / info | `endpoint_id`, `target`, `reason` |
 | `notification.sse_listen_lost` / `notification.sse_listen_restored` / `notification.template_reload_failed` | warn / info / warn | `code` |
-| `content.model_loaded` / `content.model_activated` / `content.model_tightened` / `content.model_breaking` | info / info / warn / error | `generation`, `types`, `code` |
-| `content.migration_batch` / `content.index_created` / `content.index_dropped` | info | `type`, `rows` / `index` |
+| `content.model_loaded` / `content.model_activated` / `content.model_tightened` / `content.model_breaking` | info / info / warn / error | `version`, `fingerprint`, `types`, `locales` / `previous_version`, `change_classes` / `content_type`, `counts`, `truncated` / `path`, `change`, `code` |
+| `content.migration_batch` / `content.index_created` / `content.index_dropped` | info | `type`, `rows` / `index`, `content_type`, `field`, `table`, `purpose` / `index`, `reason` |
+| `content.index_failed` (a derived index build that stops activation, CT-C2) | error | `index`, `content_type`, `field`, `code`, `cause`, `attempts` |
 | `content.schedule_failed` | warn | `entry_id`, `action`, `code` |
 | `content.blob_cleanup` / `content.spool_cleared` | info | `driver`, `count` |
 

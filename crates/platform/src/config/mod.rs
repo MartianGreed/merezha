@@ -270,6 +270,11 @@ impl ModuleSection {
             .map(Some)
             .map_err(|code| ConfigIssue::new(self.key(key), code, origin))
     }
+    /// The canonical directory of `merezha.toml`, which relative paths in
+    /// the section resolve against (empty for [`ModuleSection::empty`]).
+    pub fn base_dir(&self) -> &Path {
+        &self.resolver.base_dir
+    }
     /// The layer that supplied `key`.
     pub fn origin(&self, key: &str) -> Origin {
         self.overridden.get(key).cloned().unwrap_or(Origin::File)

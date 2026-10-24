@@ -179,6 +179,7 @@ struct Inner {
     app_id: String,
     instance_id: String,
     database: Database,
+    migrate: bool,
     clock: Arc<dyn Clock>,
     random: Arc<dyn Random>,
     http: OutboundHttp,
@@ -211,6 +212,7 @@ impl AppContext {
             app_id: app_id.to_owned(),
             instance_id: crate::config::default_instance_id(None),
             database,
+            migrate: false,
             clock: Arc::new(SystemClock),
             random: Arc::new(OsRandom),
             http: None,
@@ -232,6 +234,13 @@ impl AppContext {
     }
     pub fn database(&self) -> &Database {
         &self.inner.database
+    }
+    /// `database.migrate`: this host applies schema changes at startup.
+    /// Modules with schema work of their own beyond migrations (content
+    /// model activation) do it only when this is `true` and otherwise
+    /// verify it, reporting not ready while it is pending.
+    pub fn migrate(&self) -> bool {
+        self.inner.migrate
     }
     pub fn clock(&self) -> &dyn Clock {
         self.inner.clock.as_ref()
@@ -319,6 +328,7 @@ pub struct AppContextBuilder {
     app_id: String,
     instance_id: String,
     database: Database,
+    migrate: bool,
     clock: Arc<dyn Clock>,
     random: Arc<dyn Random>,
     http: Option<OutboundHttp>,
@@ -333,6 +343,11 @@ pub struct AppContextBuilder {
 impl AppContextBuilder {
     pub fn instance_id(mut self, instance_id: &str) -> Self {
         self.instance_id = instance_id.to_owned();
+        self
+    }
+    /// See [`AppContext::migrate`]; `false` by default.
+    pub fn migrate(mut self, migrate: bool) -> Self {
+        self.migrate = migrate;
         self
     }
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -383,6 +398,7 @@ impl AppContextBuilder {
                 app_id: self.app_id,
                 instance_id: self.instance_id,
                 database: self.database,
+                migrate: self.migrate,
                 clock: self.clock,
                 random: self.random,
                 http,

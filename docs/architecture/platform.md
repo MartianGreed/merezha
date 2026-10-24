@@ -24,8 +24,10 @@ by readiness); it is the access boundary, and blob files and subdirectories
 below it follow the process umask.
 
 `merezha run --config merezha.toml` (`crates/cli/src/run.rs`) puts them
-together with the existing runtime and application layer. `merezha serve`
-is unchanged.
+together with the existing runtime and application layer, and registers the
+content block ([Content](#content)) and the notifications block
+([Notifications block](#notifications-block)), each off until its
+`[modules.<name>]` section is present. `merezha serve` is unchanged.
 
 ## Running a project
 
@@ -70,8 +72,10 @@ and one `startup.failed` event carrying a stable `code`:
    them. A changed checksum, unknown applied version or out-of-order version
    stops startup in both modes. Pending migrations in verify mode do not stop
    startup; readiness stays false until they are applied.
-7. Start modules in registration order, each within 10 s
-   (`module_start_failed`; modules already started are shut down). The
+7. Start modules in registration order, each within 10 s or the bound it
+   declares through `Module::start_timeout` (`module_start_failed`, logged
+   as `module.start_failed` with the module's own `code`, or `timeout`;
+   modules already started are shut down). The
    PostgreSQL application module starts first and reports its own code
    instead: `storage_schema` while its migrations are pending,
    `storage_configuration` when the database belongs to another
@@ -312,7 +316,9 @@ Each table is opaque to the kernel and validated by the module of that name
 through `Module::configure`. Module issues are reported with kernel issues. A
 section without a registered module fails `unknown_module`. A registered
 module without a section stays disabled. `ModuleSection::secret` resolves
-secrets with the kernel rules.
+secrets with the kernel rules, and `ModuleSection::base_dir` is the
+directory relative paths resolve against (the canonical directory of
+`merezha.toml`).
 
 ### Configuration error codes
 
@@ -451,7 +457,10 @@ dot, `<area>.<noun>_<verb>`.
 `listener.draining`, `listener.drain_timeout`, `listener.stopped`,
 `module.source_refused`,
 `http.request.completed`, `health.ready`, `health.not_ready`,
-`notification.captured`, and from the jobs runtime `outbox.relayed`,
+`notification.captured`, from the content block `content.model_loaded`,
+`content.model_activated`, `content.model_tightened`,
+`content.model_breaking`, `content.index_created`, `content.index_dropped`
+and `content.index_failed`, and from the jobs runtime `outbox.relayed`,
 `outbox.quarantined`, `outbox.relay_failed`, `job.admin_action`,
 `job.subscription_sync_failed`, `job.leased`, `job.completed`,
 `job.retry_scheduled`, `job.dead_lettered`, `job.lease_lost`,
@@ -481,6 +490,7 @@ its own `invocation.completed` and `registry.*` JSON lines.
 | `extra_sources()` | kernel sources it writes as besides its name; only `api` for `notifications` is granted |
 | `events()` | `ModuleEvents { publishes, consumes }`, logged at start |
 | `start(AppContext)` | start background work within the start timeout |
+| `start_timeout()` | the bound on its `start`; `None` (default) keeps the host's 10 s. Content declares its activation bound (300 s plus 10 s) because it builds indexes before it is ready |
 | `routes(&AppContext)` | an axum `Router` nested under `/v1/<name>` |
 | `ready()` | readiness contribution, answered within 1 s |
 | `shutdown(deadline)` | stop and drain background work after the listener drained |
@@ -504,6 +514,10 @@ register blocks.
 
 - `app_id()` and `instance_id()` (`app.instance_id`).
 - `database()`: the `Database` pool.
+- `migrate()`: `database.migrate`. Modules whose start does schema work of
+  their own beyond migrations (content model activation) do it only when
+  it is `true`, and otherwise verify and report not ready while it is
+  pending.
 - `clock()`: `Clock` with wall-clock `now()` and monotonic `monotonic()`;
   `SystemClock` by default, replaceable in tests.
 - `random()`: `Random`, the operating system CSPRNG through `getrandom`;
@@ -711,7 +725,13 @@ first failed use.
   client for session statements, and `DetachedClient::transaction(deadline,
   work)` has exactly the contract of `Database::transaction`. Dropping it
   closes the session, which releases its locks; after `database_timeout` or
-  `commit_outcome_unknown` drop it rather than reuse it.
+  `commit_outcome_unknown` drop it rather than reuse it. Each detached
+  session sets `client_connection_check_interval = 500ms`
+  (`CONNECTION_CHECK_INTERVAL`), so the server ends a session whose client
+  went away within about half a second even mid-statement: an aborted
+  migration run, content activation or background runner stuck in a
+  `CREATE INDEX CONCURRENTLY` or a lock wait releases its advisory lock
+  then instead of at its statement timeout.
 - `classify(&tokio_postgres::Error)` maps driver errors to stable codes:
   `database_conflict` and `unique_violation` (conflict), `database_timeout`,
   `database_busy` and `database_unavailable` (transient),
@@ -1067,6 +1087,104 @@ every build that compiles the dev-dependencies: the `merezha` binary built
 by `cargo test` or `--all-targets` reads the variable. Builds without them,
 such as `cargo build --release -p merezha-cli` or `cargo build
 --workspace`, ignore it.
+
+## Content
+
+`merezha-content` (`crates/content`, CT-C1 and CT-C2) is the content block,
+a `Module` named `content` with schema `merezha_content` (ledger key
+`content`). C2 ships its schema, model activation and readiness; entry,
+delivery and asset routes come with C3 onward. The design is
+[content.md](../design/content.md).
+
+```toml
+[modules.content]          # the section's presence enables the block
+model = "content.toml"     # the default
+```
+
+`model` follows the runtime manifest's path rules: relative to
+`merezha.toml`, no `..` or absolute paths, and it must resolve (symlinks
+included) to a regular file inside that directory (`invalid_path`; a
+missing or unreadable file is `content_model_unreadable`). The file is
+read and validated with the configuration, so `merezha run` reports every
+model problem in its `invalid_config` issues, each keyed
+`modules.content.model:<toml path>` with code `content_model_invalid`;
+`merezha content diff` prints the same problems with their messages. Any
+other key is `unknown_key` until the slice that gives it behaviour.
+
+At start, after migrations:
+
+- With `database.migrate = true`, one host at a time activates the model
+  under the session advisory lock `0x6d7a636f6e74656e` (`mzconten`) on a
+  connection detached from the pool, polled like the migration lock. It
+  compares the model with the active row of `merezha_content.models`,
+  builds the derived indexes (`content_ix_<16 hex>`) the model needs with
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, outside any transaction,
+  dropping an invalid one of the same name first, then in one transaction
+  supersedes the active row, inserts the model as active, syncs `locales`,
+  bumps every scope's generation and appends `content.model_activated` to
+  the outbox. It then drops the derived indexes the model no longer needs.
+  A transient build failure (lock or statement timeout, lost connection) is
+  retried twice, after 1 s and 2 s; a third failure or a unique violation
+  stops startup (`content.index_failed`, `index_build_failed`) with the
+  previous model still active. The whole run is bounded by 300 s
+  (`content_activation_timeout`). A current model gets the index
+  reconciliation only, which repairs a crashed run.
+- With `database.migrate = false` the host changes nothing. Readiness stays
+  false with `content_model_pending` while the model is newer than the
+  active one (or the schema is missing), `index_build_pending` while a
+  derived index is missing or invalid, until another host completes it.
+- In both modes, refused changes stop startup with `content_model_breaking`
+  (each logged as `content.model_breaking` with its path and change code),
+  and a changed fingerprint under the same version with
+  `content_model_version_unchanged`. A host whose model is older than the
+  active one starts but reports `content_model_outdated`, as does a host
+  whose model another host superseded; such a host drains.
+
+Every content write transaction of C3 onward starts with
+`ContentState::check_writable`, a `FOR SHARE` lock on the loaded model's
+active row. Without that row the active version decides: a newer one fails
+the write `content_model_superseded` and turns the host outdated; an older
+one or none (the loaded model is still pending, as on a new host before a
+migrating one activated it) fails `content_model_pending`, and the host
+stays as it is. Both are 503 with `Retry-After: 1`.
+
+After the activation commits, the index drop pass (each drop bounded by
+30 s) and the tightening count (30 s, on a pooled session after the lock is
+released) are best effort: a failure logs `content.index_failed`
+(`operation = "drop"`) or `content.model_tightened` with its `code`, and the
+next start retries the drops.
+
+Operations notes:
+
+- Modules start before the listener binds, so a migrating host with a
+  pending model is not listening (and answers no health probe) while it
+  builds indexes: up to 310 s (the 300 s activation bound plus 10 s).
+  Startup probes should allow for it.
+- The activation transaction's `FOR UPDATE` on the active row waits for
+  every content write holding `FOR SHARE`, bounded by
+  `database.statement_timeout`. A steady stream of overlapping writes can
+  starve it; activation then fails (`database_timeout`) and the next start
+  retries. Deploy model changes at a quieter moment if writes never pause.
+
+`merezha content diff --config merezha.toml [--set SECTION.KEY=VALUE]...`
+prints, without changing anything, the file's model, the active one, the
+status (`fresh`, `current`, `pending`, `content_model_outdated`,
+`content_model_version_unchanged` or `content_model_breaking`), one
+`<class> <path> <change>` line per classified change and the derived
+indexes it would build or drop. It exits 0 when the model is current or
+would activate, 1 when it would not, and 2 when the configuration, the
+model or the database cannot be read (`content.diff_failed` at level
+`error` on stderr with the code, and the issues for `invalid_config`; an
+invalid model's problems are printed on stdout with their messages, one
+`content_model_invalid: <toml path> <message>` line each).
+
+Error codes it registers: `content_model_invalid`,
+`content_model_version_unchanged`, `content_model_breaking`,
+`content_not_configured`, `index_build_failed`, `validation_failed` (422),
+`invalid_json` (400), `content_type_not_found` (404), and
+`content_model_superseded`, `content_model_outdated`,
+`content_model_pending`, `content_model_conflict`,
+`content_activation_timeout`, `index_build_pending` (503).
 
 ## Dependencies
 
