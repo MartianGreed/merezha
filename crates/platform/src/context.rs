@@ -149,7 +149,13 @@ fn transport(error: reqwest::Error) -> Failure {
 #[derive(Clone)]
 pub struct AppContext {
     inner: Arc<Inner>,
+    /// The module this context was handed to, which fixes the sources it
+    /// may write as. `None` for the host's own context.
+    module: Option<Source>,
 }
+/// Sources only the host's own context can bind: HTTP routes of the
+/// kernel (`api`) and reactions (`application`).
+pub const KERNEL_SOURCES: [&str; 2] = ["api", "application"];
 struct Inner {
     app_id: String,
     instance_id: String,
@@ -215,12 +221,36 @@ impl AppContext {
     pub fn http(&self) -> &OutboundHttp {
         &self.inner.http
     }
-    /// The outbox bound to `source`, the caller's module name (or `api`,
-    /// `application`). It validates every append before the implementation
-    /// sees it. Fails permanent `invalid_source`.
+    /// The module this context belongs to; `None` for the host's own.
+    pub fn module(&self) -> Option<&str> {
+        self.module.as_ref().map(Source::as_str)
+    }
+    /// This context as handed to module `name`: its handles can only be
+    /// bound to `name`. The host binds each module's context at start.
+    pub(crate) fn for_module(&self, name: &str) -> Result<Self, Failure> {
+        Ok(Self {
+            inner: self.inner.clone(),
+            module: Some(Source::new(name)?),
+        })
+    }
+    /// The source a handle may be bound to: a module's context binds its
+    /// own name only, so blocks cannot write in each other's dedupe
+    /// namespace or claim identity's membership exemption; the host's
+    /// context binds any source, [`KERNEL_SOURCES`] included. Fails
+    /// permanent `invalid_source` or `source_not_allowed`.
+    fn source(&self, source: &str) -> Result<Source, Failure> {
+        let source = Source::new(source)?;
+        match &self.module {
+            Some(own) if *own != source => Err(Failure::permanent("source_not_allowed")),
+            _ => Ok(source),
+        }
+    }
+    /// The outbox bound to `source`. It validates every append before the
+    /// implementation sees it. See [`AppContext::module`] for which sources
+    /// a context may bind.
     pub fn outbox(&self, source: &str) -> Result<SourceOutbox, Failure> {
         Ok(SourceOutbox::new(
-            Source::new(source)?,
+            self.source(source)?,
             self.inner.outbox.clone(),
         ))
     }
@@ -230,9 +260,10 @@ impl AppContext {
     pub fn authorizer(&self) -> &Arc<dyn Authorizer> {
         &self.inner.authorizer
     }
-    /// The notifier bound to `source`. Fails permanent `invalid_source`.
+    /// The notifier bound to `source`, with the same source rule as
+    /// [`AppContext::outbox`].
     pub fn notifier(&self, source: &str) -> Result<Arc<dyn Notifier>, Failure> {
-        Ok(self.inner.notifications.bind(&Source::new(source)?))
+        Ok(self.inner.notifications.bind(&self.source(source)?))
     }
     /// `false` while notifications are only captured: blocks that must not
     /// lose security mail refuse to start on that.
@@ -304,6 +335,7 @@ impl AppContextBuilder {
             None => OutboundHttp::new()?,
         };
         Ok(AppContext {
+            module: None,
             inner: Arc::new(Inner {
                 app_id: self.app_id,
                 instance_id: self.instance_id,
@@ -408,5 +440,37 @@ mod tests {
             !seen[0].contains("b7ad6b7169203331"),
             "a child span id is sent"
         );
+    }
+
+    #[test]
+    fn module_contexts_bind_only_their_own_source() {
+        let db = merezha_postgres::Database::connect(&merezha_postgres::DatabaseConfig::new(
+            merezha_postgres::Secret::new("postgres://127.0.0.1:1/none"),
+        ))
+        .unwrap();
+        let policy = Arc::new(crate::ports::DenyAll);
+        let host = AppContext::builder("tasks", db, policy).build().unwrap();
+        assert_eq!(host.module(), None);
+        for source in ["identity", "api", "application"] {
+            assert!(host.outbox(source).is_ok() && host.notifier(source).is_ok());
+        }
+        let content = host.for_module("content").unwrap();
+        assert_eq!(content.module(), Some("content"));
+        assert_eq!(
+            content.outbox("content").unwrap().source().as_str(),
+            "content"
+        );
+        assert!(content.notifier("content").is_ok());
+        for spoof in ["identity", "api", "application", "notifications"] {
+            assert_eq!(
+                content.outbox(spoof).unwrap_err().code,
+                "source_not_allowed"
+            );
+            assert_eq!(
+                content.notifier(spoof).err().map(|f| f.code),
+                Some("source_not_allowed".into())
+            );
+        }
+        assert_eq!(content.outbox("Bad").unwrap_err().code, "invalid_source");
     }
 }

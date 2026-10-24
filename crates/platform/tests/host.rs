@@ -729,3 +729,50 @@ async fn a_code_registered_twice_with_different_statuses_stops_startup() {
         ("error_code_conflict", Some("other"))
     );
 }
+
+/// Tries to write as other sources from the context the host hands it.
+struct Spoofer {
+    refused: Arc<std::sync::Mutex<Vec<String>>>,
+}
+impl Module for Spoofer {
+    fn name(&self) -> &'static str {
+        "spoofer"
+    }
+    fn start(&self, ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
+        Box::pin(async move {
+            assert_eq!(ctx.module(), Some("spoofer"));
+            ctx.outbox("spoofer")?;
+            ctx.notifier("spoofer")?;
+            let mut refused = self.refused.lock().unwrap();
+            for source in ["identity", "api", "application"] {
+                if let Err(failure) = ctx.outbox(source) {
+                    refused.push(format!("outbox:{source}:{}", failure.code));
+                }
+                if let Err(failure) = ctx.notifier(source) {
+                    refused.push(format!("notifier:{source}:{}", failure.code));
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn modules_cannot_bind_handles_for_another_source() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let refused = Arc::new(std::sync::Mutex::new(Vec::new()));
+    Host::start(
+        config(&test, true, ""),
+        vec![Box::new(Spoofer {
+            refused: refused.clone(),
+        })],
+        parts(),
+    )
+    .await
+    .unwrap();
+    let refused = refused.lock().unwrap().clone();
+    assert_eq!(refused.len(), 6, "{refused:?}");
+    assert!(refused.iter().all(|r| r.ends_with(":source_not_allowed")));
+}

@@ -273,7 +273,14 @@ impl Host {
         let mut started: Vec<Arc<dyn Module>> = Vec::new();
         for module in &modules {
             let at = tokio::time::Instant::from_std(Instant::now() + parts.timeouts.module_start);
-            let result = tokio::time::timeout_at(at, module.start(ctx.clone())).await;
+            let own = ctx
+                .for_module(module.name())
+                .map_err(|failure| StartupError {
+                    failure,
+                    migration: None,
+                    module: Some(module.name()),
+                })?;
+            let result = tokio::time::timeout_at(at, module.start(own)).await;
             if !matches!(result, Ok(Ok(()))) {
                 tracing::error!(event = "module.start_failed", module = module.name());
                 stop_modules(&started, parts.timeouts.module_shutdown).await;
@@ -299,7 +306,14 @@ impl Host {
         ));
         let mut router = health::router(readiness.clone());
         for module in &modules {
-            router = router.nest(&format!("/v1/{}", module.name()), module.routes(&ctx));
+            let own = ctx
+                .for_module(module.name())
+                .map_err(|failure| StartupError {
+                    failure,
+                    migration: None,
+                    module: Some(module.name()),
+                })?;
+            router = router.nest(&format!("/v1/{}", module.name()), module.routes(&own));
         }
         let router = edge::apply(
             router.merge(parts.routes),

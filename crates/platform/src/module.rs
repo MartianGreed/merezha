@@ -11,7 +11,16 @@ use merezha_postgres::Migration;
 use std::time::Instant;
 
 /// Names of route prefixes owned by the host; modules cannot use them.
-pub const RESERVED_NAMES: [&str; 5] = ["application", "services", "pipelines", "reload", "health"];
+/// `api` and `application` are also the kernel-only outbox and notifier
+/// sources.
+pub const RESERVED_NAMES: [&str; 6] = [
+    "application",
+    "api",
+    "services",
+    "pipelines",
+    "reload",
+    "health",
+];
 
 /// Integration events a module publishes and consumes through the outbox.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -60,7 +69,8 @@ pub trait Module: Send + Sync + 'static {
         ModuleEvents::default()
     }
     /// Start background tasks. Bounded by the host's start timeout; a
-    /// failure aborts startup.
+    /// failure aborts startup. `ctx` is bound to this module: its outbox and
+    /// notifier handles can only be bound to [`Module::name`].
     fn start(&self, ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
         let _ = ctx;
         Box::pin(async { Ok(()) })
