@@ -390,7 +390,7 @@ pub(crate) fn decode_cursor(
 
 /// Whether `text` parses under `cast` exactly as PostgreSQL will cast it,
 /// so a forged cursor never reaches the database as a cast error.
-fn castable(cast: &str, text: &str) -> bool {
+pub(crate) fn castable(cast: &str, text: &str) -> bool {
     let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
     match cast {
         "bigint" => {

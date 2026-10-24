@@ -338,9 +338,14 @@ one transaction marks the active `models` row `superseded`, inserts the new
 one as `active`, syncs `locales`, bumps the affected generations and appends
 `content.model_activated`. After that it drops the indexes the new model no
 longer needs and rebuilds the `published` fallback rows that a new locale or
-a changed fallback affects, in batches of 500 entries (C4 adds this step
-with materialization; until then nothing writes `published`). Readiness
-stays false until all of it completes. A lost session loses its lock too,
+a changed fallback affects, in batches of 500 entries. Readiness
+stays false until all of it completes. As built in C4: the activation
+transaction records a pending row in `merezha_content.rebuilds`
+(migration 3) when it inserts a locale or changes a fallback; each batch
+re-materializes every live entry with a published variant, in id order,
+and advances the row's cursor, so the next migrating start resumes a
+crashed rebuild, and every host of the model reports
+`content_rebuild_pending` until it is done. A lost session loses its lock too,
 so the run reopens one (twice at most), retakes the lock and plans again,
 keeping each index's attempt count. With `database.migrate = false`, a pending model
 change fails readiness with `content_model_pending`.
@@ -536,6 +541,11 @@ remain without a matching index: `sys.created_at` (an `entries` column),
 and every sort of two or more keys, which reads the first key's index
 order and sorts the rest. Delivery lists over `published` (C5) choose
 their tie-breaker the same way.
+
+Migration 3 (C4) adds `rebuilds (version integer PRIMARY KEY REFERENCES
+models, after_entry uuid, state text CHECK (state IN ('pending', 'done')),
+updated_at timestamptz NOT NULL)`, the resume cursor of the fallback
+rebuild (section 2).
 
 ### Derived indexes
 
@@ -905,6 +915,37 @@ their singleton forms); the rest arrive with C4, C5 and C7. As built:
 - A save of a non-default variant share-locks the default variant while it
   reads the shared values, so a concurrent default save cannot be undone
   by a stale copy.
+
+C4 ships publish, unpublish, the batches, the variant and entry deletes,
+undelete and the trash. As built:
+
+- Every publish, unpublish and delete locks the entry `FOR UPDATE` before
+  its variant, and a batch locks its entries in id order first, so
+  concurrent batches never deadlock. Each re-materializes all of the
+  entry's `published` rows (one per configured locale whose chain reaches
+  a published variant), a superset of the rows the change affects.
+- `require_published` checks that the target has a `published` row in
+  the referrer's locale (the chain resolved), after every item of the
+  transaction is materialized, so one batch can publish a target with its
+  referrers.
+- Batch items are checked in order: a failure names its item in
+  `details` (`/items/<n>` plus the item's own path), and a repeated
+  `(type, id, locale)` is `duplicate_item`. `revision` is required on
+  publish items and refused on unpublish items.
+- Unpublishing a variant that is not published answers 200 without an
+  event or a generation bump. Undeleting a live entry does too.
+- Deleting clears the variants' published pointers (undelete restores
+  drafts only) and removes the entry's refs; undelete records the drafts'
+  refs again. The variant delete of a published variant appends
+  `content.entry_unpublished` with reason `delete`.
+- `purge=true` reaches trashed entries too. Purging a live entry appends
+  what a delete does, then `content.entry_purged`.
+- `GET /trash` without `type` lists the types the caller reads, each
+  checked in its resource scope; organization types need the principal's
+  tenant.
+- The trash purge is the cron schedule `content.trash_purge`, in UTC.
+- The tightening count reads only own `published` rows
+  (`source_locale = locale`); fallback rows repeat their source.
 
 Until identity lands, C3 relies on the host's policy: a private listener
 allows every route, a public one denies every route (`unauthenticated`

@@ -1,4 +1,5 @@
-//! `merezha run` mounts the content management routes (CT-C3): a private
+//! `merezha run` mounts the content management routes (CT-C3, and C4's
+//! publishing, deletion and trash routes): a private
 //! listener allows them through the loopback policy, a public one without
 //! identity denies them. A real process against real PostgreSQL; skips
 //! with a message when `MEREZHA_TEST_DATABASE_URL` is unset.
@@ -63,6 +64,26 @@ fn the_host_serves_content_management_routes_behind_its_policy() {
     let list = support::request(address, "GET", "/v1/content/manage/entries/page", "");
     assert_eq!(list.status, 200);
     assert_eq!(list.body["items"][0]["fields"]["title"], "Home");
+    // C4: batch publish, delete and the trash through the binary.
+    let id = created.body["sys"]["id"].as_str().unwrap().to_owned();
+    let published = support::request(
+        address,
+        "POST",
+        "/v1/content/manage/batch/publish",
+        &json!({"items": [{"type": "page", "id": id, "locale": "en", "revision": 1}]}).to_string(),
+    );
+    assert_eq!(published.status, 200, "{:?}", published.body);
+    assert_eq!(published.body["items"][0]["sys"]["status"], "published");
+    let deleted = support::request(
+        address,
+        "DELETE",
+        &format!("/v1/content/manage/entries/page/{id}"),
+        "",
+    );
+    assert_eq!(deleted.status, 204, "{:?}", deleted.body);
+    let trash = support::request(address, "GET", "/v1/content/manage/trash", "");
+    assert_eq!(trash.status, 200, "{:?}", trash.body);
+    assert_eq!(trash.body["items"][0]["id"], id.as_str());
     host.stop();
 
     let config = project(dir.path(), "listen = \"127.0.0.1:0\"\npublic = true");

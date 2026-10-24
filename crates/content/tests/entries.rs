@@ -520,8 +520,9 @@ async fn a_second_singleton_fails() {
 }
 
 /// Every entry route, as `(method, path after the type, precondition,
-/// body)`; `{id}` is replaced.
-const ENTRY_ROUTES: [(&str, &str, &str, &str); 9] = [
+/// body)`; `{id}` is replaced. C4 adds publish, unpublish, the variant
+/// delete, the entry delete and undelete.
+const ENTRY_ROUTES: [(&str, &str, &str, &str); 14] = [
     ("GET", "/{id}", "", ""),
     ("GET", "/{id}/en", "", ""),
     ("PUT", "/{id}/en", "if-match", r#"{"fields":{"title":"x"}}"#),
@@ -541,6 +542,11 @@ const ENTRY_ROUTES: [(&str, &str, &str, &str); 9] = [
     ("GET", "/{id}/en/revisions/1", "", ""),
     ("POST", "/{id}/en/revisions/1/restore", "if-match", ""),
     ("GET", "/{id}/referrers", "", ""),
+    ("POST", "/{id}/en/publish", "if-match", ""),
+    ("POST", "/{id}/en/unpublish", "if-match", ""),
+    ("DELETE", "/{id}/en", "if-match", ""),
+    ("DELETE", "/{id}?if_unreferenced=true", "", ""),
+    ("POST", "/{id}/undelete", "", ""),
 ];
 
 #[tokio::test]
@@ -558,15 +564,28 @@ async fn every_entry_route_answers_404_for_another_type_or_scope_and_changes_not
             .await,
     );
     let foreign = seed_row(&fx.db, "org:acme", "article", r#"{"title":"Secret"}"#).await;
+    // A ref to `own`, so the guarded delete proves it reached the row
+    // without deleting it.
+    execute(
+        &fx.db,
+        &format!(
+            "INSERT INTO merezha_content.refs \
+                 (scope, from_entry, from_locale, stage, path, target_kind, target_id) \
+             VALUES ('app', '{author}', 'en', 'draft', '/fields/x', 'entry', '{own}')"
+        ),
+    )
+    .await;
     // The routes reach the row of the right type and scope.
     for (method, path, condition, body) in ENTRY_ROUTES {
-        let mut call = fx.call(
-            Method::from_bytes(method.as_bytes()).unwrap(),
-            &format!(
-                "/v1/content/manage/entries/article{}",
-                path.replace("{id}", &own)
-            ),
-        );
+        let mut call = fx
+            .call(
+                Method::from_bytes(method.as_bytes()).unwrap(),
+                &format!(
+                    "/v1/content/manage/entries/article{}",
+                    path.replace("{id}", &own)
+                ),
+            )
+            .by(Some("admin"));
         if method == "PATCH" {
             call = call.header("content-type", "application/merge-patch+json");
         }
@@ -578,7 +597,13 @@ async fn every_entry_route_answers_404_for_another_type_or_scope_and_changes_not
         }
         let reply = call.raw(body.as_bytes()).send().await;
         assert!(
-            reply.status == StatusCode::OK || reply.code() == "revision_conflict",
+            reply.status == StatusCode::OK
+                || [
+                    "revision_conflict",
+                    "default_variant_required",
+                    "entry_referenced"
+                ]
+                .contains(&reply.code()),
             "{method} {path}: {:?}",
             reply.body
         );
@@ -590,7 +615,9 @@ async fn every_entry_route_answers_404_for_another_type_or_scope_and_changes_not
                 "/v1/content/manage/entries/article{}",
                 path.replace("{id}", wrong)
             );
-            let mut call = fx.call(Method::from_bytes(method.as_bytes()).unwrap(), &uri);
+            let mut call = fx
+                .call(Method::from_bytes(method.as_bytes()).unwrap(), &uri)
+                .by(Some("admin"));
             if method == "PATCH" {
                 call = call.header("content-type", "application/merge-patch+json");
             }
@@ -605,6 +632,36 @@ async fn every_entry_route_answers_404_for_another_type_or_scope_and_changes_not
                 (StatusCode::NOT_FOUND, "entry_not_found"),
                 "{method} {uri}"
             );
+        }
+    }
+    // The purge and the batches refuse them too.
+    for wrong in [&author, &foreign] {
+        let purge = fx
+            .call(
+                Method::DELETE,
+                &format!("/v1/content/manage/entries/article/{wrong}?purge=true"),
+            )
+            .by(Some("admin"))
+            .send()
+            .await;
+        assert_eq!(purge.code(), "entry_not_found");
+        for (batch, item) in [
+            (
+                "publish",
+                json!({"type": "article", "id": wrong, "locale": "en", "revision": 1}),
+            ),
+            (
+                "unpublish",
+                json!({"type": "article", "id": wrong, "locale": "en"}),
+            ),
+        ] {
+            let reply = fx
+                .post(&format!("/v1/content/manage/batch/{batch}"))
+                .by(Some("admin"))
+                .json(&json!({ "items": [item] }))
+                .send()
+                .await;
+            assert_eq!(reply.code(), "entry_not_found", "{batch}");
         }
     }
     assert_eq!(snapshot(&fx.db).await, before);
@@ -1182,79 +1239,162 @@ async fn an_oversized_body_is_body_limit_before_field_rules() {
     assert_eq!(reply.code(), "body_limit", "{:?}", reply.body);
 }
 
-/// Every management route with the permission class it needs.
-const MANAGEMENT_ROUTES: [(&str, &str, bool, &str, &str); 16] = [
-    ("GET", "/entries/article", false, "", ""),
+/// Every management route with the permission it needs: `read`,
+/// `write`, `publish`, `delete` or `purge` (delete and purge). The
+/// destructive ones come last, so the passing round can run them in order.
+const MANAGEMENT_ROUTES: [(&str, &str, &str, &str, &str); 25] = [
+    ("GET", "/entries/article", "read", "", ""),
     (
         "POST",
         "/entries/article",
-        true,
+        "write",
         "",
         r#"{"fields":{"title":"New"}}"#,
     ),
-    ("GET", "/entries/article/{id}", false, "", ""),
-    ("GET", "/entries/article/{id}/referrers", false, "", ""),
-    ("GET", "/entries/article/{id}/en", false, "", ""),
+    ("GET", "/entries/article/{id}", "read", "", ""),
+    ("GET", "/entries/article/{id}/referrers", "read", "", ""),
+    ("GET", "/entries/article/{id}/en", "read", "", ""),
     (
         "PUT",
         "/entries/article/{id}/en",
-        true,
+        "write",
         "if-match",
         r#"{"fields":{"title":"x"}}"#,
     ),
     (
         "PATCH",
         "/entries/article/{id}/en",
-        true,
+        "write",
         "if-match",
         r#"{"fields":{"title":"x"}}"#,
     ),
-    ("GET", "/entries/article/{id}/en/revisions", false, "", ""),
-    ("GET", "/entries/article/{id}/en/revisions/1", false, "", ""),
+    ("GET", "/entries/article/{id}/en/revisions", "read", "", ""),
+    (
+        "GET",
+        "/entries/article/{id}/en/revisions/1",
+        "read",
+        "",
+        "",
+    ),
     (
         "POST",
         "/entries/article/{id}/en/revisions/1/restore",
-        true,
+        "write",
         "if-match",
         "",
     ),
-    ("GET", "/singletons/site_settings/en", false, "", ""),
+    ("GET", "/singletons/site_settings/en", "read", "", ""),
     (
         "PUT",
         "/singletons/site_settings/fr",
-        true,
+        "write",
         "if-none-match",
         r#"{"fields":{"site_name":"S"}}"#,
     ),
     (
         "PATCH",
         "/singletons/site_settings/en",
-        true,
+        "write",
         "if-match",
         r#"{"fields":{"site_name":"x"}}"#,
     ),
     (
         "GET",
         "/singletons/site_settings/en/revisions",
-        false,
+        "read",
         "",
         "",
     ),
     (
         "GET",
         "/singletons/site_settings/en/revisions/1",
-        false,
+        "read",
         "",
         "",
     ),
     (
         "POST",
         "/singletons/site_settings/en/revisions/1/restore",
-        true,
+        "write",
         "if-match",
         "",
     ),
+    (
+        "POST",
+        "/entries/article/{id}/en/publish",
+        "publish",
+        "if-match",
+        "",
+    ),
+    (
+        "POST",
+        "/entries/article/{id}/en/unpublish",
+        "publish",
+        "if-match",
+        "",
+    ),
+    (
+        "POST",
+        "/singletons/site_settings/en/publish",
+        "publish",
+        "if-match",
+        "",
+    ),
+    (
+        "POST",
+        "/singletons/site_settings/en/unpublish",
+        "publish",
+        "if-match",
+        "",
+    ),
+    (
+        "POST",
+        "/batch/publish",
+        "publish",
+        "",
+        r#"{"items":[{"type":"article","id":"{id}","locale":"en","revision":999}]}"#,
+    ),
+    (
+        "POST",
+        "/batch/unpublish",
+        "publish",
+        "",
+        r#"{"items":[{"type":"article","id":"{id}","locale":"en"}]}"#,
+    ),
+    ("GET", "/trash?type=article", "read", "", ""),
+    (
+        "DELETE",
+        "/entries/article/{id}/en",
+        "write",
+        "if-match",
+        "",
+    ),
+    (
+        "DELETE",
+        "/entries/article/{id}?purge=true",
+        "purge",
+        "",
+        "",
+    ),
 ];
+
+/// The principal each permission class passes with, and whether
+/// `principal` holds `class` on articles and the singleton.
+fn holder(class: &str) -> &'static str {
+    match class {
+        "read" => "reader",
+        "write" => "editor",
+        "publish" => "publisher",
+        "delete" => "deleter",
+        _ => "purger",
+    }
+}
+fn holds(principal: Option<&str>, class: &str) -> bool {
+    matches!(
+        (principal, class),
+        (Some("reader"), "read") | (Some("publisher"), "publish") | (Some("deleter"), "delete")
+    )
+}
 
 #[tokio::test]
 async fn every_management_route_checks_its_own_permission() {
@@ -1274,25 +1414,33 @@ async fn every_management_route_checks_its_own_permission() {
         .await;
     assert_eq!(settings.status, StatusCode::CREATED);
     let before = snapshot(&fx.db).await;
-    for (method, path, writes, condition, body) in MANAGEMENT_ROUTES {
+    let mut routes: Vec<(&str, &str, &str, &str, &str)> = MANAGEMENT_ROUTES.to_vec();
+    // The soft delete and undelete, between the variant delete and purge.
+    routes.insert(24, ("DELETE", "/entries/article/{id}", "delete", "", ""));
+    routes.insert(
+        25,
+        ("POST", "/entries/article/{id}/undelete", "delete", "", ""),
+    );
+    for (method, path, class, condition, body) in &routes {
         let uri = format!("/v1/content/manage{}", path.replace("{id}", &id));
+        let body = body.replace("{id}", &id);
         for principal in [
             None,
             Some("reader"),
             Some("publisher"),
+            Some("deleter"),
             Some("author_writer"),
         ] {
-            let allowed = principal == Some("reader") && !writes;
-            if allowed {
+            if holds(principal, class) {
                 continue;
             }
             let mut call = fx
                 .call(Method::from_bytes(method.as_bytes()).unwrap(), &uri)
                 .by(principal);
-            if method == "PATCH" {
+            if *method == "PATCH" {
                 call = call.header("content-type", "application/merge-patch+json");
             }
-            match condition {
+            match *condition {
                 "if-match" => call = call.if_match(1),
                 "if-none-match" => call = call.header("if-none-match", "*"),
                 _ => {}
@@ -1310,24 +1458,26 @@ async fn every_management_route_checks_its_own_permission() {
         }
         assert_eq!(snapshot(&fx.db).await, before, "{method} {path}");
     }
-    // The reader passes every read route, the editor every route.
-    for (method, path, writes, condition, body) in MANAGEMENT_ROUTES {
+    // Each passes with the principal holding its permission.
+    for (method, path, class, condition, body) in &routes {
         let uri = format!("/v1/content/manage{}", path.replace("{id}", &id));
-        let principal = if writes { "editor" } else { "reader" };
+        let body = body.replace("{id}", &id);
+        let principal = holder(class);
         let mut call = fx
             .call(Method::from_bytes(method.as_bytes()).unwrap(), &uri)
             .by(Some(principal));
-        if method == "PATCH" {
+        if *method == "PATCH" {
             call = call.header("content-type", "application/merge-patch+json");
         }
-        match condition {
+        match *condition {
             "if-match" => call = call.header("if-match", "\"r999\""),
             "if-none-match" => call = call.header("if-none-match", "*"),
             _ => {}
         }
         let reply = call.raw(body.as_bytes()).send().await;
         assert!(
-            reply.status.is_success() || reply.code() == "revision_conflict",
+            reply.status.is_success()
+                || ["revision_conflict", "default_variant_required"].contains(&reply.code()),
             "{principal} {method} {uri}: {:?}",
             reply.body
         );

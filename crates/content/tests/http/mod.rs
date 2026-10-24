@@ -65,6 +65,45 @@ access = "public"
 fields = [{ name = "site_name", type = "string", required = true }]
 "#;
 
+/// Three locales in a chain (`fr-BE` falls back to `fr`, `fr` to `en`):
+/// a localized article with a shared, `require_published` author and a
+/// unique slug, the author, a non-localized page and a singleton.
+pub const CHAIN_MODEL: &str = r#"
+version = 1
+locales = [
+  { code = "en", default = true },
+  { code = "fr", fallback = "en" },
+  { code = "fr-BE", fallback = "fr" },
+]
+
+[types.author]
+access = "public"
+title_field = "name"
+fields = [{ name = "name", type = "string", required = true }]
+
+[types.article]
+access = "public"
+title_field = "title"
+fields = [
+  { name = "title", type = "string", required = true, sortable = true },
+  { name = "slug", type = "slug", from = "title" },
+  { name = "code", type = "string", unique = true },
+  { name = "author", type = "reference", to = ["author"], localized = false, require_published = true },
+  { name = "related", type = "reference", to = ["article"], cardinality = "many" },
+]
+
+[types.page]
+access = "public"
+localized = false
+title_field = "title"
+fields = [{ name = "title", type = "string", required = true }]
+
+[types.site_settings]
+kind = "singleton"
+access = "public"
+fields = [{ name = "site_name", type = "string", required = true }]
+"#;
+
 /// The content permissions an editor holds.
 pub const EDITOR: [&str; 2] = ["content.entries.read", "content.entries.write"];
 
@@ -125,6 +164,31 @@ pub fn principal(name: &str) -> Principal {
             vec![id("publisher")],
             set(&["content.entries.publish"]),
         )),
+        "deleter" => GrantSnapshot::empty().with_application(Grants::new(
+            vec![id("deleter")],
+            set(&["content.entries.delete"]),
+        )),
+        "purger" => GrantSnapshot::empty().with_application(Grants::new(
+            vec![id("purger")],
+            set(&["content.entries.delete", "content.entries.purge"]),
+        )),
+        // Publish `article` only.
+        "article_publisher" => GrantSnapshot::empty().with_application_resource(
+            id("content_type"),
+            id("article"),
+            set(&["content.entries.publish", "content.entries.read"]),
+        ),
+        // Every content entry permission.
+        "admin" => GrantSnapshot::empty().with_application(Grants::new(
+            vec![id("admin")],
+            set(&[
+                "content.entries.read",
+                "content.entries.write",
+                "content.entries.publish",
+                "content.entries.delete",
+                "content.entries.purge",
+            ]),
+        )),
         // Read and write on another type only.
         "author_writer" => GrantSnapshot::empty().with_application_resource(
             id("content_type"),
@@ -169,6 +233,7 @@ pub struct Fixture {
     pub handle: ContentHandle,
     pub db: Database,
     pub dir: tempfile::TempDir,
+    pub jobs: Arc<PgJobs>,
 }
 
 /// Write the project into `dir`: `merezha.toml` with `[modules.content]`
@@ -214,7 +279,12 @@ pub async fn start_in(
             drain: Duration::from_secs(5),
             ..Timeouts::default()
         },
-        jobs: Some(Arc::new(PgJobs::new(&config.jobs))),
+        jobs: None,
+    };
+    let jobs = Arc::new(PgJobs::new(&config.jobs));
+    let parts = HostParts {
+        jobs: Some(jobs.clone()),
+        ..parts
     };
     let db = Database::connect(&config.database).unwrap();
     let host = Host::start(config, modules, parts)
@@ -227,6 +297,7 @@ pub async fn start_in(
         handle,
         db,
         dir,
+        jobs,
     }
 }
 
@@ -402,6 +473,8 @@ pub async fn snapshot(db: &Database) -> String {
         "SELECT coalesce(string_agg(t::text, '|' ORDER BY t::text), '') FROM merezha_content.variants t",
         "SELECT coalesce(string_agg(t::text, '|' ORDER BY t::text), '') FROM merezha_content.revisions t",
         "SELECT coalesce(string_agg(t::text, '|' ORDER BY t::text), '') FROM merezha_content.refs t",
+        "SELECT coalesce(string_agg(t::text, '|' ORDER BY t::text), '') FROM merezha_content.published t",
+        "SELECT coalesce(string_agg(t::text, '|' ORDER BY t::text), '') FROM merezha_content.generations t",
         "SELECT count(*)::text FROM merezha_jobs.outbox",
     ] {
         let row = client.query_one(sql, &[]).await.unwrap();
@@ -458,4 +531,134 @@ pub async fn seed_row(db: &Database, scope: &str, content_type: &str, data: &str
         .unwrap()
         .get(0);
     id
+}
+
+/// `"<locale>:<source_locale>:<revision>"` of every `published` row of
+/// entry `id`, by locale.
+pub async fn rows(db: &Database, id: &str) -> Vec<String> {
+    strings(
+        db,
+        &format!(
+            "SELECT locale || ':' || source_locale || ':' || revision \
+               FROM merezha_content.published WHERE entry_id = '{id}' ORDER BY locale"
+        ),
+    )
+    .await
+}
+
+/// One text column of every row of `sql`.
+pub async fn strings(db: &Database, sql: &str) -> Vec<String> {
+    let client = db.acquire(soon()).await.unwrap();
+    client
+        .query(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("{e}: {sql}"))
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect()
+}
+
+/// The envelopes of the content events on `topic`, oldest first.
+pub async fn events(db: &Database, topic: &str) -> Vec<Value> {
+    strings(
+        db,
+        &format!(
+            "SELECT payload::text FROM merezha_jobs.outbox \
+              WHERE source = 'content' AND topic = '{topic}' ORDER BY id"
+        ),
+    )
+    .await
+    .iter()
+    .map(|text| serde_json::from_str(text).unwrap())
+    .collect()
+}
+
+/// Content event records per topic, as `"<topic>=<count>"`.
+pub async fn event_counts(db: &Database) -> Vec<String> {
+    strings(
+        db,
+        "SELECT topic || '=' || count(*) FROM merezha_jobs.outbox \
+          WHERE source = 'content' AND topic <> 'content.model_activated' \
+          GROUP BY topic ORDER BY topic",
+    )
+    .await
+}
+
+/// The generation of `scope`, 0 without a row.
+pub async fn generation(db: &Database, scope: &str) -> i64 {
+    scalar(
+        db,
+        &format!(
+            "SELECT coalesce((SELECT generation FROM merezha_content.generations \
+              WHERE scope = '{scope}'), 0)"
+        ),
+    )
+    .await
+}
+
+impl Client {
+    /// `POST .../{locale}/publish` with `If-Match: "r<revision>"`, as
+    /// `admin`.
+    pub async fn publish(
+        &self,
+        content_type: &str,
+        id: &str,
+        locale: &str,
+        revision: i64,
+    ) -> Reply {
+        self.post(&format!("{}/publish", variant(content_type, id, locale)))
+            .by(Some("admin"))
+            .if_match(revision)
+            .send()
+            .await
+    }
+    /// `POST .../{locale}/unpublish` with `If-Match: "r<revision>"`, as
+    /// `admin`.
+    pub async fn unpublish(
+        &self,
+        content_type: &str,
+        id: &str,
+        locale: &str,
+        revision: i64,
+    ) -> Reply {
+        self.post(&format!("{}/unpublish", variant(content_type, id, locale)))
+            .by(Some("admin"))
+            .if_match(revision)
+            .send()
+            .await
+    }
+    /// Create the `locale` variant of `id` with `fields`.
+    pub async fn add_variant(
+        &self,
+        content_type: &str,
+        id: &str,
+        locale: &str,
+        fields: Value,
+    ) -> Reply {
+        let reply = self
+            .put(&variant(content_type, id, locale))
+            .header("if-none-match", "*")
+            .json(&serde_json::json!({ "fields": fields }))
+            .send()
+            .await;
+        assert_eq!(reply.status, StatusCode::CREATED, "{:?}", reply.body);
+        reply
+    }
+}
+
+/// The id of a variant document.
+pub fn id_of(reply: &Reply) -> String {
+    reply.body["sys"]["id"].as_str().unwrap().to_owned()
+}
+
+/// Whether `host` reports ready within a few seconds (the jobs runtime
+/// turns ready after its first subscription and schedule sync).
+pub async fn eventually_ready(host: &Host) -> bool {
+    for _ in 0..50 {
+        if host.readiness().check().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
 }

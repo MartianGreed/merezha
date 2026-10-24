@@ -9,11 +9,11 @@ use crate::{
     schema::MIGRATIONS,
     settings::{ContentSettings, KEYS},
 };
-use merezha_domain::Failure;
+use merezha_domain::{Failure, Identity};
 use merezha_platform::{
     AppContext, BoxFuture, Database, ErrorCode, Migration, Module, ModuleEvents, ModuleSection, Tx,
     config::{ConfigIssue, Origin},
-    ports::{JobContext, JobFailure, JobHandler},
+    ports::{JobContext, JobFailure, JobHandler, KindOptions, ScheduleDeclaration},
 };
 use std::{
     io::Read,
@@ -80,7 +80,7 @@ impl ContentState {
     pub fn path(&self) -> &Path {
         &self.path
     }
-    /// `[modules.content]` limits and revision retention.
+    /// `[modules.content]` limits, revision retention and the trash.
     pub fn settings(&self) -> &ContentSettings {
         &self.settings
     }
@@ -310,6 +310,29 @@ impl ContentModule {
             .state()
             .ok_or_else(|| Failure::permanent("content_not_configured"))
     }
+    /// Register the content job kinds, each through
+    /// [`ContentState::guard_jobs`], and their schedules:
+    /// `content.trash_purge` on the `content` queue, declared as the cron
+    /// schedule of the same name with `trash.purge_cron` in UTC (C4).
+    fn register_jobs(&self, ctx: &AppContext, state: &Arc<ContentState>) -> Result<(), Failure> {
+        let jobs = ctx.jobs(NAME)?;
+        let store = Store::new(state.clone(), ctx.clone(), ctx.outbox(NAME)?);
+        jobs.register(
+            crate::trash::TRASH_PURGE,
+            crate::trash::QUEUE,
+            state.guard_jobs(Arc::new(crate::trash::TrashPurge { store })),
+            KindOptions::default(),
+        )?;
+        jobs.schedule(ScheduleDeclaration {
+            name: crate::trash::TRASH_PURGE.to_owned(),
+            cron: state.settings().trash.purge_cron.clone(),
+            timezone: crate::settings::PURGE_TIMEZONE.to_owned(),
+            queue: Identity::new(crate::trash::QUEUE)?,
+            kind: Identity::new(crate::trash::TRASH_PURGE)?,
+            payload: serde_json::json!({}),
+        })?;
+        Ok(())
+    }
 }
 
 /// The model options C2 can provide: the content permissions only (the
@@ -477,20 +500,20 @@ impl Module for ContentModule {
                     Ok(report) => {
                         if report.plan.status == crate::Status::Outdated {
                             state.mark_outdated();
-                        } else {
+                        } else if !report.rebuild_pending {
                             state.current.store(true, Ordering::SeqCst);
                         }
-                        Ok(())
                     }
-                    Err(error) => Err(error.failure),
+                    Err(error) => return Err(error.failure),
                 }
+                self.register_jobs(&ctx, &state)
             } else {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let client = match ctx.database().acquire(deadline).await {
                     Ok(client) => client,
                     // Readiness keeps checking; a database that answered the
                     // host's ping is only briefly unavailable.
-                    Err(_) => return Ok(()),
+                    Err(_) => return self.register_jobs(&ctx, &state),
                 };
                 match verify(&**client, &model).await {
                     Ok(Verified::Ready) => state.current.store(true, Ordering::SeqCst),
@@ -506,7 +529,7 @@ impl Module for ContentModule {
                     }
                     Err(_) => {}
                 }
-                Ok(())
+                self.register_jobs(&ctx, &state)
             }
         })
     }

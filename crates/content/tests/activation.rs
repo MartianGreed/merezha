@@ -44,6 +44,7 @@ async fn migration_1_applies_and_leaves_the_search_path_alone() {
             "locales",
             "models",
             "published",
+            "rebuilds",
             "refs",
             "revisions",
             "variants"
@@ -264,13 +265,26 @@ async fn additive_tightening_access_and_index_changes_activate() {
         .await,
         ["en:-", "fr:en", "fr-BE:fr"]
     );
+    // The activation bumps it, and so does the rebuild of the published
+    // rows the new `fr-BE` locale needs (C4): the published `en` entry now
+    // serves `fr` and `fr-BE` too.
     assert_eq!(
         scalar_i64(
             &db,
             "SELECT generation FROM merezha_content.generations WHERE scope = 'app'"
         )
         .await,
-        8
+        9
+    );
+    assert_eq!(report.rebuilt, 1);
+    assert!(!report.rebuild_pending);
+    assert_eq!(
+        strings(
+            &db,
+            "SELECT locale || ':' || source_locale FROM merezha_content.published ORDER BY locale"
+        )
+        .await,
+        ["en:en", "fr:en", "fr-BE:en"]
     );
     // New indexes built (category sort, isbn unique), the dropped ones gone
     // (reading_minutes sort, legacy_code unique), the slug's kept.

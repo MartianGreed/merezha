@@ -18,7 +18,10 @@ use merezha_domain::{Classification, Failure, Identity};
 use merezha_platform::{
     AppContext, BoxFuture, Database, FieldError, Tx,
     errors::MAX_DETAILS,
-    ports::{DedupeKey, MessageContext, NewEvent, OnDuplicate, SourceOutbox},
+    ports::{
+        DedupeKey, MAX_RECORDS_PER_APPEND, MessageContext, NewEvent, OnDuplicate, OutboxRecord,
+        SourceOutbox,
+    },
 };
 use merezha_postgres::{classify, tokio_postgres};
 use serde_json::{Map, Value, json};
@@ -85,6 +88,12 @@ pub struct Actor {
     pub kind: String,
     /// The request id, the events' correlation id.
     pub correlation: Option<String>,
+}
+impl Actor {
+    /// The events' `actor`: `{"subject", "kind"}`.
+    pub(crate) fn json(&self) -> Value {
+        json!({"subject": self.subject, "kind": self.kind})
+    }
 }
 
 /// How a save meets the variant.
@@ -303,13 +312,13 @@ where
     }
 }
 
-fn sql(error: &tokio_postgres::Error) -> Rejection {
+pub(crate) fn sql(error: &tokio_postgres::Error) -> Rejection {
     Rejection::new(classify(error))
 }
 
 /// A failed write statement: unique violations map to their conflict, or
 /// through the derived index name to a `unique` detail on the field.
-fn write_error(error: &tokio_postgres::Error, indexes: &[DerivedIndex]) -> Rejection {
+pub(crate) fn write_error(error: &tokio_postgres::Error, indexes: &[DerivedIndex]) -> Rejection {
     let db = error.as_db_error();
     if error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
         && let Some(constraint) = db.and_then(|d| d.constraint())
@@ -350,7 +359,7 @@ impl std::fmt::Debug for Store {
 }
 
 /// Fields `content_type` keeps on the default variant only.
-fn shared_fields(content_type: &ContentType) -> Vec<String> {
+pub(crate) fn shared_fields(content_type: &ContentType) -> Vec<String> {
     if !content_type.localized {
         return Vec::new();
     }
@@ -363,21 +372,21 @@ fn shared_fields(content_type: &ContentType) -> Vec<String> {
 }
 
 /// The first top-level slug field, the one `draft_slug` mirrors.
-fn slug_field(content_type: &ContentType) -> Option<&crate::model::Field> {
+pub(crate) fn slug_field(content_type: &ContentType) -> Option<&crate::model::Field> {
     content_type
         .fields
         .iter()
         .find(|f| matches!(f.kind, FieldKind::Slug(_)))
 }
 
-fn parse_object(text: &str) -> Result<Map<String, Value>, Rejection> {
+pub(crate) fn parse_object(text: &str) -> Result<Map<String, Value>, Rejection> {
     match serde_json::from_str(text) {
         Ok(Value::Object(map)) => Ok(map),
         _ => Err(Rejection::new(Failure::transient("internal"))),
     }
 }
 
-fn new_id(ctx: &AppContext) -> Result<Uuid, Failure> {
+pub(crate) fn new_id(ctx: &AppContext) -> Result<Uuid, Failure> {
     let mut random = [0u8; 10];
     ctx.random().fill(&mut random)?;
     let millis = u64::try_from(jiff::Timestamp::now().as_millisecond()).unwrap_or(0);
@@ -385,14 +394,14 @@ fn new_id(ctx: &AppContext) -> Result<Uuid, Failure> {
 }
 
 /// A context for the work inside one transaction.
-struct Work {
-    model: Arc<ContentModel>,
-    state: Arc<ContentState>,
-    ctx: AppContext,
-    outbox: SourceOutbox,
-    indexes: Arc<Vec<DerivedIndex>>,
-    retain: i64,
-    max_entry_bytes: usize,
+pub(crate) struct Work {
+    pub(crate) model: Arc<ContentModel>,
+    pub(crate) state: Arc<ContentState>,
+    pub(crate) ctx: AppContext,
+    pub(crate) outbox: SourceOutbox,
+    pub(crate) indexes: Arc<Vec<DerivedIndex>>,
+    pub(crate) retain: i64,
+    pub(crate) max_entry_bytes: usize,
 }
 
 impl Store {
@@ -411,13 +420,13 @@ impl Store {
     pub fn state(&self) -> &Arc<ContentState> {
         &self.state
     }
-    fn deadline(&self) -> Instant {
+    pub(crate) fn deadline(&self) -> Instant {
         Instant::now() + self.state.settings().limits.query_timeout
     }
-    fn database(&self) -> &Database {
+    pub(crate) fn database(&self) -> &Database {
         self.ctx.database()
     }
-    fn work(&self) -> Work {
+    pub(crate) fn work(&self) -> Work {
         Work {
             model: self.state.model().clone(),
             state: self.state.clone(),
@@ -857,7 +866,7 @@ async fn variant_exists(
     .ok_or_else(Rejection::not_found)
 }
 
-async fn read_view(
+pub(crate) async fn read_view(
     tx: &mut Tx<'_>,
     target: &Target,
     id: Uuid,
@@ -1264,36 +1273,59 @@ impl Work {
         revision: i64,
         actor: &Actor,
     ) -> Result<(), Rejection> {
+        let payload = json!({
+            "scope": target.scope,
+            "type": target.content_type,
+            "id": id,
+            "locale": locale,
+            "revision": revision,
+            "actor": actor.json(),
+        });
+        let record = self.event(target, DRAFT_SAVED, payload, actor)?;
+        self.append(tx, vec![record]).await
+    }
+
+    /// One event record of section 7 for `target`: a fresh UUIDv7 event id
+    /// as its dedupe key, the actor's request id (else the event id) as
+    /// its correlation, and the organization as its tenant.
+    pub(crate) fn event(
+        &self,
+        target: &Target,
+        topic: &str,
+        payload: Value,
+        actor: &Actor,
+    ) -> Result<OutboxRecord, Rejection> {
         let event_id = new_id(&self.ctx)?.to_string();
         let correlation = actor
             .correlation
             .as_deref()
             .and_then(|c| Identity::new(c).ok())
             .map_or_else(|| Identity::new(event_id.clone()), Ok)?;
-        let record = self.outbox.event(
-            Identity::new(DRAFT_SAVED)?,
+        Ok(self.outbox.event(
+            Identity::new(topic)?,
             NewEvent {
                 dedupe_key: DedupeKey::new(event_id)?,
                 version: 1,
                 occurred_at: jiff::Timestamp::now(),
-                payload: json!({
-                    "scope": target.scope,
-                    "type": target.content_type,
-                    "id": id,
-                    "locale": locale,
-                    "revision": revision,
-                    "actor": {"subject": actor.subject, "kind": actor.kind},
-                }),
+                payload,
                 context: MessageContext {
                     correlation_id: correlation,
                     causation_id: None,
                     tenant: target.tenant.clone(),
                 },
             },
-        );
-        self.outbox
-            .append(tx, std::slice::from_ref(&record), OnDuplicate::Fail)
-            .await?;
+        ))
+    }
+
+    /// Append `records` in the transaction, in chunks the outbox accepts.
+    pub(crate) async fn append(
+        &self,
+        tx: &mut Tx<'_>,
+        records: Vec<OutboxRecord>,
+    ) -> Result<(), Rejection> {
+        for chunk in records.chunks(MAX_RECORDS_PER_APPEND) {
+            self.outbox.append(tx, chunk, OnDuplicate::Fail).await?;
+        }
         Ok(())
     }
 }
@@ -1301,7 +1333,7 @@ impl Work {
 /// The references of the fields that pass on their own, when the whole
 /// set does not: a restore still records them, and a refused save reports
 /// reference problems with the field ones.
-fn field_references(
+pub(crate) fn field_references(
     model: &ContentModel,
     content_type: &str,
     input: &Value,

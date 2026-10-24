@@ -151,15 +151,16 @@ fn every_model_problem_is_reported_with_its_toml_path_and_unknown_keys_fail() {
 }
 
 #[test]
-fn limits_and_revision_retention_are_validated_with_every_problem_at_once() {
+fn limits_revision_retention_and_trash_are_validated_with_every_problem_at_once() {
     let dir = tempfile::tempdir().unwrap();
     project(
         dir.path(),
         false,
         "[modules.content]\n\
          limits = { max_page_size = 50, default_page_size = 60, max_filters = 0, \
-                    query_timeout = \"1h\", max_entry_bytes = \"big\", max_batch = 5 }\n\
-         revisions = { retain = 1 }\n",
+                    query_timeout = \"1h\", max_entry_bytes = \"big\", max_batch = 501 }\n\
+         revisions = { retain = 1 }\n\
+         trash = { retention = \"12h\", purge_cron = 5, keep = true }\n",
         &[("content.toml", V1)],
     );
     let issues = configure_issues(dir.path()).unwrap_err();
@@ -172,28 +173,50 @@ fn limits_and_revision_retention_are_validated_with_every_problem_at_once() {
         issues,
         [
             ("modules.content.limits.default_page_size", "out_of_range"),
-            ("modules.content.limits.max_batch", "unknown_key"),
+            ("modules.content.limits.max_batch", "out_of_range"),
             ("modules.content.limits.max_entry_bytes", "expected_integer"),
             ("modules.content.limits.max_filters", "out_of_range"),
             ("modules.content.limits.query_timeout", "out_of_range"),
             ("modules.content.revisions.retain", "out_of_range"),
+            ("modules.content.trash.keep", "unknown_key"),
+            ("modules.content.trash.purge_cron", "expected_string"),
+            ("modules.content.trash.retention", "out_of_range"),
         ]
     );
     project(
         dir.path(),
         false,
-        "[modules.content]\nlimits = { max_page_size = 10, query_timeout = \"250ms\" }\n\
-         revisions = { retain = 7 }\n",
+        "[modules.content]\nlimits = { max_page_size = 10, query_timeout = \"250ms\", max_batch = 20 }\n\
+         revisions = { retain = 7 }\ntrash = { retention = \"7d\", purge_cron = \"0 4 * * *\" }\n",
         &[("content.toml", V1)],
     );
     let handle = configure_issues(dir.path()).unwrap();
-    let settings = *handle.state().unwrap().settings();
+    let settings = handle.state().unwrap().settings().clone();
+    assert_eq!(settings.limits.max_batch, 20);
+    assert_eq!(settings.trash.retention, Duration::from_secs(7 * 86_400));
+    assert_eq!(settings.trash.purge_cron, "0 4 * * *");
     assert_eq!(settings.revisions_retain, 7);
     assert_eq!(settings.limits.max_page_size, 10);
     // The default page size follows a lower maximum.
     assert_eq!(settings.limits.default_page_size, 10);
     assert_eq!(settings.limits.query_timeout, Duration::from_millis(250));
     assert_eq!(settings.limits.max_entry_bytes, 262_144);
+    // The trash defaults: 30 days, daily at 03:23 UTC.
+    project(
+        dir.path(),
+        false,
+        "[modules.content]\n",
+        &[("content.toml", V1)],
+    );
+    let defaults = configure_issues(dir.path())
+        .unwrap()
+        .state()
+        .unwrap()
+        .settings()
+        .clone();
+    assert_eq!(defaults.trash.retention, Duration::from_secs(30 * 86_400));
+    assert_eq!(defaults.trash.purge_cron, "23 3 * * *");
+    assert_eq!(defaults.limits.max_batch, 100);
     project(
         dir.path(),
         false,
@@ -223,6 +246,9 @@ fn content_errors_register_with_the_kernel_codes() {
         ("precondition_required", 428),
         ("entry_exists", 409),
         ("singleton_exists", 409),
+        ("entry_referenced", 409),
+        ("default_variant_required", 409),
+        ("content_rebuild_pending", 503),
         ("content_model_superseded", 503),
         ("content_model_invalid", 422),
         ("content_model_breaking", 422),
@@ -241,7 +267,7 @@ fn content_errors_register_with_the_kernel_codes() {
         ContentModule::new().start_timeout(),
         Some(Duration::from_secs(310))
     );
-    assert_eq!(ContentModule::new().migrations().len(), 2);
+    assert_eq!(ContentModule::new().migrations().len(), 3);
 }
 
 fn parts(config: &merezha_platform::ProjectConfig) -> HostParts {

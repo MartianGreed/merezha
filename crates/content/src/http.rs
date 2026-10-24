@@ -8,10 +8,11 @@
 //! identity block the loopback policy allows them and a public listener
 //! denies them.
 //!
-//! Publishing, deletion and the trash are C4's, delivery C5's and assets
-//! C7's; they mount beside these routes.
+//! Publishing, deletion, the trash and batches (C4) mount beside them from
+//! [`crate::manage`]; delivery is C5's and assets C7's.
 use crate::{
     json::{body_object, optional, string, write_fields},
+    manage,
     model::{ContentType, Kind, Scope},
     query::{self, decode_cursor, encode_cursor, locale_allowed, pairs},
     store::{
@@ -39,28 +40,54 @@ use uuid::Uuid;
 
 /// Permission to list and read drafts, revisions and referrers.
 pub const ENTRIES_READ: &str = "content.entries.read";
-/// Permission to create entries, save and patch drafts and restore.
+/// Permission to create entries, save and patch drafts, restore and
+/// delete a non-default variant.
 pub const ENTRIES_WRITE: &str = "content.entries.write";
+/// Permission to publish, unpublish and batch publish.
+pub const ENTRIES_PUBLISH: &str = "content.entries.publish";
+/// Permission to move entries to the trash and undelete them.
+pub const ENTRIES_DELETE: &str = "content.entries.delete";
+/// Permission to hard-delete entries at once (`purge=true`), with
+/// [`ENTRIES_DELETE`].
+pub const ENTRIES_PURGE: &str = "content.entries.purge";
 /// The resource kind of per-type checks.
 pub const RESOURCE_KIND: &str = "content_type";
 /// `Cache-Control` of every management response.
 pub const NO_STORE: &str = "private, no-store";
 
 #[derive(Clone)]
-struct Manage {
-    store: Store,
-    policy: Arc<dyn Authorizer>,
+pub(crate) struct Manage {
+    pub(crate) store: Store,
+    pub(crate) policy: Arc<dyn Authorizer>,
 }
 
 /// The management router for `store`, checked through `policy`.
 pub(crate) fn router(store: Store, policy: Arc<dyn Authorizer>) -> Router {
     Router::new()
         .route("/manage/entries/{type}", get(list).post(create))
-        .route("/manage/entries/{type}/{id}", get(summary))
+        .route(
+            "/manage/entries/{type}/{id}",
+            get(summary).delete(manage::delete_entry),
+        )
         .route("/manage/entries/{type}/{id}/referrers", get(referrers))
         .route(
+            "/manage/entries/{type}/{id}/undelete",
+            axum::routing::post(manage::undelete),
+        )
+        .route(
             "/manage/entries/{type}/{id}/{locale}",
-            get(read_variant).put(put).patch(patch),
+            get(read_variant)
+                .put(put)
+                .patch(patch)
+                .delete(manage::delete_variant),
+        )
+        .route(
+            "/manage/entries/{type}/{id}/{locale}/publish",
+            axum::routing::post(manage::publish),
+        )
+        .route(
+            "/manage/entries/{type}/{id}/{locale}/unpublish",
+            axum::routing::post(manage::unpublish),
         )
         .route(
             "/manage/entries/{type}/{id}/{locale}/revisions",
@@ -79,6 +106,14 @@ pub(crate) fn router(store: Store, policy: Arc<dyn Authorizer>) -> Router {
             get(read_variant).put(put).patch(patch),
         )
         .route(
+            "/manage/singletons/{type}/{locale}/publish",
+            axum::routing::post(manage::publish),
+        )
+        .route(
+            "/manage/singletons/{type}/{locale}/unpublish",
+            axum::routing::post(manage::unpublish),
+        )
+        .route(
             "/manage/singletons/{type}/{locale}/revisions",
             get(revisions),
         )
@@ -90,13 +125,22 @@ pub(crate) fn router(store: Store, policy: Arc<dyn Authorizer>) -> Router {
             "/manage/singletons/{type}/{locale}/revisions/{n}/restore",
             axum::routing::post(restore),
         )
+        .route("/manage/trash", get(manage::trash))
+        .route(
+            "/manage/batch/publish",
+            axum::routing::post(manage::batch_publish),
+        )
+        .route(
+            "/manage/batch/unpublish",
+            axum::routing::post(manage::batch_unpublish),
+        )
         .with_state(Manage { store, policy })
 }
 
-type Params = Path<HashMap<String, String>>;
-type Reply = Result<Response, Rejection>;
+pub(crate) type Params = Path<HashMap<String, String>>;
+pub(crate) type Reply = Result<Response, Rejection>;
 
-fn respond(reply: Reply) -> Response {
+pub(crate) fn respond(reply: Reply) -> Response {
     reply.unwrap_or_else(error_response)
 }
 
@@ -117,7 +161,7 @@ pub(crate) fn error_response(rejection: Rejection) -> Response {
     response
 }
 
-fn json(status: StatusCode, body: String) -> Response {
+pub(crate) fn json(status: StatusCode, body: String) -> Response {
     let mut response = (status, body).into_response();
     let headers = response.headers_mut();
     headers.insert(
@@ -132,14 +176,14 @@ fn etag(revision: i64) -> String {
     format!("\"r{revision}\"")
 }
 
-fn principal(parts: &Parts) -> Option<Arc<Principal>> {
+pub(crate) fn principal(parts: &Parts) -> Option<Arc<Principal>> {
     parts
         .extensions
         .get::<Authenticated>()
         .and_then(|a| a.0.clone())
 }
 
-fn actor(parts: &Parts) -> Actor {
+pub(crate) fn actor(parts: &Parts) -> Actor {
     let correlation = parts.extensions.get::<RequestId>().map(|r| r.0.clone());
     match principal(parts) {
         Some(p) => Actor {
@@ -161,7 +205,7 @@ fn actor(parts: &Parts) -> Actor {
 impl Manage {
     /// Check `permission` for the request's principal on `type_name` and
     /// resolve the type and scope.
-    fn authorize(
+    pub(crate) fn authorize(
         &self,
         parts: &Parts,
         permission: &str,
@@ -193,7 +237,7 @@ impl Manage {
     /// Authorize and resolve the variant a route addresses: the entry id
     /// from the path, or the scope's singleton (`None` before its first
     /// save).
-    async fn locate(
+    pub(crate) async fn locate(
         &self,
         parts: &Parts,
         permission: &str,
@@ -225,7 +269,7 @@ impl Manage {
 /// answer for either and cannot enumerate type names. Past that check the
 /// first is `content_type_not_found` (the caller's `None`), the second
 /// `tenant_required`.
-fn resolve_scope(
+pub(crate) fn resolve_scope(
     content_type: Option<&ContentType>,
     principal: Option<&Principal>,
     check: &dyn Fn(&ResourceScope) -> Result<(), Rejection>,
@@ -253,14 +297,14 @@ fn resolve_scope(
 }
 
 /// An entry id from a path: a hyphenated UUID, anything else is absent.
-fn entry_id(text: &str) -> Result<Uuid, Rejection> {
+pub(crate) fn entry_id(text: &str) -> Result<Uuid, Rejection> {
     Some(text)
         .filter(|t| t.len() == 36)
         .and_then(|t| Uuid::try_parse(t).ok())
         .ok_or_else(Rejection::not_found)
 }
 
-async fn read_body(store: &Store, body: Body) -> Result<axum::body::Bytes, Rejection> {
+pub(crate) async fn read_body(store: &Store, body: Body) -> Result<axum::body::Bytes, Rejection> {
     to_bytes(body, store.state().settings().limits.max_request_bytes)
         .await
         .map_err(|_| Failure::permanent("body_limit").into())
@@ -277,14 +321,14 @@ fn fields_body(bytes: &[u8]) -> Result<Map<String, Value>, Rejection> {
 
 /// The write preconditions of `PUT`, `PATCH` and restore.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Preconditions {
+pub(crate) struct Preconditions {
     /// `If-Match` was sent: `Some(n)` for exactly `"r<n>"`, else `None`,
     /// which matches no revision.
-    matches: Option<Option<i64>>,
+    pub(crate) matches: Option<Option<i64>>,
     /// `If-None-Match: *` was sent.
-    none_match: bool,
+    pub(crate) none_match: bool,
 }
-fn preconditions(headers: &HeaderMap) -> Preconditions {
+pub(crate) fn preconditions(headers: &HeaderMap) -> Preconditions {
     let matches = headers.get(header::IF_MATCH).map(|value| {
         value
             .to_str()
@@ -305,12 +349,12 @@ fn preconditions(headers: &HeaderMap) -> Preconditions {
         none_match,
     }
 }
-fn precondition_required() -> Rejection {
+pub(crate) fn precondition_required() -> Rejection {
     Failure::permanent("precondition_required").into()
 }
 
 /// `fields=a,b` on single-variant reads.
-fn selection(
+pub(crate) fn selection(
     content_type: &ContentType,
     query: Option<&str>,
     allowed: &[&str],
@@ -346,7 +390,7 @@ fn field_list(query: &HashMap<String, String>) -> Option<Vec<String>> {
 
 /// The management variant document (section 5, entry JSON), fields in
 /// model order.
-fn variant_json(
+pub(crate) fn variant_json(
     content_type: &ContentType,
     view: &VariantView,
     selection: Option<&[String]>,
@@ -383,7 +427,7 @@ fn variant_json(
     out
 }
 
-fn variant_response(
+pub(crate) fn variant_response(
     status: StatusCode,
     content_type: &ContentType,
     view: &VariantView,
@@ -412,7 +456,7 @@ fn location(view: &VariantView) -> String {
     )
 }
 
-fn page_json(items: Vec<String>, next: Option<String>, limit: u32) -> String {
+pub(crate) fn page_json(items: Vec<String>, next: Option<String>, limit: u32) -> String {
     format!(
         "{{\"items\":[{}],\"page\":{{\"next_cursor\":{},\"limit\":{limit}}}}}",
         items.join(","),
@@ -421,7 +465,7 @@ fn page_json(items: Vec<String>, next: Option<String>, limit: u32) -> String {
 }
 
 /// `limit` and `cursor` of the history and referrer listings.
-fn paging(
+pub(crate) fn paging(
     store: &Store,
     query: &HashMap<String, String>,
 ) -> Result<(u32, Option<String>), Rejection> {
@@ -440,7 +484,7 @@ fn paging(
     Ok((limit, query.get("cursor").cloned()))
 }
 
-fn fingerprint(parts: &[&str]) -> String {
+pub(crate) fn fingerprint(parts: &[&str]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(parts.join("\n").as_bytes());
     digest[..8].iter().fold(String::new(), |mut out, b| {
@@ -560,37 +604,39 @@ async fn summary(State(manage): State<Manage>, Path(params): Params, request: Re
         selection_empty(parts.uri.query())?;
         let id = entry_id(params.get("id").map(String::as_str).unwrap_or(""))?;
         let summary = manage.store.summary(&target, id).await?;
-        let variants: Vec<String> = summary
-            .variants
-            .iter()
-            .map(|(locale, draft, published, updated)| {
-                format!(
-                    "{{\"locale\":{},\"status\":{},\"draft_revision\":{draft},\
-                     \"published_revision\":{},\"updated_at\":{}}}",
-                    string(locale),
-                    string(status(*draft, *published)),
-                    published.map_or_else(|| "null".to_owned(), |p| p.to_string()),
-                    string(updated)
-                )
-            })
-            .collect();
-        Ok(json(
-            StatusCode::OK,
-            format!(
-                "{{\"sys\":{{\"id\":{},\"type\":{},\"created_at\":{},\"deleted_at\":{}}},\
-                 \"variants\":[{}]}}",
-                string(&summary.id),
-                string(&summary.content_type),
-                string(&summary.created_at),
-                optional(summary.deleted_at.as_deref()),
-                variants.join(",")
-            ),
-        ))
+        Ok(json(StatusCode::OK, summary_json(&summary)))
     };
     respond(run.await)
 }
 
-fn selection_empty(query: Option<&str>) -> Result<(), Rejection> {
+/// `GET /entries/{type}/{id}`: the entry and its variants.
+pub(crate) fn summary_json(summary: &crate::store::EntrySummary) -> String {
+    let variants: Vec<String> = summary
+        .variants
+        .iter()
+        .map(|(locale, draft, published, updated)| {
+            format!(
+                "{{\"locale\":{},\"status\":{},\"draft_revision\":{draft},\
+                 \"published_revision\":{},\"updated_at\":{}}}",
+                string(locale),
+                string(status(*draft, *published)),
+                published.map_or_else(|| "null".to_owned(), |p| p.to_string()),
+                string(updated)
+            )
+        })
+        .collect();
+    format!(
+        "{{\"sys\":{{\"id\":{},\"type\":{},\"created_at\":{},\"deleted_at\":{}}},\
+         \"variants\":[{}]}}",
+        string(&summary.id),
+        string(&summary.content_type),
+        string(&summary.created_at),
+        optional(summary.deleted_at.as_deref()),
+        variants.join(",")
+    )
+}
+
+pub(crate) fn selection_empty(query: Option<&str>) -> Result<(), Rejection> {
     if pairs(query)?.is_empty() {
         Ok(())
     } else {

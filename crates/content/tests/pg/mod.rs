@@ -168,6 +168,12 @@ pub async fn seed(
                         CASE WHEN $5 THEN now() END
                    FROM new
                  RETURNING entry_id
+             ), history AS (
+                 INSERT INTO merezha_content.revisions
+                     (entry_id, locale, revision, model_version, kind, data, created_at, created_by)
+                 SELECT entry_id, $3, 1, (SELECT max(version) FROM merezha_content.models),
+                        'create', $4::text::jsonb, now(), 'sys_test'
+                   FROM drafts
              )
              INSERT INTO merezha_content.published
                  (entry_id, locale, source_locale, scope, content_type, revision, data,
