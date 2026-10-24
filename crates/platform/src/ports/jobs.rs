@@ -4,8 +4,8 @@
 //! name like the outbox.
 //!
 //! [`Jobs::queue_status`] is the read behind the jobs admin API's
-//! `GET queues` and `GET outbox` and TE's status and gauges (R10). AP-B3
-//! adds `schedule` (module-declared cron) here.
+//! `GET queues` and `GET outbox` and TE's status and gauges (R10).
+//! [`Jobs::schedule`] declares a module's cron schedules (AP §B.7).
 use super::{DedupeKey, JobFailure, MessageContext, Source};
 use crate::BoxFuture;
 use merezha_domain::{Failure, Identity};
@@ -140,6 +140,36 @@ impl std::fmt::Debug for JobRegistration {
     }
 }
 
+/// A cron schedule a module declares through [`JobsHandle::schedule`]
+/// (AP §B.7), stored with the module's name as its source. Each occurrence
+/// enqueues one job of `kind` on `queue` with `payload`. `Debug` never
+/// prints the payload.
+#[derive(Clone, PartialEq)]
+pub struct ScheduleDeclaration {
+    /// `[a-z][a-z0-9_.-]{0,63}`, unique across config and modules.
+    pub name: String,
+    /// Five fields (minute to day of week); see [`crate::cron`].
+    pub cron: String,
+    /// An IANA zone such as `Europe/Paris`, or `UTC`.
+    pub timezone: String,
+    pub queue: Identity,
+    /// A kind the declaring module registered.
+    pub kind: Identity,
+    /// At most 64 KiB encoded, JSON-compatible numbers only.
+    pub payload: Value,
+}
+impl std::fmt::Debug for ScheduleDeclaration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScheduleDeclaration")
+            .field("name", &self.name)
+            .field("cron", &self.cron)
+            .field("timezone", &self.timezone)
+            .field("queue", &self.queue)
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One queue in [`QueueStatus`], with TE's state names: `ready` and
 /// `delayed` are `available` jobs whose `run_at` is past or future,
 /// `leased` is `running`, `dead` is `dead`; terminal rows are not counted.
@@ -218,6 +248,10 @@ pub trait Jobs: Send + Sync {
     /// Fan event records on `topic` out to jobs of `kind`, which `source`
     /// registered; stored in `merezha_jobs.subscriptions` at start.
     fn subscribe(&self, source: &Source, topic: &Identity, kind: &Identity) -> Result<(), Failure>;
+    /// Declare a cron schedule for a kind `source` registered; stored in
+    /// `merezha_jobs.schedules` at start and re-declared on every
+    /// heartbeat, like subscriptions.
+    fn schedule(&self, source: &Source, schedule: ScheduleDeclaration) -> Result<(), Failure>;
     /// Queue and outbox state, read in one bounded pass.
     fn queue_status(&self) -> BoxFuture<'_, Result<QueueStatus, Failure>>;
 }
@@ -276,6 +310,11 @@ impl JobsHandle {
         self.inner
             .subscribe(&self.source, &Identity::new(topic)?, &Identity::new(kind)?)
     }
+    /// Declare a cron schedule for this source's registered `kind`; must
+    /// run before the jobs runtime starts. See [`Jobs::schedule`].
+    pub fn schedule(&self, schedule: ScheduleDeclaration) -> Result<(), Failure> {
+        self.inner.schedule(&self.source, schedule)
+    }
     /// See [`Jobs::queue_status`].
     pub async fn queue_status(&self) -> Result<QueueStatus, Failure> {
         self.inner.queue_status().await
@@ -297,6 +336,9 @@ impl Jobs for UnavailableJobs {
         Err(Failure::permanent("jobs_unavailable"))
     }
     fn subscribe(&self, _: &Source, _: &Identity, _: &Identity) -> Result<(), Failure> {
+        Err(Failure::permanent("jobs_unavailable"))
+    }
+    fn schedule(&self, _: &Source, _: ScheduleDeclaration) -> Result<(), Failure> {
         Err(Failure::permanent("jobs_unavailable"))
     }
     fn queue_status(&self) -> BoxFuture<'_, Result<QueueStatus, Failure>> {

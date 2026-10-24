@@ -24,7 +24,7 @@ use tokio::sync::{Notify, Semaphore, watch};
 /// `'MZJB'`, the advisory lock class of the jobs runtime.
 pub(crate) const MZJB: i32 = 1_297_762_882;
 /// Bound on one lease, heartbeat, reaper or release statement.
-const STATEMENT_DEADLINE: Duration = Duration::from_secs(5);
+pub(crate) const STATEMENT_DEADLINE: Duration = Duration::from_secs(5);
 /// Most jobs one reaper statement reclaims, and statements per tick.
 const REAP_BATCH: usize = 100;
 const MAX_REAP_BATCHES: usize = 10;
@@ -64,6 +64,9 @@ pub(crate) struct WorkerConfig {
     pub listen: bool,
     pub listen_check: Duration,
     pub max_lag: Option<Duration>,
+    /// Bound on one lease transaction, [`STATEMENT_DEADLINE`] outside
+    /// tests.
+    pub lease_deadline: Duration,
 }
 
 const LEASE: &str = "
@@ -307,6 +310,13 @@ impl Worker {
         tasks.push(tokio::spawn(retain(self.clone())));
     }
 
+    /// Whether the drain began: dispatchers lease no more, and a lease
+    /// that lands from here on is parked and released, never run.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn stopping(&self) -> bool {
+        *self.stop.borrow()
+    }
+
     /// `false` while `jobs.readiness.max_lag_ms` is set and exceeded.
     pub(crate) fn lagging(&self) -> bool {
         self.lagging.load(Ordering::Relaxed)
@@ -345,7 +355,7 @@ impl Worker {
         let lease_secs = lane.plan.settings.lease.as_secs_f64();
         let global = i64::from(lane.plan.global_concurrency);
         self.database
-            .transaction(deadline(), move |tx| {
+            .transaction(Instant::now() + self.config.lease_deadline, move |tx| {
                 Box::pin(async move {
                     if global > 0 {
                         tx.execute(

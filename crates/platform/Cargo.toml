@@ -12,6 +12,7 @@ merezha-postgres = { path = "../postgres" }
 merezha-telemetry = { path = "../telemetry" }
 axum = { workspace = true, features = ["matched-path"] }
 bytes.workspace = true
+croner.workspace = true
 futures-core.workspace = true
 getrandom.workspace = true
 http-body-util.workspace = true

@@ -11,7 +11,8 @@ use serde_json::Value;
 const MAX_DELAY_HOURS: i64 = 365 * 24;
 
 /// Outbox sources: `[a-z][a-z0-9_]{0,31}`, the column's CHECK. `outbox` and
-/// `cron` are refused: they prefix the keys the relay and the scheduler mint.
+/// `cron` are refused: they prefix the keys the relay and the scheduler
+/// mint; so is `config`, the source of configured schedules.
 pub(crate) fn source(source: &str) -> Result<(), Failure> {
     let bytes = source.as_bytes();
     let valid = (1..=32).contains(&bytes.len())
@@ -19,7 +20,7 @@ pub(crate) fn source(source: &str) -> Result<(), Failure> {
         && bytes
             .iter()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
-        && !matches!(source, "outbox" | "cron");
+        && !matches!(source, "outbox" | "cron" | "config");
     if valid {
         Ok(())
     } else {
@@ -125,6 +126,7 @@ mod tests {
             "a-b",
             "outbox",
             "cron",
+            "config",
             &"s".repeat(33),
         ] {
             assert_eq!(source(bad).unwrap_err().code, "invalid_source", "{bad}");

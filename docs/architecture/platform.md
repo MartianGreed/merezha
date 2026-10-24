@@ -263,8 +263,9 @@ no `enabled` key (R12). AP-B1 gives `[jobs.relay]`, `[jobs.subscriptions]` and `
 workers theirs: `workers`, `poll_interval_ms`, `reaper_interval_ms`,
 `drain_timeout_ms`, every `[jobs.defaults]` and `[jobs.queues.<name>]`
 key, `[jobs.retention]` and `[jobs.readiness] max_lag_ms` (see "Jobs and
-the outbox"). `[jobs.scheduler]` and `[[jobs.schedules]]` stay *reserved*
-until cron (AP-B3) ships.
+the outbox"). AP-B3 gives `[jobs.scheduler]` and `[[jobs.schedules]]`
+theirs (cron, below); `[jobs.subscriptions]` also paces the schedule
+declarations.
 
 | Table | Key | Type | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -274,7 +275,7 @@ until cron (AP-B3) ships.
 | | `drain_timeout_ms` | duration | `20000` | 0 to 10 min |
 | `[jobs.relay]` | `interval_ms` | duration | `1000` | 100 ms to 10 min |
 | | `batch` | integer | `100` | 1 to 1000 |
-| `[jobs.scheduler]` | `interval_ms` | duration | `10000` | 1 s to 1 h |
+| `[jobs.scheduler]` | `interval_ms` | duration | `10000` | 1 s to 1 h; every instance ticks this often (and once at start) |
 | `[jobs.defaults]` | `max_attempts` | integer | `10` | 1 to 100 |
 | | `backoff_base_ms` | duration | `1000` | 10 ms to 1 day; at most `backoff_max_ms` (`backoff_base_exceeds_max`) |
 | | `backoff_max_ms` | duration | `3600000` | 10 ms to 1 day |
@@ -284,17 +285,32 @@ until cron (AP-B3) ships.
 | | `global_concurrency` | integer | `0` | 0 is unlimited |
 | | `max_attempts`, `backoff_base_ms`, `backoff_max_ms`, `lease_ms`, `timeout_ms` | as `[jobs.defaults]` | inherited | queue settings live only here (R1) |
 | `[jobs.retention]` | `succeeded`, `dead`, `outbox`, `audit` | duration string | `7d`, `30d`, `7d`, `365d` | 1 h to 3650 d |
-| `[jobs.subscriptions]` | `heartbeat` | duration string | `5m` | 100 ms to 1 d; every instance re-declares its subscriptions this often |
-| | `retire_after` | duration string | `1h` | 300 ms to 30 d, at least three heartbeats (`retire_after_too_short`); a subscription nobody declared for this long is retired |
+| `[jobs.subscriptions]` | `heartbeat` | duration string | `5m` | 100 ms to 1 d; every instance re-declares its subscriptions and schedules this often |
+| | `retire_after` | duration string | `1h` | 300 ms to 30 d, at least three heartbeats (`retire_after_too_short`); a subscription or schedule nobody declared for this long is retired |
 | `[jobs.readiness]` | `max_lag_ms` | duration | unset | 1 s to 1 day; unset, backlog is no readiness input (R10) |
 
 Queue names are dot-separated `[a-z][a-z0-9_]*` segments, at most 64 bytes
 (`invalid_queue_name`), at most 64 queues. `[[jobs.schedules]]` entries take
-`name` (required, unique), `cron` (required, 5 or 6 fields), `timezone`
-(default `UTC`), `queue` and `kind` (required) and `payload` (a table, default
-`{}`, no dates, at most 64 KiB as JSON), at most 256 entries. The cron
-expression and time zone are checked for shape only; the scheduler parses them
-when it ships.
+`name` (required, unique, `[a-z][a-z0-9_.-]{0,63}`, else `invalid_name`),
+`cron` (required, exactly five fields: minute, hour, day of month, month,
+day of week), `timezone` (an IANA name, default `UTC`), `queue` and `kind`
+(required) and `payload` (a table, default `{}`, no dates, at most 64 KiB as
+JSON), at most 256 entries. Validation parses each expression with `croner`
+and resolves each zone from the bundled tzdb, so a bad entry fails startup
+with every other problem: `invalid_cron` (six fields with seconds, `@daily`
+nicknames, out-of-range values, or an expression that never fires such as
+`0 0 30 2 *`), `invalid_timezone` (not shaped like a zone name) and
+`unknown_timezone` (not in the tzdb).
+
+```toml
+[[jobs.schedules]]
+name = "tasks.reminders"
+cron = "0 9 * * mon-fri"      # 09:00 on weekdays
+timezone = "Europe/Paris"
+queue = "default"
+kind = "tasks.send_reminders"
+payload = { only = ["late"] }
+```
 
 ### `[telemetry]`
 
@@ -548,7 +564,7 @@ as before, and runs no OTLP pipeline.
 
 | Method | Contract |
 | --- | --- |
-| `name()` | `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not `application`, `api`, `services`, `pipelines`, `reload`, `health`, `jobs` (the jobs runtime), `outbox` or `cron` (job key prefixes the relay and the scheduler mint). Names the section, route prefix and migration ledger key; never changes. |
+| `name()` | `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not `application`, `api`, `services`, `pipelines`, `reload`, `health`, `jobs` (the jobs runtime), `outbox` or `cron` (job key prefixes the relay and the scheduler mint), or `config` (the source of configured schedules). Names the section, route prefix and migration ledger key; never changes. |
 | `configure(&ModuleSection)` | validate and keep `[modules.<name>]`; return every issue at once. Default: only an empty section. |
 | `migrations()` | ordered forward-only `Migration::new(version, name, sql)` or `Migration::non_transactional(..)` for its own schema |
 | `errors()` | `ErrorCode { code, status }` it returns, registered at startup; default none |
@@ -1038,7 +1054,7 @@ runs the same checks, and its PostgreSQL tests print the skip message.
 
 ## Jobs and the outbox
 
-`merezha-jobs` implements AP §B for AP-B1 and AP-B2 (cron is AP-B3). Its migration 0001 (ledger key
+`merezha-jobs` implements AP §B for AP-B1, AP-B2 and AP-B3. Its migration 0001 (ledger key
 `jobs`) creates schema `merezha_jobs`: `outbox`, `subscriptions`, `jobs`,
 `attempts`, `schedules` and `admin_actions`, with AP §B.2's constraints,
 including the R3 rule that a flagged (`contains_secret`) record has no
@@ -1154,6 +1170,54 @@ state, and the R10 trace columns.
   (`available` now, attempt refunded, attempts row `released`) and logs
   `job.released`. `JobHandler::accepts_leases()` (default `true`) is read
   before every lease; the worker leases only kinds whose handler accepts.
+- **Cron** (AP-B3, AP §B.7). Schedules come from `[[jobs.schedules]]`
+  (source `config`) and from modules through `JobsHandle::schedule(
+  ScheduleDeclaration { name, cron, timezone, queue, kind, payload })`,
+  called from `Module::start` for a kind the module registered
+  (`kind_not_registered`), with a name no other schedule of the instance
+  uses (`schedule_already_declared`), at most 256 per instance
+  (`too_many_schedules`), validated like config (`invalid_schedule_name`,
+  `invalid_cron`, `invalid_timezone`, `unknown_timezone`) and refused
+  after start (`jobs_started`). Module name `config` is reserved for the
+  configured schedules' source. Schedules follow the subscriptions'
+  rolling-deploy rule: at start and every `jobs.subscriptions.heartbeat`,
+  each instance upserts the schedules it declares (`last_declared_at`,
+  reactivating a retired one) and retires those nobody declared for
+  `jobs.subscriptions.retire_after` (`retired_at` set, the row kept, never
+  fired), all in one transaction under
+  `pg_advisory_xact_lock(MZJB, hashtext('schedules'))`. A schedule only a
+  newer version declares therefore survives older instances restarting.
+  When two versions declare one name with different definitions
+  (expression, zone, queue, kind or payload, digested in `definition`),
+  the other definition replaces the stored one only if its `app.version`
+  is strictly greater (dotted numbers; otherwise no precedence), if
+  nobody re-declared the stored definition for `2 x heartbeat`, or if
+  the row is retired; otherwise the stored one stands and the instance
+  logs `job.schedule_conflict` once per streak. A replacement keeps a due
+  run (it fires once, with the new definition) and otherwise recomputes
+  `next_run_at` from now; a reactivation recomputes it from now.
+  `merezha run` passes `app.version`. Every instance ticks every `jobs.scheduler.interval_ms` and
+  once at start, `workers = false` included: under
+  `pg_try_advisory_xact_lock(MZJB, hashtext('scheduler'))` (taken: skip
+  this tick), it locks up to 32 due rows at a time with
+  `FOR UPDATE SKIP LOCKED` and, per row, inserts one job keyed
+  `cron:{name}:{epoch seconds of the occurrence}` (`ON CONFLICT DO
+  NOTHING`, `schedule_name`, `scheduled_for`, the queue's
+  `max_attempts`, correlation id = the key) and moves `next_run_at` to the
+  first occurrence strictly after `max(occurrence, now)`: a downtime
+  spanning several occurrences runs one job, then the normal cadence.
+  Times come from the database clock. A due row this version cannot
+  parse stays due for an instance that can, is kept out of the tick's
+  later batches and is logged once per streak. Daylight saving time follows
+  croner (OCPS): in a spring-forward gap a fixed-time schedule (`30 2 * *
+  *`) runs at the first minute after the gap and an interval schedule
+  (`*/30 * * * *`) skips the missing occurrences; in a fall-back overlap
+  a fixed-time schedule runs once, in the first pass, and an interval
+  schedule runs in both. `PgJobs::schedule_now` runs one tick. A failing
+  tick logs `job.worker_failed` with task `scheduler`, a failing schedule
+  declaration `job.schedule_sync_failed`, and each fired occurrence
+  `job.schedule_fired` (debug). Readiness waits for the first schedule
+  sync too.
 - **Secrets (R3).** A flagged job's payload is nulled by the same
   statement that makes it terminal: success, dead letter (handler or
   reaper), cancel. The admin API never returns a flagged payload.
@@ -1196,26 +1260,49 @@ state, and the R10 trace columns.
   in a task detached from the request, so a disconnect or the HTTP drain
   cannot cut one; `POST dead/replay` answers `200` with
   `"complete":true`, or `202` with the counts so far and
-  `"complete":false` when the run outlasts 30 s. Bad bodies and query
+  `"complete":false` when the run outlasts 30 s. `GET
+  schedules?limit=&after=` lists schedules by name (limit 1 to 200,
+  default 50, `next` cursor) with `name`, `source`, `cron`, `timezone`,
+  `queue`, `kind`, `enabled`, `retired_at`, `next_run_at`, `last_run_at`
+  and `last_job_id`, never the payload. `POST schedules/{name}/pause`
+  sets `enabled = false` (a paused schedule never fires), `/resume`
+  re-enables a paused one with `next_run_at` recomputed from now (the
+  occurrences it missed never run), and `/trigger` enqueues one job now
+  keyed `cron:{name}:manual:{key}`, with `key` from an optional
+  `Idempotency-Key` header (1 to 120 bytes of `[A-Za-z0-9._:-]`, else
+  `422`; a retry returns the same job with `"inserted":false`) or the
+  time in milliseconds, without moving the cadence
+  (`{"name","job_id","idempotency_key","inserted"}`; `409
+  schedule_retired` for a retired schedule); pause and resume answer the
+  schedule's listing entry, an unknown name or action is `404
+  not_found` (after the permission check), and each writes an `admin_actions` row (`schedule_pause`,
+  `schedule_resume`, `schedule_trigger`). Bad bodies and query
   strings fail `invalid_input` (400) or `validation_failed` (422) with
   `details` that never echo input.
 
 Error codes it registers: `invalid_topic`, `invalid_queue`,
 `invalid_run_at`, `invalid_event_envelope`, `invalid_record_data`, `job_payload_limit`,
 `kind_already_registered`, `kind_not_registered`, `too_many_kinds` and
-`jobs_started` (422), `not_quarantined`, `not_dead`, `not_cancellable` and
-`reissue_claim_lost` (409), `jobs_not_ready` (503). Migration 0002 adds the `outbox_quarantined`
+`jobs_started`, `invalid_schedule_name`, `schedule_already_declared` and
+`too_many_schedules` (422), `not_quarantined`, `not_dead`, `not_cancellable`,
+`reissue_claim_lost` and `schedule_retired` (409), `jobs_not_ready` (503); the kernel registers
+`invalid_cron`, `invalid_timezone` and `unknown_timezone` (422), which
+`merezha_platform::cron` returns. Migration 0002 adds the `outbox_quarantined`
 index the admin listing, the outbox count and retention read, the
 `jobs_due` index the readiness lag reads, and the `reissue_claimed_at`
-claim column (only on `cancelled` rows) with its index.
+claim column (only on `cancelled` rows) with its index. Migration 0003
+adds `schedules.last_declared_at`, `retired_at`, `declared_version` and
+`definition_declared_at` and the `schedules_due` index the tick reads.
 
 Process tests hold the relay with `MEREZHA_JOBS_TEST_RELAY=off` (or
 `interval`, no `LISTEN`), and `MEREZHA_JOBS_TEST_HANDLER=<ms>` registers a
 `test.sleep` kind on queue `default` whose handler sleeps that long,
 ignoring `cancel`. Only builds with the `test-hooks` feature read
-them; the feature also adds `PgJobs::without_heartbeat` and
+them; the feature also adds `PgJobs::without_heartbeat`,
 `PgJobs::with_reissue_timing` (shorter hook deadline, claim timeout and
-`202` wait), and
+`202` wait), `PgJobs::with_lease_deadline` (a lease transaction that may
+wait longer than 5 s on the queue lock) and `PgJobs::workers_stopping`
+(whether the drain began), and
 `merezha-jobs`' own tests enable it through a self dev-dependency. `merezha-cli`'s dev-dependency enables it, and Cargo unifies that into
 every build that compiles the dev-dependencies: the `merezha` binary built
 by `cargo test` or `--all-targets` reads the variable. Builds without them,
@@ -1418,6 +1505,7 @@ Rust 1.98.0.
 | `uuid` | 1.29.0 | 1.89.0 | Apache-2.0 OR MIT | none | platform: notification and webhook handles |
 | `bytes` | 1.12.1 | 1.57 | MIT | `std` | platform: blob bodies |
 | `futures-core` | 0.3.34 | 1.36 | MIT OR Apache-2.0 | `std` | platform: blob streams |
+| `croner` | =4.0.2 | unset (edition 2021) | MIT | `jiff` only, no default `chrono` (R14); pulls `derive_builder` 0.20.2 (MIT OR Apache-2.0) and `strum` 0.27.2 (MIT, MSRV 1.66.1) with their proc-macro crates | platform: `cron`, used by config validation and the scheduler |
 
 The aws-lc-rs provider is shared by the database TLS connector and reqwest,
 so one crypto provider is compiled. Wasmtime still locks `sha2` 0.10 for
@@ -1437,9 +1525,9 @@ itself.
 - The events, outbox and jobs `trace_parent`/`trace_state` columns exist
   but stay empty until the telemetry block fills them from the current span
   (TE-T3 for events, TE-T5 for the outbox and jobs).
-- Cron (`[[jobs.schedules]]`, `JobsHandle::schedule`, the scheduler and
-  the schedule admin routes) is AP-B3. Job attempts open no `process`
-  span and the `merezha.job.*` instruments do not exist yet (TE-T5).
+- Job attempts open no `process` span and the `merezha.job.*`
+  instruments, `merezha.job.schedule.fired` included, do not exist yet
+  (TE-T5).
 - PostgreSQL application storage (AP-A2) has no background projection
   runners, warm-up readiness or application admin API yet (AP-A3); catch-up
   and rebuild run in the request.

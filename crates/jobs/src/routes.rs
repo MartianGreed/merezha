@@ -1,8 +1,10 @@
 //! The jobs admin HTTP API (AP §D.1), nested by the host under `/v1/jobs`:
 //! `/v1/jobs/admin/...`. Every route checks its permission at
 //! [`ResourceScope::Application`] (R5) through the host's policy before
-//! anything else: `jobs.admin.read` for reads, `jobs.admin.write` for
-//! writes, and `jobs.admin.payload` as well to see a payload. Without the
+//! anything else: `jobs.admin.read` for reads (`GET queues`, `jobs`,
+//! `jobs/{id}`, `outbox`, `schedules`), `jobs.admin.write` for writes
+//! (replay, cancel, purge, requeue, and `schedules/{name}/pause`, `/resume`
+//! and `/trigger`), and `jobs.admin.payload` as well to see a payload. Without the
 //! identity block the loopback policy allows them and a public listener
 //! denies them.
 use crate::{
@@ -20,7 +22,7 @@ use axum::{
 use merezha_domain::{Failure, Identity, valid_name};
 use merezha_platform::{
     ErrorReply, FieldError,
-    config::valid_queue_name,
+    config::{valid_queue_name, valid_schedule_name},
     edge::Authenticated,
     ports::{Authorizer, ResourceScope},
 };
@@ -50,6 +52,8 @@ pub(crate) fn router(jobs: PgJobs, policy: Arc<dyn Authorizer>) -> Router {
         .route("/admin/dead/purge", post(purge))
         .route("/admin/outbox", get(outbox))
         .route("/admin/outbox/{id}/requeue", post(requeue))
+        .route("/admin/schedules", get(schedules))
+        .route("/admin/schedules/{name}/{action}", post(schedule_action))
         .with_state(Admin { jobs, policy })
 }
 
@@ -416,6 +420,93 @@ async fn purge(State(admin): State<Admin>, request: Request) -> Response {
             .await
             .map_err(failure)?;
         ok(json!({ "purged": purged }))
+    };
+    respond(run.await)
+}
+
+async fn schedules(State(admin): State<Admin>, request: Request) -> Response {
+    let run = async {
+        let (parts, _) = request.into_parts();
+        admin.allow(&parts, &[READ])?;
+        let mut limit = 50;
+        let mut after = None;
+        let mut problems = Vec::new();
+        for (key, value) in query(&parts.uri, &["limit", "after"])? {
+            let path = format!("/{key}");
+            match key.as_str() {
+                "limit" => match value.parse::<u32>() {
+                    Ok(n @ 1..=crate::MAX_SCHEDULES_LISTED) => limit = n,
+                    _ => problems.push(field_error(&path, "out_of_range")),
+                },
+                _ if valid_schedule_name(&value) => after = Some(value),
+                _ => problems.push(field_error(&path, "invalid_cursor")),
+            }
+        }
+        if !problems.is_empty() {
+            return Err(invalid(problems));
+        }
+        let page = admin
+            .jobs
+            .list_schedules(after.as_deref(), limit)
+            .await
+            .map_err(failure)?;
+        ok(json!(page))
+    };
+    respond(run.await)
+}
+
+/// `POST schedules/{name}/pause`, `/resume` and `/trigger`.
+async fn schedule_action(
+    State(admin): State<Admin>,
+    Path((name, action)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let run = async {
+        let (parts, _) = request.into_parts();
+        // The permission first: an unknown action or name tells a caller
+        // without it nothing.
+        let principal = admin.allow(&parts, &[WRITE])?;
+        if !matches!(action.as_str(), "pause" | "resume" | "trigger") || !valid_schedule_name(&name)
+        {
+            return Err(failure(Failure::permanent("not_found")));
+        }
+        let principal = principal.as_deref();
+        match action.as_str() {
+            "pause" => ok(json!(
+                admin
+                    .jobs
+                    .pause_schedule(&name, principal)
+                    .await
+                    .map_err(failure)?
+            )),
+            "resume" => ok(json!(
+                admin
+                    .jobs
+                    .resume_schedule(&name, principal)
+                    .await
+                    .map_err(failure)?
+            )),
+            _ => {
+                // An optional `Idempotency-Key`: a retry returns the job the
+                // first call enqueued.
+                let key = match parts.headers.get("idempotency-key") {
+                    None => None,
+                    Some(value) => match value.to_str() {
+                        Ok(key) if crate::valid_trigger_key(key) => Some(key.to_owned()),
+                        _ => {
+                            return Err(invalid(vec![field_error("", "invalid_idempotency_key")]));
+                        }
+                    },
+                };
+                ok(json!(
+                    admin
+                        .jobs
+                        .trigger_schedule(&name, key.as_deref(), principal)
+                        .await
+                        .map_err(failure)?
+                ))
+            }
+        }
     };
     respond(run.await)
 }

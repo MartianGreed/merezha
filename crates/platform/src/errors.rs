@@ -99,6 +99,9 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("outbox_batch_limit", 422),
     ErrorCode::new("outbox_payload_limit", 422),
     ErrorCode::new("jobs_unavailable", 422),
+    ErrorCode::new("invalid_cron", 422),
+    ErrorCode::new("invalid_timezone", 422),
+    ErrorCode::new("unknown_timezone", 422),
     ErrorCode::new("blob_store_unavailable", 422),
     ErrorCode::new("invalid_blob_key", 422),
     ErrorCode::new("upstream_body_limit", 422),
@@ -938,6 +941,9 @@ fn after() -> Failure {
             "kernel",
             "apply",
             "verify",
+            // `cron::CronProblem::field`, a configuration key segment.
+            "cron",
+            "timezone",
             // Configuration issue codes from `config::failed`, not failures.
             "config_unreadable",
             "config_too_large",

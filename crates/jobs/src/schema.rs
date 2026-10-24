@@ -149,7 +149,27 @@ CREATE INDEX jobs_reissuing ON merezha_jobs.jobs (reissue_claimed_at)
     WHERE reissue_claimed_at IS NOT NULL;
 ";
 
-pub(crate) const MIGRATIONS: [Migration; 2] = [
+/// AP-B3. Schedules follow the subscriptions' rolling-deploy rule: every
+/// declaring instance refreshes `last_declared_at`, and a schedule nobody
+/// declared for `jobs.subscriptions.retire_after` gets `retired_at` (kept,
+/// never fired) instead of being disabled by one instance's config.
+/// `enabled` stays the admin pause flag. `declared_version` (the
+/// declarer's `app.version`) and `definition_declared_at` (the last
+/// declaration of the stored definition) decide between two versions'
+/// definitions of one name. The tick reads due rows through
+/// `schedules_due`.
+const CRON: &str = "
+ALTER TABLE merezha_jobs.schedules
+    ADD COLUMN last_declared_at timestamptz NOT NULL DEFAULT now(),
+    ADD COLUMN retired_at timestamptz NULL,
+    ADD COLUMN declared_version text NULL CHECK (octet_length(declared_version) <= 128),
+    ADD COLUMN definition_declared_at timestamptz NOT NULL DEFAULT now();
+CREATE INDEX schedules_due ON merezha_jobs.schedules (next_run_at)
+    WHERE enabled AND retired_at IS NULL;
+";
+
+pub(crate) const MIGRATIONS: [Migration; 3] = [
     Migration::new(1, "initial", INITIAL),
     Migration::new(2, "workers", WORKERS),
+    Migration::new(3, "cron", CRON),
 ];

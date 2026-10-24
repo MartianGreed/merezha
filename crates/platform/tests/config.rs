@@ -610,6 +610,52 @@ kind = "k"
     }
 }
 
+/// AP-B3 test 1: cron expressions and zones are parsed at config
+/// validation, every problem is listed with the others, and seconds fields
+/// are refused (five fields only).
+#[test]
+fn schedule_expressions_and_zones_are_parsed_at_validation_and_reported_together() {
+    let entry = |name: &str, cron: &str, timezone: &str| {
+        format!(
+            "[[jobs.schedules]]\nname = \"{name}\"\ncron = \"{cron}\"\ntimezone = \"{timezone}\"\nqueue = \"default\"\nkind = \"tasks.remind\"\n"
+        )
+    };
+    let text = [
+        entry("seconds", "0 0 9 * * *", "UTC"),
+        entry("minute", "61 * * * *", "Europe/Paris"),
+        entry("month", "0 9 * 13 *", "UTC"),
+        entry("never", "0 0 30 2 *", "UTC"),
+        entry("zone", "0 9 * * mon-fri", "Europe/Atlantis"),
+        entry("both", "*/5 * * * * *", "Mars/Olympus"),
+        entry("shape", "0 9 * * *", "../etc/zoneinfo"),
+        entry("Upper", "0 9 * * *", "UTC"),
+        entry("good", "0 9 * * mon-fri", "Europe/Paris"),
+    ]
+    .concat();
+    let found = codes(&load(&text, &[], &[]).unwrap_err());
+    let expected = [
+        ("jobs.schedules[0].cron", "invalid_cron"),
+        ("jobs.schedules[1].cron", "invalid_cron"),
+        ("jobs.schedules[2].cron", "invalid_cron"),
+        ("jobs.schedules[3].cron", "invalid_cron"),
+        ("jobs.schedules[4].timezone", "unknown_timezone"),
+        ("jobs.schedules[5].cron", "invalid_cron"),
+        ("jobs.schedules[5].timezone", "unknown_timezone"),
+        ("jobs.schedules[6].timezone", "invalid_timezone"),
+        ("jobs.schedules[7].name", "invalid_name"),
+    ];
+    assert_eq!(
+        found,
+        expected
+            .iter()
+            .map(|(key, code)| (key.to_string(), *code))
+            .collect::<Vec<_>>(),
+        "every problem, in order, and nothing about the good entry"
+    );
+    let config = load(&entry("good", "0 9 * * MON-FRI", "Europe/Paris"), &[], &[]).unwrap();
+    assert_eq!(config.jobs.schedules[0].cron, "0 9 * * MON-FRI");
+}
+
 #[test]
 fn application_extensions_validate_with_the_section() {
     let config = load("[application]\npath = \"application.toml\"\n", &[], &[]).unwrap();
@@ -922,7 +968,7 @@ impl Module for Named {
 
 #[test]
 fn modules_named_after_reserved_prefixes_are_refused_at_startup() {
-    for name in ["jobs", "outbox", "cron", "api", "application"] {
+    for name in ["jobs", "outbox", "cron", "config", "api", "application"] {
         let project = Project::new(&format!("{MINIMAL}\n[modules.{name}]\n"));
         let errors = configure(&project.input(&[URL], &[]), vec![Box::new(Named(name))])
             .err()

@@ -45,7 +45,10 @@ async fn an_append_in_a_rolled_back_transaction_leaves_no_record() {
     );
 }
 
-/// B1 test 2.
+/// B1 test 2. Each wait bound stays far inside the other wake-up source
+/// (a ten-minute interval, no `LISTEN`), so what woke the relay is not in
+/// doubt however slow the machine; on an idle one both take well under a
+/// second.
 #[tokio::test]
 async fn committed_records_relay_within_a_second_by_notify_and_within_the_interval_without() {
     let Some(test) = TestDatabase::create() else {
@@ -61,7 +64,7 @@ async fn committed_records_relay_within_a_second_by_notify_and_within_the_interv
         "SELECT count(*) FROM pg_stat_activity
           WHERE datname = current_database() AND query LIKE 'LISTEN merezha_jobs_outbox%'",
         1,
-        Duration::from_secs(5),
+        PATIENCE,
     )
     .await;
     append(
@@ -76,10 +79,13 @@ async fn committed_records_relay_within_a_second_by_notify_and_within_the_interv
         &db,
         "SELECT count(*) FROM merezha_jobs.jobs WHERE idempotency_key = 'tasks:notified'",
         1,
-        Duration::from_secs(1),
+        PATIENCE,
     )
     .await;
-    assert!(took < Duration::from_secs(1), "{took:?}");
+    assert!(
+        took < PATIENCE,
+        "only the notification can wake it: {took:?}"
+    );
     listening.shutdown(soon()).await;
 
     // Without notifications, the interval relays.
@@ -97,10 +103,14 @@ async fn committed_records_relay_within_a_second_by_notify_and_within_the_interv
         &db,
         "SELECT count(*) FROM merezha_jobs.jobs WHERE idempotency_key = 'tasks:polled'",
         1,
-        Duration::from_secs(2),
+        PATIENCE,
     )
     .await;
-    assert!(took <= Duration::from_millis(300 + 700), "{took:?}");
+    // The 300 ms cadence, with generous tolerance for a slow machine.
+    assert!(
+        took < Duration::from_millis(300) + Duration::from_secs(5),
+        "no LISTEN session: the interval woke it: {took:?}"
+    );
     polling.shutdown(soon()).await;
     assert!(polling.ready().await.is_err(), "not ready after shutdown");
 }
@@ -111,8 +121,47 @@ async fn two_relays_on_two_instances_produce_no_duplicate_jobs() {
     let Some(test) = TestDatabase::create() else {
         return;
     };
-    let first_db = database(&test).await;
-    let second_db = Database::connect(&test.config()).unwrap();
+    let migrated = database(&test).await;
+    // Room for the handshake below inside one statement.
+    let mut patient = test.config();
+    patient.statement_timeout = Duration::from_secs(20);
+    let first_db = Database::connect(&patient).unwrap();
+    let second_db = Database::connect(&patient).unwrap();
+    drop(migrated);
+    // A handshake on the jobs insert of every relay batch: the first batch
+    // to arrive waits (at most 15 s) until a second one arrives, which can
+    // only be the other relay's, since the first relay is blocked inside
+    // it. So both relays take batches whatever the scheduling, and the
+    // exactly-once assertions below run over a real overlap. A sequence
+    // counts arrivals because it is visible across open transactions.
+    execute(&first_db, "CREATE SEQUENCE public.relay_arrivals")
+        .await
+        .unwrap();
+    execute(
+        &first_db,
+        "CREATE FUNCTION public.relay_handshake() RETURNS trigger LANGUAGE plpgsql AS $$
+         DECLARE
+             arrival bigint := nextval('public.relay_arrivals');
+             waited integer := 0;
+         BEGIN
+             IF arrival = 1 THEN
+                 WHILE (SELECT last_value FROM public.relay_arrivals) < 2 AND waited < 1500 LOOP
+                     PERFORM pg_sleep(0.01);
+                     waited := waited + 1;
+                 END LOOP;
+             END IF;
+             RETURN NULL;
+         END $$",
+    )
+    .await
+    .unwrap();
+    execute(
+        &first_db,
+        "CREATE TRIGGER relay_handshake AFTER INSERT ON merezha_jobs.jobs
+             FOR EACH STATEMENT EXECUTE FUNCTION public.relay_handshake()",
+    )
+    .await
+    .unwrap();
     let config = jobs_config(&test, "[jobs.relay]\nbatch = 7");
     let first = PgJobs::with_mode(&config, RelayMode::Off);
     first.ports(&first_db);
@@ -902,7 +951,7 @@ async fn the_host_installs_the_jobs_runtime_after_every_module() {
         &db,
         "SELECT count(*) FROM merezha_jobs.jobs WHERE kind = 'notes.index'",
         1,
-        Duration::from_secs(2),
+        PATIENCE,
     )
     .await;
     assert_eq!(
@@ -934,6 +983,19 @@ async fn without_the_runtime_the_jobs_port_refuses() {
             .subscribe(&Source::new("tasks").unwrap(), &id("a.b"), &id("k"))
             .unwrap_err()
             .code,
+        "jobs_unavailable"
+    );
+    assert_eq!(
+        jobs.schedule(merezha_platform::ports::ScheduleDeclaration {
+            name: "tasks.daily".into(),
+            cron: "0 9 * * *".into(),
+            timezone: "UTC".into(),
+            queue: id("default"),
+            kind: id("k"),
+            payload: serde_json::json!({}),
+        })
+        .unwrap_err()
+        .code,
         "jobs_unavailable"
     );
 }

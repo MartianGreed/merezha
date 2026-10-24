@@ -5,17 +5,16 @@
 //! the kernel `Outbox` port, the `Jobs` port behind every module's
 //! `JobsHandle` (enqueue, cancel, register, subscribe, queue status), the
 //! relay that turns committed outbox records into jobs, the workers that
-//! lease and run them (dispatch, heartbeat, reaper, retry, drain), retention
-//! and the admin API under `/v1/jobs/admin/`.
-//!
-//! Seam for AP-B3: cron adds `JobsHandle::schedule`, the scheduler tick and
-//! the schedule admin routes beside [`PgJobs::admin_router`]'s.
+//! lease and run them (dispatch, heartbeat, reaper, retry, drain), retention,
+//! cron (`[[jobs.schedules]]`, `JobsHandle::schedule` and the scheduler
+//! tick) and the admin API under `/v1/jobs/admin/`.
 pub mod admin;
 mod outbox;
 mod relay;
 mod retention;
 mod retry;
 mod routes;
+mod scheduler;
 mod schema;
 mod validate;
 mod worker;
@@ -27,12 +26,16 @@ pub use admin::{
 pub use outbox::{OUTBOX_CHANNEL, PgOutbox};
 pub use relay::{JOBS_CHANNEL, RelayReport};
 pub use retention::{RETENTION_INTERVAL, RetentionReport};
+pub use scheduler::{
+    CONFIG_SOURCE, MAX_SCHEDULES, MAX_SCHEDULES_LISTED, SchedulePage, ScheduleSummary, TickReport,
+    Triggered, valid_trigger_key,
+};
 
 use merezha_domain::{Failure, Identity};
 use merezha_platform::{
     AppContext, BoxFuture, Database, ErrorCode, JobsPorts, JobsRuntime, Migration, Module,
     config::{JobsConfig, SubscriptionsConfig},
-    ports::{Enqueued, JobRegistration, Jobs, NewJob, QueueStatus, Source},
+    ports::{Enqueued, JobRegistration, Jobs, NewJob, QueueStatus, ScheduleDeclaration, Source},
 };
 use merezha_postgres::{Listener, classify};
 use relay::RelaySettings;
@@ -58,10 +61,14 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("kind_not_registered", 422),
     ErrorCode::new("too_many_kinds", 422),
     ErrorCode::new("jobs_started", 422),
+    ErrorCode::new("invalid_schedule_name", 422),
+    ErrorCode::new("schedule_already_declared", 422),
+    ErrorCode::new("too_many_schedules", 422),
     ErrorCode::new("not_quarantined", 409),
     ErrorCode::new("not_dead", 409),
     ErrorCode::new("not_cancellable", 409),
     ErrorCode::new("reissue_claim_lost", 409),
+    ErrorCode::new("schedule_retired", 409),
     ErrorCode::new("jobs_not_ready", 503),
 ];
 /// Per-instance slots of a queue a registered kind names but `[jobs.queues]`
@@ -106,6 +113,8 @@ struct Registry {
     kinds: BTreeMap<String, Kind>,
     /// `(topic, kind)` to the kind's queue and source.
     subscriptions: BTreeMap<(String, String), (String, String)>,
+    /// Config and module schedules by name.
+    schedules: BTreeMap<String, scheduler::Declared>,
 }
 
 struct Inner {
@@ -114,6 +123,7 @@ struct Inner {
     subscriptions: SubscriptionsConfig,
     listen_check: Duration,
     heartbeat: bool,
+    lease_deadline: Duration,
     reissue: admin::ReissueTiming,
     mode: RelayMode,
     database: OnceLock<Database>,
@@ -125,6 +135,18 @@ struct Inner {
     unrouted: AtomicU64,
     stop: tokio::sync::watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    scheduler: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// `app.version`, which decides between definitions two versions
+    /// declare for one schedule name.
+    app_version: Option<String>,
+    /// Names whose stored definition another declaration kept, for
+    /// `job.schedule_conflict` once per streak.
+    conflicts: Mutex<std::collections::BTreeSet<String>>,
+    /// Due names the last tick could not schedule, logged once per streak.
+    unschedulable: Mutex<std::collections::BTreeSet<String>>,
+    /// A `[[jobs.schedules]]` entry that failed to parse, returned by
+    /// `start`; config validation makes this unreachable from a file.
+    schedule_error: Option<Failure>,
 }
 
 /// The jobs runtime on PostgreSQL. Cheap to clone; clones share state.
@@ -200,6 +222,18 @@ impl PgJobs {
     /// The runtime in `mode`. Workers listen on `merezha_jobs` only in
     /// [`RelayMode::Listen`]; otherwise they poll.
     pub fn with_mode(config: &JobsConfig, mode: RelayMode) -> Self {
+        let mut registry = Registry::default();
+        let mut schedule_error = None;
+        for entry in &config.schedules {
+            match scheduler::from_config(entry) {
+                Ok(declared) => {
+                    registry.schedules.insert(declared.name.clone(), declared);
+                }
+                Err(failure) => {
+                    schedule_error.get_or_insert(failure);
+                }
+            }
+        }
         Self {
             inner: Arc::new(Inner {
                 config: config.clone(),
@@ -207,19 +241,34 @@ impl PgJobs {
                 subscriptions: config.subscriptions.clone(),
                 listen_check: LISTEN_CHECK_INTERVAL,
                 heartbeat: true,
+                lease_deadline: worker::STATEMENT_DEADLINE,
                 reissue: admin::ReissueTiming::default(),
                 mode,
                 database: OnceLock::new(),
                 ctx: OnceLock::new(),
                 worker: OnceLock::new(),
-                registry: Mutex::new(Registry::default()),
+                registry: Mutex::new(registry),
                 started: AtomicBool::new(false),
                 ready: AtomicBool::new(false),
                 unrouted: AtomicU64::new(0),
                 stop: tokio::sync::watch::channel(false).0,
                 task: Mutex::new(None),
+                scheduler: Mutex::new(None),
+                app_version: None,
+                conflicts: Mutex::default(),
+                unschedulable: Mutex::default(),
+                schedule_error,
             }),
         }
+    }
+    /// The application's `app.version`: a schedule definition declared by a
+    /// strictly newer dotted-numeric version replaces another version's
+    /// (AP §B.7). Call before sharing the runtime.
+    pub fn with_app_version(mut self, version: Option<String>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.app_version = version;
+        }
+        self
     }
     /// Probe an idle `LISTEN` session every `interval` instead of
     /// [`LISTEN_CHECK_INTERVAL`]; call before sharing the runtime.
@@ -237,6 +286,26 @@ impl PgJobs {
             inner.heartbeat = false;
         }
         self
+    }
+    /// Let one lease transaction wait up to `deadline` instead of 5 s
+    /// (feature `test-hooks`), for tests that hold a lease back on the
+    /// queue lock; the pool's statement timeout must allow it too. Call
+    /// before sharing the runtime.
+    #[cfg(feature = "test-hooks")]
+    pub fn with_lease_deadline(mut self, deadline: Duration) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.lease_deadline = deadline;
+        }
+        self
+    }
+    /// Whether the workers' drain began (feature `test-hooks`), so a test
+    /// can release a held lease only once the dispatchers saw the stop.
+    #[cfg(feature = "test-hooks")]
+    pub fn workers_stopping(&self) -> bool {
+        self.inner
+            .worker
+            .get()
+            .is_some_and(|worker| worker.stopping())
     }
     /// Shorter reissue bounds for tests (feature `test-hooks`): the hook
     /// deadline, the age after which the reaper reverts a claim, and how
@@ -261,7 +330,7 @@ impl PgJobs {
     pub(crate) fn reissue_timing(&self) -> admin::ReissueTiming {
         self.inner.reissue
     }
-    /// Migrations 0001 and 0002 of `merezha_jobs`, under ledger key `jobs`.
+    /// Migrations 0001 to 0003 of `merezha_jobs`, under ledger key `jobs`.
     pub fn migrations() -> &'static [Migration] {
         &schema::MIGRATIONS
     }
@@ -374,6 +443,7 @@ impl PgJobs {
                 listen: self.inner.mode == RelayMode::Listen,
                 listen_check: self.inner.listen_check,
                 max_lag: config.readiness_max_lag,
+                lease_deadline: self.inner.lease_deadline,
             },
         );
         if self.inner.worker.set(worker.clone()).is_ok() {
@@ -395,6 +465,56 @@ impl PgJobs {
             .unrouted
             .fetch_add(report.unrouted, Ordering::Relaxed);
         Ok(report)
+    }
+    /// Run one scheduler tick now (AP §B.7): every due occurrence becomes
+    /// one job. The background scheduler runs the same tick every
+    /// `jobs.scheduler.interval_ms`.
+    pub async fn schedule_now(&self) -> Result<TickReport, Failure> {
+        scheduler::tick(
+            self.database()?,
+            &self.inner.settings,
+            &self.inner.unschedulable,
+        )
+        .await
+    }
+    /// Schedules by name after `after` (D.1 `GET schedules`).
+    pub async fn list_schedules(
+        &self,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<SchedulePage, Failure> {
+        scheduler::list(self.database()?, after, limit).await
+    }
+    /// Pause a schedule (D.1 `POST schedules/{name}/pause`), audited for
+    /// `principal`. Fails `not_found`.
+    pub async fn pause_schedule(
+        &self,
+        name: &str,
+        principal: Option<&str>,
+    ) -> Result<ScheduleSummary, Failure> {
+        scheduler::pause(self.database()?, name, principal).await
+    }
+    /// Resume a paused schedule from now (D.1 `POST
+    /// schedules/{name}/resume`), audited. Fails `not_found`.
+    pub async fn resume_schedule(
+        &self,
+        name: &str,
+        principal: Option<&str>,
+    ) -> Result<ScheduleSummary, Failure> {
+        scheduler::resume(self.database()?, name, principal).await
+    }
+    /// Enqueue one job of a schedule now (D.1 `POST
+    /// schedules/{name}/trigger`), keyed `cron:{name}:manual:{key}` with the
+    /// caller's `key` (see [`valid_trigger_key`]) or `unix_ms`,
+    /// audited. Fails `not_found`, `validation_failed` for a bad key, or
+    /// conflict `schedule_retired`.
+    pub async fn trigger_schedule(
+        &self,
+        name: &str,
+        key: Option<&str>,
+        principal: Option<&str>,
+    ) -> Result<Triggered, Failure> {
+        scheduler::trigger(self.database()?, &self.inner.settings, name, key, principal).await
     }
     /// Return a quarantined record to pending once its cause is fixed
     /// (D.1 `POST outbox/{id}/requeue`), with an `admin_actions` row for
@@ -455,6 +575,9 @@ impl PgJobs {
         Ok(())
     }
     fn launch(&self, ctx: AppContext) -> Result<(), Failure> {
+        if let Some(failure) = &self.inner.schedule_error {
+            return Err(failure.clone());
+        }
         let database = ctx.database().clone();
         let _ = self.inner.database.set(database.clone());
         let _ = self.inner.ctx.set(ctx);
@@ -479,6 +602,38 @@ impl PgJobs {
     /// `jobs.subscriptions.retire_after`. No instance deactivates anything
     /// from its own registry, so during a rolling deploy a subscription any
     /// live version declares keeps receiving events.
+    /// Declare this instance's schedules and retire those nobody declared
+    /// for `jobs.subscriptions.retire_after` (see the scheduler module).
+    async fn sync_schedules(&self, database: &Database) -> Result<(), Failure> {
+        let declared: Vec<scheduler::Declared> =
+            self.registry().schedules.values().cloned().collect();
+        let report = scheduler::sync(
+            database,
+            declared,
+            self.inner.app_version.clone(),
+            self.inner.subscriptions.heartbeat,
+            self.inner.subscriptions.retire_after,
+        )
+        .await?;
+        let mut streak = self
+            .inner
+            .conflicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for name in report
+            .conflicts
+            .iter()
+            .filter(|name| !streak.contains(*name))
+        {
+            tracing::warn!(
+                event = "job.schedule_conflict",
+                schedule = name.as_str(),
+                version = self.inner.app_version.as_deref().unwrap_or("")
+            );
+        }
+        *streak = report.conflicts.into_iter().collect();
+        Ok(())
+    }
     async fn sync_subscriptions(&self, database: &Database) -> Result<(), Failure> {
         let (topics, kinds, queues, sources) = {
             let registry = self.registry();
@@ -534,10 +689,16 @@ fn classification(failure: &Failure) -> &'static str {
     }
 }
 
-/// One subscription heartbeat; logs `job.subscription_sync_failed` once
-/// per failure streak. Returns whether it succeeded.
-async fn declare(jobs: &PgJobs, database: &Database, failing: &mut bool) -> bool {
-    match jobs.sync_subscriptions(database).await {
+/// Failure streaks of the two declarations a heartbeat makes.
+#[derive(Default)]
+struct Failing {
+    subscriptions: bool,
+    schedules: bool,
+}
+
+/// Log a declaration failure once per streak as `event`.
+fn streak(result: Result<(), Failure>, failing: &mut bool, event: &'static str) -> bool {
+    match result {
         Ok(()) => {
             *failing = false;
             true
@@ -545,13 +706,65 @@ async fn declare(jobs: &PgJobs, database: &Database, failing: &mut bool) -> bool
         Err(failure) => {
             if !*failing {
                 tracing::warn!(
-                    event = "job.subscription_sync_failed",
+                    event,
                     code = failure.code.as_str(),
                     classification = classification(&failure)
                 );
             }
             *failing = true;
             false
+        }
+    }
+}
+
+/// One heartbeat: declare subscriptions, then schedules. Logs
+/// `job.subscription_sync_failed` and `job.schedule_sync_failed` once per
+/// failure streak each. Returns whether both succeeded.
+async fn declare(jobs: &PgJobs, database: &Database, failing: &mut Failing) -> bool {
+    let subscriptions = streak(
+        jobs.sync_subscriptions(database).await,
+        &mut failing.subscriptions,
+        "job.subscription_sync_failed",
+    );
+    let schedules = streak(
+        jobs.sync_schedules(database).await,
+        &mut failing.schedules,
+        "job.schedule_sync_failed",
+    );
+    subscriptions && schedules
+}
+
+/// Tick every `jobs.scheduler.interval_ms`, starting now, until stop. A
+/// failing tick logs `job.worker_failed` (task `scheduler`) once per
+/// streak and retries at the interval.
+async fn schedule_loop(
+    jobs: PgJobs,
+    database: Database,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let interval = jobs.inner.config.scheduler_interval;
+    let mut failing = false;
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        match scheduler::tick(&database, &jobs.inner.settings, &jobs.inner.unschedulable).await {
+            Ok(_) => failing = false,
+            Err(failure) => {
+                if !failing {
+                    tracing::warn!(
+                        event = "job.worker_failed",
+                        task = "scheduler",
+                        code = failure.code.as_str(),
+                        classification = classification(&failure)
+                    );
+                }
+                failing = true;
+            }
+        }
+        tokio::select! {
+            _ = stop.changed() => return,
+            () = tokio::time::sleep(interval) => {}
         }
     }
 }
@@ -578,7 +791,7 @@ async fn background(
     // Subscriptions first, so no event relays before its subscribers exist.
     // Pending migrations in verify mode keep this retrying and the runtime
     // not ready.
-    let mut failing = false;
+    let mut failing = Failing::default();
     loop {
         if declare(&jobs, &database, &mut failing).await {
             break;
@@ -594,6 +807,18 @@ async fn background(
     if jobs.inner.config.workers {
         jobs.start_workers(&database);
     }
+    // Every instance ticks; row locks and the occurrence key make each
+    // occurrence one job.
+    let ticking = tokio::spawn(schedule_loop(
+        jobs.clone(),
+        database.clone(),
+        jobs.inner.stop.subscribe(),
+    ));
+    *jobs
+        .inner
+        .scheduler
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ticking);
     jobs.inner.ready.store(true, Ordering::SeqCst);
     let mut next_heartbeat = tokio::time::Instant::now() + heartbeat;
     if jobs.inner.mode == RelayMode::Off {
@@ -713,8 +938,8 @@ impl Module for PgJobs {
     fn errors(&self) -> &[ErrorCode] {
         ERRORS
     }
-    /// Starts after every other module: subscriptions are synced, then the
-    /// relay runs in the background.
+    /// Starts after every other module: subscriptions and schedules are
+    /// synced, then the relay and the scheduler run in the background.
     fn start(&self, ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
         let result = self.launch(ctx);
         Box::pin(async move { result })
@@ -723,7 +948,7 @@ impl Module for PgJobs {
     fn routes(&self, ctx: &AppContext) -> axum::Router {
         self.admin_router(ctx.authorizer().clone())
     }
-    /// Ready once subscriptions are synced and the workers started
+    /// Ready once subscriptions and schedules are synced and the workers started
     /// (`jobs.workers = true`), until shutdown; with
     /// `jobs.readiness.max_lag_ms`, not while the backlog is older.
     fn ready(&self) -> BoxFuture<'_, Result<(), Failure>> {
@@ -742,7 +967,8 @@ impl Module for PgJobs {
             }
         })
     }
-    /// Stops the relay and drains the workers (AP §B.8): no new leases,
+    /// Stops the relay and the scheduler and drains the workers (AP §B.8):
+    /// no new leases,
     /// in-flight jobs get `jobs.drain_timeout_ms` (within `deadline`), then
     /// `cancel` and a 2 s grace, then the rest is released with the attempt
     /// refunded. A relay batch in progress finishes or, past `deadline`, is
@@ -753,16 +979,16 @@ impl Module for PgJobs {
             if let Some(worker) = self.inner.worker.get() {
                 worker.drain(deadline).await;
             }
-            let task = self
-                .inner
-                .task
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(mut task) = task {
-                let at = tokio::time::Instant::from_std(deadline);
-                if tokio::time::timeout_at(at, &mut task).await.is_err() {
-                    task.abort();
+            for slot in [&self.inner.task, &self.inner.scheduler] {
+                let task = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(mut task) = task {
+                    let at = tokio::time::Instant::from_std(deadline);
+                    if tokio::time::timeout_at(at, &mut task).await.is_err() {
+                        task.abort();
+                    }
                 }
             }
         })
@@ -915,6 +1141,26 @@ impl Jobs for PgJobs {
     }
     fn queue_status(&self) -> BoxFuture<'_, Result<QueueStatus, Failure>> {
         Box::pin(self.status())
+    }
+    fn schedule(&self, source: &Source, schedule: ScheduleDeclaration) -> Result<(), Failure> {
+        validate::source(source.as_str())?;
+        let declared = scheduler::from_module(source.as_str(), &schedule)?;
+        let mut registry = self.registry();
+        if self.inner.started.load(Ordering::SeqCst) {
+            return Err(Failure::permanent("jobs_started"));
+        }
+        match registry.kinds.get(schedule.kind.as_str()) {
+            Some(owned) if owned.source == *source => {}
+            _ => return Err(Failure::permanent("kind_not_registered")),
+        }
+        if registry.schedules.contains_key(&declared.name) {
+            return Err(Failure::permanent("schedule_already_declared"));
+        }
+        if registry.schedules.len() >= MAX_SCHEDULES {
+            return Err(Failure::permanent("too_many_schedules"));
+        }
+        registry.schedules.insert(declared.name.clone(), declared);
+        Ok(())
     }
     fn subscribe(&self, source: &Source, topic: &Identity, kind: &Identity) -> Result<(), Failure> {
         validate::topic(topic.as_str())?;

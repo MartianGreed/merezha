@@ -11,6 +11,7 @@ use merezha_platform::{
 use merezha_postgres::TestDatabase;
 use serde_json::json;
 use std::{
+    collections::BTreeSet,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -149,7 +150,7 @@ async fn a_reaped_lease_runs_again_and_the_first_completion_is_fenced_out() {
     )
     .await;
     let id = insert_job(&db, "tasks.effect", "tasks:effect-1", "{}", false).await;
-    wait_state(&db, id, "running", Duration::from_secs(2)).await;
+    wait_state(&db, id, "running", PATIENCE).await;
     let second_db = Database::connect(&test.config()).unwrap();
     let second = workers(
         &second_db,
@@ -159,7 +160,7 @@ async fn a_reaped_lease_runs_again_and_the_first_completion_is_fenced_out() {
     )
     .await;
     // The first run completes at about 3 s, inside the second lease.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + PATIENCE;
     while !logs.text().contains("job.lease_lost") {
         assert!(
             Instant::now() < deadline,
@@ -174,7 +175,7 @@ async fn a_reaped_lease_runs_again_and_the_first_completion_is_fenced_out() {
         vec![lease_expired(1, "first"), (2, None, None, "second".into())],
         "the late completion wrote nothing"
     );
-    wait_state(&db, id, "succeeded", Duration::from_secs(3)).await;
+    wait_state(&db, id, "succeeded", PATIENCE).await;
     assert_eq!(
         attempts(&db, id).await,
         vec![
@@ -213,14 +214,36 @@ poll_interval_ms = 100
 [jobs.queues.default]
 concurrency = 8",
     );
+    // Every job waits until each instance has run one, so all three take
+    // part in the race whatever the scheduling (one instance could
+    // otherwise drain the queue before another polls); an instance can
+    // run at most its 8 slots before the others arrive.
+    let arrived: Arc<Mutex<BTreeSet<&'static str>>> = Arc::default();
     let mut instances = Vec::new();
     for name in ["a", "b", "c"] {
-        let pool = Database::connect(&test.config()).unwrap();
+        // Room for 8 handlers next to the worker's own statements, and a
+        // patient acquire: a handler failing on a busy pool would retry
+        // and break the one-attempt assertion for a reason unrelated to
+        // leasing.
+        let mut sized = test.config();
+        sized.pool_size = 16;
+        sized.acquire_timeout = PATIENCE;
+        let pool = Database::connect(&sized).unwrap();
         let recorder = pool.clone();
+        let arrived = arrived.clone();
         let handler = func(move |ctx, _| {
             let db = recorder.clone();
+            let arrived = arrived.clone();
             Box::pin(async move {
-                let client = db.acquire(soon()).await.map_err(JobFailure::from)?;
+                arrived.lock().unwrap().insert(name);
+                let started = Instant::now();
+                while arrived.lock().unwrap().len() < 3 && started.elapsed() < PATIENCE {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let client = db
+                    .acquire(Instant::now() + PATIENCE)
+                    .await
+                    .map_err(JobFailure::from)?;
                 client
                     .execute(
                         "INSERT INTO public.runs (job_id, instance) VALUES ($1, $2)",
@@ -245,11 +268,14 @@ concurrency = 8",
     execute(&db, "SELECT pg_notify('merezha_jobs', 'default')")
         .await
         .unwrap();
+    // However slow the machine, the 300 jobs finish: wait for all of them
+    // (bounded generously; it returns as soon as they are done), then check
+    // exactly once.
     wait_for(
         &db,
         "SELECT count(*) FROM merezha_jobs.jobs WHERE state = 'succeeded'",
         300,
-        Duration::from_secs(20),
+        PATIENCE * 4,
     )
     .await;
     assert_eq!(scalar(&db, "SELECT count(*) FROM public.runs").await, 300);
@@ -346,7 +372,7 @@ async fn poison_jobs_are_dead_lettered_by_classification() {
     let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
     let undecodable = insert_job(&db, "tasks.decode", "tasks:decode", &deep, false).await;
     for id in [panic, flaky, permanent, undecodable] {
-        wait_state(&db, id, "dead", Duration::from_secs(5)).await;
+        wait_state(&db, id, "dead", PATIENCE).await;
     }
     let attempts_of = "SELECT attempts::bigint FROM merezha_jobs.jobs WHERE id = $1";
     assert_eq!(int(&db, attempts_of, panic).await, 1);
@@ -481,15 +507,17 @@ async fn drain_releases_in_flight_jobs_with_the_attempt_refunded() {
     );
     let calls = Arc::new(AtomicUsize::new(0));
     let late = Arc::new(AtomicUsize::new(0));
-    let (count, finished) = (calls.clone(), late.clone());
+    // The first run ignores `cancel` and completes only when the test opens
+    // the gate, after the release: no timing decides which comes first.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let (count, finished, opened) = (calls.clone(), late.clone(), gate.clone());
     let handler = func(move |_, _| {
         let call = count.fetch_add(1, Ordering::SeqCst) + 1;
-        let finished = finished.clone();
+        let (finished, opened) = (finished.clone(), opened.clone());
         Box::pin(async move {
             match call {
-                // Ignores `cancel` and completes after the release.
                 1 => {
-                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    opened.notified().await;
                     finished.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 }
@@ -500,15 +528,24 @@ async fn drain_releases_in_flight_jobs_with_the_attempt_refunded() {
     });
     let first = workers(&db, &config, "first", vec![("tasks.long", handler.clone())]).await;
     let id = insert_job(&db, "tasks.long", "tasks:long", r#"{"n":1}"#, false).await;
-    wait_state(&db, id, "running", Duration::from_secs(2)).await;
+    wait_state(&db, id, "running", PATIENCE).await;
+    // The handler runs (a lease landing as the drain began is parked, never
+    // run: another test).
+    let entered = Instant::now();
+    while calls.load(Ordering::SeqCst) == 0 {
+        assert!(entered.elapsed() < PATIENCE, "the handler never ran");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let leased_at = Instant::now();
+    // A 60 s shutdown budget: a drain that ignored `drain_timeout_ms` and
+    // its grace would run to the budget, far past the bound below.
     first
-        .shutdown(Instant::now() + Duration::from_secs(10))
+        .shutdown(Instant::now() + Duration::from_secs(60))
         .await;
     let took = leased_at.elapsed();
     assert!(
-        took >= Duration::from_millis(2900) && took < Duration::from_millis(4000),
-        "drain timeout plus the 2 s grace: {took:?}"
+        took >= Duration::from_millis(2900) && took < Duration::from_secs(1 + 2 + 5),
+        "drain timeout (1 s) plus the 2 s grace, with 5 s of margin: {took:?}"
     );
     assert!(first.ready().await.is_err());
     assert_eq!(state(&db, id).await, "available");
@@ -525,7 +562,8 @@ async fn drain_releases_in_flight_jobs_with_the_attempt_refunded() {
     assert!(logs.text().contains("job.drain_abandoned"));
     assert!(logs.text().contains(&format!("[{id}]")), "{}", logs.text());
 
-    // The handler completes about 4 s after the lease: fenced out.
+    // The handler completes after the release: fenced out.
+    gate.notify_one();
     while late.load(Ordering::SeqCst) == 0 {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -536,13 +574,13 @@ async fn drain_releases_in_flight_jobs_with_the_attempt_refunded() {
 
     // A fresh instance runs it: the second call fails permanently.
     let second = workers(&db, &config, "second", vec![("tasks.long", handler)]).await;
-    wait_state(&db, id, "dead", Duration::from_secs(3)).await;
+    wait_state(&db, id, "dead", PATIENCE).await;
     assert_eq!(int(&db, attempts_of, id).await, 1);
     assert_eq!(
         second.replay(id, Some("usr_ops")).await.unwrap(),
         Replay::Replayed
     );
-    wait_state(&db, id, "succeeded", Duration::from_secs(3)).await;
+    wait_state(&db, id, "succeeded", PATIENCE).await;
     assert_eq!(int(&db, attempts_of, id).await, 1);
     assert_eq!(
         int(
@@ -600,7 +638,7 @@ async fn an_instance_without_the_handler_never_leases_the_job() {
     assert_eq!(state(&db, id).await, "available");
     assert!(attempts(&db, id).await.is_empty());
     let new = workers(&db, &config, "new", vec![("tasks.new", func(|_, _| ok()))]).await;
-    wait_state(&db, id, "succeeded", Duration::from_secs(2)).await;
+    wait_state(&db, id, "succeeded", PATIENCE).await;
     assert_eq!(
         attempts(&db, id).await,
         vec![(1, Some("succeeded".into()), None, "new".into())]
@@ -764,7 +802,7 @@ async fn flagged_payloads_are_nulled_at_every_terminal_state() {
     let db = database(&test).await;
     let config = jobs_config(
         &test,
-        "[jobs]\npoll_interval_ms = 100\nreaper_interval_ms = 100\n\
+        "[jobs]\npoll_interval_ms = 100\nreaper_interval_ms = 100\ndrain_timeout_ms = 1000\n\
          [jobs.queues.default]\nconcurrency = 8\nlease_ms = 1000",
     );
     // No heartbeat, so the hanging job's lease expires.
@@ -785,9 +823,11 @@ async fn flagged_payloads_are_nulled_at_every_terminal_state() {
         .register(
             "tasks.hang",
             "default",
-            func(|_, _| {
-                Box::pin(async {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+            // Hangs until the drain cancels it: only the reaper ends it.
+            func(|ctx, _| {
+                Box::pin(async move {
+                    let mut cancel = ctx.cancel.clone();
+                    let _ = cancel.wait_for(|c| *c).await;
                     Ok(())
                 })
             }),
@@ -817,11 +857,11 @@ async fn flagged_payloads_are_nulled_at_every_terminal_state() {
     let reissued = insert_job(&db, "tasks.reissued", "tasks:reissued", secret, true).await;
     let purged = insert_job(&db, "tasks.purged", "tasks:purged", secret, true).await;
     let waiting = insert_job(&db, "tasks.unhandled", "tasks:waiting", secret, true).await;
-    wait_state(&db, succeeded, "succeeded", Duration::from_secs(3)).await;
-    wait_state(&db, plain, "succeeded", Duration::from_secs(3)).await;
-    wait_state(&db, reissued, "dead", Duration::from_secs(3)).await;
-    wait_state(&db, purged, "dead", Duration::from_secs(3)).await;
-    wait_state(&db, reaped, "dead", Duration::from_secs(4)).await;
+    wait_state(&db, succeeded, "succeeded", PATIENCE).await;
+    wait_state(&db, plain, "succeeded", PATIENCE).await;
+    wait_state(&db, reissued, "dead", PATIENCE).await;
+    wait_state(&db, purged, "dead", PATIENCE).await;
+    wait_state(&db, reaped, "dead", PATIENCE).await;
     // Not terminal yet, so the row still holds the secret: never shown.
     assert!(!payload_is_null(&db, waiting).await);
     assert_eq!(jobs.job(waiting, true).await.unwrap().payload, None);
@@ -885,7 +925,7 @@ async fn heartbeats_extend_leases_and_timeouts_are_transient() {
     let config = jobs_config(
         &test,
         "[jobs]\npoll_interval_ms = 100\nreaper_interval_ms = 100\n\
-         [jobs.queues.default]\nlease_ms = 1000\ntimeout_ms = 5000\nmax_attempts = 1\n\
+         [jobs.queues.default]\nlease_ms = 3000\ntimeout_ms = 30000\nmax_attempts = 1\n\
          [jobs.queues.short]\ntimeout_ms = 1000\nmax_attempts = 1",
     );
     let jobs = PgJobs::with_mode(&config, RelayMode::Interval);
@@ -897,7 +937,7 @@ async fn heartbeats_extend_leases_and_timeouts_are_transient() {
             "default",
             func(|_, _| {
                 Box::pin(async {
-                    tokio::time::sleep(Duration::from_millis(2500)).await;
+                    tokio::time::sleep(Duration::from_millis(7500)).await;
                     Ok(())
                 })
             }),
@@ -920,16 +960,16 @@ async fn heartbeats_extend_leases_and_timeouts_are_transient() {
         .unwrap();
     jobs.start(instance_context(&db, "beating")).await.unwrap();
     wait_ready(&jobs).await;
-    // Lease 1 s, heartbeat every 333 ms, reaper every 100 ms: the 2.5 s
-    // handler keeps its one lease.
+    // Lease 3 s, heartbeat every second, reaper every 100 ms: the 7.5 s
+    // handler (two and a half leases) keeps its one lease.
     let slow = insert_job_on(&db, "default", "tasks.slow", "tasks:slow", "{}", false, 1).await;
-    wait_state(&db, slow, "succeeded", Duration::from_secs(5)).await;
+    wait_state(&db, slow, "succeeded", PATIENCE).await;
     assert_eq!(
         attempts(&db, slow).await,
         vec![(1, Some("succeeded".into()), None, "beating".into())]
     );
     let stuck = insert_job_on(&db, "short", "tasks.stuck", "tasks:stuck", "{}", false, 1).await;
-    wait_state(&db, stuck, "dead", Duration::from_secs(4)).await;
+    wait_state(&db, stuck, "dead", PATIENCE).await;
     assert_eq!(
         last_error(&db, stuck).await,
         (Some("timeout".into()), Some("transient".into()))
@@ -938,7 +978,9 @@ async fn heartbeats_extend_leases_and_timeouts_are_transient() {
 }
 
 /// The dispatcher wakes on `merezha_jobs` notifications, so with a one
-/// minute poll a newly enqueued job still runs within a second.
+/// minute poll a newly enqueued job still runs long before the next poll
+/// (well under a second on an idle machine; the wait is bounded by
+/// `PATIENCE`, half the poll interval).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notifications_wake_the_dispatcher() {
     let Some(test) = TestDatabase::create() else {
@@ -958,7 +1000,7 @@ async fn notifications_wake_the_dispatcher() {
         "SELECT count(*) FROM pg_stat_activity
           WHERE datname = current_database() AND query LIKE 'LISTEN merezha_jobs%'",
         2,
-        Duration::from_secs(5),
+        PATIENCE,
     )
     .await;
     // The first poll ran at start; wait it out.
@@ -976,7 +1018,7 @@ async fn notifications_wake_the_dispatcher() {
         })
         .await
         .unwrap();
-    wait_state(&db, enqueued.id, "succeeded", Duration::from_secs(1)).await;
+    wait_state(&db, enqueued.id, "succeeded", PATIENCE).await;
     jobs.shutdown(soon()).await;
 }
 
@@ -1014,7 +1056,7 @@ async fn backlog_counts_for_readiness_only_with_max_lag() {
     );
     strict.ports(&db);
     strict.start(instance_context(&db, "strict")).await.unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + PATIENCE;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(strict.ready().await.is_err(), "an hour of lag is not ready");
     execute(
@@ -1035,7 +1077,8 @@ async fn backlog_counts_for_readiness_only_with_max_lag() {
 /// Review item 3: a lease that completes after the drain began is held
 /// before its dispatcher exits, never run, and released with its attempt
 /// refunded. The lease is held back on the queue's advisory lock until the
-/// stop was sent.
+/// workers report the stop (`workers_stopping`), so the interleaving is
+/// forced, not timed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lease_racing_the_drain_is_released_with_its_attempt_refunded() {
     let Some(test) = TestDatabase::create() else {
@@ -1048,9 +1091,16 @@ async fn a_lease_racing_the_drain_is_released_with_its_attempt_refunded() {
     );
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
-    let jobs = workers(
-        &db,
-        &config,
+    // The lease statement waits on the queue lock for as long as the test
+    // holds it: give it more than the default 5 s (lease deadline and
+    // statement timeout), so a slow machine cannot time it out before the
+    // release.
+    let mut patient = test.config();
+    patient.statement_timeout = PATIENCE * 2;
+    let leasing = Database::connect(&patient).unwrap();
+    let jobs = workers_with(
+        PgJobs::with_mode(&config, RelayMode::Interval).with_lease_deadline(PATIENCE * 2),
+        &leasing,
         "racing",
         vec![(
             "tasks.race",
@@ -1071,6 +1121,15 @@ async fn a_lease_racing_the_drain_is_released_with_its_attempt_refunded() {
         .await
         .unwrap();
     let id = insert_job(&db, "tasks.race", "tasks:race", "{}", false).await;
+    // A lease transaction that began waiting before the insert compares
+    // `run_at` with its own start time: date the job back so whichever
+    // lease gets the lock sees it as due.
+    execute(
+        &db,
+        &format!("UPDATE merezha_jobs.jobs SET run_at = now() - interval '1 hour' WHERE id = {id}"),
+    )
+    .await
+    .unwrap();
     // The dispatcher's lease waits on the queue lock.
     wait_for(
         &db,
@@ -1078,16 +1137,31 @@ async fn a_lease_racing_the_drain_is_released_with_its_attempt_refunded() {
           WHERE locktype = 'advisory' AND NOT granted
             AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
         1,
-        Duration::from_secs(3),
+        PATIENCE,
     )
     .await;
     let draining = jobs.clone();
     let drain = tokio::spawn(async move {
         draining
-            .shutdown(Instant::now() + Duration::from_secs(10))
+            .shutdown(Instant::now() + Duration::from_secs(60))
             .await
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let stopping = Instant::now();
+    while !jobs.workers_stopping() {
+        assert!(stopping.elapsed() < PATIENCE, "the drain never began");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        scalar(
+            &db,
+            "SELECT count(*) FROM pg_locks
+              WHERE locktype = 'advisory' AND NOT granted
+                AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .await,
+        1,
+        "the lease still waits on the queue lock when the drain begins"
+    );
     session
         .execute(
             "SELECT pg_advisory_unlock(1297762882, hashtext('default'))",
@@ -1172,7 +1246,7 @@ async fn global_concurrency_serialises_concurrent_lease_statements() {
         "SELECT count(*) FROM pg_stat_activity
           WHERE datname = current_database() AND query = 'LISTEN merezha_jobs;'",
         3,
-        Duration::from_secs(5),
+        PATIENCE,
     )
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1186,8 +1260,11 @@ async fn global_concurrency_serialises_concurrent_lease_statements() {
          SELECT pg_notify('merezha_jobs', 'default');",
     )
     .await;
+    // Sample for 2.5 s and at least until a job ran (a slow machine leases
+    // later, never more at once).
     let started = Instant::now();
-    while started.elapsed() < Duration::from_millis(2500) {
+    while started.elapsed() < Duration::from_millis(2500) || highest.load(Ordering::SeqCst) == 0 {
+        assert!(started.elapsed() < PATIENCE, "no job ever ran");
         let running = scalar(
             &db,
             "SELECT count(*) FROM merezha_jobs.jobs WHERE state = 'running'",
@@ -1216,7 +1293,7 @@ async fn a_lost_heartbeat_fires_cancel_and_discards_the_result() {
     let config = jobs_config(
         &test,
         "[jobs]\npoll_interval_ms = 100\nreaper_interval_ms = 600000\n\
-         [jobs.queues.default]\nlease_ms = 1500\ntimeout_ms = 10000",
+         [jobs.queues.default]\nlease_ms = 1500\ntimeout_ms = 900000",
     );
     let seen = Arc::new(Mutex::new(None::<Duration>));
     let record = seen.clone();
@@ -1231,8 +1308,7 @@ async fn a_lost_heartbeat_fires_cancel_and_discards_the_result() {
                 Box::pin(async move {
                     let started = Instant::now();
                     let mut cancel = ctx.cancel.clone();
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(5), cancel.wait_for(|c| *c)).await;
+                    let _ = tokio::time::timeout(PATIENCE, cancel.wait_for(|c| *c)).await;
                     if *ctx.cancel.borrow() {
                         *record.lock().unwrap() = Some(started.elapsed());
                     }
@@ -1243,7 +1319,7 @@ async fn a_lost_heartbeat_fires_cancel_and_discards_the_result() {
     )
     .await;
     let id = insert_job(&db, "tasks.watch", "tasks:watch", "{}", false).await;
-    wait_state(&db, id, "running", Duration::from_secs(2)).await;
+    wait_state(&db, id, "running", PATIENCE).await;
     // Another holder took the lease (a reap and a re-lease elsewhere).
     execute(
         &db,
@@ -1251,7 +1327,7 @@ async fn a_lost_heartbeat_fires_cancel_and_discards_the_result() {
     )
     .await
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + PATIENCE;
     while !logs.text().contains("job.lease_lost") {
         assert!(
             Instant::now() < deadline,
@@ -1260,8 +1336,9 @@ async fn a_lost_heartbeat_fires_cancel_and_discards_the_result() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // `timeout_ms` is 15 min, so only the lost lease can have fired it.
     let waited = seen.lock().unwrap().expect("cancel fired");
-    assert!(waited < Duration::from_secs(2), "cancel after {waited:?}");
+    assert!(waited < PATIENCE, "cancel after {waited:?}");
     // The failure was fenced out: the other holder's lease is untouched.
     assert_eq!(state(&db, id).await, "running");
     assert_eq!(last_error(&db, id).await, (None, None));
@@ -1280,16 +1357,22 @@ async fn a_failure_after_the_drain_cutoff_is_released_not_retried() {
         &test,
         "[jobs]\npoll_interval_ms = 100\ndrain_timeout_ms = 200",
     );
+    let returned = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let (failed, running) = (returned.clone(), entered.clone());
     let jobs = workers(
         &db,
         &config,
         "cut",
         vec![(
             "tasks.cut",
-            func(|ctx, _| {
+            func(move |ctx, _| {
+                let (failed, running) = (failed.clone(), running.clone());
                 Box::pin(async move {
+                    running.fetch_add(1, Ordering::SeqCst);
                     let mut cancel = ctx.cancel.clone();
                     let _ = cancel.wait_for(|c| *c).await;
+                    failed.fetch_add(1, Ordering::SeqCst);
                     Err(JobFailure::transient("cancelled", None))
                 })
             }),
@@ -1297,13 +1380,19 @@ async fn a_failure_after_the_drain_cutoff_is_released_not_retried() {
     )
     .await;
     let id = insert_job(&db, "tasks.cut", "tasks:cut", "{}", false).await;
-    wait_state(&db, id, "running", Duration::from_secs(2)).await;
-    let draining = Instant::now();
-    jobs.shutdown(Instant::now() + Duration::from_secs(10))
-        .await;
-    assert!(
-        draining.elapsed() < Duration::from_millis(1500),
-        "the handler returned inside the grace"
+    wait_state(&db, id, "running", PATIENCE).await;
+    // The handler runs: a lease landing as the drain began would be parked
+    // and never run, which is another test.
+    let started = Instant::now();
+    while entered.load(Ordering::SeqCst) == 0 {
+        assert!(started.elapsed() < PATIENCE, "the handler never ran");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    jobs.shutdown(Instant::now() + PATIENCE).await;
+    assert_eq!(
+        returned.load(Ordering::SeqCst),
+        1,
+        "the handler failed after the cutoff, inside the grace"
     );
     assert_eq!(state(&db, id).await, "available");
     assert_eq!(

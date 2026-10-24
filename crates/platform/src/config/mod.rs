@@ -14,7 +14,7 @@ pub use duration::parse_duration;
 pub use jobs::{
     ApplicationAppend, ApplicationBackground, ApplicationProjections, ApplicationReactors, CatchUp,
     JobDefaults, JobRetention, JobSchedule, JobsConfig, QueueConfig, RelayConfig,
-    SubscriptionsConfig, valid_queue_name,
+    SubscriptionsConfig, valid_queue_name, valid_schedule_name,
 };
 pub use merezha_telemetry::config::{
     Compression, HeaderSecret, LogFormat, LogLevel, LogsConfig, MetricsConfig, PrivacyConfig,
