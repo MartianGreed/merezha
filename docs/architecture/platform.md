@@ -2187,9 +2187,12 @@ a permission type); `delivery.cache_control_private` otherwise; every delivery
 response, errors included, has `Vary: Authorization, Cookie`, and errors
 are `private, no-store`.
 
-Codes added by C5: `populate_limit`, `response_too_large` (400). Delivery's statements are
-registered (`merezha_content::STATEMENTS`: `content.delivery.*`,
-`content.preview.*`, `content.populate.*`).
+Codes added by C5: `populate_limit`, `response_too_large` (400). Every
+content statement is registered: `merezha_content::STATEMENTS` (`content.*`:
+activation and indexes, entries, revisions and references, publishing and
+the trash, delivery, preview and population, and `merezha content diff`'s
+`content.diff.read_only`) and `merezha_content::media::STATEMENTS` for
+assets.
 
 ### Content assets
 
