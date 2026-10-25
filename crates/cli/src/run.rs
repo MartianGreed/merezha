@@ -354,6 +354,7 @@ impl From<String> for Stop {
 /// identity block, `route_access_undeclared`. The first issue is the code;
 /// any other validation failure stops startup as before.
 fn check_access(
+    config: &merezha_platform::ProjectConfig,
     application: &merezha_application::config::Config,
     identity: bool,
 ) -> Result<(), Stop> {
@@ -365,7 +366,13 @@ fn check_access(
         _ => {}
     }
     let catalog = crate::permission_catalog(application);
-    let issues = application.host_issues(&|permission| catalog.contains(permission), identity);
+    // Every user holds `builtin_grants.user` (identity §5).
+    let everyone = user_grants(config, &catalog);
+    let issues = application.host_issues(
+        &|permission| catalog.contains(permission),
+        &|permission| everyone.iter().any(|held| held.as_str() == permission),
+        identity,
+    );
     let Some(first) = issues.first() else {
         return Ok(());
     };
@@ -373,6 +380,27 @@ fn check_access(
         code: first.code.to_owned(),
         issues: serde_json::to_string(&issues).ok(),
     })
+}
+
+/// The permissions of identity's `builtin_grants.user`, expanded against
+/// `catalog`: what every active user holds at application scope. Empty
+/// without the identity block.
+fn user_grants(
+    config: &merezha_platform::ProjectConfig,
+    catalog: &merezha_identity::Catalog,
+) -> merezha_platform::ports::PermissionSet {
+    let user = config
+        .modules
+        .get(merezha_identity::NAME)
+        .and_then(|section| section.table.get("rbac"))
+        .and_then(|rbac| rbac.get("builtin_grants"))
+        .and_then(|grants| grants.get("user"))
+        .and_then(|user| user.as_array());
+    catalog.expand(
+        user.into_iter()
+            .flatten()
+            .filter_map(|grant| grant.as_str()),
+    )
 }
 
 /// Identity §5: `builtin_grants.user` are application grants every user
@@ -384,18 +412,7 @@ fn warn_user_grants_on_tenant_routes(
     application: &merezha_application::config::Config,
 ) {
     use merezha_application::config::{RouteScope, Rule};
-    let Some(user) = config
-        .modules
-        .get(merezha_identity::NAME)
-        .and_then(|section| section.table.get("rbac"))
-        .and_then(|rbac| rbac.get("builtin_grants"))
-        .and_then(|grants| grants.get("user"))
-        .and_then(|user| user.as_array())
-    else {
-        return;
-    };
-    let granted = crate::permission_catalog(application)
-        .expand(user.iter().filter_map(|grant| grant.as_str()));
+    let granted = user_grants(config, &crate::permission_catalog(application));
     let routes = application
         .commands
         .iter()
@@ -475,7 +492,7 @@ async fn start(
                 Ok(Err(failure)) => return Err(failure.code.into()),
                 Err(_) => return Err("invalid_application_config".to_owned().into()),
             };
-            check_access(&application, options.authenticator.is_some())?;
+            check_access(&config, &application, options.authenticator.is_some())?;
             if options.authenticator.is_some() {
                 warn_user_grants_on_tenant_routes(&config, &application);
             }

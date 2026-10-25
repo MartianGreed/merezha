@@ -121,7 +121,13 @@ fn version_2_documents() -> Vec<(&'static str, String, &'static str)> {
             "ok",
         ),
         ("command access", command("access = \"public\""), "ok"),
-        ("command scope", command("scope = \"tenant\""), "ok"),
+        // Tenant routes beside the undeclared `ListTasks`, which would then
+        // read every tenant's data.
+        (
+            "command scope",
+            command("scope = \"tenant\""),
+            "cross_tenant_query",
+        ),
         (
             "command scope application",
             command("scope = \"application\""),
@@ -135,7 +141,7 @@ fn version_2_documents() -> Vec<(&'static str, String, &'static str)> {
         (
             "command resource in a tenant",
             command("resource = \"task\"\nscope = \"tenant\""),
-            "ok",
+            "cross_tenant_query",
         ),
         (
             "query permission",
@@ -465,15 +471,95 @@ partition = "tenant"
         "commands.Unknown unknown_permission",
         "commands.Bare route_access_undeclared",
     ]);
-    assert_eq!(issues(config.host_issues(&catalog, true)), with_identity);
+    assert_eq!(
+        issues(config.host_issues(&catalog, &|_| false, true)),
+        with_identity
+    );
     let mut without = own.to_vec();
     without.push("commands.Unknown unknown_permission");
-    assert_eq!(issues(config.host_issues(&catalog, false)), without);
+    assert_eq!(
+        issues(config.host_issues(&catalog, &|_| false, false)),
+        without
+    );
     // A clean document has none, and declared permissions need no catalog.
     let clean = Config::parse(
         "version = 2\n[[permissions]]\nname = \"tasks.create\"\n\
          [[commands]]\ntag = \"C\"\nservice = \"s\"\naggregate = \"Task\"\npermission = \"tasks.create\"\n",
     )
     .unwrap();
-    assert!(clean.host_issues(&|_| false, true).is_empty());
+    assert!(clean.host_issues(&|_| false, &|_| false, true).is_empty());
+}
+
+/// The PR #58 review's PoC: with tenant routes, an anonymous `List` query on
+/// an unpartitioned projection folds every tenant's events (org B's
+/// `ssn` included) and answers them to anyone. Such open application
+/// queries fail startup (`cross_tenant_query`) unless they opt in with
+/// `cross_tenant = true`; so does one checking a permission every user
+/// holds (`builtin_grants.user`), which the host passes as `everyone`.
+#[test]
+fn open_application_queries_over_tenant_data_must_opt_in() {
+    let document = |query: &str| {
+        format!(
+            r#"version = 2
+[storage]
+backend = "postgres"
+application = "leak"
+[[permissions]]
+name = "people.read"
+[[commands]]
+tag = "AddPerson"
+service = "s"
+aggregate = "Person"
+access = "authenticated"
+scope = "tenant"
+[[queries]]
+tag = "List"
+service = "s"
+projection = "people"
+{query}
+[[projections]]
+name = "people"
+service = "s"
+initial = {{}}
+"#
+        )
+    };
+    for open in ["access = \"public\"", "access = \"authenticated\"", ""] {
+        assert_eq!(code(&document(open)), "cross_tenant_query", "{open:?}");
+        let opted = Config::parse(&document(&format!("{open}\ncross_tenant = true"))).unwrap();
+        assert!(opted.route_issues().is_empty(), "{open:?}");
+        assert!(opted.queries[0].cross_tenant);
+    }
+    // A permission every user holds is as open as `authenticated`; one
+    // only some roles hold is the operator's cross-tenant grant.
+    let granted = Config::parse(&document("permission = \"people.read\"")).unwrap();
+    assert!(granted.route_issues().is_empty());
+    let everyone = |name: &str| name == "people.read";
+    assert_eq!(
+        granted
+            .host_issues(&|_| true, &everyone, true)
+            .iter()
+            .map(|i| (i.key.as_str(), i.code))
+            .collect::<Vec<_>>(),
+        [("queries.List", "cross_tenant_query")]
+    );
+    assert!(granted.host_issues(&|_| true, &|_| false, true).is_empty());
+    let opted = Config::parse(&document(
+        "permission = \"people.read\"\ncross_tenant = true",
+    ))
+    .unwrap();
+    assert!(opted.host_issues(&|_| true, &everyone, true).is_empty());
+    // Without tenant routes there is no other tenant to leak.
+    let single = document("access = \"public\"").replace("scope = \"tenant\"\n", "");
+    assert!(Config::parse(&single).is_ok());
+    // The opt-in means nothing on a tenant query.
+    let scoped = document("access = \"public\"\nscope = \"tenant\"\ncross_tenant = true")
+        .replace("initial = {}", "initial = {}\npartition = \"tenant\"");
+    assert_eq!(code(&scoped), "cross_tenant_scoped");
+    // Version 1 cannot use it.
+    let v1 = String::from(
+        "version = 1\n[[queries]]\ntag = \"Q\"\nservice = \"s\"\nprojection = \"p\"\ncross_tenant = true\n\
+         [[projections]]\nname = \"p\"\nservice = \"s\"\ninitial = 0\n",
+    );
+    assert_eq!(code(&v1), "invalid_config");
 }

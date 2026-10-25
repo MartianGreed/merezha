@@ -197,8 +197,13 @@ application permission in a block namespace: `identity.`, `content.`,
 `unknown_permission` (a route permission outside `[[permissions]]` and the
 blocks' catalog), `resource_requires_tenant`, `tenant_query_unpartitioned`,
 `partitioned_query_unscoped`, `tenant_aggregate` (with any tenant scope, an
-aggregate containing `:`) and `partitions_require_postgres` (memory and SQLite
-keep one state per projection). Changing `partition` needs a new projection
+aggregate containing `:`), `partitions_require_postgres` (memory and SQLite
+keep one state per projection) and `cross_tenant_query`: with any
+tenant-scoped route, an application-scoped query on an unpartitioned
+projection that anonymous callers or every principal may call returns every
+tenant's data, so it must opt in with `cross_tenant = true`
+(`cross_tenant_scoped` on a tenant query). `access = "authenticated"` checks
+no permission, so it ignores an API key's permission list. Changing `partition` needs a new projection
 `revision` (`storage_configuration` otherwise).
 
 Read the ephemeral port from stderr's `listener.ready`. POST JSON to

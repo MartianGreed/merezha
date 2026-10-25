@@ -1568,6 +1568,11 @@ Validation, all failing startup with every error listed at once:
   (`identity.`, `content.`, `notifications.`, `jobs.`, `application.`, `system.`).
 - A tenant-scoped query must reference a `partition = "tenant"` projection. Application-scoped
   queries must not reference one. `resource` requires `scope = "tenant"`.
+- Fail closed across tenants (C2 review): once any route is tenant-scoped, an application-scoped
+  query on an unpartitioned projection that anonymous callers (`public`, undeclared) or every
+  principal (`authenticated`, or a permission in identity's `builtin_grants.user`) may call
+  fails `cross_tenant_query`, because it **returns every tenant's data**, unless the query says
+  so with `cross_tenant = true`. The opt-in on a tenant-scoped query fails `cross_tenant_scoped`.
 - With any tenant scope, aggregate names must not contain `:`.
 - The composed stream must fit 128 bytes: `len(tenant) ≤ 40` + 1 + `len(aggregate)` + 1 +
   `len(stream)`. A stream id that is too long fails `validation_failed` per request.
@@ -1579,7 +1584,10 @@ Enforcement order for a command:
    `permission` requires a principal, then `Authorizer::check(principal, permission, scope)` with
    `ResourceScope::Tenant(principal.tenant)` (or `Resource`) for tenant routes (no tenant fails
    `tenant_required`, 403) or `ResourceScope::Application` otherwise. `platform_admin` satisfies
-   every check (R5). A denial fails `unauthorized` (403).
+   every check (R5). A denial fails `unauthorized` (403). `authenticated` checks no permission,
+   so it ignores an API key's permission list: any principal, session or key, may call it.
+   Route `resource` kinds are checked in the caller's tenant only, so identity refuses
+   application-level assignments on them (`resource_kind_tenant_only`).
 3. The host composes `"{tenant}:{aggregate}/{stream}"` from **`principal.tenant`**. The request body
    only ever names the local stream id, so cross-tenant addressing is impossible by construction.
    The `streams` CHECK constraint backs this up.
@@ -2144,6 +2152,15 @@ presence and subject to the key scope. *Closed in C2 by the second option (below
 - The application's `[[permissions]]` and route `resource` kinds join identity's catalog in
   `merezha_cli::identity_module`, and identity §5's warning for `builtin_grants.user` on a
   tenant route is the TE event `identity.user_grant_tenant_route`.
+- Review fixes. `cross_tenant_query` and the `cross_tenant` opt-in (§C.4); `merezha run` passes
+  the expanded `builtin_grants.user` to `Config::host_issues`. Route `resource` kinds join
+  through the new `IdentityModule::add_tenant_resource_kinds`: application-level assignments on
+  them fail `resource_kind_tenant_only` (422), since a route never checks them at application
+  scope. Each rebuild request is a new candidate (migration 0002 adds the identity column
+  `projection_rebuilds.candidate`): a run stops when the candidate it started on is replaced,
+  its candidate commits, failure marks and swap match the candidate id, and a partitioned run
+  clears stale partitions before every batch at checkpoint 0, so a rebuild abandoned and
+  requested again while its run holds the lock never builds on the old request's partitions.
 
 **C3 tests.**
 

@@ -146,8 +146,10 @@ fn add_application(
             .map(|p| (p.name.as_str(), p.description.as_str())),
     );
     debug_assert!(added.is_ok(), "filtered application permissions");
+    // Routes check resources at tenant scope only, so an application-level
+    // grant on these kinds could never take effect.
     let kinds: Vec<&str> = application.resource_kinds().into_iter().collect();
-    identity.add_resource_kinds(&kinds);
+    identity.add_tenant_resource_kinds(&kinds);
 }
 /// This binary's permission catalog with `application`'s permissions: what
 /// a route `permission` must name (AP §C.4, `unknown_permission`).
@@ -198,7 +200,11 @@ pub fn open_application(
     // has no identity block, so undeclared routes stay allowed.
     let catalog = permission_catalog(&config);
     if let Some(issue) = config
-        .host_issues(&|permission| catalog.contains(permission), false)
+        .host_issues(
+            &|permission| catalog.contains(permission),
+            &|_| false,
+            false,
+        )
         .first()
     {
         return Err(merezha_domain::Failure::permanent(issue.code));

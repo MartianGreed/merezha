@@ -75,6 +75,7 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("passkey_exists", 409),
     ErrorCode::new("unknown_permission", 422),
     ErrorCode::new("unknown_resource_kind", 422),
+    ErrorCode::new("resource_kind_tenant_only", 422),
     ErrorCode::new("organization_limit", 422),
     ErrorCode::new("role_limit", 422),
     ErrorCode::new("assignment_limit", 422),
@@ -171,6 +172,7 @@ pub struct IdentityModule {
     catalog: Catalog,
     resource_kinds: BTreeSet<String>,
     endpoints: std::collections::BTreeMap<String, crate::oauth::ProviderEndpoints>,
+    tenant_resource_kinds: BTreeSet<String>,
     settings: Option<Settings>,
     metrics: Arc<OnceLock<Metrics>>,
     core: Arc<OnceLock<Arc<Core>>>,
@@ -192,6 +194,7 @@ impl IdentityModule {
             catalog: Catalog::builtin(),
             resource_kinds: BTreeSet::new(),
             endpoints: std::collections::BTreeMap::new(),
+            tenant_resource_kinds: BTreeSet::new(),
             settings: None,
             metrics: Arc::new(OnceLock::new()),
             core: Arc::new(OnceLock::new()),
@@ -238,6 +241,16 @@ impl IdentityModule {
         endpoints: crate::oauth::ProviderEndpoints,
     ) {
         self.endpoints.insert(name.to_owned(), endpoints);
+    }
+    /// [`IdentityModule::add_resource_kinds`] for kinds whose resources
+    /// always belong to a tenant, such as the application's route
+    /// `resource` kinds (AP-C2, checked only at tenant scope): tenant role
+    /// assignments may target them, application-level ones fail
+    /// `resource_kind_tenant_only`, since they could never take effect.
+    pub fn add_tenant_resource_kinds(&mut self, kinds: &[&str]) {
+        self.add_resource_kinds(kinds);
+        self.tenant_resource_kinds
+            .extend(kinds.iter().map(|k| (*k).to_owned()));
     }
     /// The permission catalog this module checks grants against.
     pub fn catalog(&self) -> &Catalog {
@@ -320,6 +333,7 @@ impl IdentityModule {
                 Some(passkeys) => Some(Arc::new(crate::passkeys::relying_party(passkeys)?)),
                 None => None,
             },
+            tenant_resource_kinds: self.tenant_resource_kinds.clone(),
             rbac,
             settings,
             ctx,

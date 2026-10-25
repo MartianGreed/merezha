@@ -248,10 +248,19 @@ pub struct QueryRoute {
     /// of a `partition = "tenant"` projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<RouteScope>,
+    /// Version 2: an application-scoped query on an unpartitioned
+    /// projection, in an application with tenant routes, that anonymous
+    /// callers or every user may call **returns every tenant's data**. It
+    /// is refused at startup (`cross_tenant_query`) unless this opts in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cross_tenant: bool,
 }
 impl QueryRoute {
     fn access_keys(&self) -> bool {
-        self.permission.is_some() || self.access.is_some() || self.scope.is_some()
+        self.permission.is_some()
+            || self.access.is_some()
+            || self.scope.is_some()
+            || self.cross_tenant
     }
     /// What the route requires of its caller.
     pub fn rule(&self) -> Rule<'_> {
@@ -511,7 +520,13 @@ impl Config {
     ///   `:`, so a tenant stream `{tenant}:{aggregate}/{id}` never reads as
     ///   another route's;
     /// - `partitions_require_postgres`: a partitioned projection on memory
-    ///   or SQLite storage.
+    ///   or SQLite storage;
+    /// - `cross_tenant_query`: with any tenant-scoped route, an
+    ///   application-scoped query on an unpartitioned projection open to
+    ///   anonymous callers (`public`, or undeclared) or to any principal
+    ///   (`authenticated`), unless it sets `cross_tenant = true`, since it
+    ///   returns every tenant's data; `cross_tenant_scoped`: the opt-in on
+    ///   a tenant-scoped query.
     ///
     /// [`Config::validate`] fails with the first; a host lists them all
     /// with [`Config::host_issues`].
@@ -572,9 +587,22 @@ impl Config {
                 .find(|p| p.name == route.projection)
                 .is_some_and(Projection::partitioned);
             match (route.route_scope(), partitioned) {
-                (RouteScope::Tenant, false) => issue(key, "tenant_query_unpartitioned"),
-                (RouteScope::Application, true) => issue(key, "partitioned_query_unscoped"),
+                (RouteScope::Tenant, false) => issue(key.clone(), "tenant_query_unpartitioned"),
+                (RouteScope::Application, true) => issue(key.clone(), "partitioned_query_unscoped"),
                 _ => {}
+            }
+            if route.cross_tenant && route.route_scope() == RouteScope::Tenant {
+                issue(key.clone(), "cross_tenant_scoped");
+            }
+            // Fail closed: once tenants exist, an open application query on
+            // an unpartitioned projection reads every tenant's events.
+            if self.cross_tenant_exposed(route, partitioned)
+                && matches!(
+                    route.rule(),
+                    Rule::Public | Rule::Authenticated | Rule::Undeclared
+                )
+            {
+                issue(key, "cross_tenant_query");
             }
         }
         if !matches!(self.storage, StorageConfig::Postgres { .. }) {
@@ -594,8 +622,34 @@ impl Config {
     /// route setting neither `permission` nor `access`. Without identity a
     /// route may stay undeclared: only a private loopback listener's
     /// allow-all policy serves it.
-    pub fn host_issues(&self, catalog: &dyn Fn(&str) -> bool, identity: bool) -> Vec<RouteIssue> {
+    ///
+    /// `everyone` says whether every user holds a permission (identity's
+    /// `builtin_grants.user`): an application query checking one is as
+    /// open as `access = "authenticated"`, so `cross_tenant_query` applies
+    /// to it too.
+    pub fn host_issues(
+        &self,
+        catalog: &dyn Fn(&str) -> bool,
+        everyone: &dyn Fn(&str) -> bool,
+        identity: bool,
+    ) -> Vec<RouteIssue> {
         let mut issues = self.route_issues();
+        for route in &self.queries {
+            let partitioned = self
+                .projections
+                .iter()
+                .find(|p| p.name == route.projection)
+                .is_some_and(Projection::partitioned);
+            if let Rule::Permission(permission) = route.rule()
+                && self.cross_tenant_exposed(route, partitioned)
+                && everyone(permission.as_str())
+            {
+                issues.push(RouteIssue {
+                    key: format!("queries.{}", route.tag.as_str()),
+                    code: "cross_tenant_query",
+                });
+            }
+        }
         let declared: BTreeSet<&str> = self
             .permissions
             .iter()
@@ -631,6 +685,21 @@ impl Config {
             }
         }
         issues
+    }
+    /// Whether `route` would read every tenant's data: the application has
+    /// a tenant-scoped route, the query is application-scoped on an
+    /// unpartitioned projection, and it does not opt in (`cross_tenant`).
+    fn cross_tenant_exposed(&self, route: &QueryRoute, partitioned: bool) -> bool {
+        let tenants = self
+            .commands
+            .iter()
+            .map(CommandRoute::route_scope)
+            .chain(self.queries.iter().map(QueryRoute::route_scope))
+            .any(|scope| scope == RouteScope::Tenant);
+        tenants
+            && route.route_scope() == RouteScope::Application
+            && !partitioned
+            && !route.cross_tenant
     }
     /// The resource kinds routes name in `resource`, for the identity
     /// block's role assignments.

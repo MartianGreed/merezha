@@ -244,7 +244,7 @@ pub const DELETE_REBUILD: Statement = Statement::new(
 pub const REBUILD: Statement = Statement::new(
     "app.rebuilds.read",
     "SELECT merezha_app.projection_rebuilds",
-    "SELECT state::text, checkpoint, target, row_revision, status, generation \
+    "SELECT state::text, checkpoint, target, row_revision, status, generation, candidate \
     FROM merezha_app.projection_rebuilds WHERE name = $1 AND revision = $2",
 );
 pub const REBUILD_STATUS: Statement = Statement::new(
@@ -252,14 +252,15 @@ pub const REBUILD_STATUS: Statement = Statement::new(
     "SELECT merezha_app.projection_rebuilds",
     "SELECT status FROM merezha_app.projection_rebuilds WHERE name = $1 AND revision = $2",
 );
-/// Persist the candidate after a batch, with CAS on the rebuild row. Zero
-/// rows: the rebuild was abandoned, failed or resumed elsewhere.
+/// Persist the candidate after a batch, with CAS on the rebuild row and
+/// its candidate id (`$6`). Zero rows: the rebuild was abandoned (and
+/// perhaps requested again), failed or resumed elsewhere.
 pub const COMMIT_CANDIDATE: Statement = Statement::new(
     "app.rebuilds.commit",
     "UPDATE merezha_app.projection_rebuilds",
     "UPDATE merezha_app.projection_rebuilds \
     SET state = $3::text::json, checkpoint = $4, row_revision = row_revision + 1 \
-    WHERE name = $1 AND revision = $2 AND row_revision = $5 AND status = 'running' \
+    WHERE name = $1 AND revision = $2 AND row_revision = $5 AND candidate = $6 AND status = 'running' \
     RETURNING row_revision",
 );
 pub const FAIL_REBUILD: Statement = Statement::new(
@@ -267,7 +268,7 @@ pub const FAIL_REBUILD: Statement = Statement::new(
     "UPDATE merezha_app.projection_rebuilds",
     "UPDATE merezha_app.projection_rebuilds \
     SET status = 'failed', failure_code = $4 \
-    WHERE name = $1 AND revision = $2 AND row_revision = $3 AND status = 'running'",
+    WHERE name = $1 AND revision = $2 AND row_revision = $3 AND candidate = $5 AND status = 'running'",
 );
 /// Swap step 1: the served row, locked so a live batch orders against it.
 pub const LOCK_PROJECTION: Statement = Statement::new(
@@ -282,7 +283,7 @@ pub const TAKE_CANDIDATE: Statement = Statement::new(
     "app.rebuilds.take",
     "DELETE merezha_app.projection_rebuilds",
     "DELETE FROM merezha_app.projection_rebuilds \
-    WHERE name = $1 AND revision = $2 AND row_revision = $3 AND status = 'running' \
+    WHERE name = $1 AND revision = $2 AND row_revision = $3 AND candidate = $4 AND status = 'running' \
       AND checkpoint >= target \
     RETURNING state::text, checkpoint, generation",
 );

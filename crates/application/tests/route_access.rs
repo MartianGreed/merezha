@@ -123,6 +123,8 @@ tag = "Anyone"
 service = "domain"
 projection = "all"
 access = "public"
+# Every tenant's events: an explicit choice beside tenant routes.
+cross_tenant = true
 [[projections]]
 name = "all"
 service = "domain"

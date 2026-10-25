@@ -94,6 +94,7 @@ scope="tenant"
 tag="Total"
 service="counter"
 projection="total"
+cross_tenant=true
 [[queries]]
 tag="Mine"
 service="counter"

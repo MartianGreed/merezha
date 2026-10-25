@@ -12,3 +12,9 @@ CREATE TABLE merezha_app.projection_partitions (
     state json NOT NULL,
     PRIMARY KEY (name, revision, generation, tenant),
     FOREIGN KEY (name, revision) REFERENCES merezha_app.projections ON DELETE CASCADE);
+
+-- Each rebuild request is a new candidate. A run compares its candidate
+-- with the row on every batch, so a rebuild abandoned and requested again
+-- while the run still holds its lock is never continued as the old one.
+ALTER TABLE merezha_app.projection_rebuilds
+    ADD COLUMN candidate bigint GENERATED ALWAYS AS IDENTITY;

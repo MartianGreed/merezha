@@ -2119,8 +2119,10 @@ PR 2 as built (2026-10-25):
   the binary hands the module (`IdentityModule::add_block_permissions`).
   `application.toml` `[[permissions]]` and route `resource` kinds are AP-C2's
   syntax; since AP-C2 they join through `add_application_permissions` and
-  `add_resource_kinds` (`merezha_cli::identity_module`), beside the blocks'
-  kinds (`content_type`). Wildcards inside
+  `add_tenant_resource_kinds` (`merezha_cli::identity_module`), beside the
+  blocks' kinds (`content_type`, `add_resource_kinds`). Routes check their
+  kinds inside the caller's organization only, so an application-level
+  assignment on one fails `resource_kind_tenant_only` (422). Wildcards inside
   a block namespace are accepted only in `builtin_grants` (operator
   configuration), so a release adding a block permission never widens a
   custom role, a declared role or a key. `admin` holds every catalog

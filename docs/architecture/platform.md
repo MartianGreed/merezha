@@ -200,7 +200,9 @@ a receipt or calling any guest:
 | `permission` | `401 unauthenticated` | `Authorizer::check(principal, permission, scope)`: `Application`, `Tenant(principal.tenant)`, or `Resource { tenant, kind: resource, id: stream }`; `403 unauthorized` without the grant, `platform_admin` passes (break-glass audited first) |
 | neither (version 1) | served only under the loopback allow-all policy; `403 unauthorized` otherwise | the same |
 
-A tenant route without an active organization fails `403 tenant_required`.
+`access = "authenticated"` checks no permission, so it ignores an API key's
+permission list: any principal, session or key, may call it. A tenant route
+without an active organization fails `403 tenant_required`.
 Tenant commands write `{tenant}:{aggregate}/{stream}` of the principal's
 active organization and key their receipts by it; tenant queries read its
 partition. A principal's receipts are scoped apart from anonymous callers
@@ -217,11 +219,18 @@ application's `[[permissions]]` and the blocks' catalog; and the document's
 own `route_access_conflict`, `invalid_permission`, `block_prefix`,
 `duplicate_permission`, `resource_requires_tenant`,
 `tenant_query_unpartitioned`, `partitioned_query_unscoped`,
-`tenant_aggregate` and `partitions_require_postgres`. The application's
+`tenant_aggregate`, `partitions_require_postgres`, `cross_tenant_query` and
+`cross_tenant_scoped`. `cross_tenant_query` fails closed: with any
+tenant-scoped route, an application-scoped query on an unpartitioned
+projection open to anonymous callers (`public`, undeclared) or to every
+principal (`authenticated`, or a permission in `builtin_grants.user`)
+returns every tenant's data, so it must say `cross_tenant = true`. The application's
 `[[permissions]]` join identity's catalog
 (`IdentityModule::add_application_permissions`), so roles, keys and
 `builtin_grants` can grant them, and route `resource` kinds become kinds
-assignments may target (`add_resource_kinds`). With the identity block a
+tenant role assignments may target (`add_tenant_resource_kinds`); routes check
+them inside the caller's organization only, so an application-level
+assignment on one fails `422 resource_kind_tenant_only`. With the identity block a
 `builtin_grants.user` grant that a route checks at `scope = "tenant"` logs
 `identity.user_grant_tenant_route` (warn, `permission`, `route`): `user`
 grants hold in every organization, so tenant permissions belong in `member`.
@@ -1158,7 +1167,7 @@ organization): `identity.organization_created`, `_updated`, `_deleted`,
 Error codes PR 2 registers: `permission_escalation`, `email_mismatch`,
 `builtin_role` (403), `slug_taken`, `slug_reserved`, `role_key_taken`,
 `role_in_use`, `already_member`, `invitation_stale` (409), `unknown_permission`,
-`unknown_resource_kind`, `organization_limit`, `role_limit`,
+`unknown_resource_kind`, `resource_kind_tenant_only`, `organization_limit`, `role_limit`,
 `assignment_limit`, `service_account_limit`, `api_key_limit`,
 `declared_role_in_use` (422).
 
@@ -1916,7 +1925,10 @@ a tenant without one reads the configured initial state. A rebuild writes the
 next generation beside the served one, swaps it in with the row, then deletes
 older generations in chunks of 1000 (`app.partitions.sweep_old`); before its
 first batch it clears partitions an abandoned rebuild left
-(`app.partitions.sweep_stale`). Changing `partition` needs a new `revision`
+(`app.partitions.sweep_stale`). Each rebuild request is a new candidate
+(`projection_rebuilds.candidate`): a run stops when the request it started on
+was abandoned and requested again, so it never builds on the old request's
+partitions. Changing `partition` needs a new `revision`
 (`storage_configuration`). `POST .../catch-up` on a partitioned projection
 answers `{checkpoint, head}`.
 

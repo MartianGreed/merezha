@@ -562,6 +562,9 @@ pub struct Core {
     /// The WebAuthn relying party, when passkeys are configured.
     #[cfg(feature = "passkeys")]
     pub webauthn: Option<Arc<webauthn_rs::Webauthn>>,
+    /// Of those, the kinds whose resources always belong to a tenant: no
+    /// application-level assignment (`resource_kind_tenant_only`).
+    pub tenant_resource_kinds: std::collections::BTreeSet<String>,
 }
 impl std::fmt::Debug for Core {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

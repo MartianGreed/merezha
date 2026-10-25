@@ -128,6 +128,9 @@ pub struct RunHooks {
     /// A one-shot pause of a background run after it took its slot and
     /// before its first step.
     pub before_run: Option<Arc<Pause>>,
+    /// A one-shot pause of a rebuild run before it reads its candidate for
+    /// the next batch.
+    pub rebuild_batch: Option<Arc<Pause>>,
 }
 /// See [`RunHooks::pause`].
 #[derive(Debug, Default)]
@@ -997,6 +1000,9 @@ struct Candidate {
     row_revision: i64,
     running: bool,
     generation: i32,
+    /// The request's identity: a rebuild abandoned and requested again is
+    /// another candidate.
+    id: i64,
 }
 impl Session<'_> {
     fn candidate(&self) -> Result<Option<Candidate>, Failure> {
@@ -1020,6 +1026,7 @@ impl Session<'_> {
             row_revision: row.get(3),
             running: row.get::<_, &str>(4) == "running",
             generation: row.get(5),
+            id: row.get(6),
         }))
     }
     /// Persist the candidate with CAS on the rebuild row, then, for a
@@ -1028,6 +1035,7 @@ impl Session<'_> {
     /// changed elsewhere, and then nothing is written.
     fn commit_candidate(
         &mut self,
+        id: i64,
         row_revision: i64,
         state: Option<&serde_json::Value>,
         checkpoint: u64,
@@ -1050,7 +1058,7 @@ impl Session<'_> {
                         .query_opt(
                             tx,
                             &sql::COMMIT_CANDIDATE,
-                            &[&name, &revision, &text, &checkpoint, &row_revision],
+                            &[&name, &revision, &text, &checkpoint, &row_revision, &id],
                         )
                         .await
                         .map_err(|e| read_error(&e))?;
@@ -1064,14 +1072,20 @@ impl Session<'_> {
             }),
         )
     }
-    fn fail_candidate(&self, row_revision: i64, failure: &Failure) -> Result<(), Failure> {
+    fn fail_candidate(&self, id: i64, row_revision: i64, failure: &Failure) -> Result<(), Failure> {
         self.store.step(self.bounds, async {
             self.store
                 .db
                 .execute(
                     &self.client,
                     &sql::FAIL_REBUILD,
-                    &[&self.name, &self.revision, &row_revision, &failure.code],
+                    &[
+                        &self.name,
+                        &self.revision,
+                        &row_revision,
+                        &failure.code,
+                        &id,
+                    ],
                 )
                 .await
                 .map_err(|e| read_error(&e))
@@ -1082,7 +1096,11 @@ impl Session<'_> {
     /// finished candidate this run built and publish it as the next
     /// generation, with its generation. `None` when the rebuild was
     /// abandoned meanwhile.
-    fn swap(&mut self, row_revision: i64) -> Result<Option<(ProjectionState, i32)>, Failure> {
+    fn swap(
+        &mut self,
+        id: i64,
+        row_revision: i64,
+    ) -> Result<Option<(ProjectionState, i32)>, Failure> {
         let (name, revision) = (self.name.clone(), self.revision);
         let sleep = self.store.shared.options.hooks().pause;
         let hard = self.bounds.hard;
@@ -1097,7 +1115,11 @@ impl Session<'_> {
                         .map_err(|e| read_error(&e))?
                         .ok_or_else(invalid)?;
                     let Some(taken) = db
-                        .query_opt(tx, &sql::TAKE_CANDIDATE, &[&name, &revision, &row_revision])
+                        .query_opt(
+                            tx,
+                            &sql::TAKE_CANDIDATE,
+                            &[&name, &revision, &row_revision, &id],
+                        )
                         .await
                         .map_err(|e| read_error(&e))?
                     else {
@@ -1167,26 +1189,39 @@ fn rebuild_batches(
     let store = session.store;
     let batch = app.config().limits.batch_size as u64;
     let partitioned = projection.partitioned();
-    let mut fresh = partitioned;
+    let mut started = None;
     loop {
+        let pause = store.shared.options.hooks().rebuild_batch;
+        store.step(bounds, async {
+            Pause::hold(pause, projection.name.as_str()).await;
+            Ok(())
+        })?;
         let Some(candidate) = session.candidate()? else {
             return Ok(Outcome::Idle);
         };
         if !candidate.running {
             return Ok(Outcome::Idle);
         }
-        // Before a partitioned rebuild's first batch, nothing at its target
-        // generation is legitimate yet: clear what an abandoned rebuild or
-        // an interrupted sweep left, so absent partitions mean the initial
-        // state.
-        if std::mem::take(&mut fresh) && candidate.checkpoint == 0 {
+        // A rebuild abandoned and requested again while this run held the
+        // lock is another candidate: stop, and the next run builds it from
+        // its start.
+        if *started.get_or_insert(candidate.id) != candidate.id {
+            return Ok(Outcome::Idle);
+        }
+        // Before a partitioned candidate's first batch, nothing at its
+        // target generation is legitimate yet: clear what an abandoned
+        // rebuild or an interrupted sweep left, so absent partitions mean
+        // the initial state. Checked on every batch, not only a run's
+        // first.
+        if partitioned && candidate.checkpoint == 0 {
             let served = session.row()?.generation;
             session.sweep(true, served)?;
         }
         if candidate.checkpoint >= candidate.target {
             #[cfg(test)]
             super::tests::crash_cut("rebuild_before_swap");
-            let Some((pair, generation)) = session.swap(candidate.row_revision)? else {
+            let Some((pair, generation)) = session.swap(candidate.id, candidate.row_revision)?
+            else {
                 return Ok(Outcome::Idle);
             };
             #[cfg(test)]
@@ -1239,12 +1274,13 @@ fn rebuild_batches(
         let (state, partitions) = match projected {
             Ok(projected) => projected,
             Err(failure) => {
-                session.fail_candidate(candidate.row_revision, &failure.failure)?;
+                session.fail_candidate(candidate.id, candidate.row_revision, &failure.failure)?;
                 return Err(failure);
             }
         };
         if session
             .commit_candidate(
+                candidate.id,
                 candidate.row_revision,
                 state.as_ref(),
                 last,

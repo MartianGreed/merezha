@@ -59,12 +59,14 @@ tag = "Mine"
 service = "view"
 projection = "tasks"
 access = "authenticated"
-scope = "{scope}"
+scope = "{scope}"{opt_in}
 [[queries]]
 tag = "Totals"
 service = "view"
 projection = "totals"
 access = "public"
+# Every tenant's events, on purpose (AP §C.4).
+cross_tenant = true
 [[projections]]
 name = "tasks"
 service = "view"
@@ -80,6 +82,12 @@ initial = {{ n = 0 }}
             "tenant"
         } else {
             "application"
+        },
+        // Unpartitioned, `Mine` reads every tenant's events.
+        opt_in = if partition == "tenant" {
+            ""
+        } else {
+            "\ncross_tenant = true"
         },
     ))
     .unwrap()
@@ -561,6 +569,19 @@ fn changing_partition_needs_a_new_revision() {
         .map(|r| (r.get(0), r.get(1)))
         .collect();
     assert_eq!(partitioned, [(1, true), (2, false)]);
+    // The other direction: an unpartitioned revision reopened as
+    // partitioned.
+    assert_eq!(
+        pg.open(config_with(2, "tenant", ""), &probe, background())
+            .err()
+            .unwrap()
+            .code,
+        "storage_configuration"
+    );
+    assert!(
+        pg.open(config_with(3, "tenant", ""), &probe, background())
+            .is_ok()
+    );
 }
 
 /// Tests that race a deadline or a pause; CI runs them alone
@@ -705,5 +726,71 @@ mod timing {
             .map(|r| serde_json::from_str(r.get::<_, &str>(0)).unwrap())
             .collect();
         assert_eq!(states, vec![json!({"n": 1, "by": "winner"}); 3]);
+    }
+
+    /// PR #58 review: a partitioned rebuild abandoned and requested again
+    /// while its run still holds the `b:` lock is another candidate. The
+    /// run pauses inside its first candidate commit; meanwhile the rebuild
+    /// is abandoned (waiting on that commit) and requested again, and the
+    /// run's next batch then sees the new request. It must not continue it
+    /// over the old request's partitions: every tenant ends with exactly
+    /// its own events.
+    #[test]
+    fn a_rebuild_replaced_under_its_running_lock_never_double_counts() {
+        let Some(pg) = Pg::new() else { return };
+        let commit = Arc::new(Pause::default());
+        let batch = Arc::new(Pause::default());
+        let probe = Arc::new(Probe {
+            by: "a",
+            ..Probe::default()
+        });
+        let instance = pg
+            .open(
+                config_with(1, "tenant", "[limits]\ntimeout_ms = 30000\nbatch_size = 16"),
+                &probe,
+                Pg::background(
+                    CatchUp::Manual,
+                    RunHooks {
+                        pause: Some(commit.clone()),
+                        rebuild_batch: Some(batch.clone()),
+                        ..RunHooks::default()
+                    },
+                ),
+            )
+            .unwrap();
+        let app = &instance.app;
+        for i in 0..100 {
+            let principal = member("usr_a", &format!("org_{}", i % 10));
+            app.command_as(principal, add("t-1", None)).unwrap();
+        }
+        app.catch_up("tasks").unwrap();
+        commit.arm("tasks", Duration::from_millis(1500));
+        std::thread::scope(|scope| {
+            let rebuilding = scope.spawn(|| app.rebuild("tasks").unwrap());
+            while !commit.entered() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // The run's next batch waits while the request is replaced.
+            batch.arm("tasks", Duration::from_millis(2500));
+            app.admit().unwrap().abandon_rebuild("tasks").unwrap();
+            app.admit()
+                .unwrap()
+                .request_rebuild("tasks", false, None)
+                .unwrap();
+            let rebuilt = rebuilding.join().unwrap();
+            assert_eq!(rebuilt.checkpoint, 100);
+        });
+        assert!(batch.entered(), "the run reached its next batch");
+        let partitions = pg.partitions();
+        assert_eq!(partitions.len(), 10);
+        assert!(
+            partitions.values().all(|n| *n == 10),
+            "no tenant counted twice: {partitions:?}"
+        );
+        assert_eq!(
+            pg.count("SELECT count(*) FROM merezha_app.projection_partitions"),
+            10,
+            "only the served generation remains"
+        );
     }
 }

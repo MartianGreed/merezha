@@ -372,7 +372,8 @@ fn project(dir: &Path, application: &str, identity: bool) -> std::path::PathBuf 
     let identity = if identity {
         "[modules.identity]\napp_origin = \"http://localhost:5173\"\n\
          secret_key = { env = \"IDENTITY_SECRET\" }\ndev_print_links = true\n\
-         [modules.identity.password]\nargon2_memory_kib = 19456\n"
+         [modules.identity.password]\nargon2_memory_kib = 19456\n\
+         [modules.identity.rbac.application_roles.support]\nname = \"Support\"\npermissions = [\"tasks.add\"]\n"
     } else {
         ""
     };
@@ -388,9 +389,19 @@ fn project(dir: &Path, application: &str, identity: bool) -> std::path::PathBuf 
     config
 }
 
-/// One HTTP/1.1 request: status, raw headers and body.
+/// One HTTP/1.1 POST: status, raw headers and body.
 fn http(
     address: std::net::SocketAddr,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, String, Value) {
+    send_http(address, "POST", path, headers, body)
+}
+/// One HTTP/1.1 request: status, raw headers and body.
+fn send_http(
+    address: std::net::SocketAddr,
+    method: &str,
     path: &str,
     headers: &[(&str, &str)],
     body: &str,
@@ -402,7 +413,7 @@ fn http(
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
     let mut head = format!(
-        "POST {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n",
         body.len()
     );
@@ -501,6 +512,13 @@ aggregate = "Counter"
 permission = "tasks.add"
 scope = "tenant"
 [[commands]]
+tag = "Rename"
+service = "protocol"
+aggregate = "Counter"
+permission = "tasks.add"
+scope = "tenant"
+resource = "task"
+[[commands]]
 tag = "Global"
 service = "protocol"
 aggregate = "Counter"
@@ -521,6 +539,7 @@ tag = "Count"
 service = "protocol"
 projection = "count"
 access = "authenticated"
+cross_tenant = true
 [[projections]]
 name = "total"
 service = "protocol"
@@ -740,6 +759,36 @@ fn identity_grants_decide_every_application_route() {
     assert!(caught.2.get("state").is_none(), "{:?}", caught.2);
     assert_eq!(caught.2["head"], global.2["position"]);
     assert_eq!(caught.2["checkpoint"], global.2["position"]);
+    // Route `resource` kinds are tenant-only: routes check them inside the
+    // caller's organization, so an application-level assignment on one
+    // could never take effect and is refused. Block kinds still take one.
+    let get = |path: &str| send_http(address, "GET", path, &ada_headers, "");
+    let roles = get("/v1/identity/application/roles");
+    assert_eq!(roles.0, 200, "{:?}", roles.2);
+    let support = roles.2["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["key"] == "support")
+        .expect("the declared role")["id"]
+        .clone();
+    let users = get("/v1/identity/application/users?email=ada%40example.com");
+    let ada_id = users.2["items"][0]["id"].clone();
+    let assign = |kind: &str| {
+        http(
+            address,
+            "/v1/identity/application/role-assignments",
+            &ada_headers,
+            &json!({"user_id": ada_id, "role_id": support, "resource": {"kind": kind, "id": "t-1"}})
+                .to_string(),
+        )
+    };
+    assert_eq!(
+        code(&assign("task")),
+        (422, Some("resource_kind_tenant_only".into()))
+    );
+    let content = assign("content_type");
+    assert_eq!(content.0, 201, "{:?}", content.2);
     host.stop();
 }
 
@@ -806,6 +855,37 @@ fn startup_refuses_undeclared_unknown_and_unpartitioned_routes() {
     let config = project(dir.path(), &base(undeclared), false);
     let failed = Host::spawn(&config, &unreachable, "allowed").failed();
     assert_ne!(failed["code"], "route_access_undeclared");
+    // The PR #58 review's PoC: beside tenant routes, an anonymous `List`
+    // on an unpartitioned projection would answer every tenant's data
+    // (org B's `ssn`); so would one checking a permission every user
+    // holds. Both stop startup unless the query opts in.
+    let leak = |list: &str, user: Option<&str>, name: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let routes = format!(
+            "[[permissions]]\nname = \"people.read\"\n\
+             [[commands]]\ntag = \"AddPerson\"\nservice = \"protocol\"\naggregate = \"Person\"\n\
+             access = \"authenticated\"\nscope = \"tenant\"\n\
+             [[queries]]\ntag = \"List\"\nservice = \"protocol\"\nprojection = \"total\"\n{list}\n"
+        );
+        let config = project(dir.path(), &base(&routes), true);
+        if let Some(user) = user {
+            let mut text = fs::read_to_string(&config).unwrap();
+            text.push_str(&format!(
+                "[modules.identity.rbac.builtin_grants]\nuser = [\"{user}\"]\n"
+            ));
+            fs::write(&config, text).unwrap();
+        }
+        Host::spawn(&config, &unreachable, name).failed()
+    };
+    for (list, user) in [
+        ("access = \"public\"", None),
+        ("permission = \"people.read\"", Some("people.*")),
+    ] {
+        let failed = leak(list, user, "leak");
+        assert_eq!(failed["code"], "cross_tenant_query", "{list}: {failed}");
+        let opted = leak(&format!("{list}\ncross_tenant = true"), user, "opted");
+        assert_ne!(opted["code"], "cross_tenant_query", "{list}: {opted}");
+    }
     // Identity §5: a `builtin_grants.user` grant a tenant route checks is
     // warned about once per route (it holds in every organization).
     let dir = tempfile::tempdir().unwrap();
