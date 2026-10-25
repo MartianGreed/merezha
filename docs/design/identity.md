@@ -1140,6 +1140,24 @@ Steps 2 to 4 make a key's power its list intersected with its owner's live
 grants at the key's scope. Minting checks the same (`permission_escalation`),
 so a key never exceeds its owner.
 
+A key also never exceeds its minter (`api_keys.created_by`). This is an
+invariant of evaluation, not of the paths that change grants. When the
+minter is not the owner (a service account's key), the `Authenticator`
+caps the key's list at what the minter holds now at the key's scope
+(`Tenant(org)` for a tenant key, `Application` otherwise). The cap comes
+from the minter's own snapshot, cached and stamped with the minter's
+`authz_version`, its membership and the organization's version, and the
+key snapshot is stamped with the same. So a demotion, a custom role edit,
+an application role revocation or any later path shrinks the key on the
+next request on every instance. A minter that is deleted, disabled,
+unverified (while verification is required) or, for a tenant key, no
+longer a member leaves the key no power: it answers `401 unauthenticated`
+as a revoked key does. Account deletion and disabling also revoke every
+key the user minted or owns (`api_key.revoked`, reasons `minter_deleted`
+and `minter_disabled`), and removal and role changes keep their
+revocations (§4), so listings show the state. Listing keys with
+break-glass is audited like every break-glass use.
+
 `AccessDenied` carries the internal reason (`no_grant`, `tenant_mismatch`,
 `key_scope`, `key_limit`, `unauthenticated`) for audit and debug logs, as the
 TypeScript `Decision.reason` did. HTTP shows only `unauthorized` (403), or
@@ -1562,6 +1580,7 @@ identity defines none. Spans are TE's `identity {operation}`.
 | Cross-tenant access (IDOR) | Organization in every scoped check, tenant match required unless an application grant matches, tenant keys pinned, 404 for foreign ids. |
 | Last owner lockout | Sole-owner invariant under row lock. |
 | Leaked API key | Prefixed format for secret scanning, mandatory expiry, revocation, last-use stamps, audit of use after revocation, dies when the owner leaves or is disabled. |
+| A minter's authority outlives it through a key | A key is capped at its minter's live grants at the key's scope on every request (§5) and has no power once the minter is deleted, disabled or no longer a member; deletion, disabling, removal and losing the minting permission also revoke it. |
 | Ex-member keeps access | Membership removal bumps `authz_version`, revokes the user's keys for the organization and the service account keys it minted there, and deletes its pending invitations, in one transaction; a demotion does the same for the authority it loses; acceptance re-checks the inviter's live grants; sessions lose the organization; authentication refuses a user's tenant key without a live membership. |
 | Argon2 denial of service | Semaphore with queue timeout, per-IP limits before hashing, 1 KiB password byte cap. |
 | Rate-limit table growth | Keys are fixed-size digests. Cleanup removes drained buckets. |
@@ -2108,8 +2127,8 @@ PR 2 as built (2026-10-25):
   that does; `authorization.denied` once per principal and permission per
   instance on identity's routes (both best effort: past 64 writes in flight
   a row is dropped and logged `identity.audit_dropped`);
-  `authorization.break_glass` before the use, fail closed (§5). The review
-  of PR #47 added the authority cleanup on removal and demotion, the
+  `authorization.break_glass` before the use, fail closed (§5). Keys are
+  capped by their minter's live grants (§5). The reviews of PR #47 added the authority cleanup on removal and demotion, the
   inviter re-check at acceptance, the fail-closed break-glass audit, the
   live owner re-check, `is_member` for active verified users only and the
   `builtin_grants.user` wildcard rule.

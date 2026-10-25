@@ -215,13 +215,17 @@ impl Policy {
     }
     /// An API key's limit: its list expanded, pinned to `tenant`.
     pub fn key_limit(&self, grants: &[String], tenant: Option<TenantId>) -> KeyLimit {
+        KeyLimit::new(self.key_permissions(grants), tenant)
+    }
+    /// The concrete permissions a key's stored list names.
+    pub fn key_permissions(&self, grants: &[String]) -> PermissionSet {
         let list: Vec<&str> = grants
             .iter()
             .map(String::as_str)
             // A stored wildcard that is no longer allowed grants nothing.
             .filter(|g| self.catalog.check_grant(g, Wildcards::Application).is_ok())
             .collect();
-        KeyLimit::new(self.catalog.expand(list), tenant)
+        self.catalog.expand(list)
     }
 
     /// Assemble a snapshot. `tenant` is `None` without an active tenant;
@@ -345,6 +349,10 @@ pub struct Stamp {
     /// The membership (or the tenant service account) the tenant grants
     /// came from; `None` without tenant grants.
     pub membership: Option<Uuid>,
+    /// A key minted by someone other than its owner: the minter's version
+    /// and its membership in the key's organization, whose grants cap the
+    /// key.
+    pub minter: Option<(i64, Option<Uuid>)>,
 }
 
 /// The in-process snapshot cache, keyed by `(credential id, organization
@@ -736,6 +744,7 @@ mod tests {
             org_version: Some(2),
             generation: 1,
             membership: None,
+            minter: Some((4, None)),
         };
         let key = (Uuid::from_u128(1), None);
         cache.put(key, stamp, Arc::new(GrantSnapshot::empty()));
@@ -755,6 +764,14 @@ mod tests {
             },
             Stamp {
                 membership: Some(Uuid::from_u128(9)),
+                ..stamp
+            },
+            Stamp {
+                minter: Some((5, None)),
+                ..stamp
+            },
+            Stamp {
+                minter: Some((4, Some(Uuid::from_u128(9)))),
                 ..stamp
             },
         ] {

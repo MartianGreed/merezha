@@ -348,14 +348,17 @@ impl Core {
             Scope::Tenant(org) => self.scoped(who, org).await?,
             Scope::Application => who.clone(),
         };
-        let all = who
-            .principal
-            .check(
-                &merezha_domain::Identity::new("identity.api_keys.read")
-                    .map_err(|_| Failure::permanent("internal"))?,
-                &scope.resource_scope(),
-            )
-            .is_ok();
+        let read = merezha_domain::Identity::new("identity.api_keys.read")
+            .map_err(|_| Failure::permanent("internal"))?;
+        let all = match who.principal.check(&read, &scope.resource_scope()) {
+            // Break-glass is audited before the listing is served.
+            Ok(merezha_platform::ports::Allowed::BreakGlass) => {
+                self.audit_break_glass(&who.principal, &read).await?;
+                true
+            }
+            Ok(_) => true,
+            Err(_) => false,
+        };
         let only = if all {
             None
         } else {

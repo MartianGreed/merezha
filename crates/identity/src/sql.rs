@@ -409,9 +409,13 @@ macro_rules! key_authenticate {
                     k.permissions, k.expires_at, k.revoked_at, k.last_used_at,
                     u.status, u.email_verified_at, u.authz_version,
                     sa.status, sa.authz_version, sa.organization_id,
-                    o.id, o.authz_version, m.id
+                    o.id, o.authz_version, m.id,
+                    k.created_by, mu.status, mu.email_verified_at, mu.authz_version, mm.id
                FROM merezha_identity.api_keys k
                LEFT JOIN merezha_identity.users u ON u.id = k.user_id
+               LEFT JOIN merezha_identity.users mu ON mu.id = k.created_by
+               LEFT JOIN merezha_identity.memberships mm
+                      ON mm.organization_id = k.organization_id AND mm.user_id = k.created_by
                LEFT JOIN merezha_identity.service_accounts sa ON sa.id = k.service_account_id
                LEFT JOIN merezha_identity.organizations o
                       ON o.id = coalesce(k.organization_id, $2::uuid)
@@ -422,8 +426,9 @@ macro_rules! key_authenticate {
         )
     };
 }
-/// A key by public id with its owner, organization and membership: the
-/// key's own organization, or `$2` for an application key.
+/// A key by public id with its owner, organization and membership (the
+/// key's own organization, or `$2` for an application key), and its
+/// minter's status, version and membership in the key's organization.
 pub const KEY_AUTHENTICATE: Statement = Statement::new(
     "identity.api_keys.authenticate",
     "SELECT merezha_identity.api_keys",
@@ -434,6 +439,15 @@ pub const KEY_RESOLVE: Statement = Statement::new(
     "identity.api_keys.resolve",
     "SELECT merezha_identity.api_keys",
     key_authenticate!("k.id = $1::uuid"),
+);
+/// Revoke every key user `$1` minted, anywhere (account deletion and
+/// disabling).
+pub const KEYS_REVOKE_MINTED_ALL: Statement = Statement::new(
+    "identity.api_keys.revoke_minted_all",
+    "UPDATE merezha_identity.api_keys",
+    "UPDATE merezha_identity.api_keys SET revoked_at = $2
+      WHERE created_by = $1 AND revoked_at IS NULL
+     RETURNING id, organization_id",
 );
 /// Revoke the service account keys user `$1` minted in organization `$2`.
 pub const KEYS_REVOKE_MINTED: Statement = Statement::new(

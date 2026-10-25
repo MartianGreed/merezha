@@ -290,6 +290,37 @@ impl Core {
             (None, None) => Ok(None),
         }
     }
+    /// Revoke every key `user` minted or owns, anywhere, audited with
+    /// `reason`: its account is being deleted or disabled. The service
+    /// accounts stay.
+    pub(crate) async fn revoke_everything_minted(
+        &self,
+        tx: &mut Tx<'_>,
+        user: Uuid,
+        reason: &'static str,
+        actor: crate::core::Actor,
+        client: &Client,
+    ) -> Result<(), Failure> {
+        let revoked = self
+            .db()
+            .query(
+                &*tx,
+                &crate::sql::KEYS_REVOKE_MINTED_ALL,
+                &[&user, &self.now()],
+            )
+            .await
+            .map_err(sql)?;
+        for key in &revoked {
+            let mut audit = Audit::new("api_key.revoked", actor)
+                .target_of("api_key", key.get(0))
+                .detail("reason", reason);
+            if let Some(org) = key.get::<_, Option<Uuid>>(1) {
+                audit = audit.organization(org);
+            }
+            self.audit(tx, audit, client).await?;
+        }
+        Ok(())
+    }
     /// What a member keeps after losing authority in `org` (removed, or a
     /// role change; the caller holds the organization lock): the service
     /// account keys it minted are revoked unless it still holds

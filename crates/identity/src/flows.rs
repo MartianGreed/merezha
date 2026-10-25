@@ -1510,6 +1510,10 @@ impl Core {
                         .await
                         .map_err(sql)?;
                     core.metrics.sessions_revoked("logout", sessions);
+                    // The service account keys it minted outlive the row
+                    // (no foreign key): revoke them first.
+                    core.revoke_everything_minted(tx, user.id, "minter_deleted", Actor::User(user.id), &client)
+                        .await?;
                     core.db().execute(&*tx, &crate::sql::USER_DELETE, &[&user.id])
                         .await
                         .map_err(sql)?;

@@ -103,6 +103,12 @@ struct KeyRow {
     org: Option<Uuid>,
     org_version: Option<i64>,
     membership: Option<Uuid>,
+    /// Who minted the key, and that user as it stands now.
+    created_by: Option<Uuid>,
+    minter_status: Option<String>,
+    minter_verified: Option<Timestamp>,
+    minter_version: Option<i64>,
+    minter_membership: Option<Uuid>,
 }
 fn key_row(row: &tokio_postgres::Row) -> KeyRow {
     KeyRow {
@@ -124,6 +130,11 @@ fn key_row(row: &tokio_postgres::Row) -> KeyRow {
         org: row.get(15),
         org_version: row.get(16),
         membership: row.get(17),
+        created_by: row.get(18),
+        minter_status: row.get(19),
+        minter_verified: row.get(20),
+        minter_version: row.get(21),
+        minter_membership: row.get(22),
     }
 }
 
@@ -282,6 +293,75 @@ impl Core {
         }
     }
 
+    /// The cap a key's minter places on it when the minter is not its owner
+    /// (a service account's key): the minter must be active, verified when
+    /// verification is required and, for a tenant key, a member of the
+    /// key's organization, else the key is no credential at all; the key
+    /// keeps only what the minter holds now at the key's scope, from the
+    /// minter's own version-stamped snapshot, so a demotion, a custom role
+    /// edit or an application role revocation shrinks the key on the next
+    /// request on every instance.
+    async fn minter_cap(
+        self: &Arc<Self>,
+        session: &impl Session,
+        row: &KeyRow,
+        owner: &Owner,
+    ) -> Result<Option<crate::grants::MinterCap>, Result<Refusal, Failure>> {
+        if let Owner::User(user) = owner
+            && row.created_by.is_none_or(|minter| minter == *user)
+        {
+            // Its owner minted it: the owner's live grants already cap it.
+            return Ok(None);
+        }
+        let Some(minter) = row.created_by else {
+            return Err(Ok(Refusal::Owner));
+        };
+        let active = row.minter_status.as_deref() == Some("active")
+            && (!self.settings.require_verified_email || row.minter_verified.is_some());
+        let Some(version) = row.minter_version.filter(|_| active) else {
+            return Err(Ok(Refusal::Owner));
+        };
+        let (org, scope) = match row.organization {
+            Some(org) => {
+                let Some(membership) = row.minter_membership else {
+                    return Err(Ok(Refusal::Owner));
+                };
+                let Some(org_version) = row.org_version else {
+                    return Err(Ok(Refusal::Owner));
+                };
+                (
+                    Some(OrgFacts {
+                        id: org,
+                        version: org_version,
+                        holder: Some(membership),
+                    }),
+                    merezha_platform::ports::ResourceScope::Tenant(ids::identity(
+                        ids::ORGANIZATION,
+                        org,
+                    )),
+                )
+            }
+            None => (None, merezha_platform::ports::ResourceScope::Application),
+        };
+        let grants = self
+            .snapshot(session, minter, Owner::User(minter), version, org, None)
+            .await
+            .map_err(Err)?;
+        let principal = self.user_principal(minter, row.organization, grants, None);
+        let allowed = self
+            .rbac
+            .key_permissions(&row.permissions)
+            .iter()
+            .filter(|p| principal.check(p, &scope).is_ok())
+            .cloned()
+            .collect();
+        Ok(Some(crate::grants::MinterCap {
+            version,
+            membership: row.minter_membership,
+            allowed,
+        }))
+    }
+
     /// Every rule of section 3 on a key row, then its principal.
     async fn key_principal_from(
         self: &Arc<Self>,
@@ -322,9 +402,11 @@ impl Core {
             }
             _ => return Err(Ok(Refusal::Owner)),
         };
+        let minter = self.minter_cap(session, row, &owner).await?;
         let key = KeyFacts {
             grants: row.permissions.clone(),
             organization: row.organization,
+            minter,
         };
         let org_facts = |holder| -> Option<OrgFacts> {
             Some(OrgFacts {

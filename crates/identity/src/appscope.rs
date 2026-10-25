@@ -190,6 +190,14 @@ impl Core {
                             let revoked = core.delete_sessions(tx, target, None).await?;
                             core.metrics.sessions_revoked("admin", revoked);
                             core.delete_tokens(tx, target).await?;
+                            core.revoke_everything_minted(
+                                tx,
+                                target,
+                                "minter_disabled",
+                                who.actor,
+                                &who.client,
+                            )
+                            .await?;
                         }
                         core.audit(
                             tx,

@@ -1036,7 +1036,11 @@ once when created; only the SHA-256 digest of the secret is stored. A key
 is pinned to one organization or the application, lists its permissions,
 and its power is that list intersected with its owner's live grants at its
 scope: a tenant key never acts elsewhere, an application key never in a
-tenant, and a `platform_admin`'s key never breaks glass. A revoked (audited
+tenant, and a `platform_admin`'s key never breaks glass. A key minted by
+someone other than its owner (a service account's) is also capped, on
+every request, at what its minter holds now at the key's scope, and has no
+power once the minter is deleted, disabled or no longer a member; deleting
+or disabling an account revokes every key it minted. A revoked (audited
 `api_key.used_after_revocation`) or expired key, an inactive owner, and a
 user's tenant key without its owner's live membership answer
 `401 unauthenticated`; removing a member revokes its keys for the

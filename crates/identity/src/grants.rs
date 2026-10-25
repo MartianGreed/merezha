@@ -46,6 +46,17 @@ pub struct OrgFacts {
 pub struct KeyFacts {
     pub grants: Vec<String>,
     pub organization: Option<Uuid>,
+    /// The minter's cap of a key minted by someone other than its owner (a
+    /// service account's key): only these permissions survive.
+    pub minter: Option<MinterCap>,
+}
+/// What a key's minter still holds at the key's scope, with the version
+/// and membership that stamp it.
+#[derive(Clone, Debug)]
+pub struct MinterCap {
+    pub version: i64,
+    pub membership: Option<Uuid>,
+    pub allowed: merezha_platform::ports::PermissionSet,
 }
 
 impl Core {
@@ -93,6 +104,9 @@ impl Core {
             org_version: org.map(|o| o.version),
             generation: self.rbac.generation(),
             membership: org.and_then(|o| o.holder),
+            minter: key
+                .and_then(|k| k.minter.as_ref())
+                .map(|m| (m.version, m.membership)),
         };
         let cache_key = (credential, org.map(|o| o.id));
         if cached {
@@ -177,11 +191,20 @@ impl Core {
             }
         };
         let key_limit = key.map(|k| {
-            self.rbac.key_limit(
-                &k.grants,
-                k.organization
-                    .map(|org| ids::identity(ids::ORGANIZATION, org)),
-            )
+            let tenant = k
+                .organization
+                .map(|org| ids::identity(ids::ORGANIZATION, org));
+            let listed = self.rbac.key_permissions(&k.grants);
+            let permissions = match &k.minter {
+                // A key never exceeds its minter either.
+                Some(cap) => listed
+                    .iter()
+                    .filter(|p| cap.allowed.contains(p))
+                    .cloned()
+                    .collect(),
+                None => listed,
+            };
+            merezha_platform::ports::KeyLimit::new(permissions, tenant)
         });
         let (snapshot, truncated) = self.rbac.snapshot(
             owner.holder(),

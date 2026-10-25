@@ -190,12 +190,16 @@ async fn a_key_never_exceeds_its_owner() {
         json!({"status": "active"}),
     )
     .await;
-    assert!(
-        app_key.allowed(&i, "tasks.read", "application").await,
-        "back with its owner"
+    assert_eq!(
+        app_key.check(&i, "tasks.read", "application").await.status,
+        401,
+        "disabling revoked it for good"
     );
     // ...and its account.
     let mut fresh = sign_in(&i, "ada@example.com").await;
+    let again = mint(&i, &mut fresh, "/application/api-keys", &["tasks.read"]).await;
+    let mut app_key = keyed(&again);
+    assert!(app_key.allowed(&i, "tasks.read", "application").await);
     let leave = fresh
         .delete(&i, &format!("/organizations/{k}/members/{ada_m}"))
         .await;
