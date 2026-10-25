@@ -2263,7 +2263,8 @@ invalid model's problems are printed on stdout with their messages, one
 Error codes it registers: `content_model_invalid`,
 `content_model_version_unchanged`, `content_model_breaking`,
 `content_not_configured`, `index_build_failed`, `validation_failed` (422),
-`invalid_json` (400), `content_type_not_found` (404), and
+`invalid_json` (400), `content_type_not_found` and
+`organization_not_found` (404, issue #56), and
 `content_model_superseded`, `content_model_outdated`,
 `content_model_pending`, `content_model_conflict`,
 `content_activation_timeout`, `index_build_pending` (503).
@@ -2694,11 +2695,70 @@ none.
   upload routes read up to `media.max_upload_bytes`.
 - Events of organization content carry the organization as their
   envelope `tenant` and `scope: "org:<id>"` in their payload.
-- Deleting an organization in identity leaves its content in place: no
-  longer reachable through management, but its public types and the
-  assets they reference are still served on its delivery path until
-  issue #56 lands. #56 purges it on `identity.organization_deleted` and
-  must include an operator purge; until then remove such content by hand.
+
+#### Deleted organizations
+
+When identity deletes an organization (issue #56), content stops serving
+it and purges it. Content subscribes the job kind
+`content.organization_deleted` (queue `content`) to
+`identity.organization_deleted` whenever `[modules.identity]` is present.
+The subscription's transaction records the scope in
+`merezha_content.scopes_deleted` (migration 4) and appends the job
+`content.organization_purge`. From that commit on:
+
+- Every route of the organization answers `404 organization_not_found`:
+  management of its entries, singletons, trash and batches (for any
+  principal whose tenant it still is), everything under
+  `/v1/content/o/{organization}` (delivery and its 304s, the model,
+  asset management and asset delivery, the application assets its entries
+  used included). The check runs after the route's permission check, so a
+  principal of another organization still gets its 403.
+- No write of the organization commits: every organization write takes
+  a shared transaction lock on the scope and checks the record first, and
+  the deletion takes that lock exclusively, so a write in flight commits
+  before the deletion does (and is then purged) or is refused. An upload
+  in flight gives up and removes its blob row and object.
+- `content.organization_purge` hard-deletes, 100 rows per transaction:
+  entries (with variants, revisions, `published` rows and outgoing refs),
+  refs of any scope that point at them, assets and the refs to them, then
+  hands the blobs to `content.blob_cleanup` (`orphaned` and due at once,
+  whatever `media.orphan_grace`), removes the scope's generation and marks
+  the record `purged`. On a host with media it appends a
+  `content.blob_cleanup` run, which deletes the objects under C7's
+  delete leases. Every step is idempotent: a host killed mid-purge leaves
+  the job to the next lease on any host, and a run nearing its deadline
+  appends its continuation. Another organization's rows and objects are
+  never touched, including blobs of the same bytes. Application assets
+  only the organization's entries used become deletable without `force`.
+- The record stays after the purge (organization ids are never reused),
+  so the organization never answers again. The purge appends no content
+  events; consumers learn of it from `identity.organization_deleted`.
+  Logs: `content.organization_deleted` (tenant, source) when the scope is
+  marked, `content.organization_purged` (tenant, entries, assets, blobs)
+  when the job finishes it.
+
+A purge job that dead-letters (only a persistent database failure does)
+is replayed through the jobs admin API, or finished with the operator
+command, which also covers organizations deleted before content
+subscribed, or a missed event:
+
+`merezha content purge-organization ORGANIZATION --config merezha.toml
+[--force] [--set SECTION.KEY=VALUE]...` marks the organization's scope
+deleted (source `operator`) and runs the purge to the end in the
+foreground, then prints `organization <id> marked deleted` (or `already
+marked deleted`), `purged entries <n> assets <n> blobs <n>` and `status
+purged` (`(already)` when nothing was left). It needs migration 4
+(`content_migration_pending` otherwise) and refuses, with exit code 1 and
+a `refused:` line, an organization identity still has, or one identity
+cannot confirm deleted (an id identity never issues, or no identity
+schema). `--force` purges it anyway after a `warning: --force:` line:
+its content is gone for good and content refuses the organization from
+then on, while identity keeps it. Exit code 2 when the arguments, the
+configuration or the database fail (`content.purge_failed` on stderr
+with the code). With `[modules.content.media]` configured, it appends a
+`content.blob_cleanup` run that the next running host takes, which
+deletes the released objects (`blobs released to content.blob_cleanup`).
+Safe beside a running purge job; rerun it after an interruption.
 
 ## Dependencies
 

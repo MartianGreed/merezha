@@ -240,6 +240,20 @@ impl Manage {
         ))
     }
 
+    /// [`Manage::authorize`], then `organization_not_found` (404) when the
+    /// resolved scope is a deleted organization's (issue #56): the check
+    /// of every management route before it reads.
+    pub(crate) async fn authorized(
+        &self,
+        parts: &Parts,
+        permission: &str,
+        type_name: &str,
+    ) -> Result<(Target, ContentType), Rejection> {
+        let (target, content_type) = self.authorize(parts, permission, type_name)?;
+        self.store.refuse_deleted(&target.scope).await?;
+        Ok((target, content_type))
+    }
+
     /// Authorize and resolve the variant a route addresses: the entry id
     /// from the path, or the scope's singleton (`None` before its first
     /// save).
@@ -250,7 +264,7 @@ impl Manage {
         params: &HashMap<String, String>,
     ) -> Result<(Target, ContentType, Option<Uuid>, String), Rejection> {
         let type_name = params.get("type").map(String::as_str).unwrap_or("");
-        let (target, content_type) = self.authorize(parts, permission, type_name)?;
+        let (target, content_type) = self.authorized(parts, permission, type_name).await?;
         let locale = params.get("locale").cloned().unwrap_or_default();
         if !locale_allowed(self.store.model(), &content_type, &locale) {
             return Err(Failure::permanent("locale_unknown").into());
@@ -517,7 +531,7 @@ async fn list(
 ) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
-        let (target, content_type) = manage.authorize(&parts, ENTRIES_READ, &type_name)?;
+        let (target, content_type) = manage.authorized(&parts, ENTRIES_READ, &type_name).await?;
         let limits = manage.store.state().settings().limits;
         let parsed = query::parse_list(
             manage.store.model(),
@@ -553,7 +567,7 @@ async fn create(
 ) -> Response {
     let run = async {
         let (parts, body) = request.into_parts();
-        let (target, content_type) = manage.authorize(&parts, ENTRIES_WRITE, &type_name)?;
+        let (target, content_type) = manage.authorized(&parts, ENTRIES_WRITE, &type_name).await?;
         let bytes = read_body(&manage.store, body).await?;
         let mut body = body_object(&bytes, &["id", "locale", "fields"])?;
         let fields = match body.remove("fields") {
@@ -617,7 +631,7 @@ async fn summary(State(manage): State<Manage>, Path(params): Params, request: Re
     let run = async {
         let (parts, _) = request.into_parts();
         let type_name = params.get("type").map(String::as_str).unwrap_or("");
-        let (target, _) = manage.authorize(&parts, ENTRIES_READ, type_name)?;
+        let (target, _) = manage.authorized(&parts, ENTRIES_READ, type_name).await?;
         selection_empty(parts.uri.query())?;
         let id = entry_id(params.get("id").map(String::as_str).unwrap_or(""))?;
         let summary = manage.store.summary(&target, id).await?;
@@ -983,7 +997,7 @@ async fn referrers(
     let run = async {
         let (parts, _) = request.into_parts();
         let type_name = params.get("type").map(String::as_str).unwrap_or("");
-        let (target, content_type) = manage.authorize(&parts, ENTRIES_READ, type_name)?;
+        let (target, content_type) = manage.authorized(&parts, ENTRIES_READ, type_name).await?;
         let query = selection(
             &content_type,
             parts.uri.query(),

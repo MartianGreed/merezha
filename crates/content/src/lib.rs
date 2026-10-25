@@ -54,6 +54,13 @@
 //! application scope, never the reverse or another organization (any such
 //! target answers like an absent one); assets and blobs per organization,
 //! managed under `/v1/content/o/{organization}/manage/assets`.
+//!
+//! Issue #56, deleted organizations: the `identity.organization_deleted`
+//! subscription marks the organization's scope deleted, after which every
+//! route of it answers 404 `organization_not_found` and no write of it
+//! commits, and the `content.organization_purge` job (or `merezha content
+//! purge-organization`, [`purge_organization`]) hard-deletes its rows in
+//! bounded, resumable steps and hands its blobs to the blob cleanup.
 mod activation;
 mod canonical;
 mod delivery;
@@ -66,6 +73,7 @@ mod manage;
 pub mod media;
 mod model;
 mod module;
+mod organizations;
 mod parse;
 mod populate;
 mod publish;
@@ -104,6 +112,11 @@ pub use module::{
     ContentHandle, ContentModule, ContentState, DEFAULT_MODEL_PATH, LoadError, NAME, PUBLISHES,
     load_model, lock_model_version, resolve_model_path,
 };
+pub use organizations::{
+    DeletedBy, MAX_ORGANIZATION_ID, ORGANIZATION_DELETED, ORGANIZATION_DELETED_TOPIC,
+    ORGANIZATION_NOT_FOUND, ORGANIZATION_PURGE, ORGANIZATION_PURGE_BATCH, PurgeReport, PurgeStep,
+    deletion_ready, mark_deleted, organization_scope, purge_organization, purge_step,
+};
 pub use parse::{
     CONTENT_PERMISSIONS, MAX_DESCRIPTION, MAX_MODEL_BYTES, MAX_PATTERN_BYTES, ModelOptions,
     PATTERN_SIZE_LIMIT, PermissionCatalog,
@@ -113,7 +126,7 @@ pub use publish::{Expect, Item, PUBLISHED, UNPUBLISHED};
 pub use query::{MAX_CURSOR_BYTES, MAX_FILTER_VALUES, MAX_QUERY_BYTES};
 pub use rebuild::{PendingRebuild, REBUILD_BATCH, REBUILD_JOB, pending_rebuild};
 pub use rich_text::{MAX_HREF_BYTES, MAX_MARK_DEFS, MAX_SPAN_MARKS, MAX_SPANS};
-pub use schema::{MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATIONS};
+pub use schema::{MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATIONS};
 pub use settings::{
     ContentSettings, DEFAULT_CACHE_CONTROL_PRIVATE, DEFAULT_CACHE_CONTROL_PUBLIC,
     DEFAULT_PURGE_CRON, DEFAULT_TRASH_RETENTION, Delivery, Limits, MAX_CACHE_CONTROL, Trash,
@@ -172,6 +185,7 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("default_variant_required", 409),
     ErrorCode::new("populate_limit", 400),
     ErrorCode::new("response_too_large", 400),
+    ErrorCode::new(ORGANIZATION_NOT_FOUND, 404),
 ];
 
 /// Every detail code field validation reports (section 2).

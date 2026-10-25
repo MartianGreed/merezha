@@ -438,6 +438,10 @@ impl Store {
     pub(crate) fn database(&self) -> &Database {
         self.ctx.database()
     }
+    /// The content outbox, for job records outside [`Work`].
+    pub(crate) fn outbox(&self) -> &SourceOutbox {
+        &self.outbox
+    }
     pub(crate) fn work(&self) -> Work {
         Work {
             model: self.state.model().clone(),
@@ -953,6 +957,8 @@ impl Work {
         let db = self.ctx.database();
         // Section 2: nothing validated against a superseded model commits.
         self.state.check_writable(db, tx).await?;
+        // Issue #56: nothing of a deleted organization commits.
+        crate::organizations::guard_write(db, tx, &target.scope).await?;
         let model = self.model.clone();
         let Some(content_type) = model.content_type(&target.content_type) else {
             return Err(Failure::permanent("content_type_not_found").into());

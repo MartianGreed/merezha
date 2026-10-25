@@ -51,6 +51,9 @@ pub const PUBLISHES: [&str; 10] = [
     "content.model_activated",
 ];
 
+/// Events the block consumes beside identity (issue #56).
+const CONSUMES: [&str; 1] = [crate::organizations::ORGANIZATION_DELETED_TOPIC];
+
 /// The loaded model and what this host knows about it, shared by the
 /// module, its routes (C3 onward) and its job handlers.
 pub struct ContentState {
@@ -364,7 +367,9 @@ impl ContentModule {
     /// [`ContentState::guard_jobs`], and their schedules (C4):
     /// `content.trash_purge` on the `content` queue, declared as the cron
     /// schedule of the same name with `trash.purge_cron` in UTC, and
-    /// `content.published_rebuild`, which activation enqueues.
+    /// `content.published_rebuild`, which activation enqueues. Beside
+    /// identity (issue #56), `content.organization_deleted`, subscribed to
+    /// `identity.organization_deleted`, and `content.organization_purge`.
     fn register_jobs(&self, ctx: &AppContext, state: &Arc<ContentState>) -> Result<(), Failure> {
         let jobs = ctx.jobs(NAME)?;
         let store = Store::new(state.clone(), ctx.clone(), ctx.outbox(NAME)?);
@@ -390,6 +395,29 @@ impl ContentModule {
             kind: Identity::new(crate::trash::TRASH_PURGE)?,
             payload: serde_json::json!({}),
         })?;
+        // Issue #56: deleted organizations, beside identity only.
+        if self.organizations {
+            jobs.register(
+                crate::organizations::ORGANIZATION_DELETED,
+                crate::trash::QUEUE,
+                state.guard_jobs(Arc::new(crate::organizations::OrganizationDeleted {
+                    store: Store::new(state.clone(), ctx.clone(), ctx.outbox(NAME)?),
+                })),
+                KindOptions::default(),
+            )?;
+            jobs.subscribe(
+                crate::organizations::ORGANIZATION_DELETED_TOPIC,
+                crate::organizations::ORGANIZATION_DELETED,
+            )?;
+            jobs.register(
+                crate::organizations::ORGANIZATION_PURGE,
+                crate::trash::QUEUE,
+                state.guard_jobs(Arc::new(crate::organizations::OrganizationPurge {
+                    store: Store::new(state.clone(), ctx.clone(), ctx.outbox(NAME)?),
+                })),
+                KindOptions::default(),
+            )?;
+        }
         // C7: the blob cleanup, which also purges the asset trash.
         if let Some(assets) = state.media.as_ref().and_then(|m| m.assets().cloned()) {
             let cron = assets.settings().cleanup_cron.clone();
@@ -629,7 +657,7 @@ impl Module for ContentModule {
     fn events(&self) -> ModuleEvents {
         ModuleEvents {
             publishes: &PUBLISHES,
-            consumes: &[],
+            consumes: if self.organizations { &CONSUMES } else { &[] },
         }
     }
     fn start_timeout(&self) -> Option<Duration> {

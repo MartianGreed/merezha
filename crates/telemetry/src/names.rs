@@ -1574,6 +1574,25 @@ pub const EVENTS: &[Event] = &[
             },
         ],
     ),
+    // `merezha content purge-organization` when it cannot run (issue #56).
+    ev("content.purge_failed", ERROR, &[CODE, local("usage")]),
+    // Deleted organizations (issue #56): the subscription marked the
+    // scope deleted; the purge job finished it.
+    ev(
+        "content.organization_deleted",
+        INFO,
+        &[f("tenant", key::TENANT_ID), local("source")],
+    ),
+    ev(
+        "content.organization_purged",
+        INFO,
+        &[
+            f("tenant", key::TENANT_ID),
+            local("entries"),
+            local("assets"),
+            local("blobs"),
+        ],
+    ),
     ev(
         "content.schedule_failed",
         WARN,

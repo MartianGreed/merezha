@@ -158,11 +158,7 @@ impl Media {
 /// from the scope and the hash the host computed, never from client
 /// input.
 pub fn blob_key(scope: &str, sha256: &str) -> Result<BlobKey, Failure> {
-    let tag = match scope.strip_prefix("org:") {
-        None if scope == "app" => "app".to_owned(),
-        Some(org) => format!("org-{}", &hex(&Sha256::digest(org.as_bytes()))[..32]),
-        None => return Err(Failure::permanent("invalid_input")),
-    };
+    let tag = scope_tag(scope)?;
     if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Failure::permanent("invalid_input"));
     }
@@ -172,6 +168,20 @@ pub fn blob_key(scope: &str, sha256: &str) -> Result<BlobKey, Failure> {
         &sha256[2..4]
     ))
     .map_err(Failure::from)
+}
+
+/// The key tag of a scope: `app`, or `org-` plus 32 hex characters of
+/// the organization id's SHA-256 (also the deleted organizations' job
+/// keys, so ids stay out of them too).
+pub fn scope_tag(scope: &str) -> Result<String, Failure> {
+    match scope.strip_prefix("org:") {
+        None if scope == "app" => Ok("app".to_owned()),
+        Some(org) => Ok(format!(
+            "org-{}",
+            &hex(&Sha256::digest(org.as_bytes()))[..32]
+        )),
+        None => Err(Failure::permanent("invalid_input")),
+    }
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -487,6 +497,7 @@ impl Assets {
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
                 work.state.check_writable(&db, tx).await?;
+                crate::organizations::guard_write(&db, tx, &scope).await?;
                 lock_live(&db, tx, &scope, &id).await?;
                 let (set_title, set_focal) = (title.is_some(), focal_point.is_some());
                 let (title, focal_point) = (title.flatten(), focal_point.flatten());
@@ -535,6 +546,7 @@ impl Assets {
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
                 work.state.check_writable(&db, tx).await?;
+                crate::organizations::guard_write(&db, tx, &scope).await?;
                 let row = db
                     .query_opt(&*tx, &sql::ASSET_LOCK, &[&id, &scope])
                     .await
@@ -591,6 +603,7 @@ impl Assets {
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
                 work.state.check_writable(&db, tx).await?;
+                crate::organizations::guard_write(&db, tx, &scope).await?;
                 db.query_opt(&*tx, &sql::ASSET_LOCK, &[&id, &scope])
                     .await
                     .map_err(|e| sql_error(&e))?

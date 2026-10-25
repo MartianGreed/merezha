@@ -507,6 +507,9 @@ impl Delivery {
         let deadline = self.store.deadline();
         transaction(self.store.database(), deadline, move |tx| {
             Box::pin(async move {
+                // Issue #56: a deleted organization's path serves nothing,
+                // its 304s included.
+                crate::organizations::refuse_in(&db, tx, &scope).await?;
                 let mut etag = None;
                 if let Some(tag) = tag {
                     let rows = db
@@ -924,9 +927,14 @@ fn entry_json(
 /// restricted to the types the caller reads there.
 async fn model(State(d): State<Delivery>, Path(params): PathParams, request: Request) -> Response {
     let (parts, _) = request.into_parts();
-    let run = || -> Result<Response, Rejection> {
+    let run = async || -> Result<Response, Rejection> {
         crate::http::selection_empty(parts.uri.query())?;
         let org = organization(&params)?;
+        if let Some(org) = &org {
+            d.store
+                .refuse_deleted(&format!("org:{}", org.as_str()))
+                .await?;
+        }
         let principal = principal(&parts);
         let model = d.store.model();
         // Organization types count on their organization's path only;
@@ -953,7 +961,7 @@ async fn model(State(d): State<Delivery>, Path(params): PathParams, request: Req
             None,
         ))
     };
-    run().unwrap_or_else(delivery_error)
+    run().await.unwrap_or_else(delivery_error)
 }
 
 /// `{version, fingerprint, locales, components, types}` with the

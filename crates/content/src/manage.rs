@@ -187,7 +187,7 @@ pub(crate) async fn delete_entry(
     let run = async {
         let (parts, body) = request.into_parts();
         let type_name = params.get("type").map(String::as_str).unwrap_or("");
-        let (target, content_type) = manage.authorize(&parts, ENTRIES_DELETE, type_name)?;
+        let (target, content_type) = manage.authorized(&parts, ENTRIES_DELETE, type_name).await?;
         let query = selection(
             &content_type,
             parts.uri.query(),
@@ -220,7 +220,7 @@ pub(crate) async fn undelete(
     let run = async {
         let (parts, body) = request.into_parts();
         let type_name = params.get("type").map(String::as_str).unwrap_or("");
-        let (target, _) = manage.authorize(&parts, ENTRIES_DELETE, type_name)?;
+        let (target, _) = manage.authorized(&parts, ENTRIES_DELETE, type_name).await?;
         selection_empty(parts.uri.query())?;
         empty_body(&read_body(&manage.store, body).await?)?;
         let id = entry_id(params.get("id").map(String::as_str).unwrap_or(""))?;
@@ -267,6 +267,12 @@ pub(crate) async fn trash(State(manage): State<Manage>, request: Request) -> Res
             }
             None => readable_types(&manage, &parts)?,
         };
+        // Issue #56: a deleted organization's trash is gone with it.
+        let scopes: std::collections::BTreeSet<&str> =
+            allowed.iter().map(|(scope, _)| scope.as_str()).collect();
+        for scope in scopes {
+            manage.store.refuse_deleted(scope).await?;
+        }
         let (limit, cursor) = paging(&manage.store, &query)?;
         let mut scope_key: Vec<String> = allowed.iter().map(|(s, t)| format!("{s}/{t}")).collect();
         scope_key.sort();
