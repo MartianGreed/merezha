@@ -5,7 +5,7 @@
 use crate::telemetry::{self, Metrics, tally};
 use merezha_domain::{Classification, Failure};
 use merezha_platform::config::JobsConfig;
-use merezha_postgres::{Database, classify};
+use merezha_postgres::{Database, Statement, classify};
 use merezha_telemetry::event;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
@@ -18,13 +18,20 @@ const PASS_DEADLINE: Duration = Duration::from_secs(30);
 /// The batch: unrelayed records locked by this transaction. `$2`
 /// restricts it to one record when a permanent failure is isolated. An
 /// empty batch ends the pass without a span (TE §1.2).
-const LOCK: &str = "SELECT id FROM merezha_jobs.outbox
+pub(crate) const LOCK: Statement = Statement::new(
+    "jobs.relay.lock",
+    "SELECT merezha_jobs.outbox",
+    "SELECT id FROM merezha_jobs.outbox
  WHERE relayed_at IS NULL AND quarantined_at IS NULL AND ($2::bigint IS NULL OR id = $2::bigint)
- ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED";
+ ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED",
+);
 
 /// The B.4 statement over the locked batch `$5`. Each record's stored
 /// trace context goes to every job it fans out to (TE §2.3).
-const RELAY: &str = r#"
+pub(crate) const RELAY: Statement = Statement::new(
+    "jobs.relay.batch",
+    "INSERT merezha_jobs.jobs",
+    r#"
 WITH queues (queue, max_attempts) AS (
     SELECT * FROM unnest($2::text[], $3::int[])
 ), batch AS (
@@ -84,18 +91,34 @@ SELECT (SELECT count(*) FROM marked WHERE routable) AS relayed,
            AND NOT EXISTS (SELECT 1 FROM fanned f WHERE f.id = b.id)) AS unrouted_sources,
        (SELECT array_agg(queue ORDER BY queue, kind) FROM inserted) AS job_queues,
        (SELECT array_agg(kind ORDER BY queue, kind) FROM inserted) AS job_kinds
-"#;
+"#,
+);
 
-const PENDING_IDS: &str = "SELECT id FROM merezha_jobs.outbox
- WHERE relayed_at IS NULL AND quarantined_at IS NULL ORDER BY id LIMIT $1";
+pub(crate) const PENDING_IDS: Statement = Statement::new(
+    "jobs.relay.pending",
+    "SELECT merezha_jobs.outbox",
+    "SELECT id FROM merezha_jobs.outbox
+ WHERE relayed_at IS NULL AND quarantined_at IS NULL ORDER BY id LIMIT $1",
+);
 
 /// Sets one record aside with the code of the data error it caused alone.
 /// Its payload stays, flagged or not, so a requeue can relay it once the
 /// cause is fixed; R3 nulls it at the resulting job's terminal state.
-const QUARANTINE: &str = "UPDATE merezha_jobs.outbox
+pub(crate) const QUARANTINE: Statement = Statement::new(
+    "jobs.relay.quarantine",
+    "UPDATE merezha_jobs.outbox",
+    "UPDATE merezha_jobs.outbox
    SET quarantined_at = now(), quarantine_code = $2
  WHERE id = $1 AND relayed_at IS NULL AND quarantined_at IS NULL
- RETURNING source";
+ RETURNING source",
+);
+
+/// Wakes the dispatchers of every queue a batch enqueued to, on commit.
+pub(crate) const NOTIFY_QUEUES: Statement = Statement::new(
+    "jobs.relay.notify",
+    "SELECT pg_notify()",
+    "SELECT pg_notify('merezha_jobs', q) FROM unnest($1::text[]) AS q",
+);
 
 /// What the relay resolves from `[jobs]` once at start.
 #[derive(Clone, Debug)]
@@ -214,11 +237,12 @@ async fn pass(
     metrics: &Metrics,
 ) -> Result<RelayReport, Failure> {
     let settings = settings.clone();
+    let db = database.clone();
     let (report, tally) = database
         .transaction(Instant::now() + PASS_DEADLINE, move |tx| {
             Box::pin(async move {
-                let ids: Vec<i64> = tx
-                    .query(LOCK, &[&settings.batch, &only])
+                let ids: Vec<i64> = db
+                    .query(tx, &LOCK, &[&settings.batch, &only])
                     .await
                     .map_err(|e| relay_failure(&e))?
                     .iter()
@@ -228,7 +252,7 @@ async fn pass(
                     return Ok((RelayReport::default(), Tally::default()));
                 }
                 let span = telemetry::relay_span();
-                let relayed = relay_locked(tx, &settings, &ids)
+                let relayed = relay_locked(&db, tx, &settings, &ids)
                     .instrument(span.clone())
                     .await;
                 if matches!(&relayed, Err(f) if f.classification != Classification::Permanent) {
@@ -244,13 +268,15 @@ async fn pass(
 
 /// The relay statement over the locked batch `ids`.
 async fn relay_locked(
+    db: &Database,
     tx: &mut merezha_postgres::Tx<'_>,
     settings: &RelaySettings,
     ids: &[i64],
 ) -> Result<(RelayReport, Tally), Failure> {
-    let row = tx
+    let row = db
         .query_one(
-            RELAY,
+            tx,
+            &RELAY,
             &[
                 &settings.batch,
                 &settings.queues,
@@ -263,12 +289,9 @@ async fn relay_locked(
         .map_err(|e| relay_failure(&e))?;
     let queues: Option<Vec<String>> = row.get(3);
     if let Some(queues) = queues.filter(|q| !q.is_empty()) {
-        tx.execute(
-            "SELECT pg_notify('merezha_jobs', q) FROM unnest($1::text[]) AS q",
-            &[&queues],
-        )
-        .await
-        .map_err(|e| relay_failure(&e))?;
+        db.execute(tx, &NOTIFY_QUEUES, &[&queues])
+            .await
+            .map_err(|e| relay_failure(&e))?;
     }
     let quarantined_ids: Option<Vec<i64>> = row.get(4);
     let sources: Option<Vec<String>> = row.get(5);
@@ -315,8 +338,8 @@ async fn batch(
     }
     let ids: Vec<i64> = {
         let client = database.acquire(Instant::now() + PASS_DEADLINE).await?;
-        client
-            .query(PENDING_IDS, &[&settings.batch])
+        database
+            .query(&client, &PENDING_IDS, &[&settings.batch])
             .await
             .map_err(|e| relay_failure(&e))?
             .iter()
@@ -330,12 +353,13 @@ async fn batch(
             Ok(one) => report.add(one),
             Err(failure) if failure.classification == Classification::Permanent => {
                 let code = failure.code;
+                let db = database.clone();
                 let set_aside = database
                     .transaction(Instant::now() + PASS_DEADLINE, |tx| {
                         let code = code.clone();
                         Box::pin(async move {
-                            let row = tx
-                                .query_opt(QUARANTINE, &[&id, &code])
+                            let row = db
+                                .query_opt(tx, &QUARANTINE, &[&id, &code])
                                 .await
                                 .map_err(|e| relay_failure(&e))?;
                             Ok(row.map(|row| row.get::<_, String>(0)))

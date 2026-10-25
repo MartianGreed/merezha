@@ -1178,28 +1178,34 @@ db.execute(tx, &INSERT_NOTE, &[&id, &body]).await.map_err(|e| classify(&e))?;
 
 `query`, `query_one`, `query_opt`, `execute` and `batch` run `statement.sql`;
 `batch_text` runs text built at run time (DDL naming a derived index, a
-computed `SET`) under a registered name, and `query_text` a query whose
+computed `SET`) under a registered name, and `query_text`,
+`query_one_text`, `query_opt_text` and `execute_text` a statement whose
 text varies per call (a list's filters, sort keys and cursor condition)
-with its values as parameters, returning rows; `statement.sql` documents
-the shape and the text is never recorded. The kernel's own statements are
+with its values as parameters, with the driver's contract of the method
+they are named after; `statement.sql` documents the shape and the text is
+never recorded. The kernel's own statements are
 `merezha_postgres::KERNEL_STATEMENTS` (`kernel.*`); a block lists its own
 and checks them against the kernel's with `check_registry` in a test: the
 application store's are `merezha_application::postgres::STATEMENTS`
 (`app.*`; the append is `app.events.append`, summary
 `INSERT merezha_app.events`, run prepared through `query_one_prepared`), the
-capture driver's `merezha_notifications::drivers::STATEMENTS`, content
-delivery's `merezha_content::STATEMENTS` (`content.delivery.*`,
-`content.preview.*`, `content.populate.*`; content's C2 to C4 statements
-are issue #41). SQL
-sent through the driver directly is not observed at all, so each crate
-scans its own sources in a test: `statement::scan_sources(dir, skip)`
-walks every `.rs` file and reports each call of a driver method
-(`query`, `query_typed`, `execute`, `batch_execute`, `simple_query`,
-`prepare`, `prepare_cached`, `copy_in` and the rest of
-`statement::DRIVER_METHODS`) whose second argument is not a registered
-`&STATEMENT`, comments and string contents ignored. The kernel, the
-application store and the notifications block run it; jobs, content and
-`merezha content diff` adopt the registry next (issue #41). The append
+capture driver's `merezha_notifications::drivers::STATEMENTS`, identity's
+`merezha_identity::sql::STATEMENTS`, the jobs runtime's
+`merezha_jobs::STATEMENTS` (`jobs.*`), content's `merezha_content::STATEMENTS`
+(`content.*`, `merezha content diff`'s included) and its assets'
+`merezha_content::media::STATEMENTS`. `crates/cli/tests/statement_registry.rs`
+checks every list together, as the binary runs them. SQL sent through the
+driver directly is not observed at all, so one test scans the whole
+workspace (`crates/postgres/tests/statement_scan.rs`): it walks every
+crate's `src/` and reports each call of a driver method (`query`,
+`query_one`, `query_opt`, `execute`, `batch_execute`, `query_typed`,
+`simple_query`, `prepare`, `prepare_typed`, `prepare_cached`, `copy_in`,
+`copy_out` and the rest of `statement::DRIVER_METHODS`, each with the
+driver's argument count, so `Application::query(query)` is not one) whose
+second argument is not a registered `&STATEMENT`, comments and string
+contents ignored. Its allowlist names each file still allowed such calls,
+with the exact count and the reason, and only shrinks: a new call fails,
+and so does an entry whose file has fewer calls than listed. The append
 prepares through `Database::prepare_cached(&client, &STATEMENT)`.
 
 - **`db.client.operation.duration`** (seconds) times every registered
@@ -1512,7 +1518,10 @@ state, and the R10 trace columns.
   365 days (`invalid_run_at`), and an event record whose payload is not the
   envelope `OutboxRecord::event` builds for that source
   (`invalid_event_envelope`). Keys over 160 bytes never reach it
-  (`invalid_dedupe_key`).
+  (`invalid_dedupe_key`). The runtime's `Outbox` port (the one
+  `JobsRuntime::ports` hands to contexts) runs the insert as the registered
+  `jobs.outbox.append`, with its DB span and duration series; a bare
+  `PgOutbox` value, which holds no `Database`, runs the same SQL unobserved.
 - **Enqueue.** `JobsHandle::enqueue` writes one job in its own transaction
   under the key `{source}:{key}`, the key a `Job` record of the same source
   and dedupe key relays to. The same key with the same kind and payload
@@ -2401,11 +2410,8 @@ itself.
 - Reactor lag, lock and batch instruments arrive with the reactors (AP-C3);
   the `application` section of `/v1/admin/status` (TE-T2's route) embeds
   `Application::status()` once both are on main.
-- The jobs runtime's SQL is not registered as `Statement`s yet, so its
-  statements open no DB spans (issue #41 routes them through TE-T4's
-  registry). Cron jobs keep the occurrence key as
-  their correlation id instead of a host-minted trace id (TE §2.3, with
-  TE-T3's host-minted ids).
+- Cron jobs keep the occurrence key as their correlation id instead of a
+  host-minted trace id (TE §2.3, with TE-T3's host-minted ids).
 - PostgreSQL application storage (AP-A2) has no background projection
   runners, warm-up readiness or application admin API yet (AP-A3); catch-up
   and rebuild run in the request.

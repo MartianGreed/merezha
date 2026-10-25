@@ -8,7 +8,7 @@ use merezha_platform::{
     BoxFuture, Tx,
     ports::{Appended, OnDuplicate, Outbox, OutboxRecord, OutboxTarget, validate_append},
 };
-use merezha_postgres::classify;
+use merezha_postgres::{Database, Statement, classify, tokio_postgres::types::ToSql};
 use merezha_telemetry::names::jobs::RecordKind;
 use std::{collections::HashMap, sync::Arc};
 
@@ -18,7 +18,10 @@ pub const OUTBOX_CHANNEL: &str = "merezha_jobs_outbox";
 /// One multi-row insert of every record, deduplicated on
 /// `(source, dedupe_key)`, then one notification when anything was new.
 /// Returns the ids and keys of the inserted rows.
-const APPEND: &str = "
+pub(crate) const APPEND: Statement = Statement::new(
+    "jobs.outbox.append",
+    "INSERT merezha_jobs.outbox",
+    "
 WITH rows AS (
     SELECT * FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::int2[],
                          $8::text[], $9::text[], $10::bool[], $11::text[], $12::text[], $13::text[])
@@ -38,13 +41,18 @@ WITH rows AS (
 )
 SELECT (SELECT coalesce(array_agg(id ORDER BY id), '{}') FROM inserted),
        (SELECT coalesce(array_agg(dedupe_key ORDER BY id), '{}') FROM inserted),
-       (SELECT count(*) FROM notified)";
+       (SELECT count(*) FROM notified)",
+);
 
 /// The trace context of each inserted record's `send` span (TE §2.3).
-const TRACE: &str = "
+pub(crate) const TRACE: Statement = Statement::new(
+    "jobs.outbox.trace",
+    "UPDATE merezha_jobs.outbox",
+    "
 UPDATE merezha_jobs.outbox o SET trace_parent = t.parent, trace_state = t.state
   FROM unnest($1::bigint[], $2::text[], $3::text[]) AS t (id, parent, state)
- WHERE o.id = t.id";
+ WHERE o.id = t.id",
+);
 
 /// Appends records inside the caller's transaction. It never commits and
 /// never opens a transaction. Besides the kernel's checks it refuses, before
@@ -60,8 +68,11 @@ UPDATE merezha_jobs.outbox o SET trace_parent = t.parent, trace_state = t.state
 /// second statement of the same transaction; duplicates get no span. The relay copies it
 /// into every job it fans the record out to.
 ///
-/// This form records no metrics; the jobs runtime installs a metered one
-/// behind the `Outbox` port, which also counts `merezha.outbox.appended`.
+/// This form records no metrics and, holding no [`Database`], runs its
+/// statements on the bare transaction: they open no DB span. The jobs
+/// runtime installs a metered one behind the `Outbox` port, which counts
+/// `merezha.outbox.appended` and runs the same statements through the
+/// registry.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PgOutbox;
 
@@ -77,10 +88,11 @@ impl Outbox for PgOutbox {
     }
 }
 
-/// [`PgOutbox`] counting `merezha.outbox.appended`: the jobs runtime's
-/// `Outbox` port.
-#[derive(Clone, Debug)]
+/// [`PgOutbox`] counting `merezha.outbox.appended`, its statements run
+/// through the registry: the jobs runtime's `Outbox` port.
+#[derive(Clone)]
 pub(crate) struct MeteredOutbox {
+    pub database: Database,
     pub metrics: Arc<Metrics>,
 }
 
@@ -97,7 +109,7 @@ impl Outbox for MeteredOutbox {
             source,
             records,
             on_duplicate,
-            Some(&self.metrics),
+            Some((&self.database, &self.metrics)),
         ))
     }
 }
@@ -107,7 +119,7 @@ async fn append(
     source: &str,
     records: &[OutboxRecord],
     on_duplicate: OnDuplicate,
-    metrics: Option<&Metrics>,
+    runtime: Option<(&Database, &Metrics)>,
 ) -> Result<Appended, Failure> {
     validate_append(records)?;
     validate::source(source)?;
@@ -120,27 +132,26 @@ async fn append(
     if records.is_empty() {
         return Ok(Appended::default());
     }
-    let row = tx
-        .query_one(
-            APPEND,
-            &[
-                &source,
-                &columns.dedupe_key,
-                &columns.record_kind,
-                &columns.topic,
-                &columns.queue,
-                &columns.job_kind,
-                &columns.priority,
-                &columns.run_at,
-                &columns.payload,
-                &columns.contains_secret,
-                &columns.correlation_id,
-                &columns.causation_id,
-                &columns.tenant,
-            ],
-        )
-        .await
-        .map_err(|e| classify(&e))?;
+    let params: [&(dyn ToSql + Sync); 13] = [
+        &source,
+        &columns.dedupe_key,
+        &columns.record_kind,
+        &columns.topic,
+        &columns.queue,
+        &columns.job_kind,
+        &columns.priority,
+        &columns.run_at,
+        &columns.payload,
+        &columns.contains_secret,
+        &columns.correlation_id,
+        &columns.causation_id,
+        &columns.tenant,
+    ];
+    let row = match runtime {
+        Some((db, _)) => db.query_one(tx, &APPEND, &params).await,
+        None => tx.query_one(APPEND.sql, &params).await,
+    }
+    .map_err(|e| classify(&e))?;
     let ids: Vec<i64> = row.get(0);
     let keys: Vec<String> = row.get(1);
     let inserted = ids.len();
@@ -180,12 +191,15 @@ async fn append(
     }
     // Without a recording layer there is no context and no second statement.
     if !traced.is_empty() {
-        tx.execute(TRACE, &[&traced, &parents, &states])
-            .await
-            .map_err(|e| classify(&e))?;
+        let params: [&(dyn ToSql + Sync); 3] = [&traced, &parents, &states];
+        match runtime {
+            Some((db, _)) => db.execute(tx, &TRACE, &params).await,
+            None => tx.execute(TRACE.sql, &params).await,
+        }
+        .map_err(|e| classify(&e))?;
     }
     drop(spans);
-    if let Some(metrics) = metrics {
+    if let Some((_, metrics)) = runtime {
         // Counted at append: a caller rolling back later still counts (the
         // relay counters count what was committed).
         metrics.appended(source, RecordKind::Event, events);

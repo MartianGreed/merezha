@@ -4,7 +4,7 @@
 //! `admin_actions` row (F, "Dead letters").
 use merezha_domain::Failure;
 use merezha_platform::config::JobRetention;
-use merezha_postgres::{Database, classify};
+use merezha_postgres::{Database, Statement, classify};
 use std::time::{Duration, Instant};
 
 /// How often a pass runs.
@@ -31,79 +31,108 @@ pub struct RetentionReport {
 }
 
 /// One purge: `$1` is the age in seconds, `$2` the batch size.
-const PURGES: [(&str, &str); 5] = [
+pub(crate) const PURGES: [(&str, Statement); 5] = [
     (
         "finished",
-        "DELETE FROM merezha_jobs.jobs WHERE id IN (
+        Statement::new(
+            "jobs.retention.finished",
+            "DELETE merezha_jobs.jobs",
+            "DELETE FROM merezha_jobs.jobs WHERE id IN (
              SELECT id FROM merezha_jobs.jobs
               WHERE state IN ('succeeded', 'cancelled') AND reissue_claimed_at IS NULL
                 AND finished_at < now() - make_interval(secs => $1::float8)
               ORDER BY finished_at LIMIT $2 FOR UPDATE SKIP LOCKED)",
+        ),
     ),
     (
         "dead",
-        "DELETE FROM merezha_jobs.jobs WHERE id IN (
+        Statement::new(
+            "jobs.retention.dead",
+            "DELETE merezha_jobs.jobs",
+            "DELETE FROM merezha_jobs.jobs WHERE id IN (
              SELECT id FROM merezha_jobs.jobs
               WHERE state = 'dead' AND finished_at < now() - make_interval(secs => $1::float8)
               ORDER BY finished_at LIMIT $2 FOR UPDATE SKIP LOCKED)",
+        ),
     ),
     (
         "relayed",
-        "DELETE FROM merezha_jobs.outbox WHERE id IN (
+        Statement::new(
+            "jobs.retention.relayed",
+            "DELETE merezha_jobs.outbox",
+            "DELETE FROM merezha_jobs.outbox WHERE id IN (
              SELECT id FROM merezha_jobs.outbox
               WHERE relayed_at < now() - make_interval(secs => $1::float8)
               ORDER BY relayed_at LIMIT $2 FOR UPDATE SKIP LOCKED)",
+        ),
     ),
     (
         "quarantined",
-        "DELETE FROM merezha_jobs.outbox WHERE id IN (
+        Statement::new(
+            "jobs.retention.quarantined",
+            "DELETE merezha_jobs.outbox",
+            "DELETE FROM merezha_jobs.outbox WHERE id IN (
              SELECT id FROM merezha_jobs.outbox
               WHERE quarantined_at < now() - make_interval(secs => $1::float8)
               ORDER BY quarantined_at LIMIT $2 FOR UPDATE SKIP LOCKED)",
+        ),
     ),
     (
         "audit",
-        "DELETE FROM merezha_jobs.admin_actions WHERE id IN (
+        Statement::new(
+            "jobs.retention.audit",
+            "DELETE merezha_jobs.admin_actions",
+            "DELETE FROM merezha_jobs.admin_actions WHERE id IN (
              SELECT id FROM merezha_jobs.admin_actions
               WHERE at < now() - make_interval(secs => $1::float8)
               ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED)",
+        ),
     ),
 ];
+
+/// One instance purges at a time.
+pub(crate) const LOCK: Statement = Statement::new(
+    "jobs.retention.lock",
+    "SELECT pg_try_advisory_xact_lock()",
+    "SELECT pg_try_advisory_xact_lock($1, hashtext('retention'))",
+);
+
+/// The audit row of a dead-job purge.
+pub(crate) const AUDIT: Statement = Statement::new(
+    "jobs.retention.audit_row",
+    "INSERT merezha_jobs.admin_actions",
+    "INSERT INTO merezha_jobs.admin_actions (principal, action, target, count)
+                         VALUES (NULL, 'retention_purge', 'dead', $1)",
+);
 
 /// One batch under the try-lock: `None` when another instance holds it.
 async fn batch(
     database: &Database,
     name: &'static str,
-    sql: &'static str,
+    purge: &'static Statement,
     age: f64,
 ) -> Result<Option<u64>, Failure> {
+    let db = database.clone();
     database
         .transaction(Instant::now() + BATCH_DEADLINE, move |tx| {
             Box::pin(async move {
-                let locked: bool = tx
-                    .query_one(
-                        "SELECT pg_try_advisory_xact_lock($1, hashtext('retention'))",
-                        &[&crate::worker::MZJB],
-                    )
+                let locked: bool = db
+                    .query_one(tx, &LOCK, &[&crate::worker::MZJB])
                     .await
                     .map_err(|e| classify(&e))?
                     .get(0);
                 if !locked {
                     return Ok(None);
                 }
-                let deleted = tx
-                    .execute(sql, &[&age, &BATCH])
+                let deleted = db
+                    .execute(tx, purge, &[&age, &BATCH])
                     .await
                     .map_err(|e| classify(&e))?;
                 if name == "dead" && deleted > 0 {
                     let count = i32::try_from(deleted).unwrap_or(i32::MAX);
-                    tx.execute(
-                        "INSERT INTO merezha_jobs.admin_actions (principal, action, target, count)
-                         VALUES (NULL, 'retention_purge', 'dead', $1)",
-                        &[&count],
-                    )
-                    .await
-                    .map_err(|e| classify(&e))?;
+                    db.execute(tx, &AUDIT, &[&count])
+                        .await
+                        .map_err(|e| classify(&e))?;
                 }
                 Ok(Some(deleted))
             })
@@ -117,8 +146,8 @@ pub(crate) async fn purge(
     retention: &JobRetention,
 ) -> Result<RetentionReport, Failure> {
     let mut report = RetentionReport::default();
-    for (name, sql) in PURGES {
-        let age = match name {
+    for (name, purge) in &PURGES {
+        let age = match *name {
             "finished" => retention.succeeded,
             "dead" | "quarantined" => retention.dead,
             "relayed" => retention.outbox,
@@ -126,11 +155,11 @@ pub(crate) async fn purge(
         }
         .as_secs_f64();
         for _ in 0..MAX_BATCHES {
-            let Some(deleted) = batch(database, name, sql, age).await? else {
+            let Some(deleted) = batch(database, name, purge, age).await? else {
                 report.skipped = true;
                 return Ok(report);
             };
-            match name {
+            match *name {
                 "finished" => report.finished_jobs += deleted,
                 "dead" => report.dead_jobs += deleted,
                 "relayed" | "quarantined" => report.outbox += deleted,

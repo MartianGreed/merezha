@@ -3,13 +3,13 @@
 //! `merezha_jobs.admin_actions` and logs `job.admin_action`. Payloads are
 //! never listed, and a flagged (`contains_secret`) job's payload is never
 //! returned (R3).
-use crate::{PgJobs, telemetry};
+use crate::{PgJobs, statements, telemetry};
 use merezha_domain::{Failure, Identity};
 use merezha_platform::ports::{
     MAX_QUARANTINED_LISTED, MAX_QUEUES_LISTED, OutboxSummary, QuarantinedRecord, QueueStatus,
     QueueSummary, Reissue, ReissueRequest,
 };
-use merezha_postgres::{Tx, classify, tokio_postgres::Row};
+use merezha_postgres::{Database, Statement, Tx, classify, tokio_postgres::Row};
 use merezha_telemetry::event;
 use serde::Serialize;
 use serde_json::Value;
@@ -38,8 +38,11 @@ pub const JOB_STATES: [&str; 5] = ["available", "running", "succeeded", "dead", 
 fn timestamp(micros: i64) -> jiff::Timestamp {
     jiff::Timestamp::from_microsecond(micros).unwrap_or(jiff::Timestamp::UNIX_EPOCH)
 }
-fn micros(column: &str) -> String {
-    format!("(extract(epoch FROM {column}) * 1000000)::bigint")
+/// A `timestamptz` column as microseconds since the epoch.
+macro_rules! micros {
+    ($column:literal) => {
+        concat!("(extract(epoch FROM ", $column, ") * 1000000)::bigint")
+    };
 }
 fn count(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
@@ -65,14 +68,20 @@ pub struct JobSummary {
     pub finished_at: Option<jiff::Timestamp>,
     pub replays: i32,
 }
-fn summary_columns() -> String {
-    format!(
-        "id, queue, kind, state, attempts, max_attempts, {}, last_error_code, last_error_class,
-         contains_secret, {}, {}, replays",
-        micros("run_at"),
-        micros("created_at"),
-        micros("finished_at")
-    )
+/// The columns of one [`JobSummary`], in the order [`summary`] reads them.
+macro_rules! summary_columns {
+    () => {
+        concat!(
+            "id, queue, kind, state, attempts, max_attempts, ",
+            micros!("run_at"),
+            ", last_error_code, last_error_class,
+         contains_secret, ",
+            micros!("created_at"),
+            ", ",
+            micros!("finished_at"),
+            ", replays"
+        )
+    };
 }
 fn summary(row: &Row) -> JobSummary {
     JobSummary {
@@ -178,7 +187,10 @@ pub struct BulkReplay {
 }
 
 /// Per queue counts, each half on its partial index.
-pub(crate) const QUEUE_COUNTS: &str = "
+pub(crate) const QUEUE_COUNTS: Statement = Statement::new(
+    "jobs.status.queue_counts",
+    "SELECT merezha_jobs.jobs",
+    "
 SELECT queue, sum(ready)::bigint, sum(delayed)::bigint, sum(leased)::bigint, sum(dead)::bigint,
        coalesce(extract(epoch FROM now() - min(oldest)), 0)::float8
   FROM (SELECT queue, count(*) FILTER (WHERE run_at <= now()) AS ready,
@@ -192,11 +204,15 @@ SELECT queue, sum(ready)::bigint, sum(delayed)::bigint, sum(leased)::bigint, sum
         UNION ALL
         SELECT queue, 0, 0, 0, count(*), NULL
           FROM merezha_jobs.jobs WHERE state = 'dead' GROUP BY queue) AS s
- GROUP BY queue ORDER BY queue LIMIT $1";
+ GROUP BY queue ORDER BY queue LIMIT $1",
+);
 /// Unrelayed records: pending through `outbox_pending` plus quarantined
 /// through `outbox_quarantined`. The oldest pending record is the lowest
 /// id (identity order follows insertion).
-pub(crate) const OUTBOX_BACKLOG: &str = "
+pub(crate) const OUTBOX_BACKLOG: Statement = Statement::new(
+    "jobs.status.outbox_backlog",
+    "SELECT merezha_jobs.outbox",
+    "
 SELECT (SELECT count(*) FROM merezha_jobs.outbox
          WHERE relayed_at IS NULL AND quarantined_at IS NULL)
      + (SELECT count(*) FROM merezha_jobs.outbox WHERE quarantined_at IS NOT NULL),
@@ -204,7 +220,8 @@ SELECT (SELECT count(*) FROM merezha_jobs.outbox
            (SELECT created_at FROM merezha_jobs.outbox
              WHERE relayed_at IS NULL AND quarantined_at IS NULL ORDER BY id LIMIT 1),
            (SELECT min(created_at) FROM merezha_jobs.outbox WHERE quarantined_at IS NOT NULL))),
-           0)::float8";
+           0)::float8",
+);
 
 /// Counts of a bulk replay while it runs (`POST dead/replay`).
 #[derive(Debug, Default)]
@@ -266,10 +283,16 @@ impl Default for ReissueTiming {
     }
 }
 
-const CANDIDATE: &str = "id, queue, kind, contains_secret, idempotency_key, correlation_id,
-    causation_id, tenant";
+/// The columns [`PgJobs::claimable`] reads.
+macro_rules! candidate {
+    () => {
+        "id, queue, kind, contains_secret, idempotency_key, correlation_id,
+    causation_id, tenant"
+    };
+}
 
 pub(crate) async fn audit(
+    db: &Database,
     tx: &mut Tx<'_>,
     principal: Option<&str>,
     action: &str,
@@ -277,13 +300,9 @@ pub(crate) async fn audit(
     count: u64,
 ) -> Result<(), Failure> {
     let count = i32::try_from(count).unwrap_or(i32::MAX);
-    tx.execute(
-        "INSERT INTO merezha_jobs.admin_actions (principal, action, target, count)
-         VALUES ($1, $2, $3, $4)",
-        &[&principal, &action, &target, &count],
-    )
-    .await
-    .map_err(|e| classify(&e))?;
+    db.execute(tx, &AUDIT, &[&principal, &action, &target, &count])
+        .await
+        .map_err(|e| classify(&e))?;
     Ok(())
 }
 /// What an admin write acted on, for `job.admin_action`.
@@ -302,10 +321,199 @@ fn logged(action: &str, count: u64, target: Target<'_>) {
 /// The `UPDATE … SET` of a replay back to `available`: the trace the job
 /// died in becomes the replay link of its next attempts, and the
 /// `admin job.replay` span's context (`$2`, `$3`) their parent (TE §2.3).
-const REPLAYED: &str = "state = 'available', attempts = 0, run_at = now(), finished_at = NULL,
+macro_rules! replayed {
+    () => {
+        "state = 'available', attempts = 0, run_at = now(), finished_at = NULL,
     replays = replays + 1, updated_at = now(),
     replay_trace_parent = trace_parent, replay_trace_state = trace_state,
-    trace_parent = $2, trace_state = $3";
+    trace_parent = $2, trace_state = $3"
+    };
+}
+
+/// The audit row of every admin write.
+pub(crate) const AUDIT: Statement = Statement::new(
+    "jobs.admin_actions.insert",
+    "INSERT merezha_jobs.admin_actions",
+    "INSERT INTO merezha_jobs.admin_actions (principal, action, target, count)
+         VALUES ($1, $2, $3, $4)",
+);
+
+/// A flagged dead job, locked for its reissue claim.
+pub(crate) const CLAIM_CANDIDATE: Statement = Statement::new(
+    "jobs.reissue.candidate",
+    "SELECT merezha_jobs.jobs",
+    concat!(
+        "SELECT ",
+        candidate!(),
+        ", trace_parent, trace_state FROM merezha_jobs.jobs
+                                  WHERE id = $1 AND state = 'dead' AND contains_secret FOR UPDATE"
+    ),
+);
+
+/// The reissue claim: `cancelled`, `replays + 1`, `reissue_claimed_at = now()`.
+pub(crate) const CLAIM: Statement = Statement::new(
+    "jobs.reissue.claim",
+    "UPDATE merezha_jobs.jobs",
+    "UPDATE merezha_jobs.jobs
+                                SET state = 'cancelled', replays = replays + 1,
+                                    reissue_claimed_at = now(), updated_at = now()
+                              WHERE id = $1
+                             RETURNING (extract(epoch FROM reissue_claimed_at) * 1000000)::bigint",
+);
+
+/// A reissue whose hook succeeded: the claim cleared, fenced on it.
+pub(crate) const REISSUE_SETTLED: Statement = Statement::new(
+    "jobs.reissue.settled",
+    "UPDATE merezha_jobs.jobs",
+    "UPDATE merezha_jobs.jobs SET reissue_claimed_at = NULL, updated_at = now()
+                  WHERE id = $1 AND state = 'cancelled'
+                    AND (extract(epoch FROM reissue_claimed_at) * 1000000)::bigint = $2",
+);
+
+/// A reissue whose hook failed: back to `dead`, fenced on the claim.
+pub(crate) const REISSUE_REVERTED: Statement = Statement::new(
+    "jobs.reissue.reverted",
+    "UPDATE merezha_jobs.jobs",
+    "UPDATE merezha_jobs.jobs
+                    SET state = 'dead', replays = greatest(replays - 1, 0),
+                        reissue_claimed_at = NULL, updated_at = now()
+                  WHERE id = $1 AND state = 'cancelled'
+                    AND (extract(epoch FROM reissue_claimed_at) * 1000000)::bigint = $2",
+);
+
+/// `GET jobs`: a page by id, never a payload.
+pub(crate) const LIST_JOBS: Statement = Statement::new(
+    "jobs.admin.list",
+    "SELECT merezha_jobs.jobs",
+    concat!(
+        "SELECT ",
+        summary_columns!(),
+        " FROM merezha_jobs.jobs
+              WHERE id > $1 AND ($2::text IS NULL OR queue = $2) AND ($3::text IS NULL OR state = $3)
+                AND ($4::text IS NULL OR kind = $4)
+              ORDER BY id LIMIT $5"
+    ),
+);
+
+/// `GET jobs/{id}`, with an unflagged payload on request.
+pub(crate) const JOB_DETAIL: Statement = Statement::new(
+    "jobs.admin.job",
+    "SELECT merezha_jobs.jobs",
+    concat!(
+        "SELECT ",
+        summary_columns!(),
+        ", CASE WHEN $2 AND NOT contains_secret THEN payload::text END
+                       FROM merezha_jobs.jobs WHERE id = $1"
+    ),
+);
+
+/// A job's attempt history.
+pub(crate) const JOB_ATTEMPTS: Statement = Statement::new(
+    "jobs.admin.attempts",
+    "SELECT merezha_jobs.attempts",
+    concat!(
+        "SELECT attempt, ",
+        micros!("started_at"),
+        ", ",
+        micros!("finished_at"),
+        ", outcome, error_code FROM merezha_jobs.attempts
+                      WHERE job_id = $1 ORDER BY started_at, attempt LIMIT $2"
+    ),
+);
+
+/// A job to replay, locked.
+pub(crate) const REPLAY_CANDIDATE: Statement = Statement::new(
+    "jobs.replay.candidate",
+    "SELECT merezha_jobs.jobs",
+    concat!(
+        "SELECT ",
+        candidate!(),
+        ", state FROM merezha_jobs.jobs WHERE id = $1 FOR UPDATE"
+    ),
+);
+
+/// A dead job back to `available`: the trace it died in becomes the replay
+/// link of its next attempts, the `admin job.replay` span (`$2`, `$3`) their
+/// parent (TE §2.3).
+pub(crate) const REPLAY_ONE: Statement = Statement::new(
+    "jobs.replay.one",
+    "UPDATE merezha_jobs.jobs",
+    concat!(
+        "UPDATE merezha_jobs.jobs SET ",
+        replayed!(),
+        " WHERE id = $1"
+    ),
+);
+
+/// `POST dead/replay`: matching dead jobs, oldest id first, locked.
+pub(crate) const DEAD_CANDIDATES: Statement = Statement::new(
+    "jobs.replay.dead_candidates",
+    "SELECT merezha_jobs.jobs",
+    concat!(
+        "SELECT ",
+        candidate!(),
+        " FROM merezha_jobs.jobs
+                                  WHERE state = 'dead' AND queue = $1
+                                    AND ($2::text IS NULL OR kind = $2)
+                                    AND ($3::text IS NULL OR last_error_code = $3)
+                                    AND ($4::text IS NULL OR finished_at >= $4::text::timestamptz)
+                                    AND ($5::text IS NULL OR finished_at < $5::text::timestamptz)
+                                  ORDER BY id LIMIT $6 FOR UPDATE SKIP LOCKED"
+    ),
+);
+
+/// [`REPLAY_ONE`] for the unflagged jobs of a bulk replay.
+pub(crate) const REPLAY_MANY: Statement = Statement::new(
+    "jobs.replay.many",
+    "UPDATE merezha_jobs.jobs",
+    concat!(
+        "UPDATE merezha_jobs.jobs SET ",
+        replayed!(),
+        " WHERE id = ANY($1)"
+    ),
+);
+
+/// `POST dead/purge`: one batch.
+pub(crate) const PURGE_DEAD: Statement = Statement::new(
+    "jobs.admin.purge_dead",
+    "DELETE merezha_jobs.jobs",
+    "DELETE FROM merezha_jobs.jobs WHERE id IN (
+                                     SELECT id FROM merezha_jobs.jobs
+                                      WHERE state = 'dead' AND queue = $1
+                                        AND finished_at < $2::text::timestamptz
+                                      ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED)",
+);
+
+/// `POST jobs/{id}/cancel`: an `available` job, its flagged payload nulled.
+pub(crate) const CANCEL: Statement = Statement::new(
+    "jobs.admin.cancel",
+    "UPDATE merezha_jobs.jobs",
+    "UPDATE merezha_jobs.jobs
+                                SET state = 'cancelled', finished_at = now(), updated_at = now(),
+                                    payload = CASE WHEN contains_secret THEN NULL ELSE payload END
+                              WHERE id = $1 AND state = 'available'
+                             RETURNING queue",
+);
+
+/// Whether a job exists.
+pub(crate) const EXISTS: Statement = Statement::new(
+    "jobs.admin.exists",
+    "SELECT merezha_jobs.jobs",
+    "SELECT 1 FROM merezha_jobs.jobs WHERE id = $1",
+);
+
+/// The oldest quarantined outbox records.
+pub(crate) const QUARANTINED: Statement = Statement::new(
+    "jobs.status.quarantined",
+    "SELECT merezha_jobs.outbox",
+    concat!(
+        "SELECT id, source, record_kind, quarantine_code, ",
+        micros!("quarantined_at"),
+        "
+                       FROM merezha_jobs.outbox WHERE quarantined_at IS NOT NULL
+                      ORDER BY quarantined_at, id LIMIT $1"
+    ),
+);
 
 impl PgJobs {
     fn hook(&self, kind: &str) -> Option<Arc<dyn Reissue>> {
@@ -347,17 +555,12 @@ impl PgJobs {
     async fn claim(&self, id: i64, principal: Option<&str>) -> Result<Option<Claimed>, Failure> {
         let jobs = self.clone();
         let who = principal.map(str::to_owned);
+        let db = self.database()?.clone();
         self.database()?
             .transaction(deadline(), move |tx| {
                 Box::pin(async move {
-                    let Some(row) = tx
-                        .query_opt(
-                            &format!(
-                                "SELECT {CANDIDATE}, trace_parent, trace_state FROM merezha_jobs.jobs
-                                  WHERE id = $1 AND state = 'dead' AND contains_secret FOR UPDATE"
-                            ),
-                            &[&id],
-                        )
+                    let Some(row) = db
+                        .query_opt(tx, &CLAIM_CANDIDATE, &[&id])
                         .await
                         .map_err(|e| classify(&e))?
                     else {
@@ -367,19 +570,12 @@ impl PgJobs {
                         return Ok(None);
                     };
                     claim.died_in = telemetry::parse(row.get(8), row.get(9));
-                    claim.at = tx
-                        .query_one(
-                            "UPDATE merezha_jobs.jobs
-                                SET state = 'cancelled', replays = replays + 1,
-                                    reissue_claimed_at = now(), updated_at = now()
-                              WHERE id = $1
-                             RETURNING (extract(epoch FROM reissue_claimed_at) * 1000000)::bigint",
-                            &[&id],
-                        )
+                    claim.at = db
+                        .query_one(tx, &CLAIM, &[&id])
                         .await
                         .map_err(|e| classify(&e))?
                         .get(0);
-                    audit(tx, who.as_deref(), "reissue", &id.to_string(), 1).await?;
+                    audit(&db, tx, who.as_deref(), "reissue", &id.to_string(), 1).await?;
                     Ok(Some(claim))
                 })
             })
@@ -403,23 +599,14 @@ impl PgJobs {
                 Ok(result) => result,
                 Err(_) => Err(Failure::transient("reissue_timeout")),
             };
-        let client = self.database()?.acquire(deadline()).await?;
-        let sql = match outcome {
-            Ok(()) => {
-                "UPDATE merezha_jobs.jobs SET reissue_claimed_at = NULL, updated_at = now()
-                  WHERE id = $1 AND state = 'cancelled'
-                    AND (extract(epoch FROM reissue_claimed_at) * 1000000)::bigint = $2"
-            }
-            Err(_) => {
-                "UPDATE merezha_jobs.jobs
-                    SET state = 'dead', replays = greatest(replays - 1, 0),
-                        reissue_claimed_at = NULL, updated_at = now()
-                  WHERE id = $1 AND state = 'cancelled'
-                    AND (extract(epoch FROM reissue_claimed_at) * 1000000)::bigint = $2"
-            }
+        let db = self.database()?;
+        let client = db.acquire(deadline()).await?;
+        let statement = match outcome {
+            Ok(()) => &REISSUE_SETTLED,
+            Err(_) => &REISSUE_REVERTED,
         };
-        let settled = client
-            .execute(sql, &[&claim.id, &claim.at])
+        let settled = db
+            .execute(&client, statement, &[&claim.id, &claim.at])
             .await
             .map_err(|e| classify(&e))?;
         if settled == 0 {
@@ -445,17 +632,12 @@ impl PgJobs {
     pub async fn list_jobs(&self, filter: &JobFilter) -> Result<JobPage, Failure> {
         let limit = i64::from(filter.limit.clamp(1, 200));
         let after = filter.after.unwrap_or(0);
-        let sql = format!(
-            "SELECT {} FROM merezha_jobs.jobs
-              WHERE id > $1 AND ($2::text IS NULL OR queue = $2) AND ($3::text IS NULL OR state = $3)
-                AND ($4::text IS NULL OR kind = $4)
-              ORDER BY id LIMIT $5",
-            summary_columns()
-        );
-        let client = self.database()?.acquire(deadline()).await?;
-        let rows = client
+        let db = self.database()?;
+        let client = db.acquire(deadline()).await?;
+        let rows = db
             .query(
-                &sql,
+                &client,
+                &LIST_JOBS,
                 &[&after, &filter.queue, &filter.state, &filter.kind, &limit],
             )
             .await
@@ -470,29 +652,15 @@ impl PgJobs {
     /// `GET jobs/{id}`; `payload` adds an unflagged job's payload. Fails
     /// `not_found`.
     pub async fn job(&self, id: i64, payload: bool) -> Result<JobDetail, Failure> {
-        let client = self.database()?.acquire(deadline()).await?;
-        let row = client
-            .query_opt(
-                &format!(
-                    "SELECT {}, CASE WHEN $2 AND NOT contains_secret THEN payload::text END
-                       FROM merezha_jobs.jobs WHERE id = $1",
-                    summary_columns()
-                ),
-                &[&id, &payload],
-            )
+        let db = self.database()?;
+        let client = db.acquire(deadline()).await?;
+        let row = db
+            .query_opt(&client, &JOB_DETAIL, &[&id, &payload])
             .await
             .map_err(|e| classify(&e))?
             .ok_or_else(|| Failure::permanent("not_found"))?;
-        let attempts = client
-            .query(
-                &format!(
-                    "SELECT attempt, {}, {}, outcome, error_code FROM merezha_jobs.attempts
-                      WHERE job_id = $1 ORDER BY started_at, attempt LIMIT $2",
-                    micros("started_at"),
-                    micros("finished_at")
-                ),
-                &[&id, &MAX_ATTEMPTS_LISTED],
-            )
+        let attempts = db
+            .query(&client, &JOB_ATTEMPTS, &[&id, &MAX_ATTEMPTS_LISTED])
             .await
             .map_err(|e| classify(&e))?;
         Ok(JobDetail {
@@ -539,17 +707,13 @@ impl PgJobs {
         let jobs = self.clone();
         let (parent, state) =
             telemetry::columns(telemetry::stored(&tracing::Span::current()).as_ref());
+        let db = self.database()?.clone();
         let (flagged, queue) = self
             .database()?
             .transaction(deadline(), move |tx| {
                 Box::pin(async move {
-                    let row = tx
-                        .query_opt(
-                            &format!(
-                                "SELECT {CANDIDATE}, state FROM merezha_jobs.jobs WHERE id = $1 FOR UPDATE"
-                            ),
-                            &[&id],
-                        )
+                    let row = db
+                        .query_opt(tx, &REPLAY_CANDIDATE, &[&id])
                         .await
                         .map_err(|e| classify(&e))?
                         .ok_or_else(|| Failure::permanent("not_found"))?;
@@ -563,16 +727,13 @@ impl PgJobs {
                         }
                         return Ok((true, queue));
                     }
-                    tx.execute(
-                        &format!("UPDATE merezha_jobs.jobs SET {REPLAYED} WHERE id = $1"),
-                        &[&id, &parent, &state],
-                    )
-                    .await
-                    .map_err(|e| classify(&e))?;
-                    tx.execute("SELECT pg_notify('merezha_jobs', $1)", &[&queue])
+                    db.execute(tx, &REPLAY_ONE, &[&id, &parent, &state])
                         .await
                         .map_err(|e| classify(&e))?;
-                    audit(tx, who.as_deref(), "replay", &id.to_string(), 1).await?;
+                    db.execute(tx, &statements::NOTIFY_QUEUE, &[&queue])
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    audit(&db, tx, who.as_deref(), "replay", &id.to_string(), 1).await?;
                     Ok((false, queue))
                 })
             })
@@ -645,6 +806,7 @@ impl PgJobs {
         let queue = filter.queue.clone();
         let (parent, state) =
             telemetry::columns(telemetry::stored(&tracing::Span::current()).as_ref());
+        let db = self.database()?.clone();
         let (replayed, refused, flagged) = self
             .database()?
             .transaction(deadline(), move |tx| {
@@ -652,17 +814,10 @@ impl PgJobs {
                     let after = filter.dead_after.map(|t| t.to_string());
                     let before = filter.dead_before.map(|t| t.to_string());
                     let limit = i64::from(filter.limit.clamp(1, MAX_BULK_REPLAY));
-                    let rows = tx
+                    let rows = db
                         .query(
-                            &format!(
-                                "SELECT {CANDIDATE} FROM merezha_jobs.jobs
-                                  WHERE state = 'dead' AND queue = $1
-                                    AND ($2::text IS NULL OR kind = $2)
-                                    AND ($3::text IS NULL OR last_error_code = $3)
-                                    AND ($4::text IS NULL OR finished_at >= $4::text::timestamptz)
-                                    AND ($5::text IS NULL OR finished_at < $5::text::timestamptz)
-                                  ORDER BY id LIMIT $6 FOR UPDATE SKIP LOCKED"
-                            ),
+                            tx,
+                            &DEAD_CANDIDATES,
                             &[
                                 &filter.queue,
                                 &filter.kind,
@@ -687,18 +842,23 @@ impl PgJobs {
                         }
                     }
                     if !plain.is_empty() {
-                        tx.execute(
-                            &format!("UPDATE merezha_jobs.jobs SET {REPLAYED} WHERE id = ANY($1)"),
-                            &[&plain, &parent, &state],
-                        )
-                        .await
-                        .map_err(|e| classify(&e))?;
-                        tx.execute("SELECT pg_notify('merezha_jobs', $1)", &[&filter.queue])
+                        db.execute(tx, &REPLAY_MANY, &[&plain, &parent, &state])
+                            .await
+                            .map_err(|e| classify(&e))?;
+                        db.execute(tx, &statements::NOTIFY_QUEUE, &[&filter.queue])
                             .await
                             .map_err(|e| classify(&e))?;
                     }
                     let replayed = plain.len() as u64;
-                    audit(tx, who.as_deref(), "bulk_replay", &filter.queue, replayed).await?;
+                    audit(
+                        &db,
+                        tx,
+                        who.as_deref(),
+                        "bulk_replay",
+                        &filter.queue,
+                        replayed,
+                    )
+                    .await?;
                     Ok((replayed, refused, flagged))
                 })
             })
@@ -751,23 +911,17 @@ impl PgJobs {
             let who = principal.map(str::to_owned);
             let queue = queue.to_owned();
             let before = before.clone();
+            let db = self.database()?.clone();
             let deleted = self
                 .database()?
                 .transaction(deadline(), move |tx| {
                     Box::pin(async move {
-                        let deleted = tx
-                            .execute(
-                                "DELETE FROM merezha_jobs.jobs WHERE id IN (
-                                     SELECT id FROM merezha_jobs.jobs
-                                      WHERE state = 'dead' AND queue = $1
-                                        AND finished_at < $2::text::timestamptz
-                                      ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED)",
-                                &[&queue, &before, &PURGE_BATCH],
-                            )
+                        let deleted = db
+                            .execute(tx, &PURGE_DEAD, &[&queue, &before, &PURGE_BATCH])
                             .await
                             .map_err(|e| classify(&e))?;
                         if deleted > 0 {
-                            audit(tx, who.as_deref(), "purge_dead", &queue, deleted).await?;
+                            audit(&db, tx, who.as_deref(), "purge_dead", &queue, deleted).await?;
                         }
                         Ok(deleted)
                     })
@@ -787,23 +941,17 @@ impl PgJobs {
     /// `not_cancellable` when running or terminal.
     pub async fn cancel_job(&self, id: i64, principal: Option<&str>) -> Result<(), Failure> {
         let who = principal.map(str::to_owned);
+        let db = self.database()?.clone();
         self.database()?
             .transaction(deadline(), move |tx| {
                 Box::pin(async move {
-                    let cancelled = tx
-                        .query_opt(
-                            "UPDATE merezha_jobs.jobs
-                                SET state = 'cancelled', finished_at = now(), updated_at = now(),
-                                    payload = CASE WHEN contains_secret THEN NULL ELSE payload END
-                              WHERE id = $1 AND state = 'available'
-                             RETURNING queue",
-                            &[&id],
-                        )
+                    let cancelled = db
+                        .query_opt(tx, &CANCEL, &[&id])
                         .await
                         .map_err(|e| classify(&e))?;
                     let Some(cancelled) = cancelled else {
-                        let exists = tx
-                            .query_opt("SELECT 1 FROM merezha_jobs.jobs WHERE id = $1", &[&id])
+                        let exists = db
+                            .query_opt(tx, &EXISTS, &[&id])
                             .await
                             .map_err(|e| classify(&e))?;
                         return Err(match exists {
@@ -811,7 +959,7 @@ impl PgJobs {
                             Some(_) => Failure::conflict("not_cancellable"),
                         });
                     };
-                    audit(tx, who.as_deref(), "cancel", &id.to_string(), 1).await?;
+                    audit(&db, tx, who.as_deref(), "cancel", &id.to_string(), 1).await?;
                     Ok(cancelled.get::<_, String>(0))
                 })
             })
@@ -836,15 +984,16 @@ impl PgJobs {
         &self,
         database: &merezha_postgres::Database,
     ) -> Result<crate::telemetry::Sample, Failure> {
+        let db = database.clone();
         let (rows, backlog) = database
             .transaction(Instant::now() + crate::SAMPLE_DEADLINE, |tx| {
                 Box::pin(async move {
-                    let rows = tx
-                        .query(QUEUE_COUNTS, &[&(MAX_QUEUES_LISTED as i64)])
+                    let rows = db
+                        .query(tx, &QUEUE_COUNTS, &[&(MAX_QUEUES_LISTED as i64)])
                         .await
                         .map_err(|e| classify(&e))?;
-                    let backlog = tx
-                        .query_one(OUTBOX_BACKLOG, &[])
+                    let backlog = db
+                        .query_one(tx, &OUTBOX_BACKLOG, &[])
                         .await
                         .map_err(|e| classify(&e))?;
                     Ok((rows, backlog))
@@ -861,9 +1010,10 @@ impl PgJobs {
     /// `GET queues`: per queue counts through the partial indexes
     /// (`jobs_dispatch`, `jobs_running`, `jobs_dead`).
     pub(crate) async fn queue_summaries(&self) -> Result<Vec<QueueSummary>, Failure> {
-        let client = self.database()?.acquire(deadline()).await?;
-        let rows = client
-            .query(QUEUE_COUNTS, &[&(MAX_QUEUES_LISTED as i64)])
+        let db = self.database()?;
+        let client = db.acquire(deadline()).await?;
+        let rows = db
+            .query(&client, &QUEUE_COUNTS, &[&(MAX_QUEUES_LISTED as i64)])
             .await
             .map_err(|e| classify(&e))?;
         Ok(self.summaries(&rows))
@@ -913,21 +1063,14 @@ impl PgJobs {
     /// `GET outbox`: the backlog through `outbox_pending` and
     /// `outbox_quarantined`, and the oldest quarantined records.
     pub(crate) async fn outbox_summary(&self) -> Result<OutboxSummary, Failure> {
-        let client = self.database()?.acquire(deadline()).await?;
-        let outbox = client
-            .query_one(OUTBOX_BACKLOG, &[])
+        let db = self.database()?;
+        let client = db.acquire(deadline()).await?;
+        let outbox = db
+            .query_one(&client, &OUTBOX_BACKLOG, &[])
             .await
             .map_err(|e| classify(&e))?;
-        let quarantined = client
-            .query(
-                &format!(
-                    "SELECT id, source, record_kind, quarantine_code, {}
-                       FROM merezha_jobs.outbox WHERE quarantined_at IS NOT NULL
-                      ORDER BY quarantined_at, id LIMIT $1",
-                    micros("quarantined_at")
-                ),
-                &[&(MAX_QUARANTINED_LISTED as i64)],
-            )
+        let quarantined = db
+            .query(&client, &QUARANTINED, &[&(MAX_QUARANTINED_LISTED as i64)])
             .await
             .map_err(|e| classify(&e))?;
         Ok(OutboxSummary {
@@ -951,7 +1094,15 @@ impl PgJobs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use merezha_postgres::{Database, ModuleMigrations, TestDatabase, run_migrations};
+    use merezha_postgres::{ModuleMigrations, TestDatabase, run_migrations};
+
+    const SEQSCAN_OFF: Statement = Statement::new(
+        "jobs.test.seqscan_off",
+        "SET",
+        "SET LOCAL enable_seqscan = off",
+    );
+    const EXPLAIN: Statement =
+        Statement::new("jobs.test.explain", "EXPLAIN", "EXPLAIN <a status read>");
 
     /// Review items 2 and 9: the status and lag reads use the partial
     /// indexes. With sequential scans disabled, a plan that still shows one
@@ -976,25 +1127,27 @@ mod tests {
         let reads = [
             (
                 "queue counts",
-                QUEUE_COUNTS.replace("$1", "256"),
+                QUEUE_COUNTS.sql.replace("$1", "256"),
                 &["jobs_dispatch", "jobs_running", "jobs_dead"][..],
             ),
             (
                 "outbox backlog",
-                OUTBOX_BACKLOG.to_owned(),
+                OUTBOX_BACKLOG.sql.to_owned(),
                 &["outbox_pending", "outbox_quarantined"][..],
             ),
-            ("lag", crate::worker::LAG.to_owned(), &["jobs_due"][..]),
+            ("lag", crate::worker::LAG.sql.to_owned(), &["jobs_due"][..]),
         ];
         for (name, sql, indexes) in reads {
+            let session = db.clone();
             let plan = db
                 .transaction(deadline(), move |tx| {
                     Box::pin(async move {
-                        tx.batch_execute("SET LOCAL enable_seqscan = off")
+                        session
+                            .batch(tx, &SEQSCAN_OFF)
                             .await
                             .map_err(|e| classify(&e))?;
-                        let rows = tx
-                            .query(&format!("EXPLAIN {sql}"), &[])
+                        let rows = session
+                            .query_text(tx, &EXPLAIN, &format!("EXPLAIN {sql}"), &[])
                             .await
                             .map_err(|e| classify(&e))?;
                         Ok(rows

@@ -32,6 +32,13 @@ const ALLOWED: &[(&str, &str, usize, &str)] = &[
         "the test harness's administrative connection (CREATE and DROP DATABASE), outside any pool",
     ),
     (
+        "jobs",
+        "src/outbox.rs",
+        2,
+        "`PgOutbox`, the unmetered public form tests build as a unit value, holds no Database; \
+         the runtime's `MeteredOutbox` runs the same two statements through the registry",
+    ),
+    (
         "application",
         "src/sqlite.rs",
         18,
