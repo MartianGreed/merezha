@@ -108,7 +108,18 @@ burst = 3
 limit = 5
 
 [modules.identity.organizations]
-user_can_create = false
+max_per_user = 0
+
+[modules.identity.rbac.builtin_grants]
+user = ["tasks.read"]
+owner = []
+
+[modules.identity.rbac.application_roles.owner]
+name = "Owner again"
+
+[modules.identity.rbac.application_roles.support]
+name = "Support"
+permissions = ["identity.*"]
 "#;
     let dir = tempfile::tempdir().unwrap();
     let mut input = project(dir.path(), section);
@@ -132,7 +143,14 @@ user_can_create = false
         ("unverified_account_ttl", "out_of_range"),
         ("dev_print_links", "refused_when_public"),
         ("enabled", "unknown_key"),
-        ("organizations", "unknown_key"),
+        ("organizations.max_per_user", "out_of_range"),
+        ("rbac.builtin_grants.user", "unknown_permission"),
+        ("rbac.builtin_grants.owner", "unknown_key"),
+        ("rbac.application_roles.owner", "reserved_role_key"),
+        (
+            "rbac.application_roles.support.permissions",
+            "unknown_permission",
+        ),
         ("password.min_length", "out_of_range"),
         ("password.argon2_memory_kib", "out_of_range"),
         ("password.argon2_iterations", "out_of_range"),
@@ -228,9 +246,9 @@ async fn plain_database(test: &TestDatabase) -> Database {
     Database::connect(&test.config()).unwrap()
 }
 
-/// Acceptance 1: migration 1 applies on an empty database, is recorded
-/// with its checksum, and a second start applies nothing. A changed
-/// checksum stops verification.
+/// Acceptance 1 (both PRs): migrations 1 and 2 apply on an empty
+/// database, each recorded with its checksum, and a second start applies
+/// nothing. A changed checksum stops verification.
 #[tokio::test]
 async fn migration_one_applies_once_with_its_checksum() {
     let Some(test) = TestDatabase::create() else {
@@ -244,18 +262,28 @@ async fn migration_one_applies_once_with_its_checksum() {
     let first = run_migrations(&db, &declared, MigrationMode::Apply, soon())
         .await
         .unwrap();
-    assert_eq!(first.applied.len(), 1);
+    assert_eq!(first.applied.len(), 2);
     let client = db.acquire(soon()).await.unwrap();
-    let row = client
-        .query_one(
-            "SELECT version, name, checksum FROM merezha.migrations WHERE module = 'identity'",
+    let rows = client
+        .query(
+            "SELECT version, name, checksum FROM merezha.migrations WHERE module = 'identity'
+              ORDER BY version",
             &[],
         )
         .await
         .unwrap();
-    assert_eq!(row.get::<_, i32>(0), 1);
-    assert_eq!(row.get::<_, String>(1), "identity_core");
-    assert_eq!(row.get::<_, String>(2), checksum(MIGRATIONS[0].sql));
+    assert_eq!(rows.len(), 2);
+    for (row, (version, name)) in rows
+        .iter()
+        .zip([(1, "identity_core"), (2, "organizations_rbac_api_keys")])
+    {
+        assert_eq!(row.get::<_, i32>(0), version);
+        assert_eq!(row.get::<_, String>(1), name);
+        assert_eq!(
+            row.get::<_, String>(2),
+            checksum(MIGRATIONS[version as usize - 1].sql)
+        );
+    }
     let tables: i64 = client
         .query_one(
             "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'merezha_identity'",
@@ -264,7 +292,7 @@ async fn migration_one_applies_once_with_its_checksum() {
         .await
         .unwrap()
         .get(0);
-    assert_eq!(tables, 6);
+    assert_eq!(tables, 15);
     let second = run_migrations(&db, &declared, MigrationMode::Apply, soon())
         .await
         .unwrap();

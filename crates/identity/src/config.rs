@@ -1,9 +1,12 @@
-//! `[modules.identity]` (section 8) for PR 1, validated with every problem
-//! reported at once. Tables of later slices (`organizations`, `rbac`,
-//! `service_accounts`, `api_keys`, `oauth`, `passkeys`, `tokens.invitation_ttl`,
-//! `links.invitation`, `links.sign_in_redirect`, `links.oauth_error`) stay
-//! `unknown_key` until ID PR 2 and PR 3 give them behaviour.
-use crate::gcra::{self, Rate};
+//! `[modules.identity]` (section 8) for PR 1 and PR 2, validated with every
+//! problem reported at once. Tables of PR 3 (`oauth`, `passkeys`,
+//! `links.sign_in_redirect`, `links.oauth_error`) stay `unknown_key` until
+//! it gives them behaviour.
+use crate::{
+    catalog::{Catalog, Wildcards},
+    gcra::{self, Rate},
+    rbac::{DeclaredRole, RESERVED_ROLE_KEYS, valid_role_key},
+};
 use merezha_platform::{
     ConfigInput, ModuleSection, ProjectConfig, Secret,
     config::{ConfigIssue, Origin, parse_duration},
@@ -127,6 +130,7 @@ pub struct TokenSettings {
     pub magic_link_ttl: Duration,
     pub password_reset_ttl: Duration,
     pub email_change_ttl: Duration,
+    pub invitation_ttl: Duration,
 }
 impl Default for TokenSettings {
     fn default() -> Self {
@@ -135,6 +139,79 @@ impl Default for TokenSettings {
             magic_link_ttl: minutes(15),
             password_reset_ttl: minutes(30),
             email_change_ttl: minutes(60),
+            invitation_ttl: days(7),
+        }
+    }
+}
+
+/// `[modules.identity.organizations]` (owner answer ID4: no personal
+/// organization). `user_can_create = false` gives an application without
+/// organizations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrganizationSettings {
+    pub user_can_create: bool,
+    /// Organizations one user may create.
+    pub max_per_user: u32,
+    pub max_members: u32,
+}
+impl Default for OrganizationSettings {
+    fn default() -> Self {
+        Self {
+            user_can_create: true,
+            max_per_user: 50,
+            max_members: 10_000,
+        }
+    }
+}
+
+/// `[modules.identity.rbac.builtin_grants]`: what the implicit `user` role,
+/// `admin` and `member` add to identity's own grants.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BuiltinGrants {
+    pub user: Vec<String>,
+    pub admin: Vec<String>,
+    pub member: Vec<String>,
+}
+
+/// `[modules.identity.rbac]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RbacSettings {
+    pub cache_entries: usize,
+    /// Custom roles per organization.
+    pub max_custom_roles: u32,
+    /// Resource grants per holder and scope kept in a snapshot.
+    pub max_resource_assignments: u32,
+    pub builtin_grants: BuiltinGrants,
+    /// Declared application roles by key.
+    pub application_roles: BTreeMap<String, DeclaredRole>,
+}
+impl Default for RbacSettings {
+    fn default() -> Self {
+        Self {
+            cache_entries: 10_000,
+            max_custom_roles: 100,
+            max_resource_assignments: 500,
+            builtin_grants: BuiltinGrants::default(),
+            application_roles: BTreeMap::new(),
+        }
+    }
+}
+
+/// `[modules.identity.api_keys]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApiKeySettings {
+    /// Unrevoked keys per organization, and for the application.
+    pub max_per_scope: u32,
+    pub max_ttl: Duration,
+    /// `last_used_at` is written at most once per interval.
+    pub touch_interval: Duration,
+}
+impl Default for ApiKeySettings {
+    fn default() -> Self {
+        Self {
+            max_per_scope: 100,
+            max_ttl: days(365),
+            touch_interval: minutes(5),
         }
     }
 }
@@ -147,6 +224,7 @@ pub struct Links {
     pub magic_link: String,
     pub password_reset: String,
     pub email_change: String,
+    pub invitation: String,
 }
 
 /// The validated section.
@@ -178,6 +256,11 @@ pub struct Settings {
     /// The loopback development cookie (`merezha_session`, no `Secure`).
     pub dev_cookie: bool,
     pub app_name: Option<String>,
+    pub organizations: OrganizationSettings,
+    pub rbac: RbacSettings,
+    /// `service_accounts.max_per_scope`.
+    pub service_accounts_max: u32,
+    pub api_keys: ApiKeySettings,
 }
 impl std::fmt::Debug for Settings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -223,7 +306,7 @@ const fn days(d: u64) -> Duration {
     Duration::from_secs(d * 86_400)
 }
 
-const KEYS: [&str; 18] = [
+const KEYS: [&str; 22] = [
     "app_origin",
     "api_base_url",
     "allowed_origins",
@@ -242,7 +325,15 @@ const KEYS: [&str; 18] = [
     "rate_limits",
     "audit",
     "cleanup",
+    "organizations",
+    "rbac",
+    "service_accounts",
+    "api_keys",
 ];
+/// Most declared application roles.
+const MAX_DECLARED_ROLES: usize = 64;
+/// Most grants in one list.
+const MAX_GRANTS: usize = 256;
 /// Most `allowed_origins`.
 const MAX_ORIGINS: usize = 32;
 /// Shortest `secret_key`.
@@ -424,9 +515,13 @@ impl Settings {
     /// Validate `section` for a host described by `facts`. `facts` is
     /// `None` when the kernel configuration itself is invalid; the checks
     /// that need it are skipped then.
+    ///
+    /// `catalog` is the permission catalog `builtin_grants` and declared
+    /// application roles are checked against.
     pub fn parse(
         section: &ModuleSection,
         facts: Option<&HostFacts>,
+        catalog: &Catalog,
     ) -> Result<Self, Vec<ConfigIssue>> {
         let mut r = Reader {
             section,
@@ -534,6 +629,7 @@ impl Settings {
                 "magic_link",
                 "password_reset",
                 "email_change",
+                "invitation",
             ],
         );
         let base = app_origin.clone().unwrap_or_default();
@@ -555,6 +651,7 @@ impl Settings {
             magic_link: link(&mut r, "magic_link", "/auth/magic-link"),
             password_reset: link(&mut r, "password_reset", "/auth/reset-password"),
             email_change: link(&mut r, "email_change", "/auth/confirm-email"),
+            invitation: link(&mut r, "invitation", "/auth/invitation"),
         };
         // Password.
         let password = r
@@ -689,6 +786,7 @@ impl Settings {
                     "magic_link_ttl",
                     "password_reset_ttl",
                     "email_change_ttl",
+                    "invitation_ttl",
                 ],
             );
             let d = TokenSettings::default();
@@ -720,6 +818,13 @@ impl Settings {
                     "email_change_ttl",
                     d.email_change_ttl,
                     (minutes(5), days(7)),
+                ),
+                invitation_ttl: r.duration(
+                    t,
+                    "tokens",
+                    "invitation_ttl",
+                    d.invitation_ttl,
+                    (minutes(60), days(30)),
                 ),
             }
         };
@@ -780,6 +885,50 @@ impl Settings {
             let batch = r.integer(t, "cleanup", "batch_size", 1000, (1, 10_000)) as u32;
             (cron, batch)
         };
+        let organizations = {
+            let t = r.table(
+                "organizations",
+                &["user_can_create", "max_per_user", "max_members"],
+            );
+            let d = OrganizationSettings::default();
+            OrganizationSettings {
+                user_can_create: r.boolean(t, "organizations", "user_can_create", true),
+                max_per_user: r.integer(t, "organizations", "max_per_user", 50, (1, 10_000)) as u32,
+                max_members: r.integer(
+                    t,
+                    "organizations",
+                    "max_members",
+                    u64::from(d.max_members),
+                    (1, 1_000_000),
+                ) as u32,
+            }
+        };
+        let rbac = rbac(&mut r, catalog);
+        let service_accounts_max = {
+            let t = r.table("service_accounts", &["max_per_scope"]);
+            r.integer(t, "service_accounts", "max_per_scope", 100, (1, 10_000)) as u32
+        };
+        let api_keys = {
+            let t = r.table("api_keys", &["max_per_scope", "max_ttl", "touch_interval"]);
+            let d = ApiKeySettings::default();
+            ApiKeySettings {
+                max_per_scope: r.integer(t, "api_keys", "max_per_scope", 100, (1, 10_000)) as u32,
+                max_ttl: r.duration(
+                    t,
+                    "api_keys",
+                    "max_ttl",
+                    d.max_ttl,
+                    (minutes(60), days(3650)),
+                ),
+                touch_interval: r.duration(
+                    t,
+                    "api_keys",
+                    "touch_interval",
+                    d.touch_interval,
+                    (Duration::from_secs(1), days(1)),
+                ),
+            }
+        };
         let dev_cookie = app_origin.as_deref().is_some_and(loopback_origin) && private;
         if !r.issues.is_empty() {
             return Err(r.issues);
@@ -815,8 +964,167 @@ impl Settings {
             cleanup_batch,
             dev_cookie,
             app_name: facts.and_then(|f| f.app_name.clone()),
+            organizations,
+            rbac,
+            service_accounts_max,
+            api_keys,
         })
     }
+}
+
+/// A string list of grants at `path`, each checked against `catalog`.
+fn grants(
+    r: &mut Reader<'_>,
+    value: Option<&toml::Value>,
+    path: &str,
+    catalog: &Catalog,
+    wildcards: Wildcards,
+) -> Vec<String> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let Some(items) = value.as_array() else {
+        r.issue(path, "expected_string_list");
+        return Vec::new();
+    };
+    if items.len() > MAX_GRANTS {
+        r.issue(path, "out_of_range");
+    }
+    let mut out = Vec::new();
+    for item in items {
+        match item.as_str() {
+            Some(grant) if catalog.check_grant(grant, wildcards).is_ok() => {
+                out.push(grant.to_owned())
+            }
+            Some(_) => r.issue(path, "unknown_permission"),
+            None => r.issue(path, "expected_string_list"),
+        }
+    }
+    out
+}
+
+/// `[modules.identity.rbac]`: limits, `builtin_grants` (operator
+/// configuration, any trailing wildcard) and the declared application
+/// roles (wildcards in the application's own namespaces only, keys outside
+/// the built-in ones).
+fn rbac(r: &mut Reader<'_>, catalog: &Catalog) -> RbacSettings {
+    let t = r.table(
+        "rbac",
+        &[
+            "cache_entries",
+            "max_custom_roles",
+            "max_resource_assignments",
+            "builtin_grants",
+            "application_roles",
+        ],
+    );
+    let d = RbacSettings::default();
+    let mut settings = RbacSettings {
+        cache_entries: r.integer(t, "rbac", "cache_entries", 10_000, (2, 1_000_000)) as usize,
+        max_custom_roles: r.integer(t, "rbac", "max_custom_roles", 100, (1, 1000)) as u32,
+        max_resource_assignments: r.integer(
+            t,
+            "rbac",
+            "max_resource_assignments",
+            u64::from(d.max_resource_assignments),
+            (1, 10_000),
+        ) as u32,
+        ..d
+    };
+    let Some(t) = t else {
+        return settings;
+    };
+    match t.get("builtin_grants") {
+        None => {}
+        Some(toml::Value::Table(table)) => {
+            for key in table.keys() {
+                if !["user", "admin", "member"].contains(&key.as_str()) {
+                    r.issue(&format!("rbac.builtin_grants.{key}"), "unknown_key");
+                }
+            }
+            let mut list = |name: &str| {
+                grants(
+                    r,
+                    table.get(name),
+                    &format!("rbac.builtin_grants.{name}"),
+                    catalog,
+                    Wildcards::Any,
+                )
+            };
+            settings.builtin_grants = BuiltinGrants {
+                user: list("user"),
+                admin: list("admin"),
+                member: list("member"),
+            };
+        }
+        Some(_) => r.issue("rbac.builtin_grants", "expected_table"),
+    }
+    match t.get("application_roles") {
+        None => {}
+        Some(toml::Value::Table(roles)) => {
+            if roles.len() > MAX_DECLARED_ROLES {
+                r.issue("rbac.application_roles", "out_of_range");
+            }
+            for (key, value) in roles {
+                let path = format!("rbac.application_roles.{key}");
+                if !valid_role_key(key) {
+                    r.issue(&path, "invalid_role_key");
+                    continue;
+                }
+                if RESERVED_ROLE_KEYS.contains(&key.as_str()) {
+                    r.issue(&path, "reserved_role_key");
+                    continue;
+                }
+                let Some(role) = value.as_table() else {
+                    r.issue(&path, "expected_table");
+                    continue;
+                };
+                for field in role.keys() {
+                    if !["name", "description", "permissions"].contains(&field.as_str()) {
+                        r.issue(&format!("{path}.{field}"), "unknown_key");
+                    }
+                }
+                let name = match role.get("name").and_then(|v| v.as_str()) {
+                    Some(name) if (1..=128).contains(&name.chars().count()) => name.to_owned(),
+                    Some(_) => {
+                        r.issue(&format!("{path}.name"), "out_of_range");
+                        continue;
+                    }
+                    None => {
+                        r.issue(&format!("{path}.name"), "missing_required");
+                        continue;
+                    }
+                };
+                let description = match role.get("description") {
+                    None => None,
+                    Some(toml::Value::String(text)) if text.chars().count() <= 1024 => {
+                        Some(text.clone())
+                    }
+                    Some(_) => {
+                        r.issue(&format!("{path}.description"), "out_of_range");
+                        None
+                    }
+                };
+                let permissions = grants(
+                    r,
+                    role.get("permissions"),
+                    &format!("{path}.permissions"),
+                    catalog,
+                    Wildcards::Application,
+                );
+                settings.application_roles.insert(
+                    key.clone(),
+                    DeclaredRole {
+                        name,
+                        description,
+                        grants: permissions,
+                    },
+                );
+            }
+        }
+        Some(_) => r.issue("rbac.application_roles", "expected_table"),
+    }
+    settings
 }
 
 /// The cron expression of a cleanup interval: whole minutes dividing an

@@ -149,3 +149,73 @@ async fn cleanup_removes_expired_sessions_tokens_buckets_and_old_audit_rows() {
         0
     );
 }
+
+/// ID PR 2's conditions: an unverified account holding a membership or an
+/// application role is never a cleanup candidate (so never an
+/// organization's owner); expired invitations and keys revoked or expired
+/// 30 days ago go.
+#[tokio::test]
+async fn attached_unverified_accounts_survive_and_dead_rows_go() {
+    let Some(world) = World::new(&base()).await else {
+        return;
+    };
+    let node = world.instance().await;
+    for email in [
+        "member@example.com",
+        "role@example.com",
+        "alone@example.com",
+    ] {
+        Browser::new("198.51.100.122")
+            .post(
+                &node,
+                "/registrations",
+                json!({"email": email, "password": PASSWORD}),
+            )
+            .await;
+    }
+    let mut owner = user(&world, &node, "owner@example.com").await;
+    let org = organization(&node, &mut owner, "acme").await;
+    world
+        .execute(&format!(
+            "INSERT INTO merezha_identity.memberships (id, organization_id, user_id, created_at)
+             SELECT gen_random_uuid(), '{}', id, now() FROM merezha_identity.users
+              WHERE email_normalized = 'member@example.com';
+             INSERT INTO merezha_identity.roles (id, scope, key, name, created_at, updated_at)
+             VALUES ('00000000-0000-7000-8000-0000000000c1', 'application', 'support', 'Support', now(), now());
+             INSERT INTO merezha_identity.application_role_assignments (id, user_id, role_id, created_at)
+             SELECT gen_random_uuid(), id, '00000000-0000-7000-8000-0000000000c1', now()
+               FROM merezha_identity.users WHERE email_normalized = 'role@example.com'",
+            hex(&org)
+        ))
+        .await;
+    let invited = owner
+        .post(
+            &node,
+            &format!("/organizations/{org}/invitations"),
+            json!({"email": "late@example.com", "role_ids": [MEMBER_ROLE]}),
+        )
+        .await;
+    assert_eq!(invited.status, 201);
+    let key = owner
+        .post(&node, &format!("/organizations/{org}/api-keys"), json!({"name": "k", "permissions": ["tasks.read"], "expires_at": "2027-06-01T00:00:00Z"}))
+        .await;
+    let key_id = id_at(&key, "/api_key/id");
+    owner
+        .delete(&node, &format!("/organizations/{org}/api-keys/{key_id}"))
+        .await;
+    world.clock.advance(Duration::from_secs(8 * DAY));
+    let report = node.handle.cleanup_now().await.unwrap();
+    assert_eq!(report.unverified_accounts, 1);
+    assert_eq!(report.invitations, 1);
+    assert_eq!(report.api_keys, 0, "a revoked key stays 30 days");
+    assert_eq!(
+        users(&world).await,
+        vec![
+            "member@example.com".to_owned(),
+            "owner@example.com".to_owned(),
+            "role@example.com".to_owned()
+        ]
+    );
+    world.clock.advance(Duration::from_secs(23 * DAY));
+    assert_eq!(node.handle.cleanup_now().await.unwrap().api_keys, 1);
+}

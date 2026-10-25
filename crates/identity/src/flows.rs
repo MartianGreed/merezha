@@ -62,7 +62,7 @@ pub enum CookieAction {
     Clear,
 }
 impl Reply {
-    fn json(status: u16, body: Value) -> Self {
+    pub(crate) fn json(status: u16, body: Value) -> Self {
         Self {
             status,
             body: Some(body),
@@ -70,10 +70,10 @@ impl Reply {
             binding: None,
         }
     }
-    fn accepted(status: &str) -> Self {
+    pub(crate) fn accepted(status: &str) -> Self {
         Self::json(202, json!({ "status": status }))
     }
-    fn empty(cookie: CookieAction) -> Self {
+    pub(crate) fn empty(cookie: CookieAction) -> Self {
         Self {
             status: 204,
             body: None,
@@ -85,7 +85,7 @@ impl Reply {
 
 /// An outcome a transaction commits before refusing, so a consumed or
 /// expired token stays deleted.
-type Committed<T> = Result<T, ApiError>;
+pub(crate) type Committed<T> = Result<T, ApiError>;
 
 fn invalid_token() -> ApiError {
     ApiError::code("invalid_token")
@@ -94,7 +94,12 @@ fn invalid_token() -> ApiError {
 impl Core {
     /// `{session, user?, csrf_token}` for a new session, with the token in
     /// the body (bearer) or the cookie.
-    fn session_reply(&self, status: u16, new: NewSession, user: Option<&UserRow>) -> Reply {
+    pub(crate) fn session_reply(
+        &self,
+        status: u16,
+        new: NewSession,
+        user: Option<&UserRow>,
+    ) -> Reply {
         let mut session = new.row.json(true);
         let cookie = match new.row.transport {
             Transport::Bearer => {
@@ -125,7 +130,7 @@ impl Core {
             None => RawToken::generate(self.ctx.random()),
         }
     }
-    fn transport(&self, requested: Option<Transport>) -> Result<Transport, ApiError> {
+    pub(crate) fn transport(&self, requested: Option<Transport>) -> Result<Transport, ApiError> {
         match requested.unwrap_or(Transport::Cookie) {
             Transport::Bearer if !self.settings.sessions.bearer => {
                 Err(ApiError::invalid(vec![("/transport", "unsupported")]))
@@ -176,7 +181,7 @@ impl Core {
     }
     /// Insert a user, or `None` when the address is taken (a concurrent
     /// registration won).
-    async fn insert_user(
+    pub(crate) async fn insert_user(
         &self,
         tx: &mut Tx<'_>,
         email: &Email,
@@ -248,7 +253,7 @@ impl Core {
         )
         .await
     }
-    async fn delete_sessions(
+    pub(crate) async fn delete_sessions(
         &self,
         tx: &mut Tx<'_>,
         user: Uuid,
@@ -259,7 +264,7 @@ impl Core {
             .await
             .map_err(sql)
     }
-    async fn delete_tokens(&self, tx: &mut Tx<'_>, user: Uuid) -> Result<(), Failure> {
+    pub(crate) async fn delete_tokens(&self, tx: &mut Tx<'_>, user: Uuid) -> Result<(), Failure> {
         self.db()
             .execute(&*tx, &crate::sql::TOKENS_OF_USER_DELETE, &[&user])
             .await
@@ -289,7 +294,7 @@ impl Core {
         .await
     }
     /// Charge `token.ip` when a token route refused.
-    async fn token_failed<T>(
+    pub(crate) async fn token_failed<T>(
         self: &Arc<Self>,
         result: Result<T, ApiError>,
         client: &Client,
@@ -1172,9 +1177,9 @@ impl Core {
     // ----- the caller's account -----
 
     /// `GET /me`.
-    pub async fn me(self: &Arc<Self>, caller: &Caller) -> Result<Reply, ApiError> {
+    pub async fn me(self: &Arc<Self>, user: Uuid) -> Result<Reply, ApiError> {
         let user = self
-            .read_user(caller.user)
+            .read_user(user)
             .await?
             .ok_or_else(|| ApiError::code("unauthenticated"))?;
         Ok(Reply::json(200, json!({ "user": user.json() })))
@@ -1457,9 +1462,11 @@ impl Core {
         }
     }
 
-    /// `DELETE /me` (recent session): hard-delete the account. Audit rows
-    /// keep the user id; `identity.user_deleted` tells other blocks to erase
-    /// what they hold. ID PR 2 adds the `sole_owner` refusal.
+    /// `DELETE /me` (recent session): hard-delete the account, refused
+    /// `409 sole_owner` while the user is the only owner of an
+    /// organization. Audit rows keep the user id;
+    /// `identity.membership_removed` (reason `user_deleted`) and
+    /// `identity.user_deleted` tell other blocks to erase what they hold.
     pub async fn delete_me(
         self: &Arc<Self>,
         client: &Client,
@@ -1478,6 +1485,15 @@ impl Core {
                     };
                     if user.email_normalized != confirm.normalized() {
                         return Ok(Err(ApiError::invalid(vec![("/confirm_email", "mismatch")])));
+                    }
+                    // The last owner of an organization cannot leave it
+                    // without one.
+                    if let Err(error) = core.before_user_deleted(tx, user.id, &client).await {
+                        return if error.failure.code == "sole_owner" {
+                            Ok(Err(error))
+                        } else {
+                            Err(error)
+                        };
                     }
                     let now = core.now();
                     core.audit(tx, Audit::new("user.deleted", Actor::User(user.id)), &client)

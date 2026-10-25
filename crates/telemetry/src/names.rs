@@ -1299,6 +1299,12 @@ pub const EVENTS: &[Event] = &[
         ],
     ),
     ev("identity.grants_truncated", WARN, &[local("count")]),
+    ev(
+        "identity.declared_role_in_use",
+        ERROR,
+        &[local("role"), local("count")],
+    ),
+    ev("identity.unknown_permissions", WARN, &[local("count")]),
     ev("identity.audit_write_failed", ERROR, &[CODE]),
     // The one catalog event that carries a secret: stderr only, loopback
     // development mode only.

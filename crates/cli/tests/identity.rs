@@ -1,7 +1,7 @@
 //! The identity block through the `merezha` binary: `merezha run` refuses
 //! email flows without a delivery path (acceptance 12), serves the block
-//! with printed links on loopback, installs the session authenticator in
-//! the edge and denies permission checks until ID PR 2; and `merezha
+//! with printed links on loopback, installs the authenticator and the RBAC
+//! `Authorizer` in the host; `merezha identity platform-admin`; and `merezha
 //! identity password-benchmark`.
 mod support;
 use merezha_postgres::TestDatabase;
@@ -143,11 +143,22 @@ fn run_serves_identity_with_printed_links_on_loopback() {
             .to_ascii_lowercase()
             .contains("cache-control: no-store")
     );
-    let link = host
-        .events()
-        .into_iter()
-        .find(|e| e["event"] == "identity.dev_link")
-        .expect("identity.dev_link on stderr");
+    // The stderr writer is asynchronous: wait for the line.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let link = loop {
+        if let Some(link) = host
+            .events()
+            .into_iter()
+            .find(|e| e["event"] == "identity.dev_link")
+        {
+            break link;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "identity.dev_link on stderr"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(link["purpose"], "email_verification");
     let token = link["link"]
         .as_str()
@@ -196,7 +207,9 @@ fn run_serves_identity_with_printed_links_on_loopback() {
         "",
     );
     assert_eq!(session.status, 200, "{}", session.body);
-    // The edge authenticates every route; checks deny until ID PR 2.
+    // The edge authenticates every route and the RBAC `Authorizer`
+    // decides: a user without `system.status.read` is refused, a platform
+    // admin (granted through the CLI) breaks glass, audited.
     let status = call(
         address,
         "GET",
@@ -210,6 +223,63 @@ fn run_serves_identity_with_printed_links_on_loopback() {
     );
     let anonymous = call(address, "GET", "/v1/admin/status", &[], "");
     assert_eq!(anonymous.status, 401);
+    let admin = |action: &str, email: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_merezha"))
+            .args(["identity", "platform-admin", action, email, "--config"])
+            .arg(&config)
+            .env("IDENTITY_TEST_DATABASE_URL", test.url())
+            .env("IDENTITY_SECRET", SECRET)
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        (output.status.code(), report)
+    };
+    let (code, report) = admin("grant", "ada@example.com");
+    assert_eq!(
+        (code, report["action"].as_str()),
+        (Some(0), Some("granted")),
+        "{report}"
+    );
+    assert!(report["user_id"].as_str().unwrap().starts_with("usr_"));
+    let (code, report) = admin("grant", "ada@example.com");
+    assert_eq!(
+        (code, report["action"].as_str()),
+        (Some(0), Some("unchanged"))
+    );
+    let (code, report) = admin("grant", "nobody@example.com");
+    assert_eq!(
+        (code, report["error"]["code"].as_str()),
+        (Some(2), Some("not_found"))
+    );
+    let status = call(
+        address,
+        "GET",
+        "/v1/admin/status",
+        &[("Cookie", &cookie)],
+        "",
+    );
+    assert_eq!(status.status, 200, "{}", status.body);
+    let projections = call(
+        address,
+        "GET",
+        "/v1/identity/me/permissions",
+        &[("Cookie", &cookie)],
+        "",
+    );
+    assert_eq!(projections.body["application"]["break_glass"], true);
+    let (code, report) = admin("revoke", "ada@example.com");
+    assert_eq!(
+        (code, report["action"].as_str()),
+        (Some(0), Some("revoked"))
+    );
+    let status = call(
+        address,
+        "GET",
+        "/v1/admin/status",
+        &[("Cookie", &cookie)],
+        "",
+    );
+    assert_eq!(status.status, 403, "revoked on the next request");
     // The raw runtime endpoints are not mounted beside an authenticator.
     for path in ["/v1/services", "/health"] {
         assert_eq!(call(address, "GET", path, &[], "").status, 404, "{path}");

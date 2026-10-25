@@ -11,6 +11,20 @@ use uuid::Uuid;
 pub const USER: &str = "usr";
 /// Sessions.
 pub const SESSION: &str = "ses";
+/// Organizations.
+pub const ORGANIZATION: &str = "org";
+/// Memberships.
+pub const MEMBERSHIP: &str = "mem";
+/// Invitations.
+pub const INVITATION: &str = "inv";
+/// Roles (built-in, declared and custom).
+pub const ROLE: &str = "rol";
+/// Role assignments, tenant and application.
+pub const ASSIGNMENT: &str = "asg";
+/// Service accounts.
+pub const SERVICE_ACCOUNT: &str = "svc";
+/// API keys.
+pub const API_KEY: &str = "key";
 
 /// `<prefix>_<hex>`.
 pub fn render(prefix: &str, id: Uuid) -> String {

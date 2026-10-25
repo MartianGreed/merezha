@@ -1,5 +1,10 @@
 //! The identity block as a platform [`Module`].
 use crate::{
+    catalog::Catalog,
+    directory::IdentityDirectory,
+    rbac::{GrantCache, Once, Policy, RbacAuthorizer},
+};
+use crate::{
     cleanup::{self, CleanupJob},
     config::{HostFacts, Settings},
     core::{Core, NAME, event},
@@ -10,19 +15,30 @@ use crate::{
     session::SessionAuthenticator,
 };
 use merezha_domain::Failure;
+use merezha_platform::ports::{Authorizer, Directory};
 use merezha_platform::{
     AppContext, BoxFuture, ErrorCode, Migration, Module, ModuleEvents, ModuleSection,
     config::ConfigIssue,
     ports::{Authenticator, KindOptions, ScheduleDeclaration},
 };
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, OnceLock},
+};
 
-/// Migration 1 (section 3), ledger key `identity`.
-pub const MIGRATIONS: &[Migration] = &[Migration::new(
-    1,
-    "identity_core",
-    include_str!("../migrations/0001_identity_core.sql"),
-)];
+/// Migrations 1 and 2 (section 3), ledger key `identity`.
+pub const MIGRATIONS: &[Migration] = &[
+    Migration::new(
+        1,
+        "identity_core",
+        include_str!("../migrations/0001_identity_core.sql"),
+    ),
+    Migration::new(
+        2,
+        "organizations_rbac_api_keys",
+        include_str!("../migrations/0002_organizations_rbac_api_keys.sql"),
+    ),
+];
 
 /// The codes identity returns, with their statuses (section 4, R8). The
 /// canonical kernel codes are the kernel's.
@@ -37,8 +53,24 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("email_unverified", 403),
     ErrorCode::new("account_disabled", 403),
     ErrorCode::new("registration_closed", 403),
+    ErrorCode::new("permission_escalation", 403),
+    ErrorCode::new("email_mismatch", 403),
+    ErrorCode::new("builtin_role", 403),
     ErrorCode::new("email_taken", 409),
     ErrorCode::new("sole_owner", 409),
+    ErrorCode::new("slug_taken", 409),
+    ErrorCode::new("slug_reserved", 409),
+    ErrorCode::new("role_key_taken", 409),
+    ErrorCode::new("role_in_use", 409),
+    ErrorCode::new("already_member", 409),
+    ErrorCode::new("unknown_permission", 422),
+    ErrorCode::new("unknown_resource_kind", 422),
+    ErrorCode::new("organization_limit", 422),
+    ErrorCode::new("role_limit", 422),
+    ErrorCode::new("assignment_limit", 422),
+    ErrorCode::new("service_account_limit", 422),
+    ErrorCode::new("api_key_limit", 422),
+    ErrorCode::new("declared_role_in_use", 422),
     ErrorCode::new("password_too_short", 422),
     ErrorCode::new("password_too_long", 422),
     ErrorCode::new("password_blocklisted", 422),
@@ -67,6 +99,31 @@ impl IdentityHandle {
     /// credentials until the block started.
     pub fn authenticator(&self) -> Arc<dyn Authenticator> {
         Arc::new(SessionAuthenticator::new(self.core.clone()))
+    }
+    /// The RBAC `Authorizer` to install in the host (`HostParts::authorizer`).
+    pub fn authorizer(&self) -> Arc<dyn Authorizer> {
+        Arc::new(RbacAuthorizer::new(self.core.clone()))
+    }
+    /// The `Directory` to install in the host (`HostOptions::directory`).
+    /// It answers `unavailable` until the block started.
+    pub fn directory(&self) -> Arc<dyn Directory> {
+        Arc::new(IdentityDirectory::new(self.core.clone()))
+    }
+    /// `merezha identity platform-admin grant|revoke <email>` on a started
+    /// block: `Ok((change, user id))`; `not_found` for an unknown address,
+    /// `email_unverified` to grant an unverified or disabled account.
+    pub async fn platform_admin(
+        &self,
+        email: &crate::normalize::Email,
+        grant: bool,
+    ) -> Result<(crate::appscope::AdminChange, uuid::Uuid), Failure> {
+        let core = self
+            .core
+            .get()
+            .ok_or_else(|| Failure::transient("unavailable"))?;
+        core.platform_admin(email, grant)
+            .await
+            .map_err(|e| e.failure)
     }
     /// Record the identity metrics on `meter`; call before the host starts.
     /// The first meter set wins.
@@ -97,6 +154,8 @@ impl IdentityHandle {
 /// routes `/v1/identity/` and the session [`Authenticator`].
 pub struct IdentityModule {
     facts: Option<HostFacts>,
+    catalog: Catalog,
+    resource_kinds: BTreeSet<String>,
     settings: Option<Settings>,
     metrics: Arc<OnceLock<Metrics>>,
     core: Arc<OnceLock<Arc<Core>>>,
@@ -115,11 +174,47 @@ impl IdentityModule {
     pub fn new(facts: Option<HostFacts>) -> Self {
         Self {
             facts,
+            catalog: Catalog::builtin(),
+            resource_kinds: BTreeSet::new(),
             settings: None,
             metrics: Arc::new(OnceLock::new()),
             core: Arc::new(OnceLock::new()),
             counts: Arc::new(OnceLock::new()),
         }
+    }
+    /// Add a block's permissions to the catalog (section 5), such as
+    /// `("content", &merezha_content::CONTENT_PERMISSIONS)`. Each must start
+    /// with `<block>.`; fails with the first that does not.
+    pub fn add_block_permissions(
+        &mut self,
+        block: &'static str,
+        names: &[&str],
+    ) -> Result<(), String> {
+        self.catalog.add_block(block, names)
+    }
+    /// Add the application's `[[permissions]]` to the catalog (AP-C2 reads
+    /// them from `application.toml`). Fails with `invalid_permission` or
+    /// `block_prefix` and the offending name.
+    pub fn add_application_permissions<'a>(
+        &mut self,
+        permissions: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<(), (&'static str, String)> {
+        for (name, description) in permissions {
+            self.catalog
+                .add_application(name, description)
+                .map_err(|code| (code, name.to_owned()))?;
+        }
+        Ok(())
+    }
+    /// Resource kinds role assignments may target: those a block declares
+    /// (content's `content_type`) and those routes name in `resource`.
+    pub fn add_resource_kinds(&mut self, kinds: &[&str]) {
+        self.resource_kinds
+            .extend(kinds.iter().map(|k| (*k).to_owned()));
+    }
+    /// The permission catalog this module checks grants against.
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
     }
     /// Record the identity metrics on `meter`.
     pub fn with_meter(self, meter: &opentelemetry::metrics::Meter) -> Self {
@@ -145,6 +240,53 @@ impl IdentityModule {
 }
 
 impl IdentityModule {
+    /// Open the block for an administration command (`merezha identity
+    /// platform-admin`) on `ctx` after [`Module::configure`]: no listener,
+    /// no jobs, no password hasher, no notification delivery path and no
+    /// declared role sync, so a command run with another configuration
+    /// never rewrites roles. Only the handle's administration calls work.
+    pub async fn open_admin(&self, ctx: AppContext) -> Result<(), Failure> {
+        let settings = self
+            .settings
+            .clone()
+            .ok_or_else(|| Failure::permanent("invalid_config"))?;
+        let keys = Keys::derive(
+            settings.secret_key.expose().as_bytes(),
+            settings
+                .secret_key_previous
+                .as_ref()
+                .map(|s| s.expose().as_bytes()),
+        );
+        let core = self.core_with(ctx, settings, keys, None, None)?;
+        self.core
+            .set(Arc::new(core))
+            .map_err(|_| Failure::permanent("module_already_started"))
+    }
+    fn core_with(
+        &self,
+        ctx: AppContext,
+        settings: Settings,
+        keys: Keys,
+        hasher: Option<Hasher>,
+        policy: Option<PasswordPolicy>,
+    ) -> Result<Core, Failure> {
+        let rbac = Policy::new(self.catalog.clone(), &settings.rbac, 1);
+        Ok(Core {
+            notifier: ctx.notifier(NAME)?,
+            outbox: ctx.outbox(NAME)?,
+            keys,
+            hasher,
+            policy,
+            metrics: self.metrics(&ctx),
+            grants: GrantCache::new(settings.rbac.cache_entries),
+            audited: Once::default(),
+            audit_slots: Arc::new(tokio::sync::Semaphore::new(crate::core::AUDIT_SLOTS)),
+            resource_kinds: self.resource_kinds.clone(),
+            rbac,
+            settings,
+            ctx,
+        })
+    }
     /// The meter set through the handle, else the host's
     /// (`AppContext::telemetry`, scope `merezha.identity`).
     fn metrics(&self, ctx: &AppContext) -> Metrics {
@@ -162,7 +304,11 @@ impl Module for IdentityModule {
         NAME
     }
     fn configure(&mut self, section: &ModuleSection) -> Result<(), Vec<ConfigIssue>> {
-        self.settings = Some(Settings::parse(section, self.facts.as_ref())?);
+        self.settings = Some(Settings::parse(
+            section,
+            self.facts.as_ref(),
+            &self.catalog,
+        )?);
         Ok(())
     }
     fn migrations(&self) -> &[Migration] {
@@ -253,16 +399,8 @@ impl Module for IdentityModule {
                 kind: merezha_domain::Identity::new(cleanup::KIND)?,
                 payload: serde_json::json!({}),
             })?;
-            let core = Core {
-                notifier: ctx.notifier(NAME)?,
-                outbox: ctx.outbox(NAME)?,
-                keys,
-                hasher,
-                policy,
-                metrics: self.metrics(&ctx),
-                settings,
-                ctx,
-            };
+            let core = self.core_with(ctx, settings, keys, hasher, policy)?;
+            core.sync_declared_roles().await?;
             self.core
                 .set(Arc::new(core))
                 .map_err(|_| Failure::permanent("module_already_started"))?;

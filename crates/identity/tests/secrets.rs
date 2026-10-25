@@ -455,3 +455,77 @@ async fn printed_links_go_to_stderr_only() {
     assert!(!format!("{:?}", harness.spans()).contains(&token));
     tokio::time::sleep(Duration::from_millis(1)).await;
 }
+
+/// TE-T6 for ID PR 2: API keys (valid, revoked and forged), invitation
+/// tokens and invited addresses never reach logs, spans or metrics, and the
+/// break-glass and denial audits stay in the audit table.
+#[tokio::test]
+async fn planted_keys_and_invitation_tokens_never_reach_telemetry() {
+    let harness = Harness::new();
+    let Some(world) = World::new(&base()).await else {
+        return;
+    };
+    let meter = harness.telemetry().meter("identity");
+    let node = world.instance_with(Some(&meter)).await;
+    let mut owner = user(&world, &node, "owner@example.com").await;
+    let org = organization(&node, &mut owner, "acme").await;
+    let invited = owner
+        .post(
+            &node,
+            &format!("/organizations/{org}/invitations"),
+            json!({"email": "canary-invitee@example.com", "role_ids": [MEMBER_ROLE]}),
+        )
+        .await;
+    assert_eq!(invited.status, 201);
+    let token = world
+        .mail
+        .token("identity.invitation", "canary-invitee@example.com");
+    Browser::new("198.51.100.154")
+        .post(&node, "/invitations/inspect", json!({"token": token}))
+        .await;
+    let created = owner
+        .post(&node, &format!("/organizations/{org}/api-keys"), json!({"name": "canary", "permissions": ["identity.members.read"], "expires_at": "2027-06-01T00:00:00Z"}))
+        .await;
+    let key = created.body["key"].as_str().unwrap().to_owned();
+    let mut robot = Browser::new("198.51.100.155");
+    robot.bearer = Some(key.clone());
+    assert_eq!(
+        robot
+            .get(&node, &format!("/organizations/{org}/members"))
+            .await
+            .status,
+        200
+    );
+    robot
+        .get(&node, &format!("/organizations/{org}/roles"))
+        .await;
+    let key_id = created.body["api_key"]["id"].as_str().unwrap().to_owned();
+    owner
+        .delete(&node, &format!("/organizations/{org}/api-keys/{key_id}"))
+        .await;
+    assert_eq!(robot.get(&node, "/me").await.status, 401);
+    let forged = format!("{}{}", &key[..21], "Z".repeat(43));
+    robot.bearer = Some(forged.clone());
+    assert_eq!(robot.get(&node, "/me").await.status, 401);
+    user(&world, &node, "root@example.com").await;
+    platform_admin(&node, "root@example.com").await;
+    let mut root = sign_in(&node, "root@example.com").await;
+    assert!(
+        root.allowed(&node, "identity.users.manage", "application")
+            .await
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = harness.telemetry().meter("identity");
+    for canary in [
+        key.as_str(),
+        &key[21..],
+        &key[4..20],
+        forged.as_str(),
+        &token,
+        "canary-invitee@example.com",
+    ] {
+        harness.assert_no_canary(canary);
+    }
+    assert!(!harness.spans_named("identity api_key.resolve").is_empty());
+    assert!(world.scalar("SELECT count(*) FROM merezha_identity.audit_events WHERE action = 'authorization.break_glass'").await >= 1);
+}

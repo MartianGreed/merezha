@@ -40,7 +40,7 @@ pub const BINDING: &str = "__Host-merezha_verify";
 pub const SECRET: &str = "an-identity-secret-key-of-at-least-32-bytes";
 pub const SECRET_NEXT: &str = "the-next-identity-secret-key-after-rotation";
 /// Every rate-limit table, so tests can raise the defaults.
-pub const POLICY_TABLES: [&str; 9] = [
+pub const POLICY_TABLES: [&str; 11] = [
     "sign_in_ip",
     "sign_in_account_ip",
     "sign_in_account",
@@ -50,6 +50,8 @@ pub const POLICY_TABLES: [&str; 9] = [
     "email_ip",
     "token_ip",
     "reauth_session",
+    "invitation_organization",
+    "api_key_invalid_ip",
 ];
 /// An identity section: `top` keys, cheap Argon2 at its floor, magic links
 /// on, every rate limit at 1000 per hour unless `limits` names it, then
@@ -224,6 +226,67 @@ impl NotifierFactory for MailFactory {
     }
 }
 
+/// Application permissions of the test catalog.
+pub const TASKS: [&str; 4] = [
+    "tasks.read",
+    "tasks.create",
+    "tasks.delete",
+    "tasks.admin.purge",
+];
+/// The test catalog: identity's and the host's permissions, content's,
+/// [`TASKS`], and the resource kinds `content_type` and `project`.
+pub fn catalogued(mut module: IdentityModule) -> IdentityModule {
+    module
+        .add_block_permissions(
+            "content",
+            &["content.entries.read", "content.entries.publish"],
+        )
+        .unwrap();
+    module
+        .add_application_permissions(TASKS.iter().map(|t| (*t, "")))
+        .unwrap();
+    module.add_resource_kinds(&["content_type", "project"]);
+    module
+}
+
+/// The probe route of [`Instance`]: `{"allowed": bool, "break_glass": bool,
+/// "code": ...}` for one check.
+fn check_route(
+    authorizer: &dyn merezha_platform::ports::Authorizer,
+    request: axum::extract::Request,
+) -> axum::Json<Value> {
+    use merezha_platform::ports::{Allowed, ResourceScope};
+    let principal = request
+        .extensions()
+        .get::<edge::Authenticated>()
+        .and_then(|a| a.0.clone());
+    let query = request.uri().query().unwrap_or("").to_owned();
+    let get = |key: &str| {
+        query
+            .split('&')
+            .filter_map(|p| p.split_once('='))
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| merezha_domain::Identity::new(v).unwrap())
+    };
+    let permission = get("permission").unwrap();
+    let scope = match get("scope").as_ref().map(|s| s.as_str()) {
+        Some("tenant") => ResourceScope::Tenant(get("tenant").unwrap()),
+        Some("resource") => ResourceScope::Resource {
+            tenant: get("tenant"),
+            kind: get("kind").unwrap(),
+            id: get("id").unwrap(),
+        },
+        _ => ResourceScope::Application,
+    };
+    let result = authorizer.check(principal.as_deref(), &permission, &scope);
+    axum::Json(json!({
+        "allowed": result.is_ok(),
+        "break_glass": result == Ok(Allowed::BreakGlass),
+        "code": result.err().map(|d| d.failure().code),
+        "tenant": principal.as_ref().and_then(|p| p.tenant.as_ref().map(|t| t.as_str().to_owned())),
+    }))
+}
+
 /// A project directory with `merezha.toml` and the identity section.
 pub fn project(dir: &Path, section: &str) -> ConfigInput {
     std::fs::write(
@@ -254,7 +317,7 @@ pub fn configured(
 ) -> Result<Configured, Vec<(String, String)>> {
     let dir = tempfile::tempdir().unwrap();
     let input = project(dir.path(), section);
-    let module = IdentityModule::new(facts);
+    let module = catalogued(IdentityModule::new(facts));
     let parts = IdentityModuleParts {
         handle: module.handle(),
         authenticator: module.authenticator(),
@@ -308,6 +371,7 @@ pub async fn database(test: &TestDatabase, pool: usize) -> Database {
 pub struct Instance {
     pub router: Router,
     pub handle: IdentityHandle,
+    pub authorizer: Arc<dyn merezha_platform::ports::Authorizer>,
     pub jobs: PgJobs,
     pub db: Database,
     /// The jobs workers run, so link requests are fulfilled.
@@ -443,12 +507,13 @@ impl World {
     ) -> Instance {
         let dir = tempfile::tempdir().unwrap();
         let input = project(dir.path(), &self.section);
-        let mut module = IdentityModule::new(Some(HostFacts::loopback()));
+        let mut module = catalogued(IdentityModule::new(Some(HostFacts::loopback())));
         if let Some(meter) = meter {
             module = module.with_meter(meter);
         }
         let handle = module.handle();
         let authenticator = module.authenticator();
+        let authorizer = handle.authorizer();
         let (config, mut modules) = configure(&input, vec![Box::new(module)]).unwrap();
         let module = modules.remove(0);
         let jobs = PgJobs::with_mode(
@@ -490,9 +555,20 @@ impl World {
                 .and_then(|a| a.0.as_ref().map(|p| p.subject.as_str().to_owned()));
             axum::Json(json!({ "subject": subject }))
         });
+        // A host route checking one permission through the RBAC
+        // `Authorizer`, as AP-C2's enforcement and the admin routes do:
+        // `?permission=..&scope=application|tenant|resource&tenant=org_..&kind=..&id=..`.
+        let check = {
+            let authorizer = authorizer.clone();
+            axum::routing::get(move |request: axum::extract::Request| {
+                let authorizer = authorizer.clone();
+                async move { check_route(authorizer.as_ref(), request) }
+            })
+        };
         let router = edge::apply(
             Router::new()
                 .nest("/v1/identity", module.routes(&ctx))
+                .route("/v1/probe/check", check)
                 .route("/v1/probe", probe),
             edge::EdgeSettings::new(&config.http, Arc::new(errors))
                 .authenticator(Some(authenticator)),
@@ -500,6 +576,7 @@ impl World {
         Instance {
             router,
             handle,
+            authorizer,
             jobs,
             db: self.db.clone(),
             workers,
@@ -583,6 +660,8 @@ pub struct Browser {
     pub bearer: Option<String>,
     pub origin: Option<String>,
     pub user_agent: String,
+    /// The `Merezha-Organization` header, when set.
+    pub organization: Option<String>,
 }
 impl Browser {
     pub fn new(ip: &str) -> Self {
@@ -594,6 +673,7 @@ impl Browser {
             bearer: None,
             origin: Some(APP.to_owned()),
             user_agent: "TestBrowser/1.0".into(),
+            organization: None,
         }
     }
     pub fn request(&self, method: &str, path: &str, body: Option<&Value>) -> Request<Body> {
@@ -623,6 +703,9 @@ impl Browser {
         }
         if let Some(bearer) = &self.bearer {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        if let Some(org) = &self.organization {
+            builder = builder.header("merezha-organization", org);
         }
         let body = match body {
             Some(value) => {
@@ -678,6 +761,42 @@ impl Browser {
     pub async fn get(&mut self, instance: &Instance, path: &str) -> Answer {
         self.send(instance, "GET", path, None).await
     }
+    pub async fn patch(&mut self, instance: &Instance, path: &str, body: Value) -> Answer {
+        self.send(instance, "PATCH", path, Some(body)).await
+    }
+    pub async fn put(&mut self, instance: &Instance, path: &str, body: Value) -> Answer {
+        self.send(instance, "PUT", path, Some(body)).await
+    }
+    pub async fn delete(&mut self, instance: &Instance, path: &str) -> Answer {
+        self.send(instance, "DELETE", path, None).await
+    }
+    pub async fn delete_with(&mut self, instance: &Instance, path: &str, body: Value) -> Answer {
+        self.send(instance, "DELETE", path, Some(body)).await
+    }
+    /// The probe check of `permission` at `scope` (`application`,
+    /// `tenant:<org>`, `resource:<org or ->:<kind>:<id>`).
+    pub async fn check(&mut self, instance: &Instance, permission: &str, scope: &str) -> Answer {
+        let query = match scope.split(':').collect::<Vec<_>>().as_slice() {
+            ["application"] => "scope=application".to_owned(),
+            ["tenant", org] => format!("scope=tenant&tenant={org}"),
+            ["resource", "-", kind, id] => format!("scope=resource&kind={kind}&id={id}"),
+            ["resource", org, kind, id] => {
+                format!("scope=resource&tenant={org}&kind={kind}&id={id}")
+            }
+            _ => panic!("scope {scope}"),
+        };
+        self.get(
+            instance,
+            &format!("/v1/probe/check?permission={permission}&{query}"),
+        )
+        .await
+    }
+    /// Whether the probe allows `permission` at `scope`.
+    pub async fn allowed(&mut self, instance: &Instance, permission: &str, scope: &str) -> bool {
+        let answer = self.check(instance, permission, scope).await;
+        assert_eq!(answer.status, 200, "{answer:?}");
+        answer.body["allowed"].as_bool().unwrap()
+    }
 }
 
 /// Register `email` with `password`, verify through the mailed link and
@@ -705,3 +824,161 @@ pub async fn signed_up(world: &World, instance: &Instance, email: &str, password
 }
 
 pub const PASSWORD: &str = "correct horse battery staple";
+
+/// A browser with a bearer session for `email` (its account registered and
+/// verified), so tests need no CSRF dance.
+pub async fn user(world: &World, instance: &Instance, email: &str) -> Browser {
+    let mut browser = Browser::new("198.51.100.20");
+    let answer = browser
+        .post(
+            instance,
+            "/registrations",
+            json!({"email": email, "password": PASSWORD}),
+        )
+        .await;
+    assert_eq!(answer.status, 202, "{answer:?}");
+    let token = world.mail.token("identity.verify_email", email);
+    let answer = browser
+        .post(
+            instance,
+            "/email-verifications/confirm",
+            json!({"token": token, "transport": "bearer"}),
+        )
+        .await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    browser.binding = None;
+    browser
+}
+/// Sign `email` in again with a bearer session (a second device).
+pub async fn sign_in(instance: &Instance, email: &str) -> Browser {
+    let mut browser = Browser::new("198.51.100.21");
+    let answer = browser
+        .post(
+            instance,
+            "/sessions",
+            json!({"email": email, "password": PASSWORD, "transport": "bearer"}),
+        )
+        .await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    browser
+}
+/// The id in `answer.body[pointer]`.
+pub fn id_at(answer: &Answer, pointer: &str) -> String {
+    answer
+        .body
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{pointer} in {answer:?}"))
+        .to_owned()
+}
+/// Create organization `slug` as `owner`; its id.
+pub async fn organization(instance: &Instance, owner: &mut Browser, slug: &str) -> String {
+    let answer = owner
+        .post(
+            instance,
+            "/organizations",
+            json!({"name": slug, "slug": slug}),
+        )
+        .await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    id_at(&answer, "/organization/id")
+}
+/// The seeded role ids.
+pub const OWNER_ROLE: &str = "rol_00000000000070008000000000000001";
+pub const ADMIN_ROLE: &str = "rol_00000000000070008000000000000002";
+pub const MEMBER_ROLE: &str = "rol_00000000000070008000000000000003";
+pub const PLATFORM_ADMIN_ROLE: &str = "rol_00000000000070008000000000000004";
+
+/// Invite `email` into `org` with `roles` as `inviter`, and accept as
+/// `invitee` (signed in with that address); the membership id.
+pub async fn join(
+    world: &World,
+    instance: &Instance,
+    inviter: &mut Browser,
+    org: &str,
+    invitee: &mut Browser,
+    email: &str,
+    roles: &[&str],
+) -> String {
+    let answer = inviter
+        .post(
+            instance,
+            &format!("/organizations/{org}/invitations"),
+            json!({"email": email, "role_ids": roles}),
+        )
+        .await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    let token = world.mail.token("identity.invitation", email);
+    let answer = invitee
+        .post(instance, "/invitations/accept", json!({"token": token}))
+        .await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    id_at(&answer, "/membership/id")
+}
+/// Grant `platform_admin` to `email` as the CLI does.
+pub async fn platform_admin(instance: &Instance, email: &str) {
+    let email = merezha_identity::normalize::email(email).unwrap();
+    instance.handle.platform_admin(&email, true).await.unwrap();
+}
+
+impl World {
+    /// Run `sql`; the error's SQLSTATE on failure.
+    pub async fn try_execute(&self, sql: &str) -> Result<(), String> {
+        let client = self.db.acquire(soon()).await.unwrap();
+        client
+            .batch_execute(sql)
+            .await
+            .map_err(|e| e.code().map(|c| c.code().to_owned()).unwrap_or_default())
+    }
+}
+/// The raw UUID hex of a prefixed id.
+pub fn hex(id: &str) -> String {
+    id.split_once('_').unwrap().1.to_owned()
+}
+/// The membership id of `email` in `org`, listed by `viewer`.
+pub async fn membership_of(
+    instance: &Instance,
+    viewer: &mut Browser,
+    org: &str,
+    email: &str,
+) -> String {
+    let answer = viewer
+        .get(instance, &format!("/organizations/{org}/members?limit=100"))
+        .await;
+    assert_eq!(answer.status, 200, "{answer:?}");
+    answer.body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["user"]["email"] == email)
+        .unwrap_or_else(|| panic!("{email} in {answer:?}"))["id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+impl World {
+    /// Start the identity block with another `section` on this database
+    /// and return its start result.
+    pub async fn try_start(&self, section: &str) -> Result<(), merezha_domain::Failure> {
+        let dir = tempfile::tempdir().unwrap();
+        let input = project(dir.path(), section);
+        let module = catalogued(IdentityModule::new(Some(HostFacts::loopback())));
+        let (config, mut modules) = configure(&input, vec![Box::new(module)]).unwrap();
+        let module = modules.remove(0);
+        let jobs = PgJobs::with_mode(&config.jobs, RelayMode::Off);
+        let ports = jobs.ports(&self.db);
+        let ctx = AppContext::builder(
+            "tasks",
+            self.db.clone(),
+            Arc::new(LoopbackAllowAll::new("127.0.0.1:1".parse().unwrap()).unwrap()),
+        )
+        .clock(self.clock.clone())
+        .outbox(ports.outbox)
+        .jobs(ports.jobs)
+        .notifications(Arc::new(MailFactory(self.mail.clone())))
+        .build()
+        .unwrap();
+        module.start(ctx).await
+    }
+}

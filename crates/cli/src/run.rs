@@ -136,10 +136,8 @@ pub async fn run(
 }
 
 /// [`run`] with the identity block's handle: when `[modules.identity]` is
-/// present the host installs its session authenticator and its metrics,
-/// and the permission policy denies by default (identity PR 1 has no RBAC
-/// `Authorizer` yet, and the host refuses allow-all beside an
-/// authenticator).
+/// present the host installs its authenticator (sessions and API keys),
+/// its RBAC `Authorizer` on every listener and its `Directory`.
 pub async fn run_with(
     input: ConfigInput,
     modules: Vec<Box<dyn Module>>,
@@ -196,12 +194,15 @@ pub async fn run_with(
         status: vec![Arc::new(TelemetrySection(telemetry.status_reader()))],
         ..HostOptions::default()
     };
+    let mut rbac = None;
     if let Some(identity) = identity
         && modules.iter().any(|m| m.name() == merezha_identity::NAME)
     {
         options.authenticator = Some(identity.authenticator());
+        options.directory = Some(identity.directory());
+        rbac = Some(identity.authorizer());
     }
-    let code = serve(config, modules, shutdown, options, jobs).await;
+    let code = serve(config, modules, shutdown, options, jobs, rbac).await;
     // Flush traces, logs and metrics within `shutdown_timeout_ms`, then the
     // stderr writer.
     let _ = spawn_blocking_in_span(move || telemetry.shutdown()).await;
@@ -275,6 +276,7 @@ async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
     mut options: HostOptions,
     jobs: merezha_jobs::PgJobs,
+    rbac: Option<Arc<dyn Authorizer>>,
 ) -> ExitCode {
     let (signal, stopped) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
@@ -301,7 +303,7 @@ async fn serve(
     // A shutdown signal during startup interrupts it: the host shuts the
     // modules it already started down and fails `startup_interrupted`.
     options.interrupt = Some(stopped);
-    let started = start(config, modules, options, jobs)
+    let started = start(config, modules, options, jobs, rbac)
         .instrument(tracing::info_span!(names::span::STARTUP))
         .await;
     let host = match started {
@@ -330,6 +332,7 @@ async fn start(
     modules: Vec<Box<dyn Module>>,
     mut options: HostOptions,
     jobs: merezha_jobs::PgJobs,
+    rbac: Option<Arc<dyn Authorizer>>,
 ) -> Result<Host, String> {
     let manifest = config.runtime.manifest.clone();
     let meters = options.meters.clone();
@@ -356,11 +359,13 @@ async fn start(
     // A trusted proxy means requests arrive from elsewhere even on a
     // loopback listener, so it counts as public too.
     let private = host::private_listener(&config);
-    // With the identity block (an authenticator) the policy denies every
-    // permission check until ID PR 2 brings the RBAC `Authorizer`:
-    // `401 unauthenticated` without a principal, `403 unauthorized` with one.
-    let authorizer: Arc<dyn Authorizer> = match LoopbackAllowAll::new(config.http.listen) {
-        Ok(allow) if private && options.authenticator.is_none() => Arc::new(allow),
+    // With the identity block every permission check is its RBAC
+    // `Authorizer` (identity section 5), on every listener, loopback
+    // included. Application commands and queries stay refused until AP-C2
+    // checks their route permissions with the principal.
+    let authorizer: Arc<dyn Authorizer> = match (rbac, LoopbackAllowAll::new(config.http.listen)) {
+        (Some(rbac), _) if options.authenticator.is_some() => rbac,
+        (_, Ok(allow)) if private && options.authenticator.is_none() => Arc::new(allow),
         _ => Arc::new(DenyAll),
     };
     let mut modules = modules;

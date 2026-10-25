@@ -53,6 +53,29 @@ impl Email {
     }
 }
 
+/// Slugs no organization may take (section 2).
+pub const RESERVED_SLUGS: [&str; 10] = [
+    "api", "admin", "v1", "identity", "www", "static", "assets", "health", "me", "new",
+];
+/// An organization slug: `^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`. Fails
+/// `invalid`, or `reserved` for [`RESERVED_SLUGS`].
+pub fn slug(input: &str) -> Result<String, &'static str> {
+    let bytes = input.as_bytes();
+    let edge = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let shaped = !bytes.is_empty()
+        && bytes.len() <= 63
+        && edge(bytes[0])
+        && edge(bytes[bytes.len() - 1])
+        && bytes.iter().all(|b| edge(*b) || *b == b'-');
+    if !shaped {
+        return Err("invalid");
+    }
+    if RESERVED_SLUGS.contains(&input) {
+        return Err("reserved");
+    }
+    Ok(input.to_owned())
+}
+
 /// Normalize an address: trim, NFC, split at the last `@`, IDNA the domain
 /// to lowercase ASCII, lowercase the local part. No provider folding. A
 /// second `@`, whitespace, control characters and angle brackets are
@@ -171,6 +194,28 @@ fn percent_decode(input: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slugs_follow_the_rule() {
+        for good in ["a", "acme", "acme-co", "a1-b2", &"a".repeat(63)] {
+            assert_eq!(slug(good).as_deref(), Ok(good), "{good}");
+        }
+        for bad in [
+            "",
+            "-acme",
+            "acme-",
+            "Acme",
+            "ac_me",
+            "ac me",
+            "é",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(slug(bad), Err("invalid"), "{bad}");
+        }
+        for reserved in RESERVED_SLUGS {
+            assert_eq!(slug(reserved), Err("reserved"));
+        }
+    }
 
     #[test]
     fn email_normalization_table() {

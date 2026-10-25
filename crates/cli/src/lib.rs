@@ -78,7 +78,7 @@ pub fn host_blocks(
     Vec<Box<dyn merezha_platform::Module>>,
     merezha_identity::IdentityHandle,
 ) {
-    let identity = merezha_identity::IdentityModule::new(merezha_identity::HostFacts::load(input));
+    let identity = identity_module(input);
     let handle = identity.handle();
     (
         blocks_with(input, merezha_content::ContentModule::new(), identity),
@@ -92,8 +92,28 @@ pub fn blocks(
     input: &merezha_platform::ConfigInput,
     content: merezha_content::ContentModule,
 ) -> Vec<Box<dyn merezha_platform::Module>> {
-    let identity = merezha_identity::IdentityModule::new(merezha_identity::HostFacts::load(input));
-    blocks_with(input, content, identity)
+    blocks_with(input, content, identity_module(input))
+}
+
+/// The identity block with the full permission catalog of this binary
+/// (identity section 5): identity's and the host's own permissions, the
+/// content and notifications blocks' lists, and content's `content_type`
+/// resource kind. The application's `[[permissions]]` and route `resource`
+/// kinds join with AP-C2, which owns their syntax.
+pub fn identity_module(input: &merezha_platform::ConfigInput) -> merezha_identity::IdentityModule {
+    let mut identity =
+        merezha_identity::IdentityModule::new(merezha_identity::HostFacts::load(input));
+    let added = identity
+        .add_block_permissions("content", &merezha_content::CONTENT_PERMISSIONS)
+        .and_then(|()| {
+            identity.add_block_permissions(
+                "notifications",
+                &[merezha_notifications::PREVIEW_PERMISSION],
+            )
+        });
+    debug_assert!(added.is_ok(), "block permissions follow the grammar");
+    identity.add_resource_kinds(&[merezha_content::RESOURCE_KIND]);
+    identity
 }
 
 fn blocks_with(

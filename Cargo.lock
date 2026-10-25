@@ -1827,6 +1827,7 @@ dependencies = [
  "hmac",
  "idna",
  "jiff",
+ "merezha-application",
  "merezha-domain",
  "merezha-jobs",
  "merezha-platform",

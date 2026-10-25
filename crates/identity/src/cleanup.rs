@@ -1,6 +1,7 @@
 //! The recurring `identity.cleanup` job (section 8), declared through
 //! `JobsHandle::schedule`: expired sessions and tokens, drained rate-limit
-//! buckets, audit rows past retention and, only while
+//! buckets, audit rows past retention, expired invitations, API keys
+//! revoked or expired 30 days ago and, only while
 //! `require_verified_email = true`, unverified accounts past
 //! `unverified_account_ttl` that never signed in. Every step deletes in
 //! batches of `cleanup.batch_size` to keep transactions short.
@@ -23,6 +24,9 @@ pub const KIND: &str = "identity.cleanup";
 pub const QUEUE: &str = "identity";
 /// Passes per step and run, so one run stays bounded.
 const MAX_BATCHES: u32 = 100;
+/// How long a revoked or expired key's row stays, so a later use is
+/// audited as a use after revocation (section 3).
+pub const KEY_RETENTION: Duration = Duration::from_secs(30 * 86_400);
 /// Bound on each batch statement.
 const BATCH_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -33,6 +37,8 @@ enum Step {
     Tokens,
     Buckets,
     Audit,
+    Invitations,
+    Keys,
 }
 
 /// What one pass deleted.
@@ -42,6 +48,9 @@ pub struct CleanupReport {
     pub tokens: u64,
     pub buckets: u64,
     pub audit_events: u64,
+    pub invitations: u64,
+    /// API keys revoked or expired more than 30 days ago.
+    pub api_keys: u64,
     pub unverified_accounts: u64,
     /// Live sessions after the pass, the `sessions.active` gauge.
     pub active_sessions: u64,
@@ -62,6 +71,10 @@ impl Core {
                     minus(now, self.settings.audit_retention),
                     batch,
                 )
+                .await?,
+            invitations: self.batched(Step::Invitations, now, batch).await?,
+            api_keys: self
+                .batched(Step::Keys, minus(now, KEY_RETENTION), batch)
                 .await?,
             ..CleanupReport::default()
         };
@@ -112,6 +125,16 @@ impl Core {
                         .execute(&client, &crate::sql::CLEANUP_AUDIT, &params)
                         .await
                 }
+                Step::Invitations => {
+                    self.db()
+                        .execute(&client, &crate::sql::CLEANUP_INVITATIONS, &params)
+                        .await
+                }
+                Step::Keys => {
+                    self.db()
+                        .execute(&client, &crate::sql::CLEANUP_KEYS, &params)
+                        .await
+                }
             }
             .map_err(sql)?;
             total += deleted;
@@ -125,8 +148,9 @@ impl Core {
     /// with `SKIP LOCKED`, then delete in a second statement whose snapshot
     /// postdates the locks and re-checks every condition, so an account that
     /// signed in or verified meanwhile survives. Sign-in and every
-    /// attachment lock the user row first. ID PR 2 adds the membership and
-    /// application role conditions to both statements.
+    /// attachment lock the user row first. A user with a membership or an
+    /// application role is never a candidate, so never an organization
+    /// owner.
     async fn unverified_batch(
         self: &Arc<Self>,
         cutoff: Timestamp,

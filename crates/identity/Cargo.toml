@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+merezha-application = { path = "../application" }
 merezha-domain = { path = "../domain" }
 merezha-platform = { path = "../platform" }
 merezha-postgres = { path = "../postgres" }
