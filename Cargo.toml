@@ -58,6 +58,8 @@ rust_decimal = { version = "1.43.0", default-features = false, features = ["std"
 base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 deunicode = { version = "1.6.2", default-features = false, features = ["alloc"] }
 object_store = { version = "0.14.2", default-features = false, features = ["fs", "aws"] }
+infer = { version = "0.22.0", default-features = false }
+imagesize = { version = "0.15.0", default-features = false, features = ["png", "jpeg", "gif", "webp", "heif"] }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
 opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs", "internal-logs"] }
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs", "internal-logs", "http-proto", "reqwest-blocking-client", "reqwest-rustls", "gzip-http", "grpc-tonic", "tls-aws-lc", "tls-roots", "gzip-tonic"] }

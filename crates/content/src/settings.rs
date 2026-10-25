@@ -1,9 +1,9 @@
 //! The `[modules.content]` settings that entries need (section 9):
 //! `limits.*` for request, entry, page, filter, sort, batch and query
 //! bounds, `revisions.retain`, and the trash's `retention` and
-//! `purge_cron` (C4), and population bounds and delivery cache headers
-//! (C5). Keys of later slices stay `unknown_key` until the slice that
-//! gives them behaviour.
+//! `purge_cron` (C4), population bounds and delivery cache headers
+//! (C5), and `media` (C7, [`crate::media::MediaSettings`]). Keys of later
+//! slices stay `unknown_key` until the slice that gives them behaviour.
 use merezha_platform::{
     ModuleSection,
     config::{ConfigIssue, parse_duration},
@@ -107,13 +107,15 @@ impl Default for Delivery {
 }
 
 /// The settings of the content block.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct ContentSettings {
     pub limits: Limits,
     /// Revisions kept per variant besides the published one, 2 to 10000.
     pub revisions_retain: u32,
     pub trash: Trash,
     pub delivery: Delivery,
+    /// `[modules.content.media]`; media is off without it (C7).
+    pub media: Option<crate::media::MediaSettings>,
 }
 impl Default for ContentSettings {
     fn default() -> Self {
@@ -122,12 +124,13 @@ impl Default for ContentSettings {
             revisions_retain: 100,
             trash: Trash::default(),
             delivery: Delivery::default(),
+            media: None,
         }
     }
 }
 
 /// The top-level keys `[modules.content]` accepts.
-pub(crate) const KEYS: [&str; 5] = ["model", "limits", "revisions", "trash", "delivery"];
+pub(crate) const KEYS: [&str; 6] = ["model", "limits", "revisions", "trash", "delivery", "media"];
 const TRASH_KEYS: [&str; 2] = ["retention", "purge_cron"];
 const DELIVERY_KEYS: [&str; 2] = ["cache_control_public", "cache_control_private"];
 const LIMIT_KEYS: [&str; 11] = [
@@ -283,6 +286,7 @@ impl ContentSettings {
                 }
             }
         }
+        settings.media = crate::media::MediaSettings::parse(section, &mut issues);
         if issues.is_empty() {
             Ok(settings)
         } else {
@@ -305,7 +309,7 @@ pub const PURGE_TIMEZONE: &str = "UTC";
 
 /// A five-field cron expression the jobs scheduler accepts in UTC, by
 /// AP's parser (§B.7).
-fn valid_cron(cron: &str) -> bool {
+pub(crate) fn valid_cron(cron: &str) -> bool {
     merezha_platform::cron::CronSchedule::parse(cron, PURGE_TIMEZONE).is_ok()
 }
 

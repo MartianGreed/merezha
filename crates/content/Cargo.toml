@@ -6,20 +6,26 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+merezha-blob = { path = "../blob" }
 merezha-domain = { path = "../domain" }
 merezha-platform = { path = "../platform" }
 merezha-postgres = { path = "../postgres" }
 merezha-telemetry = { path = "../telemetry" }
 axum.workspace = true
 base64.workspace = true
+bytes.workspace = true
 deunicode.workspace = true
+futures-util.workspace = true
+imagesize.workspace = true
+infer.workspace = true
 jiff.workspace = true
 regex.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tokio.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
 toml.workspace = true
 uuid.workspace = true
 
@@ -27,5 +33,4 @@ uuid.workspace = true
 merezha-application = { path = "../application" }
 merezha-jobs = { path = "../jobs" }
 merezha-telemetry = { path = "../telemetry", features = ["testing"] }
-tempfile.workspace = true
 tower.workspace = true

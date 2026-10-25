@@ -200,7 +200,24 @@ pub fn principal(name: &str) -> Principal {
             vec![id("previewer")],
             set(&["content.preview"]),
         )),
-        // `content.delivery.read` at application scope.
+        // C7: every asset permission with the entry ones.
+        "media" => GrantSnapshot::empty().with_application(Grants::new(
+            vec![id("media")],
+            set(&[
+                "content.entries.read",
+                "content.entries.write",
+                "content.entries.publish",
+                "content.assets.read",
+                "content.assets.write",
+                "content.assets.delete",
+            ]),
+        )),
+        // Reads assets only.
+        "asset_reader" => GrantSnapshot::empty().with_application(Grants::new(
+            vec![id("asset_reader")],
+            set(&["content.assets.read"]),
+        )),
+        // The ready-made delivery permission at application scope.
         "delivery_reader" => GrantSnapshot::empty().with_application(Grants::new(
             vec![id("delivery_reader")],
             set(&["content.delivery.read"]),

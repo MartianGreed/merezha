@@ -398,9 +398,11 @@ Each table is opaque to the kernel and validated by the module of that name
 through `Module::configure`. Module issues are reported with kernel issues. A
 section without a registered module fails `unknown_module`. A registered
 module without a section stays disabled. `ModuleSection::secret` resolves
-secrets with the kernel rules, and `ModuleSection::base_dir` is the
-directory relative paths resolve against (the canonical directory of
-`merezha.toml`).
+secrets with the kernel rules, `ModuleSection::secret_at(&["media", "s3",
+"secret_access_key"])` the same for a key in nested tables (a `{ env }` or
+`{ file }` reference in the file: `MEREZHA_*` overrides reach top-level
+module keys only), and `ModuleSection::base_dir` is the directory relative
+paths resolve against (the canonical directory of `merezha.toml`).
 
 ### Configuration error codes
 
@@ -421,7 +423,10 @@ directory relative paths resolve against (the canonical directory of
 `invalid_kind`, `invalid_payload`, `duplicate_name`, `invalid_endpoint`,
 `invalid_header_name`, `invalid_signal`, `duplicate_signal`, `invalid_label`,
 `invalid_resource_attribute`, `batch_exceeds_queue`, `invalid_host`,
-`plaintext_headers_refused`, `detached_sessions_exhausted`.
+`plaintext_headers_refused`, `detached_sessions_exhausted`,
+`nested_override_unsupported` (a `MEREZHA_*` variable or `--set` naming a
+key inside a module's nested table: overrides reach top-level module keys
+only).
 
 ## The HTTP edge
 
@@ -467,7 +472,11 @@ directory relative paths resolve against (the canonical directory of
   = true` has no effect.
 - refuses bodies over `http.body_limit`: a larger `Content-Length` fails at
   once and an undeclared body fails while it is read. The same limit replaces
-  the 2 MiB default of axum's `Bytes` and `Json` extractors.
+  the 2 MiB default of axum's `Bytes` and `Json` extractors. A route a
+  module lists in `Module::body_limits` (exact method and path) is read up
+  to its own limit instead, its declared length left to the route;
+  `edge::is_body_limit(&error)` tells the route that a body read stopped
+  at that limit, so it answers its own code (`asset_too_large`).
 - applies CORS and the optional `Authenticator`.
 - logs one `http.request.completed` event with method, matched route, status, duration,
   request id and trace id (the line's `trace_id`): at error for 500, at
@@ -767,6 +776,8 @@ Guest calls, dispatch and projections are instrumented (TE-T3; TE §1.2,
 | `start_timeout()` | the bound on its `start`; `None` (default) keeps the host's 10 s. Content declares its activation bound (300 s plus 10 s) because it builds indexes before it is ready |
 | `routes(&AppContext)` | an axum `Router` nested under `/v1/<name>` |
 | `ready()` | readiness contribution, answered within 1 s |
+| `blob_store()` | the `BlobStore` it provides to every context, opened from its settings; `Ok(None)` (default) provides none. Asked once after `configure`, before any module starts; a failure stops startup naming the module, a second provider stops it with `blob_store_conflict`. Content provides the store `[modules.content.media]` configures |
+| `body_limits()` | `RouteBodyLimit { method, path, limit }` for routes that bound their own body (the upload route): the edge reads such a body up to `limit` instead of `http.body_limit` and leaves a declared length to the route; default none |
 | `shutdown(deadline)` | stop and drain background work after the listener drained |
 
 `HostParts::jobs` takes the `JobsRuntime`, a `Module` named `jobs` that
@@ -826,7 +837,8 @@ register blocks.
 
 `AppContext::builder` starts from the disabled-block fallbacks; blocks replace
 them through the builder (`outbox`, `jobs`, `notifications`, `directory`,
-`authenticator`, `blobs`, `telemetry`).
+`authenticator`, `blobs`, `telemetry`). `Host::start` installs the blob
+store a module provides (`Module::blob_store`) in every context.
 
 ## Ports
 
@@ -1794,13 +1806,13 @@ such as `cargo build --release -p merezha-cli` or `cargo build
 
 ## Content
 
-`merezha-content` (`crates/content`, CT-C1 to CT-C5) is the content block,
+`merezha-content` (`crates/content`, CT-C1 to CT-C5 and CT-C7) is the content block,
 a `Module` named `content` with schema `merezha_content` (ledger key
 `content`). C2 ships its schema, model activation and readiness; C3 the
 management routes for drafts and revisions; C4 publishing, the
 `published` rows, deletion, the trash and its purge job; C5 the delivery
-API, preview, population and the model endpoints. Assets (C7) come
-later. The design is
+API, preview, population and the model endpoints; C7 assets and media
+([Content assets](#content-assets)). The design is
 [content.md](../design/content.md).
 
 ```toml
@@ -1836,8 +1848,9 @@ delivery = { cache_control_public = "public, max-age=60, stale-while-revalidate=
 | `delivery.cache_control_public` | `"public, max-age=60, stale-while-revalidate=300"` | visible ASCII, 1 to 256 bytes, no edge spaces | `Cache-Control` of a published read of an `access = "public"` type without a principal (`invalid_value`). |
 | `delivery.cache_control_private` | `"private, no-cache"` | as above | `Cache-Control` of every other published read. |
 
-The tables take only these keys in C5. `delivery.public_base_url` and
-`media` stay `unknown_key` until C7. Problems are reported with the
+The tables take only these keys; `media` is C7's ([Content
+assets](#content-assets)). `delivery.public_base_url` stays
+`unknown_key`: asset URLs are paths. Problems are reported with the
 configuration, every one at once (`out_of_range`, `expected_integer`,
 `expected_duration`, `expected_string`, `invalid_cron`, `invalid_value`,
 `expected_table`, `unknown_key`), keyed `modules.content.limits.<key>`,
@@ -2155,6 +2168,177 @@ Codes added by C5: `populate_limit`, `response_too_large` (400). Delivery's stat
 registered (`merezha_content::STATEMENTS`: `content.delivery.*`,
 `content.preview.*`, `content.populate.*`).
 
+### Content assets
+
+With `[modules.content.media]` (C7) the block stores uploaded files in a
+`BlobStore` (`merezha-blob`'s local or S3 driver), provides that store to
+every context, and accepts `asset` fields in the model (without the
+section they fail `content_model_invalid`).
+
+```toml
+[modules.content.media]          # the section's presence enables media
+driver = "local"                 # or "s3"; the default
+local = { root = "/srv/merezha/media" }   # required for local; created 0700
+serve = "proxy"                  # or "redirect" (S3 only); the default
+signed_url_ttl = "5m"            # 60 s to 3600 s
+max_upload_bytes = 52428800      # 1024 to 5368709120
+max_concurrent_uploads = 4       # 1 to 64, per host
+allowed_types = ["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
+                 "image/svg+xml", "application/pdf", "video/mp4", "video/webm",
+                 "audio/mpeg", "audio/ogg", "text/plain", "text/csv"]
+inline_types = ["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif"]
+spool_dir = "/var/tmp/merezha-content"   # default <OS temp dir>/merezha-content
+asset_cache_control = "public, max-age=3600"
+orphan_grace = "1d"              # 1 hour to 30 days
+cleanup_cron = "47 3 * * *"      # UTC
+
+[modules.content.media.s3]       # with driver = "s3"
+bucket = "media"
+region = "eu-west-1"
+endpoint = "https://s3.example.com"        # optional; AWS by default
+path_style = true
+allow_http = false
+access_key_id = { env = "S3_ACCESS_KEY_ID" }        # or { file = "..." }
+secret_access_key = { env = "S3_SECRET_ACCESS_KEY" }
+timeout = "30s"                  # 1 s to 300 s
+key_prefix = ""
+```
+
+Every problem is reported at once, keyed `modules.content.media.<key>`:
+`unknown_key`, `invalid_choice` (`driver`, `serve`), `missing_required`,
+`invalid_path` (relative `local.root` or `spool_dir`), `out_of_range`,
+`expected_duration`, `invalid_cron`, `invalid_media_type` (not a bare
+lowercase MIME type), `duplicate_name`, `media_type_unsupported` (an
+allowed type the sniffer cannot confirm: a binary signature `infer` knows,
+or `text/plain`, `text/csv`, `application/json`, `image/svg+xml`),
+`inline_type_refused` (HTML, SVG, any XML, PDF), `inline_type_not_allowed`
+(not in `allowed_types`), `invalid_header_value`,
+`unused_driver_settings` (the other driver's table), `media_config_invalid`
+(`serve = "redirect"` without S3), and the S3 driver's own
+(`invalid_name`, `invalid_endpoint`, `plaintext_endpoint_refused`,
+`invalid_key_prefix`). The credentials are nested secrets: `{ env }` or
+`{ file }` references only (`secret_literal`, `secret_unavailable`), never
+in `Debug` or logs.
+
+Startup opens the store (a local root is created 0700 and refused when it
+is a symbolic link, owned by another user or open to group or others,
+`blob_root_insecure`; a bucket is not contacted), makes `spool_dir`
+private the same way, and removes `merezha-upload-*`
+files older than an hour from it (`content.spool_cleared`). Readiness adds
+the store's probe: a `head` of `content/readiness/probe`, plus a one-key
+list on S3 (which needs `s3:ListBucket`), or the local root's mode.
+
+Routes, under `/v1/content` (management answers `private, no-store`;
+permissions are checked at `Application` scope):
+
+| Route | Permission | Success |
+| --- | --- | --- |
+| `POST /manage/assets?filename=..&title=..` (raw body, `Content-Type`) | `content.assets.write` | 201 asset, `Location` |
+| `GET /manage/assets` (`content_type` exact or `image/*`, `filename_prefix`, `limit`, `cursor`) | `content.assets.read` | 200 `{items, page}`, newest first, live assets |
+| `GET /manage/assets/{id}` | `content.assets.read` | 200 asset with `usage: {draft, published}` (refs in its scope), trashed ones too |
+| `PATCH /manage/assets/{id}` (`application/merge-patch+json` over `{title, focal_point}`) | `content.assets.write` | 200 asset |
+| `GET /manage/assets/{id}/file` (`Range`) | `content.assets.read` | 200 or 206, always `attachment`, trashed ones too |
+| `DELETE /manage/assets/{id}` (`force`, `purge`) | `content.assets.delete` | 204, or 409 `asset_in_use` |
+| `POST /manage/assets/{id}/undelete` | `content.assets.delete` | 200 asset |
+| `GET /assets/{id}/{filename}` (`Range`, `If-None-Match`) | the referencing types' `access` | 200, 206, 304, or 302 in redirect mode |
+
+An upload is checked in this order: the permission, a free upload slot
+(`overloaded`, 503, `Retry-After: 1`), the query (`filename` required;
+`title` at most 500 characters), a declared `Content-Length` over
+`max_upload_bytes` (`asset_too_large`, 413, before any byte is read) and
+the declared type, parameters stripped and `image/jpg` read as
+`image/jpeg`, against `allowed_types` (`media_type_rejected`, 415). The
+route reads up to `max_upload_bytes` whatever `http.body_limit` says. The
+body streams into a spool file while it is counted (past the limit,
+`asset_too_large`), hashed (SHA-256) and checked as UTF-8 for text types;
+a wait of 30 s for the next bytes, or a body not done within an hour,
+fails `upload_incomplete` (400). Then the first 8 KiB must carry a binary
+signature naming the declared type; without one, the declared type must be
+a text type, the bytes valid UTF-8, and an SVG must have an `<svg` root
+(`media_type_rejected`). HTML looks like text here: it is stored as the
+declared plain text and served as an attachment. PNG, JPEG, GIF, WebP and
+AVIF dimensions are read from the header; a side of 0 or over 50,000, or a
+header that does not parse, is `media_type_rejected`. The stored filename
+keeps `[A-Za-z0-9._-]` (others become `-`), drops leading punctuation,
+takes the type's extension and is at most 200 bytes; it never names a key.
+
+Blobs are content-addressed per scope at
+`content/app/sha256/<2>/<2>/<sha256>` (organizations, with C9, get
+`org-<32 hex of the id's SHA-256>`). The blob claim is its own transaction:
+a new `pending` row leased for an hour, or the existing row (`stored` or
+`orphaned` skips the put, `pending` extends the lease and puts too, a row
+being deleted is waited for up to 2 s, then `blob_unavailable`). The put
+streams the spool file and must end within the lease. One transaction then
+flips the locked blob row to `stored` (only from `stored`, `orphaned`, or
+`pending` after this upload's own put), inserts the asset and appends
+`content.asset_uploaded` (`scope, id, content_type, size, sha256, actor`).
+A row that moved meanwhile (cleanup took it) sends the upload back to the
+claim, three times at most. Two identical uploads at once both succeed
+(the claim's insert takes any conflict). A refused or failed upload
+removes its spool file, and the blob row and object it created; when that
+object delete fails too, the row goes back to `pending` with its lease
+over, and the next upload of the bytes joins it and puts again. A crashed
+upload leaves a `pending` row that cleanup removes, with its object, once
+the lease expires; an upload meeting a deletion whose lease expired takes
+the row over. Every asset and blob write starts with the model version check.
+
+Delivery serves an asset only while it is live and a published variant of
+a type the caller may read under its `access` references it (in the
+application scope; C9 adds organizations), and only under its stored
+filename; anything else is `asset_not_found` (404), so a draft-only upload
+stays unreachable with its id. Proxy mode streams with the stored type
+(`; charset=utf-8` for plain text and CSV), `Content-Disposition: inline`
+for `inline_types` and `attachment; filename="<filename>"` otherwise,
+`X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src
+'none'; sandbox`, `ETag: "<sha256>"` (a matching `If-None-Match` is 304),
+`Accept-Ranges: bytes`, `Vary: Authorization, Cookie`, and
+`asset_cache_control` when a `public` type references it (`private,
+no-cache` otherwise). One `bytes=` range (`a-b`, `a-`, `-n`) is 206 with
+`Content-Range`; one starting at or past the end is 416
+`range_not_satisfiable` with `Content-Range: bytes */<size>`; several
+ranges, other units, malformed ranges and an `If-Range` naming other bytes
+get the full body. Redirect mode (S3) answers 302 to a presigned URL valid
+for `signed_url_ttl`, with `Cache-Control: private, max-age=<ttl - 30 s>`.
+The bucket then serves the bytes without `nosniff` or the CSP, so give it
+(or its CDN) a domain of its own, never the API's or the site's;
+the object keeps the type and disposition set at its first put (`inline`
+or a filename-less `attachment`, since one object serves every asset of
+those bytes). On S3, `media.s3.timeout` bounds each request, and each wait
+for bytes of an object read rather than the whole read, so a proxied
+download of a large file is not cut while it moves.
+
+Deleting an asset fails `asset_in_use` (409) while a ref in any scope
+points at it, unless `force=true`, which leaves the refs (saves then
+report `asset_not_found`). It is soft by default (`deleted_at`; the
+asset leaves delivery and lists); `purge=true` hard-deletes at once,
+trashed or not. A live asset's delete appends `content.asset_deleted`
+(`forced`); patches append `content.asset_updated`; deletes, undeletes and
+patches bump the scope's generation. The job `content.blob_cleanup`
+(queue `content`, the cron schedule of the same name with `cleanup_cron`
+in UTC, registered through `ContentState::guard_jobs`) first hard-deletes
+assets trashed longer than `trash.retention`, 100 per transaction; a purge
+marks its blob `orphaned` once no asset row (trashed ones included) uses
+it. It then claims up to 1000 blobs, 100 per transaction (`FOR UPDATE SKIP
+LOCKED`): orphaned ones past `orphan_grace`, pending ones past their lease
+and deletions a crash abandoned (a ten-minute delete lease), marks them
+`deleting` under a delete lease, commits, then for each blob re-takes the
+row while the lease is still its own (renewing it), deletes the object
+within half the lease and the row under the renewed lease; a failed delete
+restores the previous state. A run whose lease expired and was taken over
+touches nothing, so it never deletes an object uploaded again meanwhile
+(`content.blob_cleanup` logs the count).
+
+Codes added by C7: `asset_not_found` (404), `asset_in_use` (409),
+`asset_too_large` (413), `media_type_rejected` (415), `upload_incomplete`
+(400), `spool_unavailable` (503), `media_config_invalid` (422), and
+`merezha_blob::ERRORS` (`range_not_satisfiable` 416, `blob_unavailable` and
+`blob_body_unreadable` 503, `blob_backend_rejected` 502, ...). The kernel
+adds `blob_store_conflict` (422, startup).
+
+Operations notes: give S3 buckets a lifecycle rule that aborts incomplete
+multipart uploads (a cancelled put leaves one), and keep `spool_dir` on a
+disk with room for `max_concurrent_uploads` times `max_upload_bytes`.
+
 ## Dependencies
 
 Checked with `cargo info` on 2026-10-23 (K) and 2026-10-24 (K2). All support
@@ -2178,6 +2362,8 @@ Rust 1.98.0.
 | `uuid` | 1.29.0 | 1.89.0 | Apache-2.0 OR MIT | none | platform: notification and webhook handles |
 | `bytes` | 1.12.1 | 1.57 | MIT | `std` | platform: blob bodies |
 | `futures-core` | 0.3.34 | 1.36 | MIT OR Apache-2.0 | `std` | platform: blob streams |
+| `infer` | 0.22.0 | 1.74 | MIT | none (no `std`, so no `cfb` OLE probing) | content: upload signatures |
+| `imagesize` | 0.15.0 | unset (compiled and tested on 1.98.0) | MIT | `png`, `jpeg`, `gif`, `webp`, `heif` only | content: raster dimensions |
 | `croner` | =4.0.2 | unset (edition 2021) | MIT | `jiff` only, no default `chrono` (R14); pulls `derive_builder` 0.20.2 (MIT OR Apache-2.0) and `strum` 0.27.2 (MIT, MSRV 1.66.1) with their proc-macro crates | platform: `cron`, used by config validation and the scheduler |
 
 The aws-lc-rs provider is shared by the database TLS connector and reqwest,

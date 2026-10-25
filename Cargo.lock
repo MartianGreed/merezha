@@ -1429,6 +1429,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "imagesize"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65b27460c2c92b037f3f94c538ed9a3342f3fdf923606781629ccb35f82d042a"
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1439,6 +1445,12 @@ dependencies = [
  "serde",
  "serde_core",
 ]
+
+[[package]]
+name = "infer"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4200d433cbd5178df7797c9c2e75b348b728e39631cf14520d1e2fc424201f4"
 
 [[package]]
 name = "ipnet"
@@ -1730,6 +1742,7 @@ dependencies = [
  "futures-util",
  "http",
  "jiff",
+ "libc",
  "merezha-domain",
  "merezha-platform",
  "object_store",
@@ -1771,9 +1784,14 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
+ "bytes",
  "deunicode",
+ "futures-util",
+ "imagesize",
+ "infer",
  "jiff",
  "merezha-application",
+ "merezha-blob",
  "merezha-domain",
  "merezha-jobs",
  "merezha-platform",

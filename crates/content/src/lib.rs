@@ -37,7 +37,13 @@
 //! (also on management draft reads), by-slug lookups, weak ETags from
 //! the scope generations with 304 answered from `generations` alone,
 //! cache headers, and the model endpoints. Its statements are registered
-//! ([`STATEMENTS`]). Assets are C7.
+//! ([`STATEMENTS`]).
+//!
+//! CT-C7, assets ([`media`]): `[modules.content.media]`, the blob store
+//! provided to every context, uploads streamed through a spool file with
+//! sniffing, hashing and dimensions, blobs deduplicated per scope, the
+//! asset management routes, proxy and redirect delivery, deletes with
+//! `force` and `purge`, and the `content.blob_cleanup` job.
 mod activation;
 mod canonical;
 mod delivery;
@@ -47,6 +53,7 @@ mod indexes;
 mod issues;
 mod json;
 mod manage;
+pub mod media;
 mod model;
 mod module;
 mod parse;

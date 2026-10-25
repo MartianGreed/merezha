@@ -11,9 +11,10 @@ use crate::{
 };
 use merezha_domain::{Failure, Identity};
 use merezha_platform::{
-    AppContext, BoxFuture, Database, ErrorCode, Migration, Module, ModuleEvents, ModuleSection, Tx,
+    AppContext, BoxFuture, Database, ErrorCode, Migration, Module, ModuleEvents, ModuleSection,
+    RouteBodyLimit, Tx,
     config::{ConfigIssue, Origin},
-    ports::{JobContext, JobFailure, JobHandler, KindOptions, ScheduleDeclaration},
+    ports::{BlobStore, JobContext, JobFailure, JobHandler, KindOptions, ScheduleDeclaration},
 };
 use std::{
     io::Read,
@@ -61,6 +62,8 @@ pub struct ContentState {
     /// A newer model is active: writes are refused and readiness is false
     /// for good, so the balancer drains this host.
     outdated: AtomicBool,
+    /// Assets and blobs, with `[modules.content.media]` (C7).
+    media: Option<Arc<crate::media::Media>>,
 }
 impl std::fmt::Debug for ContentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -83,6 +86,10 @@ impl ContentState {
     /// `[modules.content]` limits, revision retention and the trash.
     pub fn settings(&self) -> &ContentSettings {
         &self.settings
+    }
+    /// The media runtime, `None` without `[modules.content.media]`.
+    pub fn media(&self) -> Option<&Arc<crate::media::Media>> {
+        self.media.as_ref()
     }
     /// The pool, once [`Module::start`] ran.
     pub(crate) fn database(&self) -> Option<&Database> {
@@ -133,8 +140,21 @@ impl ContentState {
         self.outdated.store(true, Ordering::SeqCst);
     }
     /// Readiness: `content_model_outdated`, `content_model_pending`,
-    /// `index_build_pending`, or a transient database failure.
+    /// `index_build_pending`, or a transient database failure; with media,
+    /// also the blob store's probe (`ObjectBlobStore::ready`), run
+    /// alongside.
     pub async fn readiness(&self) -> Result<(), Failure> {
+        let blobs = async {
+            match self.media.as_ref().map(|media| media.store()) {
+                None => Ok(()),
+                Some(None) => Err(Failure::transient("blob_store_unavailable")),
+                Some(Some(store)) => store.ready(READY_TIMEOUT).await.map_err(Failure::from),
+            }
+        };
+        let (model, blobs) = tokio::join!(self.model_readiness(), blobs);
+        model.and(blobs)
+    }
+    async fn model_readiness(&self) -> Result<(), Failure> {
         if self.is_outdated() {
             return Err(Failure::transient("content_model_outdated"));
         }
@@ -362,17 +382,77 @@ impl ContentModule {
             kind: Identity::new(crate::trash::TRASH_PURGE)?,
             payload: serde_json::json!({}),
         })?;
+        // C7: the blob cleanup, which also purges the asset trash.
+        if let Some(assets) = state.media.as_ref().and_then(|m| m.assets().cloned()) {
+            let cron = assets.settings().cleanup_cron.clone();
+            jobs.register(
+                crate::media::BLOB_CLEANUP,
+                crate::trash::QUEUE,
+                state.guard_jobs(Arc::new(crate::media::cleanup_handler(assets))),
+                KindOptions::default(),
+            )?;
+            jobs.schedule(ScheduleDeclaration {
+                name: crate::media::BLOB_CLEANUP.to_owned(),
+                cron,
+                timezone: crate::settings::PURGE_TIMEZONE.to_owned(),
+                queue: Identity::new(crate::trash::QUEUE)?,
+                kind: Identity::new(crate::media::BLOB_CLEANUP)?,
+                payload: serde_json::json!({}),
+            })?;
+        }
+        Ok(())
+    }
+    /// With media: the blob store opened (if the host has not asked for it
+    /// yet), the spool directory private (0700, created if missing) and
+    /// cleared of spool files older than an hour, and the asset service
+    /// built for the routes and the cleanup job.
+    fn start_media(&self, ctx: &AppContext, state: &Arc<ContentState>) -> Result<(), Failure> {
+        let Some(media) = state.media.clone() else {
+            return Ok(());
+        };
+        let blobs = media.open()?;
+        let spool = merezha_blob::ensure_private_dir(&media.settings().spool_dir)?;
+        let cleared = crate::media::clear_spool(&spool, crate::media::SPOOL_MAX_AGE);
+        if cleared > 0 {
+            merezha_telemetry::event!(
+                INFO,
+                "content.spool_cleared",
+                driver = blobs.driver().as_str(),
+                count = cleared
+            );
+        }
+        media.set_assets(crate::media::Assets::new(
+            state.clone(),
+            ctx.clone(),
+            ctx.outbox(NAME)?,
+            media.clone(),
+            blobs,
+        ));
         Ok(())
     }
 }
 
-/// The model options C2 can provide: the content permissions only (the
-/// RBAC catalog arrives with identity), no media (C6 and C7 configure it)
-/// and no organizations (C9).
-fn model_options() -> ModelOptions<'static> {
+/// The content codes, the asset codes and `merezha_blob::ERRORS`, for the
+/// kernel's registry.
+fn all_errors() -> &'static [ErrorCode] {
+    static ALL: OnceLock<Vec<ErrorCode>> = OnceLock::new();
+    ALL.get_or_init(|| {
+        ERRORS
+            .iter()
+            .chain(crate::media::ERRORS)
+            .chain(merezha_blob::ERRORS)
+            .copied()
+            .collect()
+    })
+}
+
+/// The model options the host provides: the content permissions only (the
+/// RBAC catalog arrives with identity), media when
+/// `[modules.content.media]` is configured, and no organizations (C9).
+fn model_options(media: bool) -> ModelOptions<'static> {
     ModelOptions {
         permissions: &CONTENT_PERMISSIONS,
-        media: false,
+        media,
         organizations: false,
     }
 }
@@ -408,17 +488,18 @@ pub fn resolve_model_path(base: &Path, value: &str) -> Result<PathBuf, &'static 
     Ok(resolved)
 }
 
-/// Read and parse the model file at `path`. Model problems become one
-/// issue each, keyed `modules.content.model:<toml path>` with code
-/// `content_model_invalid`; their messages are the model's, printed by
-/// `merezha content diff`.
-pub fn load_model(path: &Path) -> Result<ContentModel, LoadError> {
+/// Read and parse the model file at `path`, `asset` fields accepted only
+/// with `media` (`[modules.content.media]` configured). Model problems
+/// become one issue each, keyed `modules.content.model:<toml path>` with
+/// code `content_model_invalid`; their messages are the model's, printed
+/// by `merezha content diff`.
+pub fn load_model(path: &Path, media: bool) -> Result<ContentModel, LoadError> {
     let file = std::fs::File::open(path).map_err(|_| LoadError::Unreadable)?;
     let mut text = String::new();
     file.take(MAX_MODEL_BYTES as u64 + 1)
         .read_to_string(&mut text)
         .map_err(|_| LoadError::Unreadable)?;
-    ContentModel::parse(&text, &model_options()).map_err(LoadError::Invalid)
+    ContentModel::parse(&text, &model_options(media)).map_err(LoadError::Invalid)
 }
 
 /// Why the model file could not be loaded.
@@ -458,8 +539,14 @@ impl Module for ContentModule {
                 .ok()
         });
         if let Some(path) = path {
-            match load_model(&path) {
+            // The section's presence enables asset fields, even when one
+            // of its keys is wrong: the model is judged on its own.
+            match load_model(&path, section.table.contains_key("media")) {
                 Ok(model) if issues.is_empty() => {
+                    let media = settings
+                        .media
+                        .clone()
+                        .map(|media| Arc::new(crate::media::Media::new(media)));
                     self.handle.set(Arc::new(ContentState {
                         model: Arc::new(model),
                         path,
@@ -467,6 +554,7 @@ impl Module for ContentModule {
                         database: OnceLock::new(),
                         current: AtomicBool::new(false),
                         outdated: AtomicBool::new(false),
+                        media,
                     }));
                 }
                 Ok(_) => {}
@@ -501,7 +589,24 @@ impl Module for ContentModule {
         MIGRATIONS
     }
     fn errors(&self) -> &[ErrorCode] {
-        ERRORS
+        all_errors()
+    }
+    /// The blob store `[modules.content.media]` configures, opened here
+    /// (the local root created 0700, a root open to others refused) and
+    /// installed in every context.
+    fn blob_store(&self) -> Result<Option<Arc<dyn BlobStore>>, Failure> {
+        let Some(media) = self.handle.state().and_then(|s| s.media.clone()) else {
+            return Ok(None);
+        };
+        let store: Arc<dyn BlobStore> = media.open()?;
+        Ok(Some(store))
+    }
+    /// The upload route reads up to `media.max_upload_bytes`.
+    fn body_limits(&self) -> Vec<RouteBodyLimit> {
+        match self.handle.state().and_then(|s| s.media.clone()) {
+            Some(media) => crate::media::body_limits(media.settings().max_upload_bytes),
+            None => Vec::new(),
+        }
     }
     fn events(&self) -> ModuleEvents {
         ModuleEvents {
@@ -525,6 +630,7 @@ impl Module for ContentModule {
                 locales = model.locales().len()
             );
             let _ = state.database.set(ctx.database().clone());
+            self.start_media(&ctx, &state)?;
             if ctx.migrate() {
                 let outbox = ctx.outbox(NAME)?;
                 let enqueued =
@@ -581,8 +687,13 @@ impl Module for ContentModule {
         let Ok(outbox) = ctx.outbox(NAME) else {
             return axum::Router::new();
         };
+        let assets = state.media.as_ref().and_then(|m| m.assets().cloned());
         let store = Store::new(state, ctx.clone(), outbox);
-        crate::http::router(store, ctx.authorizer().clone())
+        let router = crate::http::router(store, ctx.authorizer().clone());
+        match assets {
+            Some(assets) => router.merge(crate::media::router(assets, ctx.authorizer().clone())),
+            None => router,
+        }
     }
     fn ready(&self) -> BoxFuture<'_, Result<(), Failure>> {
         Box::pin(async move { self.state()?.readiness().await })

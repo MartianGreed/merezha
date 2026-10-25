@@ -239,6 +239,34 @@ impl ModuleSection {
             .map(Some)
             .map_err(|code| ConfigIssue::new(self.key(key), code, origin))
     }
+    /// [`ModuleSection::secret`] for a key inside nested tables, `path`
+    /// from the section down (`["media", "s3", "secret_access_key"]`): a
+    /// `{ env = "NAME" }` or `{ file = "PATH" }` reference with the kernel
+    /// rules. Issues name the dotted key. `Ok(None)` when a table on the
+    /// way or the key is absent; a non-table on the way is the caller's
+    /// `expected_table` to report. Environment and flag overrides reach
+    /// top-level module keys only, so a nested secret always comes from a
+    /// reference in the file.
+    pub fn secret_at(&self, path: &[&str]) -> Result<Option<Secret>, ConfigIssue> {
+        let Some((key, tables)) = path.split_last() else {
+            return Ok(None);
+        };
+        let mut table = &self.table;
+        for name in tables {
+            match table.get(*name) {
+                Some(toml::Value::Table(inner)) => table = inner,
+                _ => return Ok(None),
+            }
+        }
+        let Some(value) = table.get(*key) else {
+            return Ok(None);
+        };
+        let dotted = self.key(&path.join("."));
+        self.resolver
+            .resolve(value, &Origin::File)
+            .map(Some)
+            .map_err(|code| ConfigIssue::new(dotted, code, Origin::File))
+    }
     /// The canonical directory of `merezha.toml`, which relative paths in
     /// the section resolve against (empty for [`ModuleSection::empty`]).
     pub fn base_dir(&self) -> &Path {
@@ -712,6 +740,18 @@ impl Layers {
                 let (table, overridden) = self.modules.entry(name.clone()).or_default();
                 table.insert(key.clone(), module_value(&value));
                 overridden.insert(key.clone(), origin);
+            }
+            // A key inside a module's nested table (`media.s3.*`): module
+            // sections are opaque, so overrides reach top-level keys only;
+            // nested secrets take `{ env }` or `{ file }` references.
+            [modules, name, rest @ ..]
+                if modules == "modules" && valid_module_name(name) && rest.len() > 1 =>
+            {
+                issues.push(ConfigIssue::new(
+                    dotted,
+                    "nested_override_unsupported",
+                    origin,
+                ));
             }
             [section @ .., key] if !key.is_empty() && !section.is_empty() => {
                 let queue = matches!(section, [jobs, queues, name]

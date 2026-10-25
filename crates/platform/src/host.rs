@@ -9,7 +9,7 @@ use crate::{
     errors::ErrorRegistry,
     health::{self, Lifecycle, Readiness},
     module::{JobsRuntime, Module, RESERVED_NAMES},
-    ports::{Authenticator, Authorizer},
+    ports::{Authenticator, Authorizer, BlobStore},
     status::{self, ServiceInfo, StatusSection, StatusState},
 };
 use axum::{Router, extract::Request};
@@ -233,6 +233,41 @@ fn edge_settings(
         .metrics(HttpMetrics::new(&meters.meter(crate::edge::EDGE_SCOPE)))
 }
 
+/// The one blob store a module provides ([`Module::blob_store`]), asked of
+/// every module in registration order. A module failing to open its store
+/// stops startup naming it; a second provider stops it with
+/// `blob_store_conflict`.
+fn blob_store(modules: &[Arc<dyn Module>]) -> Result<Option<Arc<dyn BlobStore>>, StartupError> {
+    let mut found: Option<Arc<dyn BlobStore>> = None;
+    for module in modules {
+        let store = module.blob_store().map_err(|failure| {
+            merezha_telemetry::event!(
+                ERROR,
+                "module.start_failed",
+                module = module.name(),
+                code = failure.code.as_str()
+            );
+            StartupError {
+                failure,
+                migration: None,
+                module: Some(module.name()),
+            }
+        })?;
+        match (store, &found) {
+            (Some(_), Some(_)) => {
+                return Err(StartupError {
+                    failure: Failure::permanent("blob_store_conflict"),
+                    migration: None,
+                    module: Some(module.name()),
+                });
+            }
+            (Some(store), None) => found = Some(store),
+            (None, _) => {}
+        }
+    }
+    Ok(found)
+}
+
 /// Whether `config` describes a private listener: not public, a loopback
 /// address and no trusted proxy (requests through a proxy come from
 /// elsewhere even on loopback). Without identity, only a private listener
@@ -425,6 +460,9 @@ impl Host {
         if let Some(ports) = ports {
             builder = builder.outbox(ports.outbox).jobs(ports.jobs);
         }
+        if let Some(blobs) = blob_store(&modules)? {
+            builder = builder.blobs(blobs);
+        }
         let ctx = builder.build().map_err(|failure| StartupError {
             failure,
             migration: None,
@@ -535,6 +573,18 @@ impl Host {
                 })?;
             router = router.nest(&format!("/v1/{}", module.name()), module.routes(&own));
         }
+        let body_limits = modules
+            .iter()
+            .flat_map(|module| {
+                module.body_limits().into_iter().map(|limit| {
+                    (
+                        limit.method,
+                        format!("/v1/{}{}", module.name(), limit.path),
+                        limit.limit,
+                    )
+                })
+            })
+            .collect();
         let router = edge::apply(
             router.merge(parts.routes),
             edge_settings(
@@ -542,7 +592,8 @@ impl Host {
                 errors.clone(),
                 ctx.authenticator().cloned(),
                 &options.meters,
-            ),
+            )
+            .route_body_limits(body_limits),
         );
         // The first evaluation runs before the host is handed out, so a
         // started host reports its real readiness at once.

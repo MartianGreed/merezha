@@ -275,6 +275,61 @@ impl Module for Greeter {
 }
 
 #[test]
+fn nested_module_secrets_resolve_references_with_the_kernel_rules() {
+    let secret = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(secret.path(), "from-file\n").unwrap();
+    let project = Project::new(&format!(
+        "{MINIMAL}\n[modules.greeter]\ngreeting = \"hello\"\n\
+         [modules.greeter.media.s3]\nid = {{ env = \"S3_ID\" }}\nkey = {{ file = {:?} }}\n\
+         literal = \"plain\"\nmissing = {{ env = \"UNSET_VAR\" }}\n",
+        secret.path()
+    ));
+    let input = project.input(&[URL, ("S3_ID", "AKID")], &[]);
+    let config = merezha_platform::ProjectConfig::load(&input).unwrap();
+    let section = &config.modules["greeter"];
+    let at = |key: &str| section.secret_at(&["media", "s3", key]);
+    assert_eq!(at("id").unwrap().unwrap().expose(), "AKID");
+    assert_eq!(at("key").unwrap().unwrap().expose(), "from-file");
+    assert!(at("absent").unwrap().is_none());
+    assert!(
+        section
+            .secret_at(&["media", "gcs", "id"])
+            .unwrap()
+            .is_none()
+    );
+    let literal = at("literal").unwrap_err();
+    assert_eq!(
+        (literal.key.as_str(), literal.code),
+        ("modules.greeter.media.s3.literal", "secret_literal")
+    );
+    let missing = at("missing").unwrap_err();
+    assert_eq!(
+        (missing.key.as_str(), missing.code),
+        ("modules.greeter.media.s3.missing", "secret_unavailable")
+    );
+    // Debug never shows the resolved value.
+    assert!(!format!("{:?}", at("id").unwrap().unwrap()).contains("AKID"));
+    // Environment overrides reach top-level module keys only: a nested
+    // one is refused with a code that says so, never applied.
+    let input = project.input(
+        &[
+            URL,
+            ("S3_ID", "AKID"),
+            ("MEREZHA_MODULES__GREETER__MEDIA__S3__ID", "override"),
+        ],
+        &[],
+    );
+    let errors = merezha_platform::ProjectConfig::load(&input).unwrap_err();
+    assert_eq!(
+        codes(&errors),
+        [(
+            "modules.greeter.media.s3.id".to_owned(),
+            "nested_override_unsupported"
+        )]
+    );
+}
+
+#[test]
 fn modules_validate_their_sections_and_unknown_modules_fail_with_kernel_errors() {
     let project = Project::new(&format!(
         "{MINIMAL}\n[modules.greeter]\ngreeting = \"hello\"\ntoken = {{ env = \"GREETER_TOKEN\" }}\n"
