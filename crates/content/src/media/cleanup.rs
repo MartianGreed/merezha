@@ -126,7 +126,7 @@ impl Assets {
         let batch = i64::try_from(batch).unwrap_or(CLEANUP_BATCH);
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
-                state.check_writable(tx).await?;
+                state.check_writable(&db, tx).await?;
                 let rows = db
                     .query(&*tx, &sql::BLOB_CLEANUP_CLAIM, &[&grace, &batch, &lease])
                     .await
@@ -191,7 +191,7 @@ impl Assets {
         let (previous, previous_lease) = (blob.state.clone(), blob.lease.clone());
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
-                state.check_writable(tx).await?;
+                state.check_writable(&db, tx).await?;
                 let changed = match step {
                     Step::Retake => {
                         return Ok(db

@@ -16,6 +16,7 @@ mod retry;
 mod routes;
 mod scheduler;
 mod schema;
+mod statements;
 mod telemetry;
 mod validate;
 mod worker;
@@ -31,6 +32,7 @@ pub use scheduler::{
     CONFIG_SOURCE, MAX_SCHEDULES, MAX_SCHEDULES_LISTED, SchedulePage, ScheduleSummary, TickReport,
     Triggered, valid_trigger_key,
 };
+pub use statements::STATEMENTS;
 pub use telemetry::INSTRUMENTS;
 
 use merezha_domain::{Failure, Identity};
@@ -39,7 +41,7 @@ use merezha_platform::{
     config::{JobsConfig, SubscriptionsConfig},
     ports::{Enqueued, JobRegistration, Jobs, NewJob, QueueStatus, ScheduleDeclaration, Source},
 };
-use merezha_postgres::{Listener, classify};
+use merezha_postgres::{Listener, Statement, classify};
 use merezha_telemetry::event;
 use relay::RelaySettings;
 use std::{
@@ -114,6 +116,100 @@ pub enum RelayMode {
     /// instance relays them.
     Off,
 }
+
+/// A quarantined record back to the relay, unless its flagged payload is gone.
+pub(crate) const REQUEUE_OUTBOX: Statement = Statement::new(
+    "jobs.outbox.requeue",
+    "UPDATE merezha_jobs.outbox",
+    "UPDATE merezha_jobs.outbox SET quarantined_at = NULL, quarantine_code = NULL
+                              WHERE id = $1 AND quarantined_at IS NOT NULL
+                                AND NOT (contains_secret AND payload IS NULL)
+                             RETURNING id",
+);
+
+/// Why a requeue matched nothing.
+pub(crate) const REQUEUE_REFUSAL: Statement = Statement::new(
+    "jobs.outbox.requeue_refusal",
+    "SELECT merezha_jobs.outbox",
+    "SELECT contains_secret AND payload IS NULL, quarantined_at IS NOT NULL
+                                   FROM merezha_jobs.outbox WHERE id = $1",
+);
+
+/// The audit row of a requeue.
+pub(crate) const REQUEUE_AUDIT: Statement = Statement::new(
+    "jobs.admin_actions.outbox_requeue",
+    "INSERT merezha_jobs.admin_actions",
+    "INSERT INTO merezha_jobs.admin_actions (principal, action, target, count)
+                         VALUES ($1, 'outbox_requeue', $2, 1)",
+);
+
+/// This instance's subscriptions, declared again (the heartbeat).
+pub(crate) const DECLARE_SUBSCRIPTIONS: Statement = Statement::new(
+    "jobs.subscriptions.declare",
+    "INSERT merezha_jobs.subscriptions",
+    "INSERT INTO merezha_jobs.subscriptions (topic, job_kind, queue, source)
+                         SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[])
+                         ON CONFLICT (topic, job_kind)
+                         DO UPDATE SET queue = excluded.queue, source = excluded.source,
+                                       last_declared_at = now(), deactivated_at = NULL",
+);
+
+/// Serializes the retirement of undeclared subscriptions.
+pub(crate) const SUBSCRIPTIONS_LOCK: Statement = Statement::new(
+    "jobs.subscriptions.lock",
+    "SELECT pg_advisory_xact_lock()",
+    "SELECT pg_advisory_xact_lock(1297762882, hashtext('subscriptions'))",
+);
+
+/// Subscriptions undeclared for `retire_after`, deactivated.
+pub(crate) const RETIRE_SUBSCRIPTIONS: Statement = Statement::new(
+    "jobs.subscriptions.retire",
+    "UPDATE merezha_jobs.subscriptions",
+    "UPDATE merezha_jobs.subscriptions SET deactivated_at = now()
+                          WHERE deactivated_at IS NULL
+                            AND last_declared_at < now() - make_interval(secs => $1)",
+);
+
+/// A new job, unless its idempotency key exists in the queue.
+pub(crate) const ENQUEUE: Statement = Statement::new(
+    "jobs.jobs.enqueue",
+    "INSERT merezha_jobs.jobs",
+    "INSERT INTO merezha_jobs.jobs (queue, kind, idempotency_key, payload,
+                                     payload_digest, contains_secret, priority, run_at, max_attempts,
+                                     correlation_id, causation_id, tenant)
+                                 VALUES ($1, $2, $3, $4::text::json, sha256(convert_to($4::text, 'UTF8')),
+                                     $5, $6, coalesce($7::text::timestamptz, now()), $8, $9, $10, $11)
+                                 ON CONFLICT (queue, idempotency_key) DO NOTHING
+                                 RETURNING id",
+);
+
+/// The new job's PRODUCER span context, the parent of every attempt.
+pub(crate) const ENQUEUE_TRACE: Statement = Statement::new(
+    "jobs.jobs.trace",
+    "UPDATE merezha_jobs.jobs",
+    "UPDATE merezha_jobs.jobs SET trace_parent = $2, trace_state = $3
+                                      WHERE id = $1",
+);
+
+/// The job holding an idempotency key, and whether it matches.
+pub(crate) const ENQUEUE_EXISTING: Statement = Statement::new(
+    "jobs.jobs.existing",
+    "SELECT merezha_jobs.jobs",
+    "SELECT id, kind = $3 AND payload_digest = sha256(convert_to($4::text, 'UTF8'))
+                                   FROM merezha_jobs.jobs WHERE queue = $1 AND idempotency_key = $2",
+);
+
+/// `Jobs::cancel`: an `available` job of the caller's source.
+pub(crate) const CANCEL: Statement = Statement::new(
+    "jobs.jobs.cancel",
+    "UPDATE merezha_jobs.jobs",
+    "UPDATE merezha_jobs.jobs
+                        SET state = 'cancelled', finished_at = now(), updated_at = now(),
+                            payload = CASE WHEN contains_secret THEN NULL ELSE payload END
+                      WHERE id = $1 AND state = 'available'
+                        AND (starts_with(idempotency_key, $2::text || ':') OR kind = ANY($3::text[]))
+                     RETURNING queue",
+);
 
 struct Kind {
     source: Source,
@@ -604,42 +700,31 @@ impl PgJobs {
     /// requeued, flagged or not.
     pub async fn requeue_outbox(&self, id: i64, principal: Option<&str>) -> Result<(), Failure> {
         let principal = principal.map(str::to_owned);
+        let db = self.database()?.clone();
         self.database()?
             .transaction(Instant::now() + OPERATION_DEADLINE, move |tx| {
                 Box::pin(async move {
-                    let requeued = tx
-                        .query_opt(
-                            "UPDATE merezha_jobs.outbox SET quarantined_at = NULL, quarantine_code = NULL
-                              WHERE id = $1 AND quarantined_at IS NOT NULL
-                                AND NOT (contains_secret AND payload IS NULL)
-                             RETURNING id",
-                            &[&id],
-                        )
+                    let requeued = db
+                        .query_opt(tx, &REQUEUE_OUTBOX, &[&id])
                         .await
                         .map_err(|e| classify(&e))?;
                     if requeued.is_none() {
-                        let row = tx
-                            .query_opt(
-                                "SELECT contains_secret AND payload IS NULL, quarantined_at IS NOT NULL
-                                   FROM merezha_jobs.outbox WHERE id = $1",
-                                &[&id],
-                            )
+                        let row = db
+                            .query_opt(tx, &REQUEUE_REFUSAL, &[&id])
                             .await
                             .map_err(|e| classify(&e))?;
-                        return Err(match row.map(|r| (r.get::<_, bool>(0), r.get::<_, bool>(1))) {
-                            None => Failure::permanent("not_found"),
-                            Some((true, true)) => Failure::conflict("secret_purged"),
-                            Some(_) => Failure::conflict("not_quarantined"),
-                        });
+                        return Err(
+                            match row.map(|r| (r.get::<_, bool>(0), r.get::<_, bool>(1))) {
+                                None => Failure::permanent("not_found"),
+                                Some((true, true)) => Failure::conflict("secret_purged"),
+                                Some(_) => Failure::conflict("not_quarantined"),
+                            },
+                        );
                     }
-                    tx.execute(
-                        "INSERT INTO merezha_jobs.admin_actions (principal, action, target, count)
-                         VALUES ($1, 'outbox_requeue', $2, 1)",
-                        &[&principal, &id.to_string()],
-                    )
-                    .await
-                    .map_err(|e| classify(&e))?;
-                    tx.execute("SELECT pg_notify('merezha_jobs_outbox', '')", &[])
+                    db.execute(tx, &REQUEUE_AUDIT, &[&principal, &id.to_string()])
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    db.execute(tx, &statements::NOTIFY_OUTBOX, &[])
                         .await
                         .map_err(|e| classify(&e))?;
                     Ok(())
@@ -741,33 +826,23 @@ impl PgJobs {
             columns
         };
         let retire_after = self.inner.subscriptions.retire_after.as_secs_f64();
+        let db = database.clone();
         database
             .transaction(Instant::now() + OPERATION_DEADLINE, move |tx| {
                 Box::pin(async move {
-                    tx.execute(
-                        "INSERT INTO merezha_jobs.subscriptions (topic, job_kind, queue, source)
-                         SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[])
-                         ON CONFLICT (topic, job_kind)
-                         DO UPDATE SET queue = excluded.queue, source = excluded.source,
-                                       last_declared_at = now(), deactivated_at = NULL",
+                    db.execute(
+                        tx,
+                        &DECLARE_SUBSCRIPTIONS,
                         &[&topics, &kinds, &queues, &sources],
                     )
                     .await
                     .map_err(|e| classify(&e))?;
-                    tx.execute(
-                        "SELECT pg_advisory_xact_lock(1297762882, hashtext('subscriptions'))",
-                        &[],
-                    )
-                    .await
-                    .map_err(|e| classify(&e))?;
-                    tx.execute(
-                        "UPDATE merezha_jobs.subscriptions SET deactivated_at = now()
-                          WHERE deactivated_at IS NULL
-                            AND last_declared_at < now() - make_interval(secs => $1)",
-                        &[&retire_after],
-                    )
-                    .await
-                    .map_err(|e| classify(&e))?;
+                    db.execute(tx, &SUBSCRIPTIONS_LOCK, &[])
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    db.execute(tx, &RETIRE_SUBSCRIPTIONS, &[&retire_after])
+                        .await
+                        .map_err(|e| classify(&e))?;
                     Ok(())
                 })
             })
@@ -1173,6 +1248,7 @@ impl JobsRuntime for PgJobs {
         let _ = self.inner.database.set(database.clone());
         JobsPorts {
             outbox: Arc::new(outbox::MeteredOutbox {
+                database: database.clone(),
                 metrics: self.inner.metrics.clone(),
             }),
             jobs: Arc::new(self.clone()),
@@ -1203,19 +1279,15 @@ impl Jobs for PgJobs {
             let secret = job.contains_secret;
             let priority = job.priority;
             let metrics = self.inner.metrics.clone();
+            let db = self.database()?.clone();
             let enqueued = self
                 .database()?
                 .transaction(Instant::now() + OPERATION_DEADLINE, move |tx| {
                     Box::pin(async move {
-                        let inserted = tx
+                        let inserted = db
                             .query_opt(
-                                "INSERT INTO merezha_jobs.jobs (queue, kind, idempotency_key, payload,
-                                     payload_digest, contains_secret, priority, run_at, max_attempts,
-                                     correlation_id, causation_id, tenant)
-                                 VALUES ($1, $2, $3, $4::text::json, sha256(convert_to($4::text, 'UTF8')),
-                                     $5, $6, coalesce($7::text::timestamptz, now()), $8, $9, $10, $11)
-                                 ON CONFLICT (queue, idempotency_key) DO NOTHING
-                                 RETURNING id",
+                                tx,
+                                &ENQUEUE,
                                 &[
                                     &queue,
                                     &kind,
@@ -1242,29 +1314,21 @@ impl Jobs for PgJobs {
                             if let (Some(parent), state) =
                                 telemetry::columns(telemetry::stored(&send).as_ref())
                             {
-                                tx.execute(
-                                    "UPDATE merezha_jobs.jobs SET trace_parent = $2, trace_state = $3
-                                      WHERE id = $1",
-                                    &[&id, &parent, &state],
-                                )
-                                .await
-                                .map_err(|e| classify(&e))?;
+                                db.execute(tx, &ENQUEUE_TRACE, &[&id, &parent, &state])
+                                    .await
+                                    .map_err(|e| classify(&e))?;
                             }
                             drop(send);
                             // Wake the queue's dispatchers (AP-B2), on commit.
-                            tx.execute("SELECT pg_notify('merezha_jobs', $1)", &[&queue])
+                            db.execute(tx, &statements::NOTIFY_QUEUE, &[&queue])
                                 .await
                                 .map_err(|e| classify(&e))?;
                             return Ok(Enqueued { id, existed: false });
                         }
                         // A new statement sees a conflicting row another
                         // transaction committed meanwhile.
-                        let existing = tx
-                            .query_opt(
-                                "SELECT id, kind = $3 AND payload_digest = sha256(convert_to($4::text, 'UTF8'))
-                                   FROM merezha_jobs.jobs WHERE queue = $1 AND idempotency_key = $2",
-                                &[&queue, &key, &kind, &payload],
-                            )
+                        let existing = db
+                            .query_opt(tx, &ENQUEUE_EXISTING, &[&queue, &key, &kind, &payload])
                             .await
                             .map_err(|e| classify(&e))?;
                         match existing {
@@ -1295,20 +1359,10 @@ impl Jobs for PgJobs {
             .collect();
         Box::pin(async move {
             valid?;
-            let client = self
-                .database()?
-                .acquire(Instant::now() + OPERATION_DEADLINE)
-                .await?;
-            let cancelled = client
-                .query_opt(
-                    "UPDATE merezha_jobs.jobs
-                        SET state = 'cancelled', finished_at = now(), updated_at = now(),
-                            payload = CASE WHEN contains_secret THEN NULL ELSE payload END
-                      WHERE id = $1 AND state = 'available'
-                        AND (starts_with(idempotency_key, $2::text || ':') OR kind = ANY($3::text[]))
-                     RETURNING queue",
-                    &[&id, &source.as_str(), &kinds],
-                )
+            let db = self.database()?;
+            let client = db.acquire(Instant::now() + OPERATION_DEADLINE).await?;
+            let cancelled = db
+                .query_opt(&client, &CANCEL, &[&id, &source.as_str(), &kinds])
                 .await
                 .map_err(|e| classify(&e))?;
             if let Some(row) = &cancelled {

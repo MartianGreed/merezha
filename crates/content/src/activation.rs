@@ -4,6 +4,7 @@
 //! adds, activates it in one transaction with its outbox event, then drops
 //! the indexes it no longer needs. A new locale or a changed fallback
 //! enqueues the `published` rebuild job in the same transaction (C4).
+use crate::statements;
 use crate::{
     diff::{Change, ChangeClass, change_classes, diff},
     indexes::{DerivedIndex, derived_indexes, drop_statement, is_derived_name},
@@ -15,7 +16,7 @@ use merezha_platform::{
     Database, Random,
     ports::{DedupeKey, MessageContext, NewEvent, OnDuplicate, SourceOutbox},
 };
-use merezha_postgres::{DetachedClient, classify, tokio_postgres};
+use merezha_postgres::{DetachedClient, Session, classify};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -273,26 +274,17 @@ pub struct ActivationReport {
 }
 
 /// Read the active model.
-pub async fn read_active(
-    client: &impl tokio_postgres::GenericClient,
-) -> Result<StoredModel, Failure> {
-    let exists: bool = client
-        .query_one(
-            "SELECT to_regclass('merezha_content.models') IS NOT NULL",
-            &[],
-        )
+pub async fn read_active(db: &Database, client: &impl Session) -> Result<StoredModel, Failure> {
+    let exists: bool = db
+        .query_one(client, &statements::MODELS_EXIST, &[])
         .await
         .map_err(|e| classify(&e))?
         .get(0);
     if !exists {
         return Ok(StoredModel::NoSchema);
     }
-    let row = client
-        .query_opt(
-            "SELECT version, fingerprint, definition::text FROM merezha_content.models \
-             WHERE state = 'active'",
-            &[],
-        )
+    let row = db
+        .query_opt(client, &statements::MODEL_ACTIVE, &[])
         .await
         .map_err(|e| classify(&e))?;
     let Some(row) = row else {
@@ -310,16 +302,11 @@ pub async fn read_active(
 
 /// Existing derived indexes by name, with `pg_index.indisvalid`.
 pub async fn existing_indexes(
-    client: &impl tokio_postgres::GenericClient,
+    db: &Database,
+    client: &impl Session,
 ) -> Result<BTreeMap<String, bool>, Failure> {
-    let rows = client
-        .query(
-            "SELECT c.relname::text, i.indisvalid FROM pg_index i \
-             JOIN pg_class c ON c.oid = i.indexrelid \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = 'merezha_content' AND c.relname LIKE 'content\\_ix\\_%'",
-            &[],
-        )
+    let rows = db
+        .query(client, &statements::DERIVED_INDEXES, &[])
         .await
         .map_err(|e| classify(&e))?;
     Ok(rows
@@ -471,10 +458,13 @@ pub enum Verified {
 /// derived index `index_build_pending`. Refused changes and a reused
 /// version fail with their startup codes.
 pub async fn verify(
-    client: &impl tokio_postgres::GenericClient,
+    db: &Database,
+    client: &impl Session,
     model: &ContentModel,
 ) -> Result<Verified, ActivationError> {
-    let stored = read_active(client).await.map_err(ActivationError::new)?;
+    let stored = read_active(db, client)
+        .await
+        .map_err(ActivationError::new)?;
     let plan = Plan::new(stored.active(), model);
     if let Some(failure) = plan.failure() {
         return Err(ActivationError {
@@ -486,7 +476,7 @@ pub async fn verify(
     Ok(match plan.status {
         Status::Outdated => Verified::NotReady("content_model_outdated"),
         Status::Current => {
-            let existing = existing_indexes(client)
+            let existing = existing_indexes(db, client)
                 .await
                 .map_err(ActivationError::new)?;
             if !missing_indexes(&derived_indexes(model), &existing).is_empty() {
@@ -572,7 +562,7 @@ impl Run<'_> {
             .map_err(|failure| Stop::failed(ActivationError::new(failure)))?;
         self.statement_timeout(&session).await?;
         self.lock(&session).await?;
-        let stored = read_active(&*session)
+        let stored = read_active(self.db, &*session)
             .await
             .map_err(|f| Self::stop(&session, f))?;
         if stored == StoredModel::NoSchema {
@@ -602,7 +592,7 @@ impl Run<'_> {
             });
         }
         let expected = derived_indexes(self.model);
-        let existing = existing_indexes(&*session)
+        let existing = existing_indexes(self.db, &*session)
             .await
             .map_err(|f| Self::stop(&session, f))?;
         for index in missing_indexes(&expected, &existing) {
@@ -638,7 +628,7 @@ impl Run<'_> {
         expected: &[DerivedIndex],
     ) -> (Vec<String>, Vec<String>) {
         let (mut dropped, mut undropped) = (Vec::new(), Vec::new());
-        let existing = match existing_indexes(&**session).await {
+        let existing = match existing_indexes(self.db, session).await {
             Ok(existing) => existing,
             Err(failure) => {
                 merezha_telemetry::event!(
@@ -656,8 +646,16 @@ impl Run<'_> {
                 .saturating_duration_since(Instant::now())
                 .min(POST_ACTIVATION_BUDGET);
             let set = format!("SET statement_timeout = {}", left.as_millis().max(1));
-            let result = match session.batch_execute(&set).await {
-                Ok(()) => session.batch_execute(&drop_statement(&name)).await,
+            let result = match self
+                .db
+                .batch_text(session, &statements::SESSION_TIMEOUT, &set)
+                .await
+            {
+                Ok(()) => {
+                    self.db
+                        .batch_text(session, &statements::INDEX_DROP, &drop_statement(&name))
+                        .await
+                }
                 Err(error) => Err(error),
             };
             match result {
@@ -691,11 +689,15 @@ impl Run<'_> {
                 "content_activation_timeout",
             ))));
         }
-        session
-            .batch_execute(&format!(
-                "SET statement_timeout = {}",
-                left.as_millis().min(i32::MAX as u128)
-            ))
+        self.db
+            .batch_text(
+                session,
+                &statements::SESSION_TIMEOUT,
+                &format!(
+                    "SET statement_timeout = {}",
+                    left.as_millis().min(i32::MAX as u128)
+                ),
+            )
             .await
             .map_err(|e| Self::stop(session, classify(&e)))
     }
@@ -705,8 +707,13 @@ impl Run<'_> {
     /// for, a deadlock (as in the kernel migration runner).
     async fn lock(&self, session: &DetachedClient) -> Result<(), Stop> {
         loop {
-            let locked: bool = session
-                .query_one("SELECT pg_try_advisory_lock($1)", &[&ACTIVATION_LOCK])
+            let locked: bool = self
+                .db
+                .query_one(
+                    session,
+                    &statements::ACTIVATION_TRY_LOCK,
+                    &[&ACTIVATION_LOCK],
+                )
                 .await
                 .map_err(|e| Self::stop(session, classify(&e)))?
                 .get(0);
@@ -724,19 +731,17 @@ impl Run<'_> {
 
     /// Drop `name` when a crashed or failed concurrent build left it
     /// invalid, so the `IF NOT EXISTS` build creates it again.
-    async fn drop_invalid(session: &DetachedClient, name: &str) -> Result<(), Failure> {
-        let invalid = session
-            .query_opt(
-                "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
-                 JOIN pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE n.nspname = 'merezha_content' AND c.relname = $1 AND NOT i.indisvalid",
-                &[&name],
-            )
+    async fn drop_invalid(
+        db: &Database,
+        session: &DetachedClient,
+        name: &str,
+    ) -> Result<(), Failure> {
+        let invalid = db
+            .query_opt(session, &statements::INDEX_INVALID, &[&name])
             .await
             .map_err(|e| classify(&e))?;
         if invalid.is_some() {
-            session
-                .batch_execute(&drop_statement(name))
+            db.batch_text(session, &statements::INDEX_DROP, &drop_statement(name))
                 .await
                 .map_err(|e| classify(&e))?;
             merezha_telemetry::event!(
@@ -757,9 +762,10 @@ impl Run<'_> {
                 *count
             };
             self.statement_timeout(session).await?;
-            let result = match Self::drop_invalid(session, &index.name).await {
-                Ok(()) => session
-                    .batch_execute(&index.create)
+            let result = match Self::drop_invalid(self.db, session, &index.name).await {
+                Ok(()) => self
+                    .db
+                    .batch_text(session, &statements::INDEX_CREATE, &index.create)
                     .await
                     .map_err(|e| classify(&e)),
                 Err(failure) => Err(failure),
@@ -784,7 +790,7 @@ impl Run<'_> {
             if !lost {
                 // A failed build is dropped; the next attempt or start
                 // rebuilds it.
-                let _ = Self::drop_invalid(session, &index.name).await;
+                let _ = Self::drop_invalid(self.db, session, &index.name).await;
             }
             let retry = failure.classification == Classification::Transient;
             if !retry || attempt >= BUILD_ATTEMPTS {
@@ -839,15 +845,13 @@ impl Run<'_> {
         let job = crate::rebuild::rebuild_job(self.model.version(), None)
             .map_err(|f| Stop::failed(ActivationError::new(f)))?;
         let outbox = self.outbox.clone();
+        let db = self.db.clone();
         let result = session
             .transaction(self.deadline, move |tx| {
                 Box::pin(async move {
-                    let active = tx
-                        .query_opt(
-                            "SELECT version FROM merezha_content.models \
-                         WHERE state = 'active' FOR UPDATE",
-                            &[],
-                        )
+                    let db = &db;
+                    let active = db
+                        .query_opt(&*tx, &statements::MODEL_ACTIVE_LOCK, &[])
                         .await
                         .map_err(|e| classify(&e))?
                         .map(|row| row.get::<_, i32>(0));
@@ -856,16 +860,12 @@ impl Run<'_> {
                         // the lock makes this unreachable, so refuse to guess.
                         return Err(Failure::transient("content_model_conflict"));
                     }
-                    tx.execute(
-                    "UPDATE merezha_content.models SET state = 'superseded' WHERE state = 'active'",
-                    &[],
-                )
-                .await
-                .map_err(|e| classify(&e))?;
-                    tx.execute(
-                        "INSERT INTO merezha_content.models \
-                     (version, fingerprint, definition, state, activated_at) \
-                     VALUES ($1, $2, $3::text::jsonb, 'active', now())",
+                    db.execute(&*tx, &statements::MODEL_SUPERSEDE, &[])
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    db.execute(
+                        &*tx,
+                        &statements::MODEL_INSERT,
                         &[&version, &fingerprint, &canonical],
                     )
                     .await
@@ -875,21 +875,14 @@ impl Run<'_> {
                     let mut changed = 0;
                     for (code, _) in &locales {
                         let is_default = *code == default_locale;
-                        changed += tx.execute(
-                        "INSERT INTO merezha_content.locales (code, is_default) VALUES ($1, $2) \
-                         ON CONFLICT (code) DO NOTHING",
-                        &[code, &is_default],
-                    )
-                    .await
-                    .map_err(|e| classify(&e))?;
+                        changed += db
+                            .execute(&*tx, &statements::LOCALE_INSERT, &[code, &is_default])
+                            .await
+                            .map_err(|e| classify(&e))?;
                     }
                     for (code, fallback) in &locales {
-                        changed += tx
-                            .execute(
-                                "UPDATE merezha_content.locales SET fallback = $2 \
-                         WHERE code = $1 AND fallback IS DISTINCT FROM $2",
-                                &[code, fallback],
-                            )
+                        changed += db
+                            .execute(&*tx, &statements::LOCALE_FALLBACK, &[code, fallback])
                             .await
                             .map_err(|e| classify(&e))?;
                     }
@@ -898,36 +891,24 @@ impl Run<'_> {
                     // background job. A first activation has no rows.
                     // A rebuild still pending for an older version is carried
                     // forward: this one covers every entry.
-                    let carried = tx
-                        .execute(
-                            "UPDATE merezha_content.rebuilds \
-                                SET state = 'superseded', updated_at = now() \
-                              WHERE state = 'pending'",
-                            &[],
-                        )
+                    let carried = db
+                        .execute(&*tx, &statements::REBUILD_SUPERSEDE, &[])
                         .await
                         .map_err(|e| classify(&e))?;
                     let rebuild = (changed > 0 && previous.is_some()) || carried > 0;
                     if rebuild {
-                        tx.execute(
-                            "INSERT INTO merezha_content.rebuilds (version, state, updated_at) \
-                             VALUES ($1, 'pending', now())",
-                            &[&version],
-                        )
-                        .await
-                        .map_err(|e| classify(&e))?;
+                        db.execute(&*tx, &statements::REBUILD_INSERT, &[&version])
+                            .await
+                            .map_err(|e| classify(&e))?;
                         outbox
                             .append(tx, std::slice::from_ref(&job), OnDuplicate::Ignore)
                             .await?;
                     }
                     // Every scope's ETags change with the model (access rules,
                     // locales, the model endpoint).
-                    tx.execute(
-                        "UPDATE merezha_content.generations SET generation = generation + 1",
-                        &[],
-                    )
-                    .await
-                    .map_err(|e| classify(&e))?;
+                    db.execute(&*tx, &statements::GENERATIONS_BUMP_ALL, &[])
+                        .await
+                        .map_err(|e| classify(&e))?;
                     outbox
                         .append(tx, std::slice::from_ref(&record), OnDuplicate::Fail)
                         .await?;
@@ -995,7 +976,6 @@ impl Run<'_> {
                 return Vec::new();
             }
         };
-        let session: &tokio_postgres::Client = &client;
         let any_component = plan
             .changes
             .iter()
@@ -1015,7 +995,7 @@ impl Run<'_> {
             .collect();
         let mut out = Vec::new();
         for name in types {
-            match self.count_type(session, name).await {
+            match self.count_type(&client, name).await {
                 Ok(counts) => {
                     let summary: Vec<(&str, u64, u64)> = counts
                         .iter()
@@ -1043,7 +1023,7 @@ impl Run<'_> {
 
     async fn count_type(
         &self,
-        session: &tokio_postgres::Client,
+        session: &impl Session,
         name: &str,
     ) -> Result<Vec<TightenedCount>, Failure> {
         let Some(content_type) = self.model.content_type(name) else {
@@ -1056,16 +1036,12 @@ impl Run<'_> {
             .collect();
         let mut truncated = false;
         for published in [false, true] {
-            let sql = if published {
-                // Own rows only: a fallback row repeats its source's data.
-                "SELECT entry_id::text, locale, source_locale, data::text FROM merezha_content.published \
-                 WHERE content_type = $1 AND source_locale = locale \
-                   AND (entry_id, locale) > ($2::text::uuid, $3) \
-                 ORDER BY entry_id, locale LIMIT $4"
+            // Own rows only on `published`: a fallback row repeats its
+            // source's data.
+            let statement = if published {
+                &statements::TIGHTENED_PUBLISHED
             } else {
-                "SELECT entry_id::text, locale, locale, draft_data::text FROM merezha_content.variants \
-                 WHERE content_type = $1 AND NOT deleted AND (entry_id, locale) > ($2::text::uuid, $3) \
-                 ORDER BY entry_id, locale LIMIT $4"
+                &statements::TIGHTENED_DRAFTS
             };
             let mut after = (
                 "00000000-0000-0000-0000-000000000000".to_owned(),
@@ -1077,8 +1053,13 @@ impl Run<'_> {
                     truncated = true;
                     break;
                 }
-                let rows = session
-                    .query(sql, &[&name, &after.0, &after.1, &TIGHTENING_BATCH])
+                let rows = self
+                    .db
+                    .query(
+                        session,
+                        statement,
+                        &[&name, &after.0, &after.1, &TIGHTENING_BATCH],
+                    )
                     .await
                     .map_err(|e| classify(&e))?;
                 for row in &rows {

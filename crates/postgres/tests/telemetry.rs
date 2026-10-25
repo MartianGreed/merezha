@@ -813,3 +813,77 @@ async fn text_built_at_run_time_runs_with_parameters_under_its_registered_name()
         Some(1.0)
     );
 }
+
+const UPDATE_TEXT: Statement = Statement::new(
+    "canary.items.update_text",
+    "UPDATE canary.items",
+    "UPDATE canary.items SET body = $1 WHERE <conditions built per call>",
+);
+
+#[tokio::test]
+async fn single_row_and_execute_text_keep_the_driver_contract_under_their_names() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let harness = Harness::new();
+    let db = database(&test, &harness).for_module("canary");
+    migrate(&db).await;
+    let client = db.acquire(soon()).await.unwrap();
+    db.execute(&client, &INSERT, &[&CANARY]).await.unwrap();
+    let one = "SELECT body FROM canary.items WHERE body = $1 AND id > $2";
+    let row = db
+        .query_one_text(&client, &SELECT_TEXT, one, &[&CANARY, &0i64])
+        .instrument(caller())
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), CANARY);
+    // No row: `query_one` fails, `query_opt` answers `None`.
+    let none = "SELECT body FROM canary.items WHERE body = $1 AND id < $2";
+    let missing = db
+        .query_one_text(&client, &SELECT_TEXT, none, &[&CANARY, &0i64])
+        .instrument(caller())
+        .await;
+    assert!(missing.is_err());
+    let absent = db
+        .query_opt_text(&client, &SELECT_TEXT, none, &[&CANARY, &0i64])
+        .instrument(caller())
+        .await
+        .unwrap();
+    assert!(absent.is_none());
+    let renamed = format!("{CANARY}-renamed");
+    let changed = db
+        .execute_text(
+            &client,
+            &UPDATE_TEXT,
+            "UPDATE canary.items SET body = $1 WHERE body = $2 AND id > $3",
+            &[&renamed, &CANARY, &0i64],
+        )
+        .instrument(caller())
+        .await
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(client);
+    let spans = client_spans(&harness);
+    let named = |name: &str| {
+        spans
+            .iter()
+            .filter(|s| attribute(s, "merezha.db.statement").as_deref() == Some(name))
+            .count()
+    };
+    assert_eq!(named("canary.items.select_text"), 3);
+    assert_eq!(named("canary.items.update_text"), 1);
+    for span in &spans {
+        let text = format!("{span:?}");
+        assert!(!text.contains("id > $") && !text.contains("id < $"));
+        assert!(!text.contains(CANARY));
+    }
+    let duration = harness.metric("db.client.operation.duration");
+    assert_eq!(
+        duration.value(&[
+            ("db.collection.name", "canary.items"),
+            ("db.operation.name", "UPDATE"),
+            ("merezha.module", "canary"),
+        ]),
+        Some(1.0)
+    );
+}

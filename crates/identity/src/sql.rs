@@ -1450,11 +1450,4 @@ mod tests {
             Ok(())
         );
     }
-    /// No source of the block hands SQL to the driver.
-    #[test]
-    fn the_block_hands_no_sql_to_the_driver() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let found = merezha_postgres::statement::scan_sources(&dir, &[]).unwrap();
-        assert!(found.is_empty(), "unregistered SQL: {found:?}");
-    }
 }

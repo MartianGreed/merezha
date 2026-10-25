@@ -427,9 +427,10 @@ impl JobHandler for Writes {
             self.started.notify_one();
             self.proceed.notified().await;
             let state = self.state.clone();
+            let db = self.db.clone();
             self.db
                 .transaction(soon(), move |tx| {
-                    Box::pin(async move { state.check_writable(tx).await })
+                    Box::pin(async move { state.check_writable(&db, tx).await })
                 })
                 .await
                 .map_err(JobFailure::from)

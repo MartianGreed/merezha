@@ -1,6 +1,7 @@
 //! Management list queries (section 5, filters, sorting and pagination):
 //! the query string, typed filter values, sort keys with nulls last, and
 //! keyset cursors bound to a fingerprint of the query.
+use crate::statements;
 use crate::{
     model::{Cardinality, ContentModel, ContentType, Field, FieldKind},
     scalar,
@@ -1110,17 +1111,19 @@ impl crate::module::ContentState {
             .ok_or_else(|| Rejection::from(Failure::transient("content_model_pending")))?;
         let statement = format!("EXPLAIN (COSTS OFF) {}", parsed.statement);
         let params = parsed.params;
+        let db = database.clone();
         crate::store::transaction(
             database,
             std::time::Instant::now() + std::time::Duration::from_secs(10),
             move |tx| {
                 Box::pin(async move {
+                    let db = &db;
                     let refs: Vec<&(dyn ToSql + Sync)> = params
                         .iter()
                         .map(|p| p.as_ref() as &(dyn ToSql + Sync))
                         .collect();
-                    let rows = tx
-                        .query(&statement, &refs)
+                    let rows = db
+                        .query_text(&*tx, &statements::MANAGE_EXPLAIN, &statement, &refs)
                         .await
                         .map_err(|e| Rejection::from(merezha_postgres::classify(&e)))?;
                     Ok(rows

@@ -9,6 +9,7 @@
 //! `published` rows for every configured locale, bumps the scope's
 //! generation and appends its events. Nothing commits half-way: a batch
 //! publishes or unpublishes all of its items or none.
+use crate::statements;
 use crate::{
     model::{ContentModel, ContentType},
     refs,
@@ -19,7 +20,7 @@ use crate::{
     value::{RandomKeys, ReferenceTarget, Stage, ValidateOptions, ValueError},
 };
 use merezha_domain::{Classification, Failure};
-use merezha_platform::{FieldError, Tx, errors::MAX_DETAILS, ports::OutboxRecord};
+use merezha_platform::{Database, FieldError, Tx, errors::MAX_DETAILS, ports::OutboxRecord};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
@@ -110,6 +111,7 @@ pub(crate) fn locale_chain<'m>(model: &'m ContentModel, locale: &'m str) -> Vec<
 ///
 /// The caller holds the entry's lock and has run the model version check.
 pub(crate) async fn materialize(
+    db: &Database,
     tx: &mut Tx<'_>,
     model: &ContentModel,
     indexes: &[crate::indexes::DerivedIndex],
@@ -120,14 +122,10 @@ pub(crate) async fn materialize(
     let Some(content_type) = model.content_type(type_name) else {
         return Err(Failure::permanent("content_type_not_found").into());
     };
-    let rows = tx
+    let rows = db
         .query(
-            "SELECT v.locale, r.data::text FROM merezha_content.variants v \
-               JOIN merezha_content.revisions r \
-                 ON r.entry_id = v.entry_id AND r.locale = v.locale \
-                AND r.revision = v.published_revision \
-              WHERE v.entry_id = $1::text::uuid AND v.scope = $2 AND v.content_type = $3 \
-                AND NOT v.deleted AND v.published_revision IS NOT NULL",
+            &*tx,
+            &statements::PUBLISHED_REVISIONS,
             &[&id, &scope, &type_name],
         )
         .await
@@ -170,9 +168,9 @@ pub(crate) async fn materialize(
         sources.push(source.to_owned());
         datas.push(Value::Object(data).to_string());
     }
-    tx.execute(
-        "DELETE FROM merezha_content.published \
-          WHERE entry_id = $1::text::uuid AND scope = $2 AND content_type = $3",
+    db.execute(
+        &*tx,
+        &statements::PUBLISHED_DELETE,
         &[&id, &scope, &type_name],
     )
     .await
@@ -180,17 +178,9 @@ pub(crate) async fn materialize(
     if locales.is_empty() {
         return Ok(0);
     }
-    tx.execute(
-        "INSERT INTO merezha_content.published \
-             (entry_id, locale, source_locale, scope, content_type, revision, slug, data, \
-              published_at, first_published_at) \
-         SELECT $1::text::uuid, t.locale, t.source, $2, $3, v.published_revision, t.slug, \
-                t.data::jsonb, coalesce(v.published_at, now()), \
-                coalesce(v.first_published_at, v.published_at, now()) \
-           FROM unnest($4::text[], $5::text[], $6::text[], $7::text[]) AS t(locale, source, slug, data) \
-           JOIN merezha_content.variants v \
-             ON v.entry_id = $1::text::uuid AND v.locale = t.source \
-            AND v.scope = $2 AND v.content_type = $3",
+    db.execute(
+        &*tx,
+        &statements::PUBLISHED_INSERT,
         &[&id, &scope, &type_name, &locales, &sources, &slugs, &datas],
     )
     .await
@@ -216,27 +206,27 @@ fn published_error(
 }
 
 /// Bump the generation of `scope`, creating its row.
-pub(crate) async fn bump_generation(tx: &mut Tx<'_>, scope: &str) -> Result<(), Rejection> {
-    tx.execute(
-        "INSERT INTO merezha_content.generations (scope, generation) VALUES ($1, 1) \
-         ON CONFLICT (scope) DO UPDATE SET generation = merezha_content.generations.generation + 1",
-        &[&scope],
-    )
-    .await
-    .map_err(|e| sql(&e))?;
+pub(crate) async fn bump_generation(
+    db: &Database,
+    tx: &mut Tx<'_>,
+    scope: &str,
+) -> Result<(), Rejection> {
+    db.execute(&*tx, &statements::GENERATION_BUMP, &[&scope])
+        .await
+        .map_err(|e| sql(&e))?;
     Ok(())
 }
 
 /// Lock a live entry `FOR UPDATE` under the scope predicates.
 pub(crate) async fn lock_entry(
+    db: &Database,
     tx: &mut Tx<'_>,
     target: &Target,
     id: &str,
 ) -> Result<(), Rejection> {
-    tx.query_opt(
-        "SELECT 1 FROM merezha_content.entries \
-          WHERE id = $1::text::uuid AND scope = $2 AND content_type = $3 \
-            AND deleted_at IS NULL FOR UPDATE",
+    db.query_opt(
+        &*tx,
+        &statements::ENTRY_LOCK,
         &[&id, &target.scope, &target.content_type],
     )
     .await
@@ -254,18 +244,17 @@ struct Locked {
 }
 
 async fn lock_variant(
+    db: &Database,
     tx: &mut Tx<'_>,
     target: &Target,
     id: &str,
     locale: &str,
     expect: Expect,
 ) -> Result<Locked, Rejection> {
-    let row = tx
+    let row = db
         .query_opt(
-            "SELECT draft_revision, published_revision, first_published_at IS NULL \
-               FROM merezha_content.variants \
-              WHERE entry_id = $1::text::uuid AND locale = $2 AND scope = $3 \
-                AND content_type = $4 AND NOT deleted FOR UPDATE",
+            &*tx,
+            &statements::VARIANT_LOCK,
             &[&id, &locale, &target.scope, &target.content_type],
         )
         .await
@@ -289,6 +278,7 @@ async fn lock_variant(
 
 /// Replace the variant's `stage` refs with `rows`.
 pub(crate) async fn write_refs(
+    db: &Database,
     tx: &mut Tx<'_>,
     scope: &str,
     id: &str,
@@ -296,9 +286,9 @@ pub(crate) async fn write_refs(
     stage: &str,
     rows: &[(String, &'static str, Uuid)],
 ) -> Result<(), Rejection> {
-    tx.execute(
-        "DELETE FROM merezha_content.refs \
-          WHERE from_entry = $1::text::uuid AND from_locale = $2 AND stage = $3 AND scope = $4",
+    db.execute(
+        &*tx,
+        &statements::REFS_DELETE_STAGE,
         &[&id, &locale, &stage, &scope],
     )
     .await
@@ -309,12 +299,9 @@ pub(crate) async fn write_refs(
     let paths: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
     let kinds: Vec<String> = rows.iter().map(|r| r.1.to_owned()).collect();
     let targets: Vec<String> = rows.iter().map(|r| r.2.hyphenated().to_string()).collect();
-    tx.execute(
-        "INSERT INTO merezha_content.refs \
-             (scope, from_entry, from_locale, stage, path, target_kind, target_id) \
-         SELECT $1, $2::text::uuid, $3, $4, path, kind, target::uuid \
-           FROM unnest($5::text[], $6::text[], $7::text[]) AS t(path, kind, target) \
-         ON CONFLICT DO NOTHING",
+    db.execute(
+        &*tx,
+        &statements::REFS_INSERT,
         &[&scope, &id, &locale, &stage, &paths, &kinds, &targets],
     )
     .await
@@ -352,8 +339,9 @@ impl Work {
         actor: &Actor,
         batch: bool,
     ) -> Result<Vec<VariantView>, Rejection> {
-        self.state.check_writable(tx).await?;
-        lock_entries(tx, items).await?;
+        let db = self.ctx.database();
+        self.state.check_writable(db, tx).await?;
+        lock_entries(db, tx, items).await?;
         let mut required = Vec::new();
         let mut records = Vec::new();
         let mut views = Vec::with_capacity(items.len());
@@ -381,9 +369,9 @@ impl Work {
         targets.sort();
         targets.dedup();
         for (target, scope) in targets {
-            tx.query_opt(
-                "SELECT 1 FROM merezha_content.entries \
-                  WHERE id = $1::text::uuid AND (scope = $2 OR scope = 'app') FOR SHARE",
+            db.query_opt(
+                &*tx,
+                &statements::REQUIRED_TARGET_SHARE,
                 &[&target.hyphenated().to_string(), &scope],
             )
             .await
@@ -391,12 +379,10 @@ impl Work {
         }
         for need in &required {
             let target = need.target.hyphenated().to_string();
-            let found = tx
+            let found = db
                 .query_opt(
-                    "SELECT 1 FROM merezha_content.published \
-                      WHERE entry_id = $1::text::uuid AND locale = $2 \
-                        AND (scope = $3 OR scope = 'app') \
-                        AND (cardinality($4::text[]) = 0 OR content_type = ANY($4::text[]))",
+                    &*tx,
+                    &statements::REQUIRED_PUBLISHED,
                     &[&target, &need.locale, &need.scope, &need.types],
                 )
                 .await
@@ -417,7 +403,7 @@ impl Work {
             return Err(in_item(first, batch, Rejection::invalid(details)));
         }
         for scope in &scopes {
-            bump_generation(tx, scope).await?;
+            bump_generation(db, tx, scope).await?;
         }
         self.append(tx, records).await?;
         Ok(views)
@@ -431,6 +417,7 @@ impl Work {
         actor: &Actor,
         required: &mut Vec<Required>,
     ) -> Result<(VariantView, OutboxRecord), Rejection> {
+        let db = self.ctx.database();
         let model = self.model.clone();
         let target = &item.target;
         let Some(content_type) = model.content_type(&target.content_type) else {
@@ -438,19 +425,16 @@ impl Work {
         };
         let id = item.id.hyphenated().to_string();
         let locale = item.locale.as_str();
-        lock_entry(tx, target, &id).await?;
-        let locked = lock_variant(tx, target, &id, locale, item.expect).await?;
+        lock_entry(db, tx, target, &id).await?;
+        let locked = lock_variant(db, tx, target, &id, locale, item.expect).await?;
         let revision = item.revision.unwrap_or(locked.draft);
         if revision < 1 || revision > locked.draft {
             return Err(Failure::permanent("revision_not_found").into());
         }
-        let data = tx
+        let data = db
             .query_opt(
-                "SELECT r.data::text FROM merezha_content.revisions r \
-                   JOIN merezha_content.variants v \
-                     ON v.entry_id = r.entry_id AND v.locale = r.locale \
-                  WHERE r.entry_id = $1::text::uuid AND r.locale = $2 \
-                    AND v.scope = $3 AND v.content_type = $4 AND r.revision = $5",
+                &*tx,
+                &statements::REVISION_DATA,
                 &[&id, &locale, &target.scope, &target.content_type, &revision],
             )
             .await
@@ -475,7 +459,7 @@ impl Work {
                     details,
                 ),
             };
-        let resolution = refs::resolve(tx, &target.scope, &references).await?;
+        let resolution = refs::resolve(db, tx, &target.scope, &references).await?;
         problems.extend(resolution.problems);
         if !problems.is_empty() {
             problems.truncate(MAX_DETAILS);
@@ -499,17 +483,15 @@ impl Work {
                 });
             }
         }
-        tx.execute(
-            "UPDATE merezha_content.variants \
-                SET published_revision = $5, published_at = now(), \
-                    first_published_at = coalesce(first_published_at, now()) \
-              WHERE entry_id = $1::text::uuid AND locale = $2 AND scope = $3 \
-                AND content_type = $4 AND NOT deleted",
+        db.execute(
+            &*tx,
+            &statements::VARIANT_PUBLISH,
             &[&id, &locale, &target.scope, &target.content_type, &revision],
         )
         .await
         .map_err(|e| sql(&e))?;
         write_refs(
+            db,
             tx,
             &target.scope,
             &id,
@@ -519,6 +501,7 @@ impl Work {
         )
         .await?;
         materialize(
+            db,
             tx,
             &model,
             &self.indexes,
@@ -527,17 +510,16 @@ impl Work {
             &id,
         )
         .await?;
-        let slug: Option<String> = tx
+        let slug: Option<String> = db
             .query_opt(
-                "SELECT slug FROM merezha_content.published \
-                  WHERE entry_id = $1::text::uuid AND locale = $2 AND scope = $3 \
-                    AND content_type = $4",
+                &*tx,
+                &statements::PUBLISHED_SLUG_READ,
                 &[&id, &locale, &target.scope, &target.content_type],
             )
             .await
             .map_err(|e| sql(&e))?
             .and_then(|row| row.get(0));
-        let view = read_view(tx, target, item.id, locale, true).await?;
+        let view = read_view(db, tx, target, item.id, locale, true).await?;
         let record = self.event(
             target,
             PUBLISHED,
@@ -565,8 +547,9 @@ impl Work {
         actor: &Actor,
         batch: bool,
     ) -> Result<Vec<VariantView>, Rejection> {
-        self.state.check_writable(tx).await?;
-        lock_entries(tx, items).await?;
+        let db = self.ctx.database();
+        self.state.check_writable(db, tx).await?;
+        lock_entries(db, tx, items).await?;
         let mut records = Vec::new();
         let mut views = Vec::with_capacity(items.len());
         let mut scopes = BTreeSet::new();
@@ -575,8 +558,8 @@ impl Work {
             let id = item.id.hyphenated().to_string();
             let locale = item.locale.as_str();
             let changed = async {
-                lock_entry(tx, target, &id).await?;
-                let locked = lock_variant(tx, target, &id, locale, item.expect).await?;
+                lock_entry(db, tx, target, &id).await?;
+                let locked = lock_variant(db, tx, target, &id, locale, item.expect).await?;
                 if locked.published.is_none() {
                     return Ok(false);
                 }
@@ -589,10 +572,10 @@ impl Work {
                 scopes.insert(target.scope.clone());
                 records.push(self.unpublished(target, &id, locale, "unpublish", actor)?);
             }
-            views.push(read_view(tx, target, item.id, locale, true).await?);
+            views.push(read_view(db, tx, target, item.id, locale, true).await?);
         }
         for scope in &scopes {
-            bump_generation(tx, scope).await?;
+            bump_generation(db, tx, scope).await?;
         }
         self.append(tx, records).await?;
         Ok(views)
@@ -608,16 +591,17 @@ impl Work {
         id: &str,
         locale: &str,
     ) -> Result<(), Rejection> {
-        tx.execute(
-            "UPDATE merezha_content.variants SET published_revision = NULL, published_at = NULL \
-              WHERE entry_id = $1::text::uuid AND locale = $2 AND scope = $3 \
-                AND content_type = $4 AND NOT deleted",
+        let db = self.ctx.database();
+        db.execute(
+            &*tx,
+            &statements::VARIANT_WITHDRAW,
             &[&id, &locale, &target.scope, &target.content_type],
         )
         .await
         .map_err(|e| sql(&e))?;
-        write_refs(tx, &target.scope, id, locale, "published", &[]).await?;
+        write_refs(db, tx, &target.scope, id, locale, "published", &[]).await?;
         materialize(
+            db,
             tx,
             &self.model,
             &self.indexes,
@@ -664,34 +648,35 @@ impl Work {
         expected: Option<i64>,
         actor: &Actor,
     ) -> Result<(), Rejection> {
-        self.state.check_writable(tx).await?;
+        let db = self.ctx.database();
+        self.state.check_writable(db, tx).await?;
         let id = id.hyphenated().to_string();
-        lock_entry(tx, target, &id).await?;
+        lock_entry(db, tx, target, &id).await?;
         if locale == self.model.default_locale().code {
             return Err(Rejection::code(
                 "default_variant_required",
                 Classification::Conflict,
             ));
         }
-        let locked = lock_variant(tx, target, &id, locale, Expect::Draft(expected)).await?;
-        tx.execute(
-            "DELETE FROM merezha_content.refs \
-              WHERE from_entry = $1::text::uuid AND from_locale = $2 AND scope = $3",
+        let locked = lock_variant(db, tx, target, &id, locale, Expect::Draft(expected)).await?;
+        db.execute(
+            &*tx,
+            &statements::REFS_DELETE_VARIANT,
             &[&id, &locale, &target.scope],
         )
         .await
         .map_err(|e| sql(&e))?;
         // Its revisions go with it (`ON DELETE CASCADE`).
-        tx.execute(
-            "DELETE FROM merezha_content.variants \
-              WHERE entry_id = $1::text::uuid AND locale = $2 AND scope = $3 \
-                AND content_type = $4",
+        db.execute(
+            &*tx,
+            &statements::VARIANT_DELETE,
             &[&id, &locale, &target.scope, &target.content_type],
         )
         .await
         .map_err(|e| sql(&e))?;
         if locked.published.is_some() {
             materialize(
+                db,
                 tx,
                 &self.model,
                 &self.indexes,
@@ -700,7 +685,7 @@ impl Work {
                 &id,
             )
             .await?;
-            bump_generation(tx, &target.scope).await?;
+            bump_generation(db, tx, &target.scope).await?;
             let record = self.unpublished(target, &id, locale, "delete", actor)?;
             self.append(tx, vec![record]).await?;
         }
@@ -710,7 +695,7 @@ impl Work {
 
 /// Lock every entry of `items` in id order, so two batches over the same
 /// entries never deadlock.
-async fn lock_entries(tx: &mut Tx<'_>, items: &[Item]) -> Result<(), Rejection> {
+async fn lock_entries(db: &Database, tx: &mut Tx<'_>, items: &[Item]) -> Result<(), Rejection> {
     if items.len() < 2 {
         return Ok(());
     }
@@ -719,10 +704,9 @@ async fn lock_entries(tx: &mut Tx<'_>, items: &[Item]) -> Result<(), Rejection> 
     order.dedup_by_key(|(id, _)| *id);
     for (id, target) in order {
         // A missing entry is reported by its item, with its index.
-        tx.query_opt(
-            "SELECT 1 FROM merezha_content.entries \
-              WHERE id = $1::text::uuid AND scope = $2 AND content_type = $3 \
-                AND deleted_at IS NULL FOR UPDATE",
+        db.query_opt(
+            &*tx,
+            &statements::ENTRY_LOCK,
             &[
                 &id.hyphenated().to_string(),
                 &target.scope,

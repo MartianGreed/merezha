@@ -13,6 +13,7 @@
 //! retried job continues there. Readiness never waits for it: until it is
 //! done, delivery may serve the previous materialization for the affected
 //! locales, as during a rolling deploy.
+use crate::statements;
 use crate::{
     publish::{bump_generation, materialize},
     store::{Rejection, Store, sql},
@@ -44,25 +45,19 @@ pub struct PendingRebuild {
 
 /// The pending rebuild, if any (`None` before migration 3 too).
 pub async fn pending_rebuild(
-    client: &impl merezha_postgres::tokio_postgres::GenericClient,
+    db: &merezha_platform::Database,
+    client: &impl merezha_postgres::Session,
 ) -> Result<Option<PendingRebuild>, Failure> {
-    let exists: bool = client
-        .query_one(
-            "SELECT to_regclass('merezha_content.rebuilds') IS NOT NULL",
-            &[],
-        )
+    let exists: bool = db
+        .query_one(client, &statements::REBUILDS_EXIST, &[])
         .await
         .map_err(|e| merezha_postgres::classify(&e))?
         .get(0);
     if !exists {
         return Ok(None);
     }
-    let row = client
-        .query_opt(
-            "SELECT version, after_entry::text FROM merezha_content.rebuilds \
-              WHERE state = 'pending' ORDER BY version DESC LIMIT 1",
-            &[],
-        )
+    let row = db
+        .query_opt(client, &statements::REBUILD_PENDING, &[])
         .await
         .map_err(|e| merezha_postgres::classify(&e))?;
     Ok(row.map(|row| PendingRebuild {
@@ -116,36 +111,28 @@ impl Store {
     /// back for a current host.
     async fn rebuild_batch(&self, version: u32) -> Result<Batch, Rejection> {
         let work = self.work();
+        let db = self.database().clone();
         crate::store::transaction(self.database(), self.deadline(), move |tx| {
             Box::pin(async move {
-                work.state.check_writable(tx).await?;
+                let db = &db;
+                work.state.check_writable(db, tx).await?;
                 if version != work.model.version() {
                     return Ok(Batch::Nothing);
                 }
                 let version =
                     i32::try_from(version).map_err(|_| Failure::permanent("invalid_input"))?;
-                let Some(cursor) = tx
-                    .query_opt(
-                        "SELECT after_entry::text FROM merezha_content.rebuilds \
-                          WHERE version = $1 AND state = 'pending' FOR UPDATE",
-                        &[&version],
-                    )
+                let Some(cursor) = db
+                    .query_opt(&*tx, &statements::REBUILD_CURSOR, &[&version])
                     .await
                     .map_err(|e| sql(&e))?
                 else {
                     return Ok(Batch::Nothing);
                 };
                 let after: Option<String> = cursor.get(0);
-                let rows = tx
+                let rows = db
                     .query(
-                        "SELECT e.id::text, e.scope, e.content_type FROM merezha_content.entries e \
-                          WHERE e.deleted_at IS NULL \
-                            AND ($1::text IS NULL OR e.id > $1::text::uuid) \
-                            AND EXISTS (SELECT 1 FROM merezha_content.variants v \
-                                         WHERE v.entry_id = e.id AND v.scope = e.scope \
-                                           AND v.content_type = e.content_type \
-                                           AND NOT v.deleted AND v.published_revision IS NOT NULL) \
-                          ORDER BY e.id LIMIT $2 FOR SHARE OF e",
+                        &*tx,
+                        &statements::REBUILD_ENTRIES,
                         &[&after, &REBUILD_BATCH],
                     )
                     .await
@@ -154,19 +141,26 @@ impl Store {
                 for row in &rows {
                     let (id, scope, content_type): (String, String, String) =
                         (row.get(0), row.get(1), row.get(2));
-                    materialize(tx, &work.model, &work.indexes, &scope, &content_type, &id).await?;
+                    materialize(
+                        db,
+                        tx,
+                        &work.model,
+                        &work.indexes,
+                        &scope,
+                        &content_type,
+                        &id,
+                    )
+                    .await?;
                     scopes.insert(scope);
                 }
                 for scope in &scopes {
-                    bump_generation(tx, scope).await?;
+                    bump_generation(db, tx, scope).await?;
                 }
                 let last: Option<String> = rows.last().map(|r| r.get(0));
                 let done = (rows.len() as i64) < REBUILD_BATCH;
-                tx.execute(
-                    "UPDATE merezha_content.rebuilds \
-                        SET after_entry = $2::text::uuid, updated_at = now(), \
-                            state = CASE WHEN $3 THEN 'done' ELSE 'pending' END \
-                      WHERE version = $1",
+                db.execute(
+                    &*tx,
+                    &statements::REBUILD_ADVANCE,
                     &[&version, &last.or(after), &done],
                 )
                 .await
@@ -192,7 +186,7 @@ impl Store {
             .database()
             .acquire(std::time::Instant::now() + self.state().settings().limits.query_timeout)
             .await?;
-        let Some(pending) = pending_rebuild(&**client).await? else {
+        let Some(pending) = pending_rebuild(self.database(), &**client).await? else {
             return Ok(false);
         };
         if pending.version != self.model().version() {
@@ -226,9 +220,11 @@ impl Store {
     async fn continue_rebuild(&self, job: i64) -> Result<(), Rejection> {
         let work = self.work();
         let record = rebuild_job(work.model.version(), Some(job))?;
+        let db = self.database().clone();
         crate::store::transaction(self.database(), self.deadline(), move |tx| {
             Box::pin(async move {
-                work.state.check_writable(tx).await?;
+                let db = &db;
+                work.state.check_writable(db, tx).await?;
                 // A retried run of the same job (its lease reaped after it
                 // appended) finds the continuation there already.
                 work.append_ignoring(tx, vec![record]).await

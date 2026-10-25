@@ -121,7 +121,9 @@ pub async fn models(db: &Database) -> Vec<(i32, String)> {
 /// Derived indexes by name with `indisvalid`.
 pub async fn indexes(db: &Database) -> BTreeMap<String, bool> {
     let client = db.acquire(soon()).await.unwrap();
-    merezha_content::existing_indexes(&**client).await.unwrap()
+    merezha_content::existing_indexes(db, &**client)
+        .await
+        .unwrap()
 }
 
 /// Payloads of the `content.model_activated` outbox records, oldest first.

@@ -13,7 +13,7 @@ use merezha_platform::{
     config::{JobDefaults, JobRetention},
     ports::{JobContext, JobHandler},
 };
-use merezha_postgres::{Listener, classify};
+use merezha_postgres::{Listener, Statement, classify};
 use merezha_telemetry::{
     event,
     names::jobs::{Classification, Outcome as JobOutcome},
@@ -77,7 +77,10 @@ pub(crate) struct WorkerConfig {
     pub lease_deadline: Duration,
 }
 
-const LEASE: &str = "
+pub(crate) const LEASE: Statement = Statement::new(
+    "jobs.jobs.lease",
+    "UPDATE merezha_jobs.jobs",
+    "
 WITH cap AS (
     SELECT CASE WHEN $6::bigint > 0
                 THEN greatest(0, least($3::bigint, $6::bigint - (SELECT count(*) FROM merezha_jobs.jobs
@@ -106,11 +109,15 @@ WITH cap AS (
 SELECT id, kind, payload, attempts, max_attempts, lease_token::text, idempotency_key,
        correlation_id, causation_id, tenant, trace_parent, trace_state, replay_trace_parent,
        replay_trace_state, waited
-  FROM leased ORDER BY id";
+  FROM leased ORDER BY id",
+);
 
 /// One statement settles the job (nulling a flagged payload at a terminal
 /// state, R3) and closes its attempt, both fenced on the lease token.
-const SETTLE: &str = "
+pub(crate) const SETTLE: Statement = Statement::new(
+    "jobs.jobs.settle",
+    "UPDATE merezha_jobs.jobs",
+    "
 WITH settled AS (
     UPDATE merezha_jobs.jobs
        SET state = $3,
@@ -129,18 +136,26 @@ WITH settled AS (
            error_code = $5, error_class = $6
      WHERE lease_token = $2::text::uuid AND EXISTS (SELECT 1 FROM settled)
 )
-SELECT count(*) FROM settled";
+SELECT count(*) FROM settled",
+);
 
-const HEARTBEAT: &str = "
+pub(crate) const HEARTBEAT: Statement = Statement::new(
+    "jobs.jobs.heartbeat",
+    "UPDATE merezha_jobs.jobs",
+    "
 UPDATE merezha_jobs.jobs j SET lease_expires_at = now() + make_interval(secs => h.secs), updated_at = now()
   FROM unnest($1::text[]::uuid[], $2::float8[]) AS h (token, secs)
  WHERE j.lease_token = h.token AND j.state = 'running'
-RETURNING j.lease_token::text";
+RETURNING j.lease_token::text",
+);
 
 /// Expired leases count as failed attempts (counted at lease time); the
 /// backoff has no jitter, enough to stop a job that crashes its process from
 /// looping hot.
-const REAP: &str = "
+pub(crate) const REAP: Statement = Statement::new(
+    "jobs.jobs.reap",
+    "UPDATE merezha_jobs.jobs",
+    "
 WITH settings (queue, base_s, max_s) AS (
     SELECT * FROM unnest($1::text[], $2::float8[], $3::float8[])
 ), expired AS (
@@ -169,11 +184,15 @@ WITH settings (queue, base_s, max_s) AS (
            error_class = 'transient'
       FROM expired e WHERE a.lease_token = e.lease_token
 )
-SELECT id, queue, kind, attempts, state FROM reaped ORDER BY id";
+SELECT id, queue, kind, attempts, state FROM reaped ORDER BY id",
+);
 
 /// The drain release (AP §B.8 step 4): back to `available` now with the
 /// attempt refunded, fenced on the tokens this instance still holds.
-const RELEASE: &str = "
+pub(crate) const RELEASE: Statement = Statement::new(
+    "jobs.jobs.release",
+    "UPDATE merezha_jobs.jobs",
+    "
 WITH released AS (
     UPDATE merezha_jobs.jobs
        SET state = 'available', run_at = now(), attempts = greatest(attempts - 1, 0),
@@ -185,23 +204,39 @@ WITH released AS (
       FROM released r
      WHERE a.job_id = r.id AND a.lease_token = ANY($1::text[]::uuid[])
 )
-SELECT id FROM released ORDER BY id";
+SELECT id FROM released ORDER BY id",
+);
 
 /// The oldest due job through `jobs_due`, without scanning the backlog.
-pub(crate) const LAG: &str = "
+pub(crate) const LAG: Statement = Statement::new(
+    "jobs.jobs.lag",
+    "SELECT merezha_jobs.jobs",
+    "
 SELECT coalesce(extract(epoch FROM now() - (
            SELECT run_at FROM merezha_jobs.jobs
             WHERE state = 'available' AND run_at <= now()
-            ORDER BY run_at LIMIT 1)), 0)::float8";
+            ORDER BY run_at LIMIT 1)), 0)::float8",
+);
 
 /// Reissue claims cut between claim and hook (a crash) go back to `dead`.
-const REVERT_CLAIMS: &str = "
+pub(crate) const REVERT_CLAIMS: Statement = Statement::new(
+    "jobs.jobs.revert_claims",
+    "UPDATE merezha_jobs.jobs",
+    "
 UPDATE merezha_jobs.jobs
    SET state = 'dead', replays = greatest(replays - 1, 0), reissue_claimed_at = NULL,
        updated_at = now()
  WHERE id IN (SELECT id FROM merezha_jobs.jobs
                WHERE reissue_claimed_at < now() - make_interval(secs => $1::float8)
-               ORDER BY reissue_claimed_at LIMIT 100 FOR UPDATE SKIP LOCKED)";
+               ORDER BY reissue_claimed_at LIMIT 100 FOR UPDATE SKIP LOCKED)",
+);
+
+/// The per-queue lock of a queue with a global concurrency cap.
+pub(crate) const QUEUE_LOCK: Statement = Statement::new(
+    "jobs.queue.lock",
+    "SELECT pg_advisory_xact_lock()",
+    "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+);
 
 /// A leased job, as the lease statement returns it.
 struct Leased {
@@ -450,20 +485,19 @@ impl Worker {
         let owner = self.owner.clone();
         let lease_secs = lane.plan.settings.lease.as_secs_f64();
         let global = i64::from(lane.plan.global_concurrency);
+        let db = self.database.clone();
         self.database
             .transaction(Instant::now() + self.config.lease_deadline, move |tx| {
                 Box::pin(async move {
                     if global > 0 {
-                        tx.execute(
-                            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
-                            &[&MZJB, &queue],
-                        )
-                        .await
-                        .map_err(|e| classify(&e))?;
+                        db.execute(tx, &QUEUE_LOCK, &[&MZJB, &queue])
+                            .await
+                            .map_err(|e| classify(&e))?;
                     }
-                    let rows = tx
+                    let rows = db
                         .query(
-                            LEASE,
+                            tx,
+                            &LEASE,
                             &[&queue, &kinds, &wanted, &owner, &lease_secs, &global],
                         )
                         .await
@@ -507,7 +541,11 @@ impl Worker {
         let at = tokio::time::Instant::from_std(deadline());
         let row = tokio::time::timeout_at(
             at,
-            client.query_one(SETTLE, &[&id, &token, &state, &delay, &code, &class]),
+            self.database.query_one(
+                &client,
+                &SETTLE,
+                &[&id, &token, &state, &delay, &code, &class],
+            ),
         )
         .await
         .map_err(|_| Failure::transient("database_timeout"))?
@@ -897,7 +935,7 @@ impl Worker {
     async fn release(&self, tokens: &[String]) -> Result<Vec<i64>, Failure> {
         let client = self.database.acquire(deadline()).await?;
         let at = tokio::time::Instant::from_std(deadline());
-        let rows = tokio::time::timeout_at(at, client.query(RELEASE, &[&tokens]))
+        let rows = tokio::time::timeout_at(at, self.database.query(&client, &RELEASE, &[&tokens]))
             .await
             .map_err(|_| Failure::transient("database_timeout"))?
             .map_err(|e| classify(&e))?;
@@ -917,10 +955,13 @@ impl Worker {
         }
         let client = self.database.acquire(deadline()).await?;
         let at = tokio::time::Instant::from_std(deadline());
-        let rows = tokio::time::timeout_at(at, client.query(HEARTBEAT, &[&tokens, &secs]))
-            .await
-            .map_err(|_| Failure::transient("database_timeout"))?
-            .map_err(|e| classify(&e))?;
+        let rows = tokio::time::timeout_at(
+            at,
+            self.database.query(&client, &HEARTBEAT, &[&tokens, &secs]),
+        )
+        .await
+        .map_err(|_| Failure::transient("database_timeout"))?
+        .map_err(|e| classify(&e))?;
         let alive: HashSet<String> = rows.iter().map(|row| row.get(0)).collect();
         for token in tokens.iter().filter(|token| !alive.contains(*token)) {
             if let Some(entry) = lock(&self.in_flight).get_mut(token) {
@@ -949,7 +990,8 @@ impl Worker {
             let at = tokio::time::Instant::from_std(deadline());
             let rows = tokio::time::timeout_at(
                 at,
-                client.query(REAP, &[&queues, &bases, &maxima, &base, &max]),
+                self.database
+                    .query(&client, &REAP, &[&queues, &bases, &maxima, &base, &max]),
             )
             .await
             .map_err(|_| Failure::transient("database_timeout"))?
@@ -996,11 +1038,14 @@ impl Worker {
         let client = self.database.acquire(deadline()).await?;
         let at = tokio::time::Instant::from_std(deadline());
         let claim_timeout = self.config.claim_timeout.as_secs_f64();
-        let reverted =
-            tokio::time::timeout_at(at, client.execute(REVERT_CLAIMS, &[&claim_timeout]))
-                .await
-                .map_err(|_| Failure::transient("database_timeout"))?
-                .map_err(|e| classify(&e))?;
+        let reverted = tokio::time::timeout_at(
+            at,
+            self.database
+                .execute(&client, &REVERT_CLAIMS, &[&claim_timeout]),
+        )
+        .await
+        .map_err(|_| Failure::transient("database_timeout"))?
+        .map_err(|e| classify(&e))?;
         if reverted > 0 {
             event!(
                 INFO,
@@ -1015,7 +1060,7 @@ impl Worker {
     async fn measure_lag(&self, max: Duration) -> Result<(), Failure> {
         let client = self.database.acquire(deadline()).await?;
         let at = tokio::time::Instant::from_std(deadline());
-        let row = tokio::time::timeout_at(at, client.query_one(LAG, &[]))
+        let row = tokio::time::timeout_at(at, self.database.query_one(&client, &LAG, &[]))
             .await
             .map_err(|_| Failure::transient("database_timeout"))?
             .map_err(|e| classify(&e))?;

@@ -24,14 +24,14 @@
 //! several occurrences therefore runs one job, then the normal cadence
 //! (the missed-run policy). Times come from the database clock.
 use crate::telemetry::Metrics;
-use crate::{admin::audit, relay::RelaySettings};
+use crate::{admin::audit, relay::RelaySettings, statements};
 use merezha_domain::{Failure, compatible_json};
 use merezha_platform::{
     config::{JobSchedule, valid_queue_name, valid_schedule_name},
     cron::CronSchedule,
     ports::{MAX_PAYLOAD_BYTES, ScheduleDeclaration},
 };
-use merezha_postgres::{Database, classify};
+use merezha_postgres::{Database, Statement, classify};
 use merezha_telemetry::event;
 use serde::Serialize;
 use std::time::{Duration, Instant};
@@ -225,33 +225,23 @@ pub(crate) async fn sync(
 ) -> Result<SyncReport, Failure> {
     let retire_after = retire_after.as_secs_f64();
     let grace = (heartbeat * 2).as_secs_f64();
+    let db = database.clone();
     database
         .transaction(deadline(), move |tx| {
             Box::pin(async move {
-                tx.execute(
-                    "SELECT pg_advisory_xact_lock(1297762882, hashtext('schedules'))",
-                    &[],
-                )
-                .await
-                .map_err(|e| classify(&e))?;
-                let now: i64 = tx
-                    .query_one("SELECT (extract(epoch FROM now()) * 1000000)::bigint", &[])
+                db.execute(tx, &SCHEDULES_LOCK, &[])
+                    .await
+                    .map_err(|e| classify(&e))?;
+                let now: i64 = db
+                    .query_one(tx, &NOW, &[])
                     .await
                     .map_err(|e| classify(&e))?
                     .get(0);
                 let now = timestamp(now);
                 let names: Vec<String> = declared.iter().map(|d| d.name.clone()).collect();
                 let definitions: Vec<String> = declared.iter().map(Declared::definition).collect();
-                let rows = tx
-                    .query(
-                        "SELECT d.name, s.definition = sha256(convert_to(d.definition, 'UTF8')),
-                                s.declared_version,
-                                extract(epoch FROM now() - s.definition_declared_at)::float8,
-                                s.retired_at IS NOT NULL
-                           FROM unnest($1::text[], $2::text[]) AS d(name, definition)
-                           JOIN merezha_jobs.schedules s ON s.name = d.name",
-                        &[&names, &definitions],
-                    )
+                let rows = db
+                    .query(tx, &STORED, &[&names, &definitions])
                     .await
                     .map_err(|e| classify(&e))?;
                 let stored: std::collections::BTreeMap<String, Stored> = rows
@@ -274,13 +264,9 @@ pub(crate) async fn sync(
                     let row = stored.get(&schedule.name);
                     let replace = match row {
                         None => {
-                            tx.execute(
-                                "INSERT INTO merezha_jobs.schedules
-                                     (name, source, cron, timezone, queue, kind, payload, next_run_at,
-                                      definition, declared_version)
-                                 VALUES ($1, $2, $3, $4, $5, $6, $7::text::json, $8::text::timestamptz,
-                                         sha256(convert_to($9::text, 'UTF8')), $10)
-                                 ON CONFLICT (name) DO NOTHING",
+                            db.execute(
+                                tx,
+                                &DECLARE,
                                 &[
                                     &schedule.name,
                                     &schedule.source,
@@ -306,16 +292,9 @@ pub(crate) async fn sync(
                             } else {
                                 row.version.clone()
                             };
-                            tx.execute(
-                                "UPDATE merezha_jobs.schedules
-                                    SET source = $2, declared_version = $3,
-                                        last_declared_at = now(), definition_declared_at = now(),
-                                        next_run_at = CASE WHEN retired_at IS NOT NULL
-                                                           THEN $4::text::timestamptz ELSE next_run_at END,
-                                        updated_at = CASE WHEN retired_at IS NOT NULL
-                                                          THEN now() ELSE updated_at END,
-                                        retired_at = NULL
-                                  WHERE name = $1",
+                            db.execute(
+                                tx,
+                                &REDECLARE,
                                 &[&schedule.name, &schedule.source, &raised, &next],
                             )
                             .await
@@ -329,17 +308,9 @@ pub(crate) async fn sync(
                         }
                     };
                     if replace {
-                        tx.execute(
-                            "UPDATE merezha_jobs.schedules
-                                SET source = $2, cron = $3, timezone = $4, queue = $5, kind = $6,
-                                    payload = $7::text::json,
-                                    definition = sha256(convert_to($9::text, 'UTF8')),
-                                    declared_version = $10,
-                                    next_run_at = CASE WHEN retired_at IS NULL AND next_run_at <= now()
-                                                       THEN next_run_at ELSE $8::text::timestamptz END,
-                                    last_declared_at = now(), definition_declared_at = now(),
-                                    retired_at = NULL, updated_at = now()
-                              WHERE name = $1",
+                        db.execute(
+                            tx,
+                            &REPLACE,
                             &[
                                 &schedule.name,
                                 &schedule.source,
@@ -358,23 +329,15 @@ pub(crate) async fn sync(
                     } else {
                         // Still declared, so never retired; the stored
                         // definition stands.
-                        tx.execute(
-                            "UPDATE merezha_jobs.schedules SET last_declared_at = now() WHERE name = $1",
-                            &[&schedule.name],
-                        )
-                        .await
-                        .map_err(|e| classify(&e))?;
+                        db.execute(tx, &KEEP, &[&schedule.name])
+                            .await
+                            .map_err(|e| classify(&e))?;
                         report.conflicts.push(schedule.name.clone());
                     }
                 }
-                tx.execute(
-                    "UPDATE merezha_jobs.schedules SET retired_at = now(), updated_at = now()
-                      WHERE retired_at IS NULL
-                        AND last_declared_at < now() - make_interval(secs => $1)",
-                    &[&retire_after],
-                )
-                .await
-                .map_err(|e| classify(&e))?;
+                db.execute(tx, &RETIRE, &[&retire_after])
+                    .await
+                    .map_err(|e| classify(&e))?;
                 Ok(report)
             })
         })
@@ -455,36 +418,23 @@ async fn tick_batch(
     excluded: Vec<String>,
 ) -> Result<(TickReport, usize, Vec<String>, Fired), Failure> {
     let settings = settings.clone();
+    let db = database.clone();
     database
         .transaction(deadline(), move |tx| {
             Box::pin(async move {
                 // One ticking instance at a time; the others find the lock
                 // taken and wait for their next interval. A transaction
                 // lock, so a cancelled tick releases it with its rollback.
-                let ours: bool = tx
-                    .query_one(
-                        "SELECT pg_try_advisory_xact_lock(1297762882, hashtext('scheduler'))",
-                        &[],
-                    )
+                let ours: bool = db
+                    .query_one(tx, &TICK_LOCK, &[])
                     .await
                     .map_err(|e| classify(&e))?
                     .get(0);
                 if !ours {
                     return Ok((TickReport::default(), 0, Vec::new(), Vec::new()));
                 }
-                let rows = tx
-                    .query(
-                        "SELECT name, cron, timezone, queue, kind, payload::text,
-                                (extract(epoch FROM next_run_at) * 1000000)::bigint,
-                                (extract(epoch FROM now()) * 1000000)::bigint
-                           FROM merezha_jobs.schedules
-                          WHERE enabled AND retired_at IS NULL AND next_run_at <= now()
-                            AND NOT (name = ANY($2::text[]))
-                          ORDER BY next_run_at
-                          LIMIT $1
-                          FOR UPDATE SKIP LOCKED",
-                        &[&TICK_BATCH, &excluded],
-                    )
+                let rows = db
+                    .query(tx, &DUE, &[&TICK_BATCH, &excluded])
                     .await
                     .map_err(|e| classify(&e))?;
                 let mut report = TickReport::default();
@@ -508,6 +458,7 @@ async fn tick_batch(
                     };
                     let key = format!("cron:{name}:{}", scheduled.as_second());
                     let (id, inserted) = insert_job(
+                        &db,
                         tx,
                         &queue,
                         &kind,
@@ -518,15 +469,9 @@ async fn tick_batch(
                         scheduled,
                     )
                     .await?;
-                    tx.execute(
-                        "UPDATE merezha_jobs.schedules
-                            SET last_run_at = next_run_at, last_job_id = $2,
-                                next_run_at = $3::text::timestamptz, updated_at = now()
-                          WHERE name = $1",
-                        &[&name, &id, &next.to_string()],
-                    )
-                    .await
-                    .map_err(|e| classify(&e))?;
+                    db.execute(tx, &ADVANCE, &[&name, &id, &next.to_string()])
+                        .await
+                        .map_err(|e| classify(&e))?;
                     if inserted {
                         report.fired += 1;
                         if !woken.contains(&queue) {
@@ -545,7 +490,7 @@ async fn tick_batch(
                     }
                 }
                 for queue in &woken {
-                    tx.execute("SELECT pg_notify('merezha_jobs', $1)", &[queue])
+                    db.execute(tx, &statements::NOTIFY_QUEUE, &[queue])
                         .await
                         .map_err(|e| classify(&e))?;
                 }
@@ -559,6 +504,7 @@ async fn tick_batch(
 /// and whether this call inserted it.
 #[allow(clippy::too_many_arguments)]
 async fn insert_job(
+    db: &Database,
     tx: &mut merezha_postgres::Tx<'_>,
     queue: &str,
     kind: &str,
@@ -568,14 +514,10 @@ async fn insert_job(
     schedule: &str,
     scheduled_for: jiff::Timestamp,
 ) -> Result<(i64, bool), Failure> {
-    let inserted = tx
+    let inserted = db
         .query_opt(
-            "INSERT INTO merezha_jobs.jobs (queue, kind, idempotency_key, payload, payload_digest,
-                 max_attempts, schedule_name, scheduled_for, correlation_id)
-             VALUES ($1, $2, $3, $4::text::json, sha256(convert_to($4::text, 'UTF8')), $5, $6,
-                 $7::text::timestamptz, $3)
-             ON CONFLICT (queue, idempotency_key) DO NOTHING
-             RETURNING id",
+            tx,
+            &INSERT_JOB,
             &[
                 &queue,
                 &kind,
@@ -592,11 +534,8 @@ async fn insert_job(
         return Ok((row.get(0), true));
     }
     // A new statement sees a conflicting row another transaction committed.
-    let existing = tx
-        .query_opt(
-            "SELECT id FROM merezha_jobs.jobs WHERE queue = $1 AND idempotency_key = $2",
-            &[&queue, &key],
-        )
+    let existing = db
+        .query_opt(tx, &EXISTING_JOB, &[&queue, &key])
         .await
         .map_err(|e| classify(&e))?;
     match existing {
@@ -634,10 +573,15 @@ pub struct SchedulePage {
     pub next: Option<String>,
 }
 
-const SUMMARY: &str = "name, source, cron, timezone, queue, kind, enabled,
+/// The columns of one [`ScheduleSummary`], in the order [`summary`] reads.
+macro_rules! summary_columns {
+    () => {
+        "name, source, cron, timezone, queue, kind, enabled,
     (extract(epoch FROM retired_at) * 1000000)::bigint,
     (extract(epoch FROM next_run_at) * 1000000)::bigint,
-    (extract(epoch FROM last_run_at) * 1000000)::bigint, last_job_id";
+    (extract(epoch FROM last_run_at) * 1000000)::bigint, last_job_id"
+    };
+}
 
 fn summary(row: &merezha_postgres::tokio_postgres::Row) -> ScheduleSummary {
     ScheduleSummary {
@@ -665,13 +609,8 @@ pub(crate) async fn list(
     let limit = i64::from(limit.clamp(1, MAX_SCHEDULES_LISTED));
     let after = after.unwrap_or("").to_owned();
     let client = database.acquire(deadline()).await?;
-    let rows = client
-        .query(
-            &format!(
-                "SELECT {SUMMARY} FROM merezha_jobs.schedules WHERE name > $1 ORDER BY name LIMIT $2"
-            ),
-            &[&after, &limit],
-        )
+    let rows = database
+        .query(&client, &LIST, &[&after, &limit])
         .await
         .map_err(|e| classify(&e))?;
     let schedules: Vec<ScheduleSummary> = rows.iter().map(summary).collect();
@@ -693,21 +632,16 @@ pub(crate) async fn pause(
 ) -> Result<ScheduleSummary, Failure> {
     let name = name.to_owned();
     let principal = principal.map(str::to_owned);
+    let db = database.clone();
     let summary = database
         .transaction(deadline(), move |tx| {
             Box::pin(async move {
-                let row = tx
-                    .query_opt(
-                        &format!(
-                            "UPDATE merezha_jobs.schedules SET enabled = false, updated_at = now()
-                              WHERE name = $1 RETURNING {SUMMARY}"
-                        ),
-                        &[&name],
-                    )
+                let row = db
+                    .query_opt(tx, &PAUSE, &[&name])
                     .await
                     .map_err(|e| classify(&e))?
                     .ok_or_else(|| Failure::permanent("not_found"))?;
-                audit(tx, principal.as_deref(), "schedule_pause", &name, 1).await?;
+                audit(&db, tx, principal.as_deref(), "schedule_pause", &name, 1).await?;
                 Ok(summary(&row))
             })
         })
@@ -726,36 +660,24 @@ pub(crate) async fn resume(
 ) -> Result<ScheduleSummary, Failure> {
     let name = name.to_owned();
     let principal = principal.map(str::to_owned);
+    let db = database.clone();
     let summary = database
         .transaction(deadline(), move |tx| {
             Box::pin(async move {
-                let row = tx
-                    .query_opt(
-                        "SELECT cron, timezone, enabled,
-                                (extract(epoch FROM now()) * 1000000)::bigint
-                           FROM merezha_jobs.schedules WHERE name = $1 FOR UPDATE",
-                        &[&name],
-                    )
+                let row = db
+                    .query_opt(tx, &RESUME_READ, &[&name])
                     .await
                     .map_err(|e| classify(&e))?
                     .ok_or_else(|| Failure::permanent("not_found"))?;
                 if !row.get::<_, bool>(2) {
                     let next = parse(row.get(0), row.get(1))?.next_after(timestamp(row.get(3)))?;
-                    tx.execute(
-                        "UPDATE merezha_jobs.schedules
-                            SET enabled = true, next_run_at = $2::text::timestamptz, updated_at = now()
-                          WHERE name = $1",
-                        &[&name, &next.to_string()],
-                    )
-                    .await
-                    .map_err(|e| classify(&e))?;
+                    db.execute(tx, &RESUME, &[&name, &next.to_string()])
+                        .await
+                        .map_err(|e| classify(&e))?;
                 }
-                audit(tx, principal.as_deref(), "schedule_resume", &name, 1).await?;
-                let row = tx
-                    .query_one(
-                        &format!("SELECT {SUMMARY} FROM merezha_jobs.schedules WHERE name = $1"),
-                        &[&name],
-                    )
+                audit(&db, tx, principal.as_deref(), "schedule_resume", &name, 1).await?;
+                let row = db
+                    .query_one(tx, &SUMMARY, &[&name])
                     .await
                     .map_err(|e| classify(&e))?;
                 Ok(summary(&row))
@@ -806,16 +728,12 @@ pub(crate) async fn trigger(
     let name = name.to_owned();
     let principal = principal.map(str::to_owned);
     let settings = settings.clone();
+    let db = database.clone();
     let triggered = database
         .transaction(deadline(), move |tx| {
             Box::pin(async move {
-                let row = tx
-                    .query_opt(
-                        "SELECT queue, kind, payload::text,
-                                (extract(epoch FROM now()) * 1000000)::bigint, retired_at IS NOT NULL
-                           FROM merezha_jobs.schedules WHERE name = $1",
-                        &[&name],
-                    )
+                let row = db
+                    .query_opt(tx, &TRIGGER_READ, &[&name])
                     .await
                     .map_err(|e| classify(&e))?
                     .ok_or_else(|| Failure::permanent("not_found"))?;
@@ -831,6 +749,7 @@ pub(crate) async fn trigger(
                     None => format!("cron:{name}:manual:{}", now.as_millisecond()),
                 };
                 let (job_id, inserted) = insert_job(
+                    &db,
                     tx,
                     &queue,
                     &kind,
@@ -842,11 +761,11 @@ pub(crate) async fn trigger(
                 )
                 .await?;
                 if inserted {
-                    tx.execute("SELECT pg_notify('merezha_jobs', $1)", &[&queue])
+                    db.execute(tx, &statements::NOTIFY_QUEUE, &[&queue])
                         .await
                         .map_err(|e| classify(&e))?;
                 }
-                audit(tx, principal.as_deref(), "schedule_trigger", &name, 1).await?;
+                audit(&db, tx, principal.as_deref(), "schedule_trigger", &name, 1).await?;
                 Ok((
                     Triggered {
                         name,
@@ -867,6 +786,202 @@ pub(crate) async fn trigger(
     logged("schedule_trigger", &triggered.name);
     Ok(triggered)
 }
+
+/// Serializes declarations.
+pub(crate) const SCHEDULES_LOCK: Statement = Statement::new(
+    "jobs.schedules.lock",
+    "SELECT pg_advisory_xact_lock()",
+    "SELECT pg_advisory_xact_lock(1297762882, hashtext('schedules'))",
+);
+
+/// The database clock, in microseconds.
+pub(crate) const NOW: Statement = Statement::new(
+    "jobs.schedules.now",
+    "SELECT now()",
+    "SELECT (extract(epoch FROM now()) * 1000000)::bigint",
+);
+
+/// The stored state of each declared schedule.
+pub(crate) const STORED: Statement = Statement::new(
+    "jobs.schedules.stored",
+    "SELECT merezha_jobs.schedules",
+    "SELECT d.name, s.definition = sha256(convert_to(d.definition, 'UTF8')),
+                                s.declared_version,
+                                extract(epoch FROM now() - s.definition_declared_at)::float8,
+                                s.retired_at IS NOT NULL
+                           FROM unnest($1::text[], $2::text[]) AS d(name, definition)
+                           JOIN merezha_jobs.schedules s ON s.name = d.name",
+);
+
+/// A schedule declared for the first time.
+pub(crate) const DECLARE: Statement = Statement::new(
+    "jobs.schedules.declare",
+    "INSERT merezha_jobs.schedules",
+    "INSERT INTO merezha_jobs.schedules
+                                     (name, source, cron, timezone, queue, kind, payload, next_run_at,
+                                      definition, declared_version)
+                                 VALUES ($1, $2, $3, $4, $5, $6, $7::text::json, $8::text::timestamptz,
+                                         sha256(convert_to($9::text, 'UTF8')), $10)
+                                 ON CONFLICT (name) DO NOTHING",
+);
+
+/// A schedule declared again with its stored definition.
+pub(crate) const REDECLARE: Statement = Statement::new(
+    "jobs.schedules.redeclare",
+    "UPDATE merezha_jobs.schedules",
+    "UPDATE merezha_jobs.schedules
+                                    SET source = $2, declared_version = $3,
+                                        last_declared_at = now(), definition_declared_at = now(),
+                                        next_run_at = CASE WHEN retired_at IS NOT NULL
+                                                           THEN $4::text::timestamptz ELSE next_run_at END,
+                                        updated_at = CASE WHEN retired_at IS NOT NULL
+                                                          THEN now() ELSE updated_at END,
+                                        retired_at = NULL
+                                  WHERE name = $1",
+);
+
+/// A schedule whose declared definition takes precedence.
+pub(crate) const REPLACE: Statement = Statement::new(
+    "jobs.schedules.replace",
+    "UPDATE merezha_jobs.schedules",
+    "UPDATE merezha_jobs.schedules
+                                SET source = $2, cron = $3, timezone = $4, queue = $5, kind = $6,
+                                    payload = $7::text::json,
+                                    definition = sha256(convert_to($9::text, 'UTF8')),
+                                    declared_version = $10,
+                                    next_run_at = CASE WHEN retired_at IS NULL AND next_run_at <= now()
+                                                       THEN next_run_at ELSE $8::text::timestamptz END,
+                                    last_declared_at = now(), definition_declared_at = now(),
+                                    retired_at = NULL, updated_at = now()
+                              WHERE name = $1",
+);
+
+/// A schedule whose stored definition stands.
+pub(crate) const KEEP: Statement = Statement::new(
+    "jobs.schedules.keep",
+    "UPDATE merezha_jobs.schedules",
+    "UPDATE merezha_jobs.schedules SET last_declared_at = now() WHERE name = $1",
+);
+
+/// Schedules undeclared for `retire_after`.
+pub(crate) const RETIRE: Statement = Statement::new(
+    "jobs.schedules.retire",
+    "UPDATE merezha_jobs.schedules",
+    "UPDATE merezha_jobs.schedules SET retired_at = now(), updated_at = now()
+                      WHERE retired_at IS NULL
+                        AND last_declared_at < now() - make_interval(secs => $1)",
+);
+
+/// One ticking instance at a time.
+pub(crate) const TICK_LOCK: Statement = Statement::new(
+    "jobs.scheduler.lock",
+    "SELECT pg_try_advisory_xact_lock()",
+    "SELECT pg_try_advisory_xact_lock(1297762882, hashtext('scheduler'))",
+);
+
+/// A batch of due schedules, locked.
+pub(crate) const DUE: Statement = Statement::new(
+    "jobs.scheduler.due",
+    "SELECT merezha_jobs.schedules",
+    "SELECT name, cron, timezone, queue, kind, payload::text,
+                                (extract(epoch FROM next_run_at) * 1000000)::bigint,
+                                (extract(epoch FROM now()) * 1000000)::bigint
+                           FROM merezha_jobs.schedules
+                          WHERE enabled AND retired_at IS NULL AND next_run_at <= now()
+                            AND NOT (name = ANY($2::text[]))
+                          ORDER BY next_run_at
+                          LIMIT $1
+                          FOR UPDATE SKIP LOCKED",
+);
+
+/// A fired schedule's next run.
+pub(crate) const ADVANCE: Statement = Statement::new(
+    "jobs.scheduler.advance",
+    "UPDATE merezha_jobs.schedules",
+    "UPDATE merezha_jobs.schedules
+                            SET last_run_at = next_run_at, last_job_id = $2,
+                                next_run_at = $3::text::timestamptz, updated_at = now()
+                          WHERE name = $1",
+);
+
+/// One scheduled job, unless its occurrence key exists.
+pub(crate) const INSERT_JOB: Statement = Statement::new(
+    "jobs.scheduler.insert_job",
+    "INSERT merezha_jobs.jobs",
+    "INSERT INTO merezha_jobs.jobs (queue, kind, idempotency_key, payload, payload_digest,
+                 max_attempts, schedule_name, scheduled_for, correlation_id)
+             VALUES ($1, $2, $3, $4::text::json, sha256(convert_to($4::text, 'UTF8')), $5, $6,
+                 $7::text::timestamptz, $3)
+             ON CONFLICT (queue, idempotency_key) DO NOTHING
+             RETURNING id",
+);
+
+/// The job holding an occurrence key.
+pub(crate) const EXISTING_JOB: Statement = Statement::new(
+    "jobs.scheduler.existing_job",
+    "SELECT merezha_jobs.jobs",
+    "SELECT id FROM merezha_jobs.jobs WHERE queue = $1 AND idempotency_key = $2",
+);
+
+/// A schedule to resume, locked.
+pub(crate) const RESUME_READ: Statement = Statement::new(
+    "jobs.schedules.resume_read",
+    "SELECT merezha_jobs.schedules",
+    "SELECT cron, timezone, enabled,
+                                (extract(epoch FROM now()) * 1000000)::bigint
+                           FROM merezha_jobs.schedules WHERE name = $1 FOR UPDATE",
+);
+
+/// A paused schedule enabled, its next run from now.
+pub(crate) const RESUME: Statement = Statement::new(
+    "jobs.schedules.resume",
+    "UPDATE merezha_jobs.schedules",
+    "UPDATE merezha_jobs.schedules
+                            SET enabled = true, next_run_at = $2::text::timestamptz, updated_at = now()
+                          WHERE name = $1",
+);
+
+/// A schedule to trigger.
+pub(crate) const TRIGGER_READ: Statement = Statement::new(
+    "jobs.schedules.trigger_read",
+    "SELECT merezha_jobs.schedules",
+    "SELECT queue, kind, payload::text,
+                                (extract(epoch FROM now()) * 1000000)::bigint, retired_at IS NOT NULL
+                           FROM merezha_jobs.schedules WHERE name = $1",
+);
+
+/// `GET schedules`: a page by name.
+pub(crate) const LIST: Statement = Statement::new(
+    "jobs.schedules.list",
+    "SELECT merezha_jobs.schedules",
+    concat!(
+        "SELECT ",
+        summary_columns!(),
+        " FROM merezha_jobs.schedules WHERE name > $1 ORDER BY name LIMIT $2"
+    ),
+);
+
+/// `POST schedules/{name}/pause`.
+pub(crate) const PAUSE: Statement = Statement::new(
+    "jobs.schedules.pause",
+    "UPDATE merezha_jobs.schedules",
+    concat!(
+        "UPDATE merezha_jobs.schedules SET enabled = false, updated_at = now()
+                              WHERE name = $1 RETURNING ",
+        summary_columns!()
+    ),
+);
+
+/// One schedule as `GET schedules` lists it.
+pub(crate) const SUMMARY: Statement = Statement::new(
+    "jobs.schedules.summary",
+    "SELECT merezha_jobs.schedules",
+    concat!(
+        "SELECT ",
+        summary_columns!(),
+        " FROM merezha_jobs.schedules WHERE name = $1"
+    ),
+);
 
 #[cfg(test)]
 mod tests {

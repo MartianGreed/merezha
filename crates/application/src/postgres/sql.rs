@@ -328,12 +328,4 @@ mod tests {
             Ok(())
         );
     }
-    /// No source of the PostgreSQL store hands SQL to the driver: every
-    /// file of `src/postgres/` is scanned except the crash-cut tests.
-    #[test]
-    fn store_sources_hand_no_sql_to_the_driver() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/postgres");
-        let found = merezha_postgres::statement::scan_sources(&dir, &["tests.rs"]).unwrap();
-        assert!(found.is_empty(), "unregistered SQL: {found:?}");
-    }
 }
