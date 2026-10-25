@@ -52,7 +52,8 @@
 //! principal's active organization and delivered under
 //! `/v1/content/o/{organization}`; organization entries may reference the
 //! application scope, never the reverse or another organization (any such
-//! target answers like an absent one); assets and blobs per organization.
+//! target answers like an absent one); assets and blobs per organization,
+//! managed under `/v1/content/o/{organization}/manage/assets`.
 mod activation;
 mod canonical;
 mod delivery;

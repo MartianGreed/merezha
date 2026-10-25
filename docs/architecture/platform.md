@@ -495,7 +495,7 @@ only).
 - refuses bodies over `http.body_limit`: a larger `Content-Length` fails at
   once and an undeclared body fails while it is read. The same limit replaces
   the 2 MiB default of axum's `Bytes` and `Json` extractors. A route a
-  module lists in `Module::body_limits` (exact method and path) is read up
+  module lists in `Module::body_limits` (exact method; the path matched segment by segment, a `{name}` segment matching any one segment) is read up
   to its own limit instead, its declared length left to the route;
   `edge::is_body_limit(&error)` tells the route that a body read stopped
   at that limit, so it answers its own code (`asset_too_large`).
@@ -2392,16 +2392,17 @@ files older than an hour from it (`content.spool_cleared`). Readiness adds
 the store's probe: a `head` of `content/readiness/probe`, plus a one-key
 list on S3 (which needs `s3:ListBucket`), or the local root's mode.
 
-Routes, under `/v1/content` (management answers `private, no-store`;
-it works in the principal's active organization, checked at
-`Tenant(org)`, or in the application scope at `Application` without one,
-[Content organizations](#content-organizations)):
+Routes, under `/v1/content` (management answers `private, no-store`).
+The management routes below work in the application scope, checked at
+`Application`; each is mounted again under `/o/{organization}` for that
+organization's assets, checked at `Tenant(org)` for a principal whose
+active organization it is ([Content organizations](#content-organizations)):
 
 | Route | Permission | Success |
 | --- | --- | --- |
 | `POST /manage/assets?filename=..&title=..` (raw body, `Content-Type`) | `content.assets.write` | 201 asset, `Location` |
 | `GET /manage/assets` (`content_type` exact or `image/*`, `filename_prefix`, `limit`, `cursor`) | `content.assets.read` | 200 `{items, page}`, newest first, live assets |
-| `GET /manage/assets/{id}` | `content.assets.read` | 200 asset with `usage: {draft, published}` (refs in its scope), trashed ones too |
+| `GET /manage/assets/{id}` | `content.assets.read` | 200 asset with `usage: {draft, published, elsewhere}` (refs of its own scope by stage, and of every other scope together: what `asset_in_use` counts), trashed ones too |
 | `PATCH /manage/assets/{id}` (`application/merge-patch+json` over `{title, focal_point}`) | `content.assets.write` | 200 asset |
 | `GET /manage/assets/{id}/file` (`Range`) | `content.assets.read` | 200 or 206, always `attachment`, trashed ones too |
 | `DELETE /manage/assets/{id}` (`force`, `purge`) | `content.assets.delete` | 204, or 409 `asset_in_use` |
@@ -2542,15 +2543,23 @@ none.
   another tenant's ids; `reference_scope` is no longer reported. A client
   `id` taken in any scope is still `entry_exists` (409), since ids are one
   key: importers that set their own ids should use random UUIDs.
-- Assets of a principal with an active organization are that
-  organization's (checks at `Tenant(org)`); their `url` is
-  `/v1/content/o/{organization}/assets/{id}/{filename}`. Without a tenant
-  they are the application's, checked at `Application`.
+- Assets: the path chooses the scope, never the active organization.
+  `/v1/content/manage/assets...` manages the application's (checked at
+  `Application`; an organization key is refused, 403), and
+  `/v1/content/o/{organization}/manage/assets...` that organization's
+  (checked at `Tenant(org)`, and only for a principal whose active
+  organization it is: 403 otherwise, application grants included). An
+  organization asset's `url` is
+  `/v1/content/o/{organization}/assets/{id}/{filename}` and its
+  `Location` `/v1/content/o/{organization}/manage/assets/{id}`. Both
+  upload routes read up to `media.max_upload_bytes`.
 - Events of organization content carry the organization as their
   envelope `tenant` and `scope: "org:<id>"` in their payload.
-- Deleting an organization in identity leaves its content in place (not
-  reachable through management, still served on its public delivery
-  path); purging it is a follow-up.
+- Deleting an organization in identity leaves its content in place: no
+  longer reachable through management, but its public types and the
+  assets they reference are still served on its delivery path until
+  issue #56 lands. #56 purges it on `identity.organization_deleted` and
+  must include an operator purge; until then remove such content by hand.
 
 ## Dependencies
 

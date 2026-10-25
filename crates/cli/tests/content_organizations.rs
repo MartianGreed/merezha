@@ -69,7 +69,10 @@ fn project(dir: &Path, identity: bool) -> PathBuf {
         format!(
             "[app]\nid = \"orgs\"\n[http]\nlisten = \"127.0.0.1:0\"\n\
              [database]\nurl = {{ env = \"{DATABASE_ENV}\" }}\nmigrate = true\n\
-             [runtime]\nmanifest = \"runtime.toml\"\n{identity}[modules.content]\n"
+             [runtime]\nmanifest = \"runtime.toml\"\n{identity}[modules.content]\n\
+             [modules.content.media]\nlocal = {{ root = {:?} }}\nspool_dir = {:?}\n",
+            dir.join("media"),
+            dir.join("spool"),
         ),
     )
     .unwrap();
@@ -87,10 +90,11 @@ fn call(
     headers: &[(&str, &str)],
     body: &Value,
 ) -> Reply {
-    let body = if body.is_null() {
-        String::new()
-    } else {
-        body.to_string()
+    let body = match body {
+        Value::Null => String::new(),
+        // A raw body: sent as is, its type among `headers`.
+        Value::String(raw) => raw.clone(),
+        other => other.to_string(),
     };
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
     stream
@@ -98,9 +102,15 @@ fn call(
         .unwrap();
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n",
+         Content-Length: {}\r\n",
         body.len()
     );
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+    {
+        head.push_str("Content-Type: application/json\r\n");
+    }
     for (name, value) in headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
@@ -163,7 +173,8 @@ fn organization(address: SocketAddr, email: &str, slug: &str) -> (String, String
         &auth,
         &json!({"name": "content", "expires_at": expires.to_string(),
                 "permissions": ["content.entries.read", "content.entries.write",
-                                "content.entries.publish", "content.model.read"]}),
+                                "content.entries.publish", "content.model.read",
+                                "content.assets.read", "content.assets.write"]}),
     );
     assert_eq!(key.status, 201, "{}", key.body);
     (org, key.body["key"].as_str().unwrap().to_owned())
@@ -299,6 +310,49 @@ fn organization_keys_act_in_their_own_organization_only() {
         .map(|i| i["sys"]["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, vec![notice.as_str()]);
+    // Assets: the path names the scope. A key uploads on its own
+    // organization's path; the application's and another organization's
+    // refuse it.
+    let text = [acme_auth[0], ("Content-Type", "text/plain")];
+    let body = json!("notes");
+    let uploaded = call(
+        address,
+        "POST",
+        &format!("/v1/content/o/{acme}/manage/assets?filename=notes.txt"),
+        &text,
+        &body,
+    );
+    assert_eq!(uploaded.status, 201, "{}", uploaded.body);
+    assert!(
+        uploaded.body["url"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("/v1/content/o/{acme}/assets/")),
+        "{}",
+        uploaded.body
+    );
+    for path in [
+        "/v1/content/manage/assets?filename=notes.txt".to_owned(),
+        format!("/v1/content/o/{globex}/manage/assets?filename=notes.txt"),
+    ] {
+        let refused = call(address, "POST", &path, &text, &body);
+        assert_eq!(
+            (refused.status, refused.body["error"]["code"].as_str()),
+            (403, Some("unauthorized")),
+            "{path}"
+        );
+    }
+    let theirs = call(
+        address,
+        "GET",
+        &format!(
+            "/v1/content/o/{globex}/manage/assets/{}",
+            uploaded.body["id"].as_str().unwrap()
+        ),
+        &globex_auth,
+        &Value::Null,
+    );
+    assert_eq!(theirs.status, 404, "{}", theirs.body);
     assert_ne!(acme, globex);
     host.stop();
 }

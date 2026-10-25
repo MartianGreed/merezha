@@ -487,11 +487,18 @@ async fn a_route_with_its_own_body_limit_reads_past_the_edge_limit_and_stops_at_
     let config = project("");
     let router = Router::new()
         .route("/v1/media/upload", post(count_body))
+        .route("/v1/media/o/{org}/upload", post(count_body))
+        .route("/v1/media/o/{org}/upload/more", post(count_body))
         .route("/v1/notes", post(|body: String| async move { body }));
     let router = edge::apply(
         router,
         EdgeSettings::new(&config.http, Arc::new(ErrorRegistry::kernel())).route_body_limits(vec![
             (axum::http::Method::POST, "/v1/media/upload".into(), 3 << 20),
+            (
+                axum::http::Method::POST,
+                "/v1/media/o/{org}/upload".into(),
+                3 << 20,
+            ),
         ]),
     );
     let text = |response: axum::response::Response| async move {
@@ -518,6 +525,19 @@ async fn a_route_with_its_own_body_limit_reads_past_the_edge_limit_and_stops_at_
     let response = send(&router, over).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(text(response).await, "limit");
+    // A `{name}` segment matches one segment of any value, and only one.
+    let mut nested = request("POST", "/v1/media/o/org_a/upload", PUBLIC_PEER, None);
+    *nested.body_mut() = Body::from(vec![b'x'; 2 << 20]);
+    let response = send(&router, nested).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(text(response).await, (2u32 << 20).to_string());
+    let mut deeper = request("POST", "/v1/media/o/org_a/upload/more", PUBLIC_PEER, None);
+    *deeper.body_mut() = Body::from(vec![b'x'; 2 << 20]);
+    assert_eq!(
+        text(send(&router, deeper).await).await,
+        "limit",
+        "past `http.body_limit` on a route without its own"
+    );
     // Other routes, and other methods on the same path, keep the edge's.
     let mut other = request("POST", "/v1/notes", PUBLIC_PEER, None);
     *other.body_mut() = Body::from(vec![b'x'; 2 << 20]);

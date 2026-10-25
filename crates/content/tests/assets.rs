@@ -1189,7 +1189,10 @@ async fn asset_routes_list_read_patch_delete_undelete_and_purge() {
         .by(Some("asset_reader"))
         .send()
         .await;
-    assert_eq!(reply.body["usage"], json!({"draft": 1, "published": 0}));
+    assert_eq!(
+        reply.body["usage"],
+        json!({"draft": 1, "published": 0, "elsewhere": 0})
+    );
     assert_eq!(reply.headers["cache-control"], "private, no-store");
     fx.publish("article", &article, "en", 1).await;
     let reply = fx
@@ -1197,7 +1200,10 @@ async fn asset_routes_list_read_patch_delete_undelete_and_purge() {
         .by(Some("asset_reader"))
         .send()
         .await;
-    assert_eq!(reply.body["usage"], json!({"draft": 1, "published": 1}));
+    assert_eq!(
+        reply.body["usage"],
+        json!({"draft": 1, "published": 1, "elsewhere": 0})
+    );
     // Patch: a merge over title and focal point, an event, a new generation.
     let before = generation(&fx.db, "app").await;
     let reply = fx

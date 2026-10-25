@@ -356,7 +356,8 @@ impl EdgeSettings {
         }
     }
     /// Routes that bound their own body (`Module::body_limits`), as
-    /// `(method, full path, limit)`: for an exact match the edge stops the
+    /// `(method, full path, limit)`: for a match (`{name}` segments match
+    /// any one non-empty segment, the others exactly) the edge stops the
     /// body past `limit` instead of `http.body_limit` and leaves a declared
     /// `Content-Length` to the route, which answers its own code.
     pub fn route_body_limits(mut self, limits: Vec<(Method, String, usize)>) -> Self {
@@ -905,14 +906,32 @@ pub fn is_body_limit(error: &axum::Error) -> bool {
     false
 }
 
+/// Whether `path` is the route `pattern`: segment by segment, a `{name}`
+/// segment matching any one non-empty segment and every other segment
+/// matching exactly.
+fn path_matches(pattern: &str, path: &str) -> bool {
+    let mut want = pattern.split('/');
+    let mut have = path.split('/');
+    loop {
+        match (want.next(), have.next()) {
+            (None, None) => return true,
+            (Some(w), Some(h)) => {
+                let parameter = w.len() > 2 && w.starts_with('{') && w.ends_with('}');
+                if !(w == h || parameter && !h.is_empty()) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
 async fn limit_body(State(state): State<EdgeState>, request: Request, next: Next) -> Response {
     // A route that bounds its own body: stopped past its limit, its
     // declared length left to the route.
-    if let Some((_, _, limit)) = state
-        .route_limits
-        .iter()
-        .find(|(method, path, _)| request.method() == method && request.uri().path() == path)
-    {
+    if let Some((_, _, limit)) = state.route_limits.iter().find(|(method, path, _)| {
+        request.method() == method && path_matches(path, request.uri().path())
+    }) {
         let limit = *limit;
         let request = request.map(|body| Body::new(http_body_util::Limited::new(body, limit)));
         return next.run(request).await;

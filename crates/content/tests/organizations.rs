@@ -98,10 +98,20 @@ async fn publish(fx: &Fixture, who: &str, content_type: &str, id: &str, locale: 
     assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
 }
 
-/// `POST /manage/assets` as `who`; the asset JSON.
+/// The asset management path of `who`'s scope: its organization's, or
+/// the application's for `app_key`.
+fn assets_of(who: &str) -> String {
+    match who {
+        "key_a" | "member_a" => format!("{C}/o/{ORG_A}/manage/assets"),
+        "key_b" | "member_b" => format!("{C}/o/{ORG_B}/manage/assets"),
+        _ => manage("/assets"),
+    }
+}
+
+/// `POST .../manage/assets` in `who`'s scope; the asset JSON.
 async fn upload(fx: &Fixture, who: &str, filename: &str, bytes: &[u8]) -> Value {
     let reply = fx
-        .post(&manage(&format!("/assets?filename={filename}")))
+        .post(&format!("{}?filename={filename}", assets_of(who)))
         .by(Some(who))
         .header("content-type", "image/png")
         .raw(bytes)
@@ -320,7 +330,7 @@ fn a_tag() -> String {
 struct Row {
     method: Method,
     /// The route as the crate declares it, under `/v1/content`.
-    route: &'static str,
+    route: String,
     path: String,
     headers: Vec<(&'static str, String)>,
     body: Option<Vec<u8>>,
@@ -332,10 +342,10 @@ struct Row {
     owner: Option<u16>,
 }
 
-fn row(method: Method, route: &'static str, path: String, refused: (u16, &'static str)) -> Row {
+fn row(method: Method, route: &str, path: String, refused: (u16, &'static str)) -> Row {
     Row {
         method,
-        route,
+        route: route.to_owned(),
         path,
         headers: Vec::new(),
         body: None,
@@ -391,7 +401,6 @@ fn matrix(b: &Org, png: &[u8]) -> Vec<Row> {
     let h = &b.handbook;
     let entry = |rest: &str| manage(&format!("/entries/handbook/{h}{rest}"));
     let single = |rest: &str| manage(&format!("/singletons/org_settings/en{rest}"));
-    let asset = |rest: &str| manage(&format!("/assets/{}{rest}", b.asset));
     let org_b = format!("{C}/o/{ORG_B}");
     let org_a = format!("{C}/o/{ORG_A}");
     vec![
@@ -687,9 +696,23 @@ fn matrix(b: &Org, png: &[u8]) -> Vec<Row> {
             format!("{org_a}/handbook/by-slug/{}", b.slug),
             not_found,
         ),
-        // Assets: B's ids are absent in A's scope; delivery answers like
-        // an unknown id.
-        row(M::GET, "/manage/assets", manage("/assets"), ok).owner(200),
+        // Assets: the path names the scope. The application's refuses an
+        // organization key, B's refuses A, and in A's own scope B's ids
+        // are absent; delivery answers like an unknown id.
+        row(M::GET, "/manage/assets", manage("/assets"), refused),
+        row(
+            M::GET,
+            "/o/{organization}/manage/assets",
+            format!("{org_b}/manage/assets"),
+            refused,
+        )
+        .owner(200),
+        row(
+            M::GET,
+            "/o/{organization}/manage/assets",
+            format!("{org_a}/manage/assets"),
+            ok,
+        ),
         Row {
             body: Some(png.to_vec()),
             headers: vec![("content-type", "image/png".to_owned())],
@@ -697,25 +720,68 @@ fn matrix(b: &Org, png: &[u8]) -> Vec<Row> {
                 M::POST,
                 "/manage/assets",
                 manage("/assets?filename=same.png"),
+                refused,
+            )
+        },
+        Row {
+            body: Some(png.to_vec()),
+            headers: vec![("content-type", "image/png".to_owned())],
+            ..row(
+                M::POST,
+                "/o/{organization}/manage/assets",
+                format!("{org_b}/manage/assets?filename=same.png"),
+                refused,
+            )
+        },
+        Row {
+            body: Some(png.to_vec()),
+            headers: vec![("content-type", "image/png".to_owned())],
+            ..row(
+                M::POST,
+                "/o/{organization}/manage/assets",
+                format!("{org_a}/manage/assets?filename=same.png"),
                 (201, ""),
             )
         },
-        row(M::GET, "/manage/assets/{id}", asset(""), no_asset).owner(200),
-        row(M::PATCH, "/manage/assets/{id}", asset(""), no_asset).merge(json!({"title": "Taken"})),
-        row(M::DELETE, "/manage/assets/{id}", asset(""), no_asset),
-        row(
-            M::DELETE,
-            "/manage/assets/{id}",
-            asset("?force=true&purge=true"),
-            no_asset,
-        ),
-        row(M::GET, "/manage/assets/{id}/file", asset("/file"), no_asset).owner(200),
-        row(
-            M::POST,
-            "/manage/assets/{id}/undelete",
-            asset("/undelete"),
-            no_asset,
-        ),
+    ]
+    .into_iter()
+    .chain(
+        [
+            (format!("{C}/manage/assets"), "", refused, None),
+            (
+                format!("{org_b}/manage/assets"),
+                "/o/{organization}",
+                refused,
+                Some(200),
+            ),
+            (
+                format!("{org_a}/manage/assets"),
+                "/o/{organization}",
+                no_asset,
+                None,
+            ),
+        ]
+        .into_iter()
+        .flat_map(|(base, prefix, refusal, owner)| {
+            let at = |rest: &str| format!("{base}/{}{rest}", b.asset);
+            let route = |rest: &str| format!("{prefix}/manage/assets/{{id}}{rest}");
+            let mut rows = vec![
+                row(M::GET, &route(""), at(""), refusal),
+                row(M::PATCH, &route(""), at(""), refusal).merge(json!({"title": "Taken"})),
+                row(M::DELETE, &route(""), at(""), refusal),
+                row(M::DELETE, &route(""), at("?force=true&purge=true"), refusal),
+                row(M::GET, &route("/file"), at("/file"), refusal),
+                row(M::POST, &route("/undelete"), at("/undelete"), refusal),
+            ];
+            if let Some(status) = owner {
+                for read in rows.iter_mut().filter(|r| r.method == M::GET) {
+                    read.owner = Some(status);
+                }
+            }
+            rows
+        }),
+    )
+    .chain([
         row(
             M::GET,
             "/assets/{id}/{filename}",
@@ -735,11 +801,16 @@ fn matrix(b: &Org, png: &[u8]) -> Vec<Row> {
             format!("{org_a}/assets/{}/{}", b.asset, b.filename),
             no_asset,
         ),
-    ]
+    ])
+    .collect()
 }
 
-/// Every `(method, route)` the crate's sources mount with `.route(..)`,
-/// so a new route cannot skip the matrix.
+/// Every `(method, route)` the crate's sources mount, so a new route
+/// cannot skip the matrix. Each `.route(path, ..)` must name its methods
+/// inline (`get(..)`, `.post(..)` and the rest); any routing form the scan
+/// cannot read (`any`, `on`, a method router held in a variable,
+/// `route_service`, `nest`, `nest_service`, `fallback`) fails it instead
+/// of passing unseen.
 fn mounted_routes() -> BTreeSet<(String, String)> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
@@ -756,7 +827,37 @@ fn mounted_routes() -> BTreeSet<(String, String)> {
     let mut out = BTreeSet::new();
     for file in files {
         let text = std::fs::read_to_string(&file).unwrap();
-        let mut rest = text.as_str();
+        routes_in(&text, &file.display().to_string(), &mut out);
+    }
+    out
+}
+
+/// The `(method, route)` pairs one source file mounts, into `out`;
+/// panics on a routing form [`mounted_routes`] cannot read.
+fn routes_in(text: &str, name: &str, out: &mut BTreeSet<(String, String)>) {
+    /// `token(` as a call, not the tail of a longer name.
+    fn calls(text: &str, token: &str) -> bool {
+        let token = format!("{token}(");
+        text.match_indices(&token)
+            .any(|(i, _)| i == 0 || !text[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_'))
+    }
+    const METHODS: [&str; 8] = [
+        "get", "post", "put", "patch", "delete", "head", "options", "trace",
+    ];
+    {
+        for unread in [
+            ".route_service(",
+            ".nest_service(",
+            ".nest(",
+            ".fallback(",
+            ".fallback_service(",
+        ] {
+            assert!(
+                !text.contains(unread),
+                "{name} mounts with `{unread}`, which the matrix scan cannot read"
+            );
+        }
+        let mut rest = text;
         while let Some(at) = rest.find(".route(") {
             rest = &rest[at + ".route(".len()..];
             // The call's arguments, up to its closing parenthesis.
@@ -781,25 +882,64 @@ fn mounted_routes() -> BTreeSet<(String, String)> {
                 // A constant of the same file, such as `UPLOAD_PATH`.
                 None => {
                     let declaration = format!("const {first}: &str = \"");
-                    let at = text.find(&declaration).unwrap_or_else(|| {
-                        panic!("{first} in {}", file.display());
-                    });
+                    let at = text
+                        .find(&declaration)
+                        .unwrap_or_else(|| panic!("{first} in {name}"));
                     let value = &text[at + declaration.len()..];
                     value[..value.find('"').unwrap()].to_owned()
                 }
             };
-            for method in ["get", "post", "put", "patch", "delete"] {
-                let token = format!("{method}(");
-                let found = methods.match_indices(&token).any(|(i, _)| {
-                    i == 0 || !methods[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_')
-                });
-                if found {
-                    out.insert((method.to_uppercase(), path.clone()));
-                }
+            for unread in ["any", "on"] {
+                assert!(
+                    !calls(methods, unread),
+                    "{name}: `{path}` routes through `{unread}`, which the matrix scan cannot read"
+                );
+            }
+            let found: Vec<&str> = METHODS
+                .into_iter()
+                .filter(|method| calls(methods, method))
+                .collect();
+            assert!(
+                !found.is_empty(),
+                "{name}: `{path}` names no method the matrix scan reads: `{}`",
+                methods.trim()
+            );
+            for method in found {
+                out.insert((method.to_uppercase(), path.clone()));
             }
         }
     }
-    out
+}
+
+#[test]
+fn the_route_scan_refuses_every_form_it_cannot_read() {
+    let mut out = BTreeSet::new();
+    routes_in(
+        "const P: &str = \"/p\";\n.route(P, get(a).post(b)).route(\"/x/{id}\", axum::routing::delete(c))",
+        "ok",
+        &mut out,
+    );
+    assert_eq!(
+        out.into_iter().collect::<Vec<_>>(),
+        [
+            ("DELETE".to_owned(), "/x/{id}".to_owned()),
+            ("GET".to_owned(), "/p".to_owned()),
+            ("POST".to_owned(), "/p".to_owned()),
+        ]
+    );
+    for source in [
+        ".route(\"/a\", handlers)",
+        ".route(\"/a\", any(h))",
+        ".route(\"/a\", on(MethodFilter::GET, h))",
+        ".route_service(\"/a\", service)",
+        ".nest(\"/a\", router)",
+        ".nest_service(\"/a\", service)",
+        ".fallback(h)",
+        ".fallback_service(service)",
+    ] {
+        let refused = std::panic::catch_unwind(|| routes_in(source, "test", &mut BTreeSet::new()));
+        assert!(refused.is_err(), "{source} passed the scan");
+    }
 }
 
 #[test]
@@ -816,7 +956,7 @@ fn the_matrix_covers_every_mounted_route() {
     };
     let covered: BTreeSet<(String, String)> = matrix(&org, b"")
         .iter()
-        .map(|r| (r.method.to_string(), r.route.to_owned()))
+        .map(|r| (r.method.to_string(), r.route.clone()))
         .collect();
     let mounted = mounted_routes();
     assert!(mounted.len() > 40, "the scan found the routes: {mounted:?}");
@@ -1258,7 +1398,7 @@ async fn organization_entries_reference_the_application_and_never_the_reverse() 
     }
     // An organization's own asset has its path under the organization.
     let own = fx
-        .get(&manage(&format!("/assets/{mine}")))
+        .get(&format!("{}/{mine}", assets_of("key_a")))
         .by(Some("key_a"))
         .send()
         .await;
@@ -1334,7 +1474,7 @@ async fn identical_uploads_in_two_organizations_are_two_blobs_and_two_objects() 
     assert_eq!(tenant_of(&again), ORG_A);
     assert_eq!(tenant_of(&app), Value::Null);
     // Each organization lists its own asset rows.
-    let listed = fx.get(&manage("/assets")).by(Some("key_a")).send().await;
+    let listed = fx.get(&assets_of("key_a")).by(Some("key_a")).send().await;
     let mut ids: Vec<&str> = listed.body["items"]
         .as_array()
         .unwrap()
@@ -1349,7 +1489,11 @@ async fn identical_uploads_in_two_organizations_are_two_blobs_and_two_objects() 
     let deleted = fx
         .call(
             Method::DELETE,
-            &manage(&format!("/assets/{}?purge=true", b["id"].as_str().unwrap())),
+            &format!(
+                "{}/{}?purge=true",
+                assets_of("key_b"),
+                b["id"].as_str().unwrap()
+            ),
         )
         .by(Some("key_b"))
         .send()
@@ -1413,4 +1557,130 @@ async fn organization_etags_follow_their_own_and_the_application_generations_onl
         .send()
         .await;
     assert_eq!(reply.status, StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn the_path_chooses_the_asset_scope_whatever_the_active_organization() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dirs = Dirs::new();
+    let fx = start(&test, &dirs).await;
+    // An application editor whose active organization is A uploads on
+    // the application path: the asset is the application's, and an
+    // application entry can use it.
+    let logo = fx
+        .post(&manage("/assets?filename=logo.png"))
+        .by(Some("app_editor_a"))
+        .header("content-type", "image/png")
+        .raw(&png(2, 2, 8))
+        .send()
+        .await;
+    assert_eq!(logo.status, StatusCode::CREATED, "{:?}", logo.body);
+    let logo_id = logo.body["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        logo.headers["location"],
+        format!("{C}/manage/assets/{logo_id}").as_str()
+    );
+    assert_eq!(
+        strings(
+            &fx.db,
+            &format!("SELECT scope FROM merezha_content.assets WHERE id = '{logo_id}'")
+        )
+        .await,
+        vec!["app".to_owned()]
+    );
+    let page = create(
+        &fx,
+        "app_editor_a",
+        "page",
+        json!({"title": "Home", "image": {"id": logo_id}}),
+    )
+    .await;
+    publish(&fx, "app_editor_a", "page", &page, "en", 1).await;
+    let name = logo.body["filename"].as_str().unwrap();
+    let served = fx
+        .get(&format!("{C}/assets/{logo_id}/{name}"))
+        .by(None)
+        .send()
+        .await;
+    assert_eq!(served.status, StatusCode::OK);
+    // The same principal on its organization's path works in A ...
+    let mine = fx
+        .post(&format!("{C}/o/{ORG_A}/manage/assets?filename=mine.png"))
+        .by(Some("app_editor_a"))
+        .header("content-type", "image/png")
+        .raw(&png(3, 3, 8))
+        .send()
+        .await;
+    assert_eq!(mine.status, StatusCode::CREATED, "{:?}", mine.body);
+    let mine_id = mine.body["id"].as_str().unwrap();
+    // The organization's upload route bounds its own body too: past
+    // `http.body_limit`, within `media.max_upload_bytes`.
+    let large = fx
+        .post(&format!("{C}/o/{ORG_A}/manage/assets?filename=large.png"))
+        .by(Some("key_a"))
+        .header("content-type", "image/png")
+        .raw(&png(64, 64, 3 << 20))
+        .send()
+        .await;
+    assert_eq!(large.status, StatusCode::CREATED, "{:?}", large.body);
+    assert_eq!(
+        mine.headers["location"],
+        format!("{C}/o/{ORG_A}/manage/assets/{mine_id}").as_str()
+    );
+    // ... and never on another organization's, although its application
+    // grant would satisfy a check there: the path's organization must be
+    // its active one.
+    for who in ["app_editor_a", "app_key", "key_a"] {
+        let other = fx
+            .get(&format!("{C}/o/{ORG_B}/manage/assets"))
+            .by(Some(who))
+            .send()
+            .await;
+        assert_eq!(
+            (other.status, other.code()),
+            (StatusCode::FORBIDDEN, "unauthorized"),
+            "{who}"
+        );
+    }
+    let anonymous = fx
+        .get(&format!("{C}/o/{ORG_A}/manage/assets"))
+        .by(None)
+        .send()
+        .await;
+    assert_eq!(anonymous.code(), "unauthenticated");
+    // A tenant key never reaches the application's assets.
+    let refused = fx
+        .get(&manage(&format!("/assets/{logo_id}")))
+        .by(Some("key_a"))
+        .send()
+        .await;
+    assert_eq!(refused.code(), "unauthorized");
+    // `usage` counts the asset's own scope by stage and every other scope
+    // together, the refs a plain delete is refused for.
+    create(
+        &fx,
+        "key_a",
+        "handbook",
+        json!({"title": "Uses the logo", "image": {"id": logo_id}}),
+    )
+    .await;
+    let read = fx
+        .get(&manage(&format!("/assets/{logo_id}")))
+        .by(Some("app_key"))
+        .send()
+        .await;
+    assert_eq!(
+        read.body["usage"],
+        json!({"draft": 1, "published": 1, "elsewhere": 1}),
+        "{:?}",
+        read.body
+    );
+    let delete = fx
+        .call(Method::DELETE, &manage(&format!("/assets/{logo_id}")))
+        .by(Some("app_key"))
+        .send()
+        .await;
+    assert_eq!(delete.code(), "asset_in_use");
 }

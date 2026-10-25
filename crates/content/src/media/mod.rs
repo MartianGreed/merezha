@@ -7,8 +7,8 @@
 //! Every statement here is a registered [`STATEMENTS`] constant. Every
 //! write transaction starts with [`ContentState::check_writable`]; asset,
 //! blob and ref statements filter on `scope` (only `asset_in_use` counts
-//! referrers in every scope). Management works in the principal's active
-//! organization, or the application scope without one; delivery serves an
+//! referrers in every scope). Management works in the scope its path
+//! names (`/manage/assets` or `/o/{organization}/manage/assets`); delivery serves an
 //! organization's assets under `/v1/content/o/{organization}` (C9), each
 //! scope with its own `org-<hash>` key tag ([`blob_key`]), so identical
 //! bytes in two organizations are two blobs and two objects.
@@ -233,9 +233,17 @@ impl AssetView {
             None => format!("/v1/content/assets/{}/{}", self.id, self.filename),
         }
     }
+    /// The management path of the asset: under
+    /// `/v1/content/o/{organization}` for an organization's asset.
+    pub fn manage_url(&self) -> String {
+        match self.scope.strip_prefix("org:") {
+            Some(org) => format!("/v1/content/o/{org}/manage/assets/{}", self.id),
+            None => format!("/v1/content/manage/assets/{}", self.id),
+        }
+    }
     /// The asset JSON of section 6, in its documented order, with `usage`
     /// when given.
-    pub fn json(&self, usage: Option<(i64, i64)>) -> String {
+    pub fn json(&self, usage: Option<Usage>) -> String {
         use crate::json::{optional, string};
         let number = |n: Option<i32>| n.map_or_else(|| "null".to_owned(), |n| n.to_string());
         let mut out = format!(
@@ -257,15 +265,34 @@ impl AssetView {
             optional(self.deleted_at.as_deref()),
             string(&self.url()),
         );
-        if let Some((draft, published)) = usage {
+        if let Some(Usage {
+            draft,
+            published,
+            elsewhere,
+        }) = usage
+        {
             let _ = write!(
                 out,
-                ",\"usage\":{{\"draft\":{draft},\"published\":{published}}}"
+                ",\"usage\":{{\"draft\":{draft},\"published\":{published},\
+                 \"elsewhere\":{elsewhere}}}"
             );
         }
         out.push('}');
         out
     }
+}
+
+/// The refs pointing at an asset (`GET /manage/assets/{id}`): `draft` and
+/// `published` from entries of the asset's own scope, and `elsewhere`
+/// from every other scope, both stages (organization entries using an
+/// application asset; an organization's asset has none). A delete without
+/// `force` is refused (`asset_in_use`) while any of the three is not 0;
+/// the referrers of other scopes are counted, never named.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub draft: i64,
+    pub published: i64,
+    pub elsewhere: i64,
 }
 
 /// The filters of `GET /assets`.
@@ -308,9 +335,8 @@ pub(crate) fn not_found() -> Rejection {
     Rejection::new(Failure::permanent(ASSET_NOT_FOUND))
 }
 
-/// The scope assets of a management request live in (section 8, C9): the
-/// principal's active organization (`org:<id>`, its events' tenant), or
-/// the application scope without one.
+/// The scope a management request's path names (section 8, C9): an
+/// organization's (`org:<id>`, its events' tenant), or the application's.
 pub(crate) fn asset_target(tenant: Option<Identity>) -> Target {
     match tenant {
         Some(tenant) => Target {
@@ -354,8 +380,8 @@ impl Assets {
     }
 
     /// One asset of `scope` in any state (management reads), with its
-    /// draft and published usage counted in its scope.
-    pub async fn get(&self, scope: &str, id: &str) -> Result<(AssetView, (i64, i64)), Rejection> {
+    /// [`Usage`].
+    pub async fn get(&self, scope: &str, id: &str) -> Result<(AssetView, Usage), Rejection> {
         let db = self.db().clone();
         let (scope, id) = (scope.to_owned(), id.to_owned());
         let client = db.acquire(self.deadline()).await?;
@@ -368,7 +394,12 @@ impl Assets {
             .query_one(&client, &sql::ASSET_USAGE, &[&id, &scope])
             .await
             .map_err(|e| sql_error(&e))?;
-        Ok((AssetView::from_row(&row), (usage.get(0), usage.get(1))))
+        let usage = Usage {
+            draft: usage.get(0),
+            published: usage.get(1),
+            elsewhere: usage.get(2),
+        };
+        Ok((AssetView::from_row(&row), usage))
     }
 
     /// A live asset of `scope`, `None` when absent or trashed.

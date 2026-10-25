@@ -168,20 +168,22 @@ pub const CONTENT_ALL: [&str; 11] = [
 /// listing every content permission over an owner's tenant grants;
 /// `member_a` is a session of a member of A with those grants; `app_key`
 /// an application-scoped key with every content permission and no
-/// tenant.
+/// tenant; `app_editor_a` a session holding every content permission at
+/// application scope whose active organization is A.
 fn organization_principal(name: &str) -> Option<Principal> {
     let tenant = match name {
         "key_a" | "member_a" => Some(id(ORG_A)),
         "key_b" | "member_b" => Some(id(ORG_B)),
         "app_key" => None,
+        "app_editor_a" => Some(id(ORG_A)),
         _ => return None,
     };
     let all = set(&CONTENT_ALL);
     let grants = match &tenant {
-        Some(_) => GrantSnapshot::empty().with_tenant(Grants::new(vec![id("owner")], all.clone())),
-        None => {
-            GrantSnapshot::empty().with_application(Grants::new(vec![id("editor")], all.clone()))
+        Some(_) if name != "app_editor_a" => {
+            GrantSnapshot::empty().with_tenant(Grants::new(vec![id("owner")], all.clone()))
         }
+        _ => GrantSnapshot::empty().with_application(Grants::new(vec![id("editor")], all.clone())),
     };
     let key = name.starts_with("key_") || name == "app_key";
     let grants = if key {

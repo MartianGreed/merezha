@@ -896,7 +896,7 @@ All paths are under `/v1/content/manage`. `{type}` is a content type,
 | `POST /batch/unpublish` | `content.entries.publish` per item | `{items: [{type, id, locale}]}` | 200 `{items: [variant]}` |
 | `POST /assets` | `content.assets.write` | raw body, `Content-Type`, query `filename`, optional `title` | 201 asset |
 | `GET /assets` | `content.assets.read` | `content_type` (exact or `image/*`), `filename_prefix`, `limit`, `cursor` | 200 `{items: [asset], page}` |
-| `GET /assets/{id}` | `content.assets.read` | none | 200 asset with `usage: {draft, published}` counts |
+| `GET /assets/{id}` | `content.assets.read` | none | 200 asset with `usage: {draft, published, elsewhere}` counts (C9: `elsewhere` counts other scopes' refs) |
 | `PATCH /assets/{id}` | `content.assets.write` | merge patch over `{title, focal_point}` | 200 asset |
 | `GET /assets/{id}/file` | `content.assets.read` | `Range` | 200 or 206 bytes, any asset state except purged |
 | `DELETE /assets/{id}` | `content.assets.delete` | `force`, `purge` | 204, or 409 `asset_in_use` |
@@ -1515,10 +1515,10 @@ Management `GET /assets/{id}/file` always proxies with `attachment`.
   for it).
 - Every statement is a TE-T4 `Statement` (`merezha_content::media::STATEMENTS`);
   the media sources hand no SQL to the driver (the workspace scan).
-- C9 replaced the application-only seams: management works in the
-  principal's active organization (`Tenant(org)`), or the application
-  scope without one, and organization assets are served under
-  `/v1/content/o/{organization}` (section 8, as built).
+- C9 replaced the application-only seams: the asset routes are mounted
+  a second time under `/v1/content/o/{organization}`, for that
+  organization's assets, and their delivery is served there too
+  (section 8, as built).
 
 ## 7. Events
 
@@ -1621,9 +1621,23 @@ multi-application platform keeps that rule, so the layout survives it.
   another organization, even one planted behind validation, is only ever
   `missing`. Referrers list the target's scope only, so an application
   entry's organization referrers stay with their organizations.
-- Assets: management works in `org:<tenant>` with checks at
-  `Tenant(org)` for a principal with an active organization, else in
-  `app` at `Application`. An organization's asset has the URL
+- Assets: the path chooses the management scope, as it does for
+  delivery. `/v1/content/manage/assets...` is the application scope,
+  checked at `Application`, so a tenant-pinned key is refused there
+  (key scope, 403). `/v1/content/o/{organization}/manage/assets...` is
+  that organization's scope, checked at `Tenant(org)` for a principal
+  whose active organization it is (403 otherwise, an application grant
+  included). The active organization never moves an upload, so an
+  application editor with an organization selected still manages the
+  application assets its application entries use. The organization's
+  upload route bounds its own body like the application's (a
+  `RouteBodyLimit` path may now hold `{name}` segments). `usage` on
+  `GET .../manage/assets/{id}` counts `draft` and `published` refs of
+  the asset's own scope and `elsewhere`, the refs of every other scope
+  (organization entries using an application asset), so the three
+  together are what a delete without `force` is refused for
+  (`asset_in_use`); other scopes' referrers are counted, never named.
+  An organization's asset has the URL
   `/v1/content/o/{organization}/assets/{id}/{filename}`; that route
   serves the organization's assets and the application assets its
   published entries reference, under the referencing types' `access` on
@@ -1638,9 +1652,12 @@ multi-application platform keeps that rule, so the layout survives it.
   reference entries; another organization's publish changes no tag.
 - Content never reads identity tables, so deleting an organization in
   identity leaves its content in place, unreachable through management
-  (no principal has that tenant any more) but still served on its public
-  delivery path. Purging it on `identity.organization_deleted` is a
-  follow-up.
+  (no principal has that tenant any more) but still served on its
+  public delivery path, its assets included, until issue #56 lands.
+  #56 purges an organization's content on `identity.organization_deleted`
+  and must also give operators a purge they can run themselves (for
+  organizations deleted before it, or a missed event). Until then an
+  operator removes a deleted organization's public content by hand.
 
 ## 9. Configuration and telemetry
 
