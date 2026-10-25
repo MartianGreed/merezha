@@ -35,6 +35,13 @@ pub const REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 /// Longest user agent kept, in bytes.
 pub const MAX_USER_AGENT: usize = 512;
 
+/// Background audit writes in flight at most (break-glass, organization
+/// entry).
+pub const AUDIT_SLOTS: usize = 64;
+/// Break-glass audit writes running in the background at most (current-
+/// thread runtimes only); they share nothing with [`AUDIT_SLOTS`].
+pub const BREAK_GLASS_SLOTS: usize = 8;
+
 /// The module name: section, route prefix, ledger key, outbox source.
 pub const NAME: &str = "identity";
 
@@ -63,17 +70,36 @@ pub mod topic {
     ];
 }
 
-/// Integration events PR 1 publishes (R11, section 8).
+/// Integration events identity publishes (R11, section 8), all at
+/// version 1. Payloads carry ids, never personal data.
 pub mod event {
     pub const USER_REGISTERED: &str = "identity.user_registered";
     pub const USER_EMAIL_VERIFIED: &str = "identity.user_email_verified";
     pub const USER_EMAIL_CHANGED: &str = "identity.user_email_changed";
+    pub const USER_DISABLED: &str = "identity.user_disabled";
+    pub const USER_ENABLED: &str = "identity.user_enabled";
     pub const USER_DELETED: &str = "identity.user_deleted";
-    pub const ALL: [&str; 4] = [
+    pub const ORGANIZATION_CREATED: &str = "identity.organization_created";
+    pub const ORGANIZATION_UPDATED: &str = "identity.organization_updated";
+    pub const ORGANIZATION_DELETED: &str = "identity.organization_deleted";
+    pub const MEMBERSHIP_CREATED: &str = "identity.membership_created";
+    pub const MEMBERSHIP_ROLES_CHANGED: &str = "identity.membership_roles_changed";
+    pub const MEMBERSHIP_REMOVED: &str = "identity.membership_removed";
+    pub const USER_APPLICATION_ROLES_CHANGED: &str = "identity.user_application_roles_changed";
+    pub const ALL: [&str; 13] = [
         USER_REGISTERED,
         USER_EMAIL_VERIFIED,
         USER_EMAIL_CHANGED,
+        USER_DISABLED,
+        USER_ENABLED,
         USER_DELETED,
+        ORGANIZATION_CREATED,
+        ORGANIZATION_UPDATED,
+        ORGANIZATION_DELETED,
+        MEMBERSHIP_CREATED,
+        MEMBERSHIP_ROLES_CHANGED,
+        MEMBERSHIP_REMOVED,
+        USER_APPLICATION_ROLES_CHANGED,
     ];
 }
 
@@ -182,6 +208,8 @@ pub enum Method {
     Password,
     MagicLink,
     EmailToken,
+    /// An invitation accepted anonymously (its token proves the inbox).
+    Invitation,
 }
 impl Method {
     pub fn as_str(self) -> &'static str {
@@ -189,6 +217,7 @@ impl Method {
             Method::Password => "password",
             Method::MagicLink => "magic_link",
             Method::EmailToken => "email_token",
+            Method::Invitation => "invitation",
         }
     }
 }
@@ -284,6 +313,8 @@ pub struct SessionRow {
     pub absolute_expires_at: Timestamp,
     pub ip: Option<IpAddr>,
     pub user_agent: Option<String>,
+    /// The organization selected with `PUT /session/organization`.
+    pub active_organization: Option<Uuid>,
 }
 impl std::fmt::Debug for SessionRow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -303,6 +334,7 @@ pub(crate) fn session_row(row: &tokio_postgres::Row, at: usize) -> SessionRow {
         absolute_expires_at: row.get(at + 8),
         ip: row.get(at + 9),
         user_agent: row.get(at + 10),
+        active_organization: row.get(at + 11),
     }
 }
 impl SessionRow {
@@ -319,7 +351,10 @@ impl SessionRow {
             "authenticated_at": self.authenticated_at.to_string(),
             "idle_expires_at": self.idle_expires_at.to_string(),
             "absolute_expires_at": self.absolute_expires_at.to_string(),
-            "active_organization_id": Value::Null,
+            "active_organization_id": self
+                .active_organization
+                .map(|org| Value::String(ids::render(ids::ORGANIZATION, org)))
+                .unwrap_or(Value::Null),
             "current": current,
         })
     }
@@ -363,6 +398,8 @@ impl std::fmt::Debug for NewSession {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Actor {
     User(Uuid),
+    /// An API key (its id), whatever its owner.
+    ApiKey(Uuid),
     Anonymous,
     System,
 }
@@ -373,20 +410,31 @@ pub struct Audit {
     pub action: &'static str,
     pub outcome: &'static str,
     pub actor: Actor,
-    pub target_user: Option<Uuid>,
+    /// What the row is about: `(kind, id)` such as `("user", id)`.
+    pub target: Option<(&'static str, Uuid)>,
+    /// The organization the row belongs to, listed by its audit route.
+    pub organization: Option<Uuid>,
     /// HMAC of the address for rows about unknown accounts.
     pub subject: Option<[u8; 32]>,
     pub details: Value,
 }
 /// The only keys audit `details` may carry: methods, transports, reason
-/// codes, policy names and counts. Free text, tokens and emails never.
-pub const AUDIT_DETAIL_KEYS: [&str; 6] = [
+/// codes, policy names, counts, scopes, role keys, permission names,
+/// resource kinds and statuses. Free text, tokens and emails never.
+pub const AUDIT_DETAIL_KEYS: [&str; 13] = [
     "method",
     "transport",
     "reason",
     "policy",
     "count",
     "keep_current",
+    "scope",
+    "role_keys",
+    "permissions",
+    "permission",
+    "resource_kind",
+    "status",
+    "keep_owner",
 ];
 impl Audit {
     pub fn new(action: &'static str, actor: Actor) -> Self {
@@ -394,10 +442,11 @@ impl Audit {
             action,
             outcome: "succeeded",
             actor,
-            target_user: match actor {
-                Actor::User(id) => Some(id),
+            target: match actor {
+                Actor::User(id) => Some(("user", id)),
                 _ => None,
             },
+            organization: None,
             subject: None,
             details: json!({}),
         }
@@ -411,7 +460,16 @@ impl Audit {
         self
     }
     pub fn target(mut self, user: Uuid) -> Self {
-        self.target_user = Some(user);
+        self.target = Some(("user", user));
+        self
+    }
+    /// A target other than a user, such as `("api_key", id)`.
+    pub fn target_of(mut self, kind: &'static str, id: Uuid) -> Self {
+        self.target = Some((kind, id));
+        self
+    }
+    pub fn organization(mut self, organization: Uuid) -> Self {
+        self.organization = Some(organization);
         self
     }
     pub fn subject(mut self, subject: [u8; 32]) -> Self {
@@ -435,6 +493,8 @@ pub enum Subject<'a> {
     Email(&'a str),
     EmailIp(&'a str, Option<IpAddr>),
     Session(Uuid),
+    /// An organization, an API key or another row.
+    Id(Uuid),
 }
 fn ip_key(ip: Option<IpAddr>) -> Vec<u8> {
     match ip.map(|ip| ip.to_canonical()) {
@@ -454,7 +514,7 @@ impl Subject<'_> {
                 bytes.extend(ip_key(*ip));
                 bytes
             }
-            Subject::Session(id) => id.as_bytes().to_vec(),
+            Subject::Session(id) | Subject::Id(id) => id.as_bytes().to_vec(),
         }
     }
 }
@@ -469,6 +529,18 @@ pub struct Core {
     pub hasher: Option<Hasher>,
     pub policy: Option<PasswordPolicy>,
     pub metrics: Metrics,
+    /// The role definitions of this configuration (section 5).
+    pub rbac: crate::rbac::Policy,
+    pub grants: crate::rbac::GrantCache,
+    pub audited: crate::rbac::Once,
+    pub audit_slots: Arc<tokio::sync::Semaphore>,
+    /// Break-glass uses whose audit row is committed (section 5).
+    pub break_glass: crate::rbac::Once,
+    /// Break-glass audit writes in flight in the background.
+    pub break_glass_pending: crate::rbac::Once,
+    pub break_glass_slots: Arc<tokio::sync::Semaphore>,
+    /// Resource kinds assignments may target (`unknown_resource_kind`).
+    pub resource_kinds: std::collections::BTreeSet<String>,
 }
 impl std::fmt::Debug for Core {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -705,11 +777,13 @@ impl Core {
         let now = self.now();
         let (actor_kind, actor_id) = match audit.actor {
             Actor::User(id) => ("user", Some(id)),
+            Actor::ApiKey(id) => ("api_key", Some(id)),
             Actor::Anonymous => ("anonymous", None),
             Actor::System => ("system", None),
         };
         let subject: Option<&[u8]> = audit.subject.as_ref().map(|s| s.as_slice());
-        let target_kind = audit.target_user.map(|_| "user");
+        let target_kind = audit.target.map(|(kind, _)| kind);
+        let target_id = audit.target.map(|(_, id)| id);
         self.db()
             .execute(
                 &*tx,
@@ -722,12 +796,13 @@ impl Core {
                     &actor_kind,
                     &actor_id,
                     &target_kind,
-                    &audit.target_user,
+                    &target_id,
                     &subject,
                     &client.ip,
                     &client.user_agent,
                     &client.request_id,
                     &audit.details,
+                    &audit.organization,
                 ],
             )
             .await
@@ -765,6 +840,20 @@ impl Core {
         payload: Value,
         client: &Client,
     ) -> Result<(), Failure> {
+        self.publish_in(tx, topic, dedupe, payload, client, None)
+            .await
+    }
+    /// [`Core::publish`] with the envelope's `tenant`, the organization the
+    /// event belongs to.
+    pub async fn publish_in(
+        &self,
+        tx: &mut Tx<'_>,
+        topic: &'static str,
+        dedupe: String,
+        payload: Value,
+        client: &Client,
+        tenant: Option<Uuid>,
+    ) -> Result<(), Failure> {
         let record = self.outbox.event(
             Identity::new(topic)?,
             NewEvent {
@@ -775,7 +864,7 @@ impl Core {
                 context: MessageContext {
                     correlation_id: client.correlation(self.ctx.random()),
                     causation_id: None,
-                    tenant: None,
+                    tenant: tenant.map(|t| ids::identity(ids::ORGANIZATION, t)),
                 },
             },
         );
@@ -960,8 +1049,11 @@ impl Core {
             .execute(&*tx, &crate::sql::TOKENS_OF_USER_DELETE, &[&user.id])
             .await
             .map_err(sql)?;
-        // ID PR 2: delete the account's API keys; PR 3: passkeys and OAuth
-        // identities.
+        // Its API keys go too; PR 3 adds passkeys and OAuth identities.
+        self.db()
+            .execute(&*tx, &crate::sql::KEYS_DELETE_OF_USER, &[&user.id])
+            .await
+            .map_err(sql)?;
         self.db()
             .execute(&*tx, &crate::sql::USER_BUMP, &[&user.id, &now])
             .await
@@ -1126,6 +1218,7 @@ impl Core {
             absolute_expires_at: absolute,
             ip: client.ip,
             user_agent: client.user_agent.clone(),
+            active_organization: None,
         };
         self.db()
             .execute(
@@ -1213,6 +1306,18 @@ impl Core {
             .execute(&*tx, &crate::sql::TOKEN_REBIND, &[&old, &created.row.id])
             .await
             .map_err(sql)?;
+        let mut created = created;
+        if let Some(org) = previous.active_organization {
+            self.db()
+                .execute(
+                    &*tx,
+                    &crate::sql::SESSION_SET_ORGANIZATION,
+                    &[&created.row.id, &Some(org)],
+                )
+                .await
+                .map_err(sql)?;
+            created.row.active_organization = Some(org);
+        }
         Ok(Some(created))
     }
     /// The session row by id.
@@ -1313,6 +1418,6 @@ mod tests {
         let audit =
             Audit::new("session.created", Actor::User(Uuid::nil())).detail("method", "password");
         assert_eq!(audit.details, json!({"method": "password"}));
-        assert_eq!(audit.target_user, Some(Uuid::nil()));
+        assert_eq!(audit.target, Some(("user", Uuid::nil())));
     }
 }

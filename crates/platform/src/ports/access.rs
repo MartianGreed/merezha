@@ -370,6 +370,10 @@ pub enum DenyReason {
     TenantMismatch,
     KeyScope,
     KeyLimit,
+    /// A break-glass allow whose audit row could not be written first: the
+    /// use is refused, transient `audit_unavailable` (503), so no
+    /// break-glass use is ever unaudited.
+    AuditUnavailable,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccessDenied {
@@ -383,6 +387,7 @@ impl AccessDenied {
     pub fn failure(&self) -> Failure {
         match self.reason {
             DenyReason::Unauthenticated => Failure::permanent("unauthenticated"),
+            DenyReason::AuditUnavailable => Failure::transient("audit_unavailable"),
             _ => Failure::permanent("unauthorized"),
         }
     }

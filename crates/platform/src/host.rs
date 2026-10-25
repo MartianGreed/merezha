@@ -183,6 +183,9 @@ pub struct HostOptions {
     /// The identity block's authenticator. With one, `/v1/admin/status`
     /// requires `system.status.read` at application scope.
     pub authenticator: Option<Arc<dyn Authenticator>>,
+    /// The identity block's `Directory` (R7), installed in every module's
+    /// context; the empty fallback without one.
+    pub directory: Option<Arc<dyn crate::ports::Directory>>,
     /// The meter source of the kernel's instruments: the edge's from
     /// `meters.meter(EDGE_SCOPE)`, the PostgreSQL pool's from
     /// `meters.meter(merezha_postgres::METER_SCOPE)` (TE §1.3). The
@@ -211,6 +214,7 @@ impl std::fmt::Debug for HostOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostOptions")
             .field("authenticator", &self.authenticator.is_some())
+            .field("directory", &self.directory.is_some())
             .field(
                 "status",
                 &self.status.iter().map(|s| s.name()).collect::<Vec<_>>(),
@@ -456,6 +460,9 @@ impl Host {
                 .telemetry(options.meters.clone());
         if let Some(authenticator) = options.authenticator.clone() {
             builder = builder.authenticator(authenticator);
+        }
+        if let Some(directory) = options.directory.clone() {
+            builder = builder.directory(directory);
         }
         if let Some(ports) = ports {
             builder = builder.outbox(ports.outbox).jobs(ports.jobs);

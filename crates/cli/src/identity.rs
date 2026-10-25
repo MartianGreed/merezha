@@ -1,6 +1,10 @@
 //! `merezha identity password-benchmark`: time Argon2id on this machine
 //! (identity section 7), with the parameters of `[modules.identity.password]`
 //! when `--config` names a project, or the defaults, each overridable.
+//!
+//! `merezha identity platform-admin grant|revoke <email> --config PATH`:
+//! the only way to grant the break-glass `platform_admin` role (identity
+//! section 5), audited `platform_admin.granted` / `platform_admin.revoked`.
 use merezha_identity::{
     benchmark::{self, MAX_SAMPLES},
     config::PasswordSettings,
@@ -11,7 +15,8 @@ use serde_json::{Value, json};
 use std::{path::PathBuf, process::ExitCode};
 
 pub const USAGE: &str = "merezha identity password-benchmark [--config PATH] [--set SECTION.KEY=VALUE]... \
-     [--memory-kib N] [--iterations N] [--parallelism N] [--samples N]";
+     [--memory-kib N] [--iterations N] [--parallelism N] [--samples N] | \
+     merezha identity platform-admin grant|revoke EMAIL --config PATH [--set SECTION.KEY=VALUE]...";
 
 /// Parsed arguments.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -90,7 +95,9 @@ pub fn report(parsed: &BenchmarkArguments, env: Vec<(String, String)>) -> (Value
         };
         if let Some(section) = identity_settings {
             let facts = merezha_identity::HostFacts::load(&input);
-            if let Ok(settings) = merezha_identity::Settings::parse(&section, facts.as_ref())
+            let catalog = crate::identity_module(&input).catalog().clone();
+            if let Ok(settings) =
+                merezha_identity::Settings::parse(&section, facts.as_ref(), &catalog)
                 && let Some(password) = &settings.password
             {
                 cost = Cost::of(password);
@@ -118,20 +125,191 @@ pub fn report(parsed: &BenchmarkArguments, env: Vec<(String, String)>) -> (Value
     }
 }
 
+/// Parsed `platform-admin` arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminArguments {
+    pub grant: bool,
+    pub email: String,
+    pub config: PathBuf,
+    pub overrides: Vec<(String, String)>,
+}
+/// Parse the arguments after `platform-admin`.
+pub fn admin_arguments(args: impl IntoIterator<Item = String>) -> Option<AdminArguments> {
+    let mut args = args.into_iter();
+    let grant = match args.next()?.as_str() {
+        "grant" => true,
+        "revoke" => false,
+        _ => return None,
+    };
+    let mut email = None;
+    let mut config = None;
+    let mut overrides = Vec::new();
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--config" if config.is_none() => config = Some(PathBuf::from(args.next()?)),
+            "--set" => {
+                let pair = args.next()?;
+                let (key, value) = pair.split_once('=')?;
+                if key.is_empty() || overrides.len() >= 64 {
+                    return None;
+                }
+                overrides.push((key.to_owned(), value.to_owned()));
+            }
+            text if email.is_none() && !text.starts_with("--") => email = Some(text.to_owned()),
+            _ => return None,
+        }
+    }
+    Some(AdminArguments {
+        grant,
+        email: email?,
+        config: config?,
+        overrides,
+    })
+}
+
+/// Run `platform-admin`: the report and its exit code, 0 when done
+/// (`granted`, `revoked` or `unchanged`), 2 for invalid arguments,
+/// configuration, an unknown or unverified account or pending migrations,
+/// 1 when the database failed.
+pub async fn platform_admin(
+    parsed: &AdminArguments,
+    env: Vec<(String, String)>,
+) -> (Value, ExitCode) {
+    let Ok(email) = merezha_identity::normalize::email(&parsed.email) else {
+        return invalid("invalid_email");
+    };
+    let input = ConfigInput {
+        path: parsed.config.clone(),
+        env,
+        overrides: parsed.overrides.clone(),
+    };
+    let config = match host::configure(&input, crate::modules(&input)) {
+        Ok((config, _)) => config,
+        Err(errors) => {
+            let issues: Vec<Value> = errors
+                .0
+                .iter()
+                .map(|i| json!({"key": i.key, "code": i.code, "origin": i.origin.to_string()}))
+                .collect();
+            return (
+                json!({"status": "invalid", "error": {"code": "invalid_config"}, "issues": issues}),
+                ExitCode::from(2),
+            );
+        }
+    };
+    let Some(section) = config.modules.get(merezha_identity::NAME) else {
+        return invalid("identity_disabled");
+    };
+    let mut identity = crate::identity_module(&input);
+    if merezha_platform::Module::configure(&mut identity, section).is_err() {
+        return invalid("invalid_config");
+    }
+    let failed = |code: &str| {
+        (
+            json!({"status": "failed", "error": {"code": code}}),
+            ExitCode::from(1),
+        )
+    };
+    let database = match merezha_platform::Database::connect(&config.database) {
+        Ok(database) => database,
+        Err(failure) => return failed(&failure.code),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let jobs = merezha_jobs::PgJobs::new(&config.jobs);
+    let declared = [
+        merezha_postgres::ModuleMigrations {
+            module: merezha_identity::NAME,
+            migrations: merezha_identity::MIGRATIONS,
+        },
+        merezha_postgres::ModuleMigrations {
+            module: "jobs",
+            migrations: merezha_jobs::PgJobs::migrations(),
+        },
+    ];
+    match merezha_postgres::run_migrations(
+        &database,
+        &declared,
+        merezha_postgres::MigrationMode::Verify,
+        deadline,
+    )
+    .await
+    {
+        Ok(report) if report.is_current() => {}
+        Ok(_) => return invalid("migrations_pending"),
+        Err(error) if error.failure.classification == merezha_domain::Classification::Transient => {
+            return failed(&error.failure.code);
+        }
+        Err(error) => return invalid(&error.failure.code),
+    }
+    let ports = merezha_platform::JobsRuntime::ports(&jobs, &database);
+    let ctx = match merezha_platform::AppContext::builder(
+        &config.app.id,
+        database,
+        std::sync::Arc::new(merezha_platform::ports::DenyAll),
+    )
+    .instance_id(&config.app.instance_id)
+    .outbox(ports.outbox)
+    .jobs(ports.jobs)
+    .build()
+    {
+        Ok(ctx) => ctx,
+        Err(failure) => return failed(&failure.code),
+    };
+    if let Err(failure) = identity.open_admin(ctx).await {
+        return failed(&failure.code);
+    }
+    match identity.handle().platform_admin(&email, parsed.grant).await {
+        Ok((change, user)) => (
+            json!({
+                "status": "ok",
+                "action": change.as_str(),
+                "user_id": merezha_identity::ids::render(merezha_identity::ids::USER, user),
+            }),
+            ExitCode::SUCCESS,
+        ),
+        Err(failure) if failure.classification == merezha_domain::Classification::Transient => {
+            failed(&failure.code)
+        }
+        Err(failure) => invalid(&failure.code),
+    }
+}
+
 /// Entry point for `merezha identity ...`; prints one JSON object.
 pub fn main(args: impl IntoIterator<Item = String>) -> ExitCode {
     let mut args = args.into_iter();
-    let parsed = match args.next().as_deref() {
+    let env = || -> Vec<(String, String)> {
+        std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect()
+    };
+    let command = args.next();
+    if command.as_deref() == Some("platform-admin") {
+        let (value, code) = match admin_arguments(args) {
+            Some(parsed) => match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(platform_admin(&parsed, env())),
+                Err(_) => (
+                    json!({"status": "failed", "error": {"code": "internal"}}),
+                    ExitCode::from(1),
+                ),
+            },
+            None => {
+                let (mut value, code) = invalid("invalid_arguments");
+                value["usage"] = Value::String(USAGE.into());
+                (value, code)
+            }
+        };
+        println!("{value}");
+        return code;
+    }
+    let parsed = match command.as_deref() {
         Some("password-benchmark") => arguments(args),
         _ => None,
     };
     let (value, code) = match parsed {
-        Some(parsed) => report(
-            &parsed,
-            std::env::vars_os()
-                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-                .collect(),
-        ),
+        Some(parsed) => report(&parsed, env()),
         None => {
             let (mut value, code) = invalid("invalid_arguments");
             value["usage"] = Value::String(USAGE.into());
@@ -161,6 +339,29 @@ mod tests {
             &["--set", "a.b=c"][..],
             &["--unknown"][..],
             &["--config"][..],
+        ] {
+            assert!(parse(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn platform_admin_arguments_are_strict() {
+        let parse = |args: &[&str]| admin_arguments(args.iter().map(|a| a.to_string()));
+        let parsed = parse(&["grant", "ada@example.com", "--config", "m.toml"]).unwrap();
+        assert!(parsed.grant);
+        assert_eq!(parsed.email, "ada@example.com");
+        assert!(
+            !parse(&["revoke", "ada@example.com", "--config", "m.toml"])
+                .unwrap()
+                .grant
+        );
+        for bad in [
+            &[][..],
+            &["grant"][..],
+            &["grant", "ada@example.com"][..],
+            &["promote", "ada@example.com", "--config", "m.toml"][..],
+            &["grant", "a@x.io", "b@x.io", "--config", "m.toml"][..],
+            &["grant", "a@x.io", "--config", "m.toml", "--force"][..],
         ] {
             assert!(parse(bad).is_none(), "{bad:?}");
         }

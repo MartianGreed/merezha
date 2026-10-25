@@ -108,9 +108,20 @@ pub const REAUTH_SESSION: Policy = Policy {
     default: Rate::new(5, minutes(15)),
 };
 
-/// Every policy PR 1 enforces. The passkey, OAuth, invitation and API key
-/// policies arrive with ID PR 2 and PR 3.
-pub const POLICIES: [Policy; 9] = [
+pub const INVITATION_ORGANIZATION: Policy = Policy {
+    name: "invitation.organization",
+    charge: Charge::Arrival,
+    default: Rate::new(100, minutes(24 * 60)),
+};
+pub const API_KEY_INVALID_IP: Policy = Policy {
+    name: "api_key.invalid.ip",
+    charge: Charge::Failure,
+    default: Rate::new(60, minutes(1)),
+};
+
+/// Every policy PR 1 and PR 2 enforce. The passkey and OAuth policies
+/// arrive with PR 3.
+pub const POLICIES: [Policy; 11] = [
     SIGN_IN_IP,
     SIGN_IN_ACCOUNT_IP,
     SIGN_IN_ACCOUNT,
@@ -120,6 +131,8 @@ pub const POLICIES: [Policy; 9] = [
     EMAIL_IP,
     TOKEN_IP,
     REAUTH_SESSION,
+    INVITATION_ORGANIZATION,
+    API_KEY_INVALID_IP,
 ];
 
 /// The configuration table name of a policy: dots become underscores.
@@ -162,6 +175,7 @@ mod tests {
         assert_eq!(names.len(), POLICIES.len());
         assert_eq!(table_name(&SIGN_IN_IP), "sign_in_ip");
         assert_eq!(table_name(&EMAIL_ADDRESS_IP), "email_address_ip");
+        assert_eq!(table_name(&API_KEY_INVALID_IP), "api_key_invalid_ip");
         assert_eq!(SIGN_IN_ACCOUNT.charge, Charge::Failure);
         assert_eq!(
             EMAIL_ADDRESS.default,

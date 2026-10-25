@@ -873,11 +873,20 @@ Behavior notes:
   lock, to a built-in tenant role or a custom role of that organization
   (`404 not_found` otherwise). Invitations store them in `invitation_roles`,
   and acceptance copies them into `role_assignments` under the same lock.
+  Acceptance first re-checks the inviter as it stands now, under that lock:
+  the inviting member's live grants (or the inviting key's, when a key
+  invited) must still allow granting every invited role, `owner` by an
+  owner; otherwise the invitation is deleted and the acceptance answers
+  `409 invitation_stale`, committing nothing else. Invitation listings show
+  `invited_by` and `invited_by_key`.
 - `permission_escalation`: a caller can create or edit a role, assign a role,
   invite with roles, mint an API key, or change a user's status only if the
   caller holds every permission involved in the same scope (for a status
   change, every application permission of the target). Only owners assign
-  `owner`. `platform_admin` and `user` are never assigned over HTTP.
+  `owner`, and owner-only paths (granting or removing `owner`, ownership
+  transfer) re-read the caller's ownership under the organization lock, so
+  a demotion racing the request is honoured. `platform_admin` and `user` are
+  never assigned over HTTP.
 - The active organization (`PUT /session/organization` or the
   `Merezha-Organization` header, which wins) must be one the caller belongs
   to, or any organization when the caller holds `identity.organization.enter`
@@ -885,10 +894,19 @@ Behavior notes:
   active in its own organization only (a header naming another is `404`),
   and a user's one only while its owner is a member there (else 401).
 - Removing a membership locks the organization row and, in one transaction,
-  deletes it, revokes the user's unrevoked keys for that organization
-  (audited `api_key.revoked`, reason `membership_removed`, not revived by
-  rejoining) and bumps `users.authz_version`. Minting a user's tenant key
-  takes the same lock and requires membership, so it cannot race a removal.
+  deletes it, revokes the user's unrevoked keys for that organization and
+  every service account key it minted there (`created_by`; audited
+  `api_key.revoked`, reason `membership_removed`, not revived by
+  rejoining), deletes the invitations it sent that are still pending
+  (`invitation.revoked`, reason `inviter_removed`) and bumps
+  `users.authz_version`; the service accounts themselves stay. A role
+  change that leaves the member without `identity.service_accounts.manage`,
+  `identity.api_keys.create` or `identity.members.invite` in the
+  organization revokes, in the same transaction, the service account keys
+  it minted, its own keys, or deletes its pending invitations
+  respectively (reason `minter_demoted`, `inviter_demoted`). Key listings
+  show `created_by`. Minting a user's tenant key takes the same lock and
+  requires membership, so it cannot race a removal.
 - A service account's keys share its scope. A user can hold both kinds.
   Disabling a service account stops its keys on the next request.
 - The sole-owner invariant is checked with the organization row locked, so
@@ -940,12 +958,12 @@ canonical codes (`unauthenticated`, `unauthorized`, `actor_mismatch`,
 | 401 | `unauthenticated`, `invalid_credentials`, `invalid_token`, `invalid_ceremony`, `reauthentication_required`, `sign_in_required` | permanent |
 | 403 | `unauthorized`, `actor_mismatch`, `tenant_required`, `permission_escalation`, `origin_rejected`, `csrf_failed`, `email_unverified`, `email_mismatch`, `account_disabled`, `registration_closed`, `builtin_role` | permanent |
 | 404 | `not_found` | permanent |
-| 409 | `email_taken`, `slug_taken`, `slug_reserved`, `sole_owner`, `last_credential`, `identity_already_linked`, `role_key_taken`, `role_in_use`, `already_member`, `passkey_exists`, `conflict` | conflict |
+| 409 | `email_taken`, `slug_taken`, `slug_reserved`, `sole_owner`, `last_credential`, `identity_already_linked`, `role_key_taken`, `role_in_use`, `already_member`, `invitation_stale`, `passkey_exists`, `conflict` | conflict |
 | 413 | `body_limit` | permanent |
 | 415 | `unsupported_media_type` | permanent |
 | 422 | `validation_failed` (with `details`; one status everywhere, R8), `password_too_short`, `password_too_long`, `password_blocklisted`, `password_contextual`, `unknown_permission`, `unknown_resource_kind`, `passkey_rejected`, `organization_limit`, `role_limit`, `assignment_limit`, `service_account_limit`, `api_key_limit`, `passkey_limit` | permanent |
 | 429 | `rate_limited` (with `Retry-After`) | transient |
-| 503 | `overloaded` (with `Retry-After`), `unavailable`, `provider_unavailable` | transient |
+| 503 | `overloaded` (with `Retry-After`), `unavailable`, `provider_unavailable`, `audit_unavailable` (K's: a break-glass use whose audit row could not be written) | transient |
 
 ## 5. RBAC
 
@@ -1004,7 +1022,10 @@ organization.
 
 `[modules.identity.rbac.builtin_grants]` adds application permissions to
 `user`, `admin` and `member`. It cannot remove identity's own grants, which
-keeps the organization manageable.
+keeps the organization manageable. `admin` and `member` may name a trailing
+wildcard inside a block namespace (`content.*`); `user`, which every
+active user holds in every organization, follows the custom role rule and
+may not (`identity.*` is `unknown_permission`).
 
 Other application roles are declared in configuration
 (`[modules.identity.rbac.application_roles.<key>]`, section 8), not created
@@ -1119,12 +1140,38 @@ Steps 2 to 4 make a key's power its list intersected with its owner's live
 grants at the key's scope. Minting checks the same (`permission_escalation`),
 so a key never exceeds its owner.
 
+A key also never exceeds its minter (`api_keys.created_by`). This is an
+invariant of evaluation, not of the paths that change grants. When the
+minter is not the owner (a service account's key), the `Authenticator`
+caps the key's list at what the minter holds now at the key's scope
+(`Tenant(org)` for a tenant key, `Application` otherwise). The cap comes
+from the minter's own snapshot, cached and stamped with the minter's
+`authz_version`, its membership and the organization's version, and the
+key snapshot is stamped with the same. So a demotion, a custom role edit,
+an application role revocation or any later path shrinks the key on the
+next request on every instance. A minter that is deleted, disabled,
+unverified (while verification is required) or, for a tenant key, no
+longer a member leaves the key no power: it answers `401 unauthenticated`
+as a revoked key does. Account deletion and disabling also revoke every
+key the user minted or owns (`api_key.revoked`, reasons `minter_deleted`
+and `minter_disabled`), and removal and role changes keep their
+revocations (§4), so listings show the state. Listing keys with
+break-glass is audited like every break-glass use.
+
 `AccessDenied` carries the internal reason (`no_grant`, `tenant_mismatch`,
 `key_scope`, `key_limit`, `unauthenticated`) for audit and debug logs, as the
 TypeScript `Decision.reason` did. HTTP shows only `unauthorized` (403), or
-`unauthenticated` (401) without a principal. The caller audits each
-`Allowed::BreakGlass` as `authorization.break_glass`, once per session and
-permission per instance.
+`unauthenticated` (401) without a principal. A break-glass allow fails
+closed: its `authorization.break_glass` row is written before the use,
+once per session and permission per instance and marked only once
+committed; a write that fails or takes more than 2 s refuses the use with
+K's transient `audit_unavailable` (503, `DenyReason::AuditUnavailable`).
+Identity's own routes await the write; the host `Authorizer`, synchronous,
+waits for it in place on a multi-threaded runtime (`block_in_place`) and,
+on a current-thread runtime, refuses the first use while the row is
+written in the background. Break-glass writes share no slot with the
+best-effort audits (`authorization.denied`, `organization.entered`),
+which are dropped past 64 in flight and logged `identity.audit_dropped`.
 
 The `Authenticator` caps a snapshot at `max_resource_assignments` (default
 500) per holder per organization. Above the cap the membership still works,
@@ -1533,13 +1580,14 @@ identity defines none. Spans are TE's `identity {operation}`.
 | Cross-tenant access (IDOR) | Organization in every scoped check, tenant match required unless an application grant matches, tenant keys pinned, 404 for foreign ids. |
 | Last owner lockout | Sole-owner invariant under row lock. |
 | Leaked API key | Prefixed format for secret scanning, mandatory expiry, revocation, last-use stamps, audit of use after revocation, dies when the owner leaves or is disabled. |
-| Ex-member keeps access | Membership removal bumps `authz_version` and revokes the user's keys for the organization in one transaction; sessions lose the organization; authentication refuses a user's tenant key without a live membership. |
+| A minter's authority outlives it through a key | A key is capped at its minter's live grants at the key's scope on every request (§5) and has no power once the minter is deleted, disabled or no longer a member; deletion, disabling, removal and losing the minting permission also revoke it. |
+| Ex-member keeps access | Membership removal bumps `authz_version`, revokes the user's keys for the organization and the service account keys it minted there, and deletes its pending invitations, in one transaction; a demotion does the same for the authority it loses; acceptance re-checks the inviter's live grants; sessions lose the organization; authentication refuses a user's tenant key without a live membership. |
 | Argon2 denial of service | Semaphore with queue timeout, per-IP limits before hashing, 1 KiB password byte cap. |
 | Rate-limit table growth | Keys are fixed-size digests. Cleanup removes drained buckets. |
 | SSRF through OIDC | Issuers come only from configuration. Redirects disabled. Response size cap. |
 | Email change takeover | Recent session required, confirmation from the new inbox, notice to the old one, other sessions revoked. |
 | Notifier outage hides verification | Identity refuses to start with email flows on and no delivery path (section 8). Outbox retries. |
-| Break-glass misuse | `platform_admin` granted only by CLI, user sessions only, every use audited as `authorization.break_glass`. |
+| Break-glass misuse | `platform_admin` granted only by CLI, user sessions only, every use audited as `authorization.break_glass` before it is allowed (fail closed, `audit_unavailable`). |
 | Clock skew between instances | Expiry compares against the platform `Clock`. Instances must run NTP. Five-minute skew allowed only for ID token `iat`. |
 
 ## 8. Integration
@@ -1613,7 +1661,8 @@ and NT skips them. No phone numbers (ID10). `users` takes at most 100 ids.
 Role filters match organization-scope tenant roles or application roles;
 `None` (or `user`) means everyone. Pages are keyset-ordered by user id, at
 most 500. Service accounts never appear. `is_member` counts memberships
-only, not application grants, so NT's `recipient_not_in_tenant` check (R4)
+only, not application grants, and only of active users with a verified
+address like the other calls, so NT's `recipient_not_in_tenant` check (R4)
 stays a membership check.
 
 ### Integration events
@@ -2025,6 +2074,71 @@ Test plan:
   while assigned (startup fails); API key presented after revocation (401
   plus audit `api_key.used_after_revocation`); a disabled service account's
   key (401).
+
+PR 2 as built (2026-10-25):
+
+- The permission matrix of acceptance 2 is
+  [identity-permissions.md](identity-permissions.md), generated by
+  `crates/identity/tests/rbac.rs`.
+- Migration 2 is the SQL above plus `CHECK (cardinality(permissions) <= 256)`
+  on `roles` and the indexes `organizations_created_by_idx`,
+  `role_assignments_membership_idx`, `role_assignments_service_account_idx`,
+  `application_role_assignments_user_idx`,
+  `application_role_assignments_service_account_idx`, `api_keys_revoked_idx`
+  and `api_keys_expiry_idx` that the per-user count, the snapshot queries and
+  the cleanup job read.
+- The catalog is identity's and the host's permissions plus the blocks' lists
+  the binary hands the module (`IdentityModule::add_block_permissions`).
+  `application.toml` `[[permissions]]` and route `resource` kinds are AP-C2's
+  syntax and still refused by the application layer, so they join through
+  `add_application_permissions` and `add_resource_kinds` with AP-C2; until
+  then the resource kinds are the blocks' (`content_type`). Wildcards inside
+  a block namespace are accepted only in `builtin_grants` (operator
+  configuration), so a release adding a block permission never widens a
+  custom role, a declared role or a key. `admin` holds every catalog
+  permission except `identity.organization.delete`,
+  `identity.organization.transfer` and the application-only identity ones.
+- The RBAC `Authorizer` refuses application commands and queries
+  (`unauthorized`) until AP-C2 checks their route permissions with the
+  principal; every other host check (application and jobs admin,
+  `/v1/admin/status`, content) uses it.
+- Identity's own tenant routes evaluate the caller in the path's
+  organization: a member's session gets that organization's snapshot
+  without selecting it first; a caller with no standing there (no
+  membership, no application grant) gets `404`, a member without the
+  permission `403`.
+- An application key never takes tenant grants: a `Merezha-Organization`
+  header on one is `404` unless the key may enter any organization.
+- Changing a member's roles, editing or deleting a custom role, and deleting
+  an assignment require holding the permissions of every role involved,
+  added and removed, old and new; removing a member who is an owner
+  requires an owner. Custom role keys cannot be `owner`, `admin`, `member`,
+  `platform_admin` or `user` (`role_key_taken`), `owner` is never assigned
+  on a resource, and resource ids use identity characters (`[A-Za-z0-9._:/-]`).
+- Routes that need a recent session refuse API keys with `403 unauthorized`.
+  `GET /me` accepts a user's key.
+- Removing a membership also clears that organization from the user's
+  sessions. Accepting an invitation counts `organizations.max_members`
+  (`organization_limit`) and, for a new account, refuses with
+  `registration_closed` only when registration is `closed`. Anonymous
+  acceptances sign in with session method `invitation`.
+- `organization.entered` is audited once per session and organization per
+  instance when a header enters one, and on every `PUT session/organization`
+  that does; `authorization.denied` once per principal and permission per
+  instance on identity's routes (both best effort: past 64 writes in flight
+  a row is dropped and logged `identity.audit_dropped`);
+  `authorization.break_glass` before the use, fail closed (§5). Keys are
+  capped by their minter's live grants (§5). The reviews of PR #47 added the authority cleanup on removal and demotion, the
+  inviter re-check at acceptance, the fail-closed break-glass audit, the
+  live owner re-check, `is_member` for active verified users only and the
+  `builtin_grants.user` wildcard rule.
+- The cleanup job deletes expired invitations and keys revoked or expired
+  more than 30 days ago. `platform-admin grant` needs a verified, active
+  account. TE's catalog gains `identity.declared_role_in_use` and
+  `identity.unknown_permissions`.
+- Not done: the startup warning when `builtin_grants.user` grants a
+  permission a route checks at `scope = "tenant"` needs AP-C2's route
+  declarations.
 
 ### PR 3: OAuth, OIDC and passkeys (stage 2)
 

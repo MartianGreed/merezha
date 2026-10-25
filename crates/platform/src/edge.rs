@@ -44,6 +44,9 @@ pub const TRACESTATE: HeaderName = HeaderName::from_static("tracestate");
 /// The CSRF token cookie-authenticated unsafe requests carry (identity
 /// section 4); CORS allows it so a cross-origin front end can send it.
 pub const CSRF_TOKEN: HeaderName = HeaderName::from_static("x-csrf-token");
+/// The header that selects the active organization for one request
+/// (identity section 4).
+pub const ORGANIZATION: HeaderName = HeaderName::from_static("merezha-organization");
 const FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
@@ -470,6 +473,7 @@ fn cors(config: &CorsConfig) -> Option<tower_http::cors::CorsLayer> {
                 TRACEPARENT,
                 TRACESTATE,
                 CSRF_TOKEN,
+                ORGANIZATION,
             ])
             .expose_headers([REQUEST_ID])
             .allow_credentials(config.allow_credentials)

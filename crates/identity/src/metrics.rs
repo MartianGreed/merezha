@@ -25,6 +25,7 @@ struct Instruments {
     hash_duration: Histogram<f64>,
     hash_queue_wait: Histogram<f64>,
     audit_failures: Counter<u64>,
+    authz_cache: Counter<u64>,
     // Keeps the observable gauge registered.
     _active: opentelemetry::metrics::ObservableGauge<u64>,
 }
@@ -79,6 +80,7 @@ impl Metrics {
                 hash_duration: histogram(meter, metric::IDENTITY_PASSWORD_HASH_DURATION),
                 hash_queue_wait: histogram(meter, metric::IDENTITY_PASSWORD_HASH_QUEUE_WAIT),
                 audit_failures: counter(meter, metric::IDENTITY_AUDIT_WRITE_FAILURES),
+                authz_cache: counter(meter, metric::IDENTITY_AUTHZ_CACHE),
                 _active: gauge,
             })),
             active,
@@ -150,6 +152,13 @@ impl Metrics {
     pub fn audit_failure(&self) {
         if let Some(i) = &self.instruments {
             i.audit_failures.add(1, &[]);
+        }
+    }
+    /// A grant snapshot lookup; `result`: `hit`, `miss`.
+    pub fn authz_cache(&self, result: &'static str) {
+        if let Some(i) = &self.instruments {
+            i.authz_cache
+                .add(1, &[KeyValue::new("identity.result", result)]);
         }
     }
     /// Set by the cleanup job.

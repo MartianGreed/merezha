@@ -150,15 +150,22 @@ rebuild or delete a revision, checked the same way. A deployment exposes
 nothing unauthenticated by accident.
 
 With the identity block the edge authenticates every request through its
-session `Authenticator` (`HostOptions::authenticator`), and the host refuses
-the allow-all policy beside it (`allow_all_with_authenticator`). Identity
-PR 1 has no RBAC `Authorizer` yet and principals carry an empty grant
-snapshot, so `merezha run` installs the deny-all policy on every listener,
-loopback included: application commands and queries, the application and
-jobs admin routes and `/v1/admin/status` answer `401 unauthenticated`
-without a session and `403 unauthorized` with one, until ID PR 2. The raw
-runtime endpoints, which have no authentication of their own, are never
-mounted beside the authenticator, even on a private listener.
+`Authenticator` (sessions and `mzk_` API keys, `HostOptions::authenticator`),
+the host refuses the allow-all policy beside it
+(`allow_all_with_authenticator`), and `merezha run` installs identity's RBAC
+`Authorizer` (`HostParts::authorizer`) on every listener, loopback included,
+and its `Directory` (`HostOptions::directory`). The application and jobs
+admin routes and `/v1/admin/status` then answer to real grants:
+`401 unauthenticated` without a principal, `403 unauthorized` without the
+permission at `Application` (`application.admin.read`, `jobs.admin.read`,
+`system.status.read` and the rest of identity §5's catalog), and a
+`platform_admin` session passes every check once its
+`authorization.break_glass` audit row is written; when that write fails the
+use is refused, `503 audit_unavailable`. Application commands and queries stay refused
+(`unauthorized`) until AP-C2 checks their route permissions with the
+principal before any guest call. The raw runtime endpoints, which have no
+authentication of their own, are never mounted beside the authenticator,
+even on a private listener.
 
 ## Configuration reference
 
@@ -233,7 +240,8 @@ CORS is off while `allowed_origins` is empty.
 
 Allowed methods are GET, POST, PUT, PATCH and DELETE. Allowed request
 headers are `content-type`, `authorization`, `x-request-id`, `traceparent`,
-`tracestate` and `x-csrf-token` (identity's CSRF header, so a cross-origin
+`tracestate`, `merezha-organization` (identity's active organization) and
+`x-csrf-token` (identity's CSRF header, so a cross-origin
 front end can send it). `x-request-id` is exposed to scripts.
 
 ### `[database]`
@@ -528,7 +536,7 @@ registers:
 | 415 | `unsupported_media_type` |
 | 422 | `validation_failed` and every other permanent code the kernel emits (domain, application, port and startup codes) |
 | 429 | `rate_limited`, `database_busy` (with `Retry-After`) |
-| 503 | `overloaded`, `starting` (the early listener) and every transient code the kernel emits (`database_unavailable`, `database_timeout`, `commit_outcome_unknown`, `internal`, `storage_*`, ...), with `Retry-After` |
+| 503 | `overloaded`, `starting` (the early listener) and every transient code the kernel emits (`database_unavailable`, `database_timeout`, `commit_outcome_unknown`, `internal`, `storage_*`, `audit_unavailable` for a break-glass use whose audit row could not be written, ...), with `Retry-After` |
 | 504 | `timeout`, `upstream_timeout` |
 
 `errors::KERNEL_CODES` is the complete list. A unit test scans the kernel
@@ -854,24 +862,29 @@ pass what they learned in (`NotificationRequest::members`).
 | `Principal` | `subject` (`usr_..`, `key_..`, or `sys_<name>` for system principals, `Principal::system`), `kind` (`User`, `ApiKey`, `System`), `user`, `service_account`, `tenant`, `grants: Arc<GrantSnapshot>`, `session: Option<SessionFacts>` | |
 | `GrantSnapshot` | break-glass, application grants, application-level resource grants, tenant grants, resource grants in the tenant and an API key limit; `evaluate` and `Principal::check` decide synchronously in identity's order (ID §5) and return `Allowed::{Grant, BreakGlass}` or `AccessDenied { reason }` | |
 | `ResourceScope` | `Application`, `Tenant(id)`, `Resource { tenant: Option<id>, kind, id }`; a resource without a tenant is application-level (R5). A tenant grant never satisfies an application check | |
-| `Authorizer` | extends the application `Authorizer` with `check(Option<&Principal>, permission, scope) -> Result<Allowed, AccessDenied>`; synchronous and I/O-free. Without a principal it denies `Unauthenticated` (401), otherwise `unauthorized` (403) | `LoopbackAllowAll` on a private listener (constructible only for loopback addresses), `DenyAll` otherwise (401 anonymous, 403 with a principal) |
+| `Authorizer` | extends the application `Authorizer` with `check(Option<&Principal>, permission, scope) -> Result<Allowed, AccessDenied>`; synchronous and I/O-free. Without a principal it denies `Unauthenticated` (401), otherwise `unauthorized` (403). Identity's `RbacAuthorizer` evaluates the principal's snapshot | `LoopbackAllowAll` on a private listener (constructible only for loopback addresses), `DenyAll` otherwise (401 anonymous, 403 with a principal) |
 | `Outbox` | `append(tx, source, &[OutboxRecord], OnDuplicate) -> Appended` (AP §B.3); records carry a `DedupeKey` (at most 160 bytes, R4a; `DedupeKey::api(subject, key)` namespaces HTTP keys), an `OutboxTarget` (`Event { topic }` or `Job { queue, kind }`), a JSON payload of at most 64 KiB, `contains_secret`, `run_at`, `priority` and a `MessageContext`; at most 256 records per call. `OutboxRecord::event(source, topic, NewEvent)` (or `SourceOutbox::event`) builds an event record whose payload is the `IntegrationEvent` envelope (R11). `JobFailure` carries the code, classification and `retry_after` job handlers report | `UnavailableOutbox`: fails `outbox_unavailable`, so the caller's transaction rolls back. `merezha_jobs::PgOutbox` is the PostgreSQL implementation |
 | `Jobs` | through `JobsHandle`: `enqueue(NewJob) -> Enqueued` in its own transaction, idempotent on the queue and `{source}:{key}`; `cancel(id)`; `register(kind, queue, Arc<dyn JobHandler>, KindOptions)` and `subscribe(topic, kind)` before the jobs runtime starts; `queue_status() -> QueueStatus` (per queue `ready`, `delayed`, `leased`, `dead`, `oldest_ready_age_s` and slots, plus the outbox backlog and up to 100 quarantined records), the read behind `GET /v1/jobs/admin/queues` and `outbox` and TE's status and gauges (R10). `JobHandler`, `JobContext`, `KindOptions` and `Reissue` are AP §B.3's; `NewJob` hides its payload from `Debug` | `UnavailableJobs`: every call fails `jobs_unavailable` |
 | `Notifier` | `validate(&request)` (pure), `request(tx, NotificationRequest)` and `emit_webhook(tx, WebhookEvent)` (NT §3.1); a webhook's `source_event_id` is an `EventId` of up to 225 bytes, room for `{source}:{dedupe_key}`. Requests carry topic, 1 to 100 recipients (`User`, `Tenant`, `Application { roles }`, `Address`), channels, template, `data`, `secret_data`, locale, dedupe key, tenant, `members`, `not_before`, `expires_at`, collapse key and correlation. For sources `application` and `api` with a tenant every user recipient must be in `members` (`recipient_not_in_tenant`). `Debug` never shows data, secret data or addresses. `NotifierFactory::bind(source)` hands out bound notifiers | `CaptureNotifications`: validates structurally, logs a redacted `notification.captured` warning, keeps the last 64 redacted records (never `data`, `secret_data` or addresses) and delivers nothing |
-| `Directory` | `users(ids)` (at most 100) to verified `Contact`s, `tenant_members(tenant, roles?, PageRequest)` and `application_members(roles?, PageRequest)` (pages of at most 500, keyset by user id), `is_member(user, tenant)` (R7) | `EmptyDirectory`: resolves nothing; nobody is a member |
+| `Directory` | `users(ids)` (at most 100) to verified `Contact`s, `tenant_members(tenant, roles?, PageRequest)` and `application_members(roles?, PageRequest)` (pages of at most 500, keyset by user id), `is_member(user, tenant)` (R7). Installed through `HostOptions::directory`; identity's implements it | `EmptyDirectory`: resolves nothing; nobody is a member |
 | `BlobStore` | `put(key, BlobBody, attrs) -> BlobStat` streaming, `get(key, range?) -> BlobRead` streaming, `head`, idempotent `delete`, `signed_get_url(key, ttl) -> Option<String>` (CT §6); `BlobKey` is 1 to 1024 bytes of `[A-Za-z0-9._-]` segments; `BlobError` maps to classified failures | `UnavailableBlobStore`: fails permanent `blob_store_unavailable`. `merezha_blob::ObjectBlobStore` is the local and S3 implementation |
 
 ## Identity block
 
 `merezha-identity` (`crates/identity`, [design](../design/identity.md)) is
 the identity block, a `Module` named `identity` with schema
-`merezha_identity` (ledger key `identity`). Slice ID PR 1 ships accounts with
+`merezha_identity` (ledger key `identity`, migrations 1 `identity_core` and
+2 `organizations_rbac_api_keys`). Slice ID PR 1 ships accounts with
 email and password, email verification, password sign-in, sessions (cookie
 and bearer), the Origin and CSRF checks, reauthentication, magic links,
 password reset and change, email change, account deletion, PostgreSQL rate
 limits, audit events, the cleanup job and the session `Authenticator`.
-Organizations, RBAC, the `Authorizer`, API keys and the `Directory` come with
-ID PR 2, OAuth, OIDC and passkeys with PR 3; their tables stay `unknown_key`.
+Slice ID PR 2 adds organizations, memberships, invitations, custom,
+built-in and declared roles at tenant and application scope, service
+accounts, API keys in the `Authenticator`, the RBAC `Authorizer`, the
+`Directory` and `merezha identity platform-admin` ([Organizations, RBAC and
+keys](#organizations-rbac-and-keys)). OAuth, OIDC and passkeys come with
+PR 3; their tables stay `unknown_key`.
 
 ```toml
 [modules.identity]
@@ -903,7 +916,14 @@ secret_key = { env = "MEREZHA_IDENTITY_SECRET_KEY" }   # at least 32 bytes
 | `sessions.max_per_user`, `sessions.bearer` | `50`, `true` | 1 to 1000 | The least recently seen session is evicted past the cap; `bearer` allows `"transport": "bearer"` |
 | `tokens.email_verification_ttl`, `magic_link_ttl`, `password_reset_ttl`, `email_change_ttl` | `24h`, `15m`, `30m`, `1h` | | One-time token lifetimes |
 | `magic_links.sign_up` | `true` | | Unknown addresses get a sign-up link while registration is open |
-| `rate_limits.<policy>.limit`, `.period` | identity §7 | 1 to 1000000, 1 s to 30 d | Policies `sign_in_ip`, `sign_in_account_ip`, `sign_in_account`, `registration_ip`, `email_address_ip`, `email_address`, `email_ip`, `token_ip`, `reauth_session` |
+| `rate_limits.<policy>.limit`, `.period` | identity §7 | 1 to 1000000, 1 s to 30 d | Policies `sign_in_ip`, `sign_in_account_ip`, `sign_in_account`, `registration_ip`, `email_address_ip`, `email_address`, `email_ip`, `token_ip`, `reauth_session`, `invitation_organization` (100 per day, per organization, on arrival), `api_key_invalid_ip` (60 per minute, on failure) |
+| `links.invitation`, `tokens.invitation_ttl` | `/auth/invitation`, `7d` | 1 h to 30 d | The invitation page and lifetime |
+| `organizations.user_can_create`, `max_per_user`, `max_members` | `true`, `50`, `10000` | 1 to 10000, 1 to 1000000 | `false` gives an application without organizations (`POST /organizations` answers 403); organizations one user may create (`organization_limit`); members per organization |
+| `rbac.cache_entries`, `max_custom_roles`, `max_resource_assignments` | `10000`, `100`, `500` | 2 to 1000000, 1 to 1000, 1 to 10000 | Grant snapshots cached per instance; custom roles per organization (`role_limit`); resource grants per holder and scope kept in a snapshot (more are ignored, `identity.grants_truncated`) |
+| `rbac.builtin_grants.user`, `.admin`, `.member` | `[]` | catalog permissions or trailing wildcards, for `user` never inside a block namespace (`unknown_permission`) | Added to the implicit `user` role (every active user, every organization), `admin` and `member` |
+| `rbac.application_roles.<key>.name`, `.description`, `.permissions` | none | key `[a-z][a-z0-9_]{0,62}`, not `owner`, `admin`, `member`, `platform_admin`, `user` (`reserved_role_key`); at most 64 roles; permissions from the catalog, wildcards only outside block namespaces | Declared application roles, synced into `roles` at start |
+| `service_accounts.max_per_scope` | `100` | 1 to 10000 | Per organization and for the application (`service_account_limit`) |
+| `api_keys.max_per_scope`, `max_ttl`, `touch_interval` | `100`, `365d`, `5m` | 1 to 10000, 1 h to 3650 d, 1 s to 1 d | Unrevoked keys per scope (`api_key_limit`); the furthest `expires_at`; `last_used_at` writes |
 | `audit.retention` | `400d` | 1 d to 3650 d | Audit rows older than this are deleted by the cleanup job |
 | `cleanup.interval`, `cleanup.batch_size` | `10m`, `1000` | minutes dividing an hour, hours dividing a day, or `1d`; 1 to 10000 | The `identity.cleanup` cron schedule and its delete batches |
 
@@ -968,6 +988,108 @@ Error codes it registers: `ambiguous_credentials` (400),
 `password_too_short`, `password_too_long`, `password_blocklisted`,
 `password_contextual`, `notifications_required`, `blocklist_unavailable`
 (422).
+
+### Organizations, RBAC and keys
+
+Routes (identity §4 has the bodies and errors), all JSON with the same
+limits; `{org}` is an `org_` id and every check under it is at
+`Tenant(org)`, every check under `application/` at `Application`:
+
+- `POST`/`GET organizations`, `PUT session/organization`, `GET permissions`
+  (the catalog), `GET me/permissions`, `POST invitations/inspect`,
+  `POST invitations/accept`;
+- `GET`/`PATCH`/`DELETE organizations/{org}`, `POST .../ownership-transfers`,
+  `GET .../me/permissions`, `GET .../members`, `PATCH`/`DELETE
+  .../members/{membership}`, `POST`/`GET .../invitations`, `DELETE
+  .../invitations/{id}`, `GET`/`POST .../roles`, `PATCH`/`DELETE
+  .../roles/{role}`, `GET`/`POST .../role-assignments`, `DELETE
+  .../role-assignments/{id}`, `GET`/`POST .../service-accounts`,
+  `PATCH`/`DELETE .../service-accounts/{id}`, `GET`/`POST .../api-keys`,
+  `DELETE .../api-keys/{id}`, `GET .../audit-events`;
+- `GET application/users`, `PATCH application/users/{user}`, `GET
+  application/roles`, `GET`/`POST application/role-assignments`, `DELETE
+  application/role-assignments/{id}`, and the service account, API key and
+  audit routes of a tenant under `application/`.
+
+Listings take `?cursor&limit` (1 to 100, default 50) and answer
+`next_cursor`. An id of another type or another organization answers
+`404 not_found`, never `403`; a tenant route called by someone with no
+standing in the organization (no membership, no application grant) is
+`404` too. Every grant path (custom roles, assignments, member roles,
+invitations, API keys, user status) requires the caller to hold every
+permission involved at the target scope (`403 permission_escalation`); only
+owners grant or remove `owner`, and an organization always keeps one
+(`409 sole_owner`, also for `DELETE /me`). `platform_admin` and the implicit
+`user` are never assigned over HTTP (`403 builtin_role`).
+
+The active organization comes from `PUT session/organization` or the
+`Merezha-Organization: org_...` header (it wins; CORS allows it): one the
+caller belongs to, or any with `identity.organization.enter` at
+`Application` (audited `organization.entered`), else `404 not_found`. A
+principal carries a grant snapshot built once per request and cached per
+instance by `(credential, organization)` with the user's, service
+account's and organization's `authz_version`: any grant change is visible
+on the next request on every instance.
+
+API keys are `Authorization: Bearer mzk_<16 base32>_<43 base64url>`, shown
+once when created; only the SHA-256 digest of the secret is stored. A key
+is pinned to one organization or the application, lists its permissions,
+and its power is that list intersected with its owner's live grants at its
+scope: a tenant key never acts elsewhere, an application key never in a
+tenant, and a `platform_admin`'s key never breaks glass. A key minted by
+someone other than its owner (a service account's) is also capped, on
+every request, at what its minter holds now at the key's scope, and has no
+power once the minter is deleted, disabled or no longer a member; deleting
+or disabling an account revokes every key it minted. A revoked (audited
+`api_key.used_after_revocation`) or expired key, an inactive owner, and a
+user's tenant key without its owner's live membership answer
+`401 unauthenticated`; removing a member revokes its keys for the
+organization, and so are the service account keys it minted there
+(listings show `created_by`); its pending invitations are deleted, and a
+role change that drops the authority behind them does the same. Accepting
+an invitation re-checks its inviter's live grants
+(`409 invitation_stale`). Failed key presentations spend `api_key_invalid_ip`
+(`429 rate_limited` with `Retry-After`). Revoked and expired keys are
+deleted by the cleanup job after 30 days, expired invitations at once.
+
+`merezha run` installs identity's RBAC `Authorizer` and `Directory` with
+the block, and builds its catalog from identity's and the host's
+permissions, `merezha_content::CONTENT_PERMISSIONS` and
+`notifications.templates.preview`; the resource kind `content_type` may be
+assigned. At start the block syncs the declared application roles; a
+declared role removed while still assigned stops startup
+(`declared_role_in_use`, logged `identity.declared_role_in_use` with the
+role key and count), and stored custom role grants the catalog no longer
+has are counted in `identity.unknown_permissions` and grant nothing.
+
+`merezha identity platform-admin grant|revoke EMAIL --config PATH
+[--set SECTION.KEY=VALUE]...` is the only way to grant the break-glass
+`platform_admin` role. It needs the identity and jobs migrations applied,
+a verified active account to grant, and prints
+`{"status":"ok","action":"granted"|"revoked"|"unchanged","user_id"}` with
+exit code 0; an unknown account (`not_found`), an unverified one
+(`email_unverified`), invalid configuration or pending migrations
+(`migrations_pending`) print `{"status":"invalid","error":{"code"}}` with
+exit code 2, a database failure `{"status":"failed",...}` with exit code 1.
+It is audited `platform_admin.granted` / `platform_admin.revoked` and
+publishes `identity.user_application_roles_changed`.
+
+Integration events (R11, in the change's transaction, envelope `tenant` the
+organization): `identity.organization_created`, `_updated`, `_deleted`,
+`identity.membership_created`, `_roles_changed`, `_removed`,
+`identity.user_application_roles_changed`, `identity.user_disabled`,
+`identity.user_enabled`, besides PR 1's.
+
+Error codes PR 2 registers: `permission_escalation`, `email_mismatch`,
+`builtin_role` (403), `slug_taken`, `slug_reserved`, `role_key_taken`,
+`role_in_use`, `already_member`, `invitation_stale` (409), `unknown_permission`,
+`unknown_resource_kind`, `organization_limit`, `role_limit`,
+`assignment_limit`, `service_account_limit`, `api_key_limit`,
+`declared_role_in_use` (422).
+
+The permission matrix of the built-in roles is
+[identity-permissions.md](../design/identity-permissions.md), generated by a
+test.
 
 `merezha identity password-benchmark [--config PATH] [--set SECTION.KEY=VALUE]...
 [--memory-kib N] [--iterations N] [--parallelism N] [--samples N]` hashes
@@ -2393,9 +2515,10 @@ itself.
   `jobs.drain_timeout_ms` plus 3 s to the module shutdown budget.
 - There is no request deadline at the edge yet; handlers bound their own
   work.
-- Identity PR 1 installs the session `Authenticator` but no `Authorizer`:
-  every permission check is denied while identity is on (see
-  [Routes](#routes)) until ID PR 2.
+- With identity on, application commands and queries are refused until
+  AP-C2 enforces their route permissions; the application's
+  `[[permissions]]` and route `resource` kinds join identity's catalog then
+  (`IdentityModule::add_application_permissions`, `add_resource_kinds`).
 - The events, outbox and jobs `trace_parent`/`trace_state` columns are
   filled (TE-T3, TE-T5).
 - Reactor lag, lock and batch instruments arrive with the reactors (AP-C3);

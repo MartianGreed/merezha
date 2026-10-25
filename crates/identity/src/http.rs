@@ -32,7 +32,7 @@ pub const MAX_BODY_BYTES: usize = 16 * 1024;
 const DEFAULT_PAGE: i64 = 20;
 const MAX_PAGE: i64 = 100;
 
-type Shared = State<Arc<Core>>;
+pub(crate) type Shared = State<Arc<Core>>;
 
 /// The identity router, nested under `/v1/identity` by the host.
 pub fn router(core: Arc<Core>) -> Router {
@@ -54,6 +54,7 @@ pub fn router(core: Arc<Core>) -> Router {
         .route("/me/email-changes", post(request_email_change))
         .route("/me/email-changes/confirm", post(confirm_email_change))
         .route("/me/security-events", get(security_events))
+        .merge(crate::admin_http::routes())
         .fallback(|| async { failure(ApiError::code("not_found")) })
         .method_not_allowed_fallback(|| async { failure(ApiError::code("method_not_allowed")) })
         .layer(axum::middleware::map_response(no_store))
@@ -67,7 +68,7 @@ async fn no_store(mut response: Response) -> Response {
     response
 }
 
-fn failure(error: ApiError) -> Response {
+pub(crate) fn failure(error: ApiError) -> Response {
     let mut reply = ErrorReply::new(error.failure).details(error.details);
     if let Some(after) = error.retry_after {
         reply = reply.retry_after(after);
@@ -76,14 +77,14 @@ fn failure(error: ApiError) -> Response {
 }
 
 /// A request's facts: the client, the principal and the headers.
-struct Ctx {
-    parts: Parts,
-    client: Client,
-    caller: Option<Caller>,
-    authenticated: bool,
+pub(crate) struct Ctx {
+    pub(crate) parts: Parts,
+    pub(crate) client: Client,
+    pub(crate) caller: Option<Caller>,
+    pub(crate) authenticated: bool,
 }
 impl Ctx {
-    fn new(parts: Parts) -> Self {
+    pub(crate) fn new(parts: Parts) -> Self {
         let principal = parts
             .extensions
             .get::<Authenticated>()
@@ -111,7 +112,7 @@ impl Ctx {
     }
     /// The Origin check of anonymous unsafe requests (login CSRF);
     /// authenticated ones passed the edge's cookie checks already.
-    fn anonymous_origin(&self, core: &Core) -> Result<(), ApiError> {
+    pub(crate) fn anonymous_origin(&self, core: &Core) -> Result<(), ApiError> {
         if self.authenticated || core.origin_allowed(&self.parts.headers) {
             Ok(())
         } else {
@@ -121,19 +122,22 @@ impl Ctx {
 }
 
 /// A JSON object body being validated: every problem becomes one detail.
-struct Fields {
+pub(crate) struct Fields {
     map: Map<String, Value>,
     details: Vec<(String, &'static str)>,
 }
 impl Fields {
-    fn take(&mut self, name: &str) -> Option<Value> {
+    pub(crate) fn has(&self, name: &str) -> bool {
+        self.map.contains_key(name)
+    }
+    pub(crate) fn take(&mut self, name: &str) -> Option<Value> {
         self.map.remove(name)
     }
-    fn problem(&mut self, name: &str, code: &'static str) {
+    pub(crate) fn problem(&mut self, name: &str, code: &'static str) {
         self.details.push((format!("/{name}"), code));
     }
     /// A required string.
-    fn string(&mut self, name: &str) -> Option<String> {
+    pub(crate) fn string(&mut self, name: &str) -> Option<String> {
         match self.take(name) {
             Some(Value::String(s)) => Some(s),
             None | Some(Value::Null) => {
@@ -147,7 +151,7 @@ impl Fields {
         }
     }
     /// An optional string: absent is `None`, `null` is `Some(None)`.
-    fn nullable(&mut self, name: &str) -> Option<Option<String>> {
+    pub(crate) fn nullable(&mut self, name: &str) -> Option<Option<String>> {
         match self.take(name) {
             None => None,
             Some(Value::Null) => Some(None),
@@ -158,7 +162,7 @@ impl Fields {
             }
         }
     }
-    fn email(&mut self, name: &str) -> Option<Email> {
+    pub(crate) fn email(&mut self, name: &str) -> Option<Email> {
         let text = self.string(name)?;
         match normalize::email(&text) {
             Ok(email) => Some(email),
@@ -178,7 +182,7 @@ impl Fields {
             }
         }
     }
-    fn transport(&mut self) -> Option<Transport> {
+    pub(crate) fn transport(&mut self) -> Option<Transport> {
         let text = self.nullable("transport").flatten()?;
         let parsed = Transport::parse(&text);
         if parsed.is_none() {
@@ -186,7 +190,7 @@ impl Fields {
         }
         parsed
     }
-    fn boolean(&mut self, name: &str) -> Option<bool> {
+    pub(crate) fn boolean(&mut self, name: &str) -> Option<bool> {
         match self.take(name) {
             None | Some(Value::Null) => None,
             Some(Value::Bool(b)) => Some(b),
@@ -216,7 +220,7 @@ impl Fields {
 
 /// Split the request, require JSON within the size limit and parse it as
 /// an object.
-async fn json(request: Request) -> Result<(Ctx, Fields), ApiError> {
+pub(crate) async fn json(request: Request) -> Result<(Ctx, Fields), ApiError> {
     let (parts, body) = request.into_parts();
     let ctx = Ctx::new(parts);
     let json_type = ctx
@@ -254,7 +258,7 @@ async fn json(request: Request) -> Result<(Ctx, Fields), ApiError> {
     ))
 }
 
-fn respond(core: &Core, result: Result<Reply, ApiError>) -> Response {
+pub(crate) fn respond(core: &Core, result: Result<Reply, ApiError>) -> Response {
     let reply = match result {
         Ok(reply) => reply,
         Err(error) => return failure(error),
@@ -509,11 +513,19 @@ async fn revoke_all(State(core): Shared, request: Request) -> Response {
     })
 }
 
+/// `GET /me`: `user` access, a session or a key whose owner is a user.
 async fn me(State(core): Shared, request: Request) -> Response {
-    bodyless!(core, request, |ctx, caller| {
-        let _ = &ctx;
-        core.me(&caller).await
-    })
+    let (parts, _) = request.into_parts();
+    let user = parts
+        .extensions
+        .get::<Authenticated>()
+        .and_then(|a| a.0.as_deref())
+        .and_then(crate::grants::principal_user);
+    let result = match user {
+        Some(user) => core.me(user).await,
+        None => Err(ApiError::code("unauthenticated")),
+    };
+    respond(&core, result)
 }
 
 async fn update_me(State(core): Shared, request: Request) -> Response {
@@ -603,7 +615,7 @@ fn page(query: Option<&str>) -> Result<(Option<uuid::Uuid>, i64), ApiError> {
     }
 }
 
-fn finish(fields: &mut Fields) -> Result<(), ApiError> {
+pub(crate) fn finish(fields: &mut Fields) -> Result<(), ApiError> {
     std::mem::replace(
         fields,
         Fields {
@@ -614,7 +626,7 @@ fn finish(fields: &mut Fields) -> Result<(), ApiError> {
     .finish()
 }
 /// A field whose absence `finish` already reported.
-fn required<T>(value: Option<T>) -> Result<T, ApiError> {
+pub(crate) fn required<T>(value: Option<T>) -> Result<T, ApiError> {
     value.ok_or_else(|| ApiError::invalid(vec![]))
 }
 
