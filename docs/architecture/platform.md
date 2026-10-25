@@ -1965,13 +1965,14 @@ such as `cargo build --release -p merezha-cli` or `cargo build
 
 ## Content
 
-`merezha-content` (`crates/content`, CT-C1 to CT-C5 and CT-C7) is the content block,
+`merezha-content` (`crates/content`, CT-C1 to CT-C5, CT-C7 and CT-C9) is the content block,
 a `Module` named `content` with schema `merezha_content` (ledger key
 `content`). C2 ships its schema, model activation and readiness; C3 the
 management routes for drafts and revisions; C4 publishing, the
 `published` rows, deletion, the trash and its purge job; C5 the delivery
 API, preview, population and the model endpoints; C7 assets and media
-([Content assets](#content-assets)). The design is
+([Content assets](#content-assets)); C9 organization types
+([Content organizations](#content-organizations)). The design is
 [content.md](../design/content.md).
 
 ```toml
@@ -2254,8 +2255,9 @@ other reference on a populated path is `{"id", "type", "missing": true}`.
 ### Content delivery routes
 
 C5 serves published entries under `/v1/content` and organization types
-under `/v1/content/o/{organization}` (organization types load from C9 on;
-an application type under an organization's path, and the reverse, is
+under `/v1/content/o/{organization}` (organization types load beside
+identity, [Content organizations](#content-organizations); an application
+type under an organization's path, and the reverse, is
 `content_type_not_found`):
 
 | Route | Query |
@@ -2391,7 +2393,9 @@ the store's probe: a `head` of `content/readiness/probe`, plus a one-key
 list on S3 (which needs `s3:ListBucket`), or the local root's mode.
 
 Routes, under `/v1/content` (management answers `private, no-store`;
-permissions are checked at `Application` scope):
+it works in the principal's active organization, checked at
+`Tenant(org)`, or in the application scope at `Application` without one,
+[Content organizations](#content-organizations)):
 
 | Route | Permission | Success |
 | --- | --- | --- |
@@ -2402,7 +2406,7 @@ permissions are checked at `Application` scope):
 | `GET /manage/assets/{id}/file` (`Range`) | `content.assets.read` | 200 or 206, always `attachment`, trashed ones too |
 | `DELETE /manage/assets/{id}` (`force`, `purge`) | `content.assets.delete` | 204, or 409 `asset_in_use` |
 | `POST /manage/assets/{id}/undelete` | `content.assets.delete` | 200 asset |
-| `GET /assets/{id}/{filename}` (`Range`, `If-None-Match`) | the referencing types' `access` | 200, 206, 304, or 302 in redirect mode |
+| `GET /assets/{id}/{filename}`, `GET /o/{organization}/assets/{id}/{filename}` (`Range`, `If-None-Match`) | the referencing types' `access` on that path | 200, 206, 304, or 302 in redirect mode |
 
 An upload is checked in this order: the permission, a free upload slot
 (`overloaded`, 503, `Retry-After: 1`), the query (`filename` required;
@@ -2425,8 +2429,10 @@ keeps `[A-Za-z0-9._-]` (others become `-`), drops leading punctuation,
 takes the type's extension and is at most 200 bytes; it never names a key.
 
 Blobs are content-addressed per scope at
-`content/app/sha256/<2>/<2>/<sha256>` (organizations, with C9, get
-`org-<32 hex of the id's SHA-256>`). The blob claim is its own transaction:
+`content/app/sha256/<2>/<2>/<sha256>`, and an organization's at
+`content/org-<32 hex of the id's SHA-256>/sha256/...`, so no
+organization id appears in a bucket listing and identical bytes in two
+organizations are two objects. The blob claim is its own transaction:
 a new `pending` row leased for an hour, or the existing row (`stored` or
 `orphaned` skips the put, `pending` extends the lease and puts too, a row
 being deleted is waited for up to 2 s, then `blob_unavailable`). The put
@@ -2445,9 +2451,10 @@ the lease expires; an upload meeting a deletion whose lease expired takes
 the row over. Every asset and blob write starts with the model version check.
 
 Delivery serves an asset only while it is live and a published variant of
-a type the caller may read under its `access` references it (in the
-application scope; C9 adds organizations), and only under its stored
-filename; anything else is `asset_not_found` (404), so a draft-only upload
+a type the caller may read under its `access` references it (on the
+application path, the application's refs; on an organization's path,
+that organization's refs to its own assets and to application assets),
+and only under its stored filename; anything else is `asset_not_found` (404), so a draft-only upload
 stays unreachable with its id. Proxy mode streams with the stored type
 (`; charset=utf-8` for plain text and CSV), `Content-Disposition: inline`
 for `inline_types` and `attachment; filename="<filename>"` otherwise,
@@ -2500,6 +2507,50 @@ adds `blob_store_conflict` (422, startup).
 Operations notes: give S3 buckets a lifecycle rule that aborts incomplete
 multipart uploads (a cancelled put leaves one), and keep `spool_dir` on a
 disk with room for `max_concurrent_uploads` times `max_upload_bytes`.
+
+### Content organizations
+
+A type declaring `scope = "organization"` (C9) keeps one set of entries
+per organization, stored with scope `org:<organization id>`. Such types
+load only when `[modules.identity]` is present, whose organizations are
+the tenants; without it the model fails `content_model_invalid` at
+`modules.content.model:types.<name>.scope`. Content never reads identity
+tables: an organization without entries, or an unknown one, simply has
+none.
+
+- Management takes the organization from `Principal.tenant`: a session's
+  active organization (`PUT /v1/identity/session/organization` or the
+  `Merezha-Organization` header) or an organization API key's own. Checks
+  run at `Resource { tenant: <org>, kind: "content_type", id: <type> }`.
+  A principal without a tenant is checked at `Application` first, then
+  answered `403 tenant_required`; an organization key never acts on
+  application types (403). Another organization's ids are
+  `entry_not_found` and `asset_not_found` on every route, singletons
+  resolve the caller's own organization, and unique values, slugs,
+  singletons, generations and blobs are per organization.
+- Delivery under `/v1/content/o/{organization}`: an `authenticated` type
+  serves principals whose tenant is that organization (anonymous 401,
+  another organization's 403), a `public` one anyone, a permission type
+  is checked at `Resource { tenant: <org>, .. }`. Responses hold that
+  organization's rows and populated application entries only; any other
+  target is `missing`. Their ETags carry the organization's generation,
+  plus the application's when the type can reference entries.
+- References: an organization entry may reference its own organization's
+  entries and assets and the application's; an application entry only the
+  application's. Any other target is `reference_not_found` (or
+  `asset_not_found`), exactly like an absent id, so saves never reveal
+  another tenant's ids; `reference_scope` is no longer reported. A client
+  `id` taken in any scope is still `entry_exists` (409), since ids are one
+  key: importers that set their own ids should use random UUIDs.
+- Assets of a principal with an active organization are that
+  organization's (checks at `Tenant(org)`); their `url` is
+  `/v1/content/o/{organization}/assets/{id}/{filename}`. Without a tenant
+  they are the application's, checked at `Application`.
+- Events of organization content carry the organization as their
+  envelope `tenant` and `scope: "org:<id>"` in their payload.
+- Deleting an organization in identity leaves its content in place (not
+  reachable through management, still served on its public delivery
+  path); purging it is a follow-up.
 
 ## Dependencies
 

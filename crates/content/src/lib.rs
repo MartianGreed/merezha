@@ -46,6 +46,13 @@
 //! sniffing, hashing and dimensions, blobs deduplicated per scope, the
 //! asset management routes, proxy and redirect delivery, deletes with
 //! `force` and `purge`, and the `content.blob_cleanup` job.
+//!
+//! CT-C9, organization scope (section 8): `scope = "organization"` types
+//! beside identity ([`ContentModule::with_organizations`]), managed in the
+//! principal's active organization and delivered under
+//! `/v1/content/o/{organization}`; organization entries may reference the
+//! application scope, never the reverse or another organization (any such
+//! target answers like an absent one); assets and blobs per organization.
 mod activation;
 mod canonical;
 mod delivery;

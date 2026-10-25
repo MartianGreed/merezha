@@ -16,7 +16,7 @@ use merezha_platform::{
     edge::Authenticated,
     host::configure,
     ports::{
-        AccessDenied, Allowed, Authorizer, DenyReason, GrantSnapshot, Grants, Permission,
+        AccessDenied, Allowed, Authorizer, DenyReason, GrantSnapshot, Grants, KeyLimit, Permission,
         PermissionSet, Principal, PrincipalKind, ResourceScope,
     },
 };
@@ -144,8 +144,71 @@ fn set(names: &[&str]) -> PermissionSet {
     names.iter().map(|n| id(n)).collect()
 }
 
+/// Organization A of the C9 tests, an identity-shaped `org_` id.
+pub const ORG_A: &str = "org_0192f5c4e1b07a3c9d2e4f6a8b0c1d2a";
+/// Organization B of the C9 tests.
+pub const ORG_B: &str = "org_0192f5c4e1b07a3c9d2e4f6a8b0c1d2b";
+/// Every content permission, as an organization owner holds them.
+pub const CONTENT_ALL: [&str; 11] = [
+    "content.model.read",
+    "content.entries.read",
+    "content.entries.write",
+    "content.entries.publish",
+    "content.entries.delete",
+    "content.entries.purge",
+    "content.assets.read",
+    "content.assets.write",
+    "content.assets.delete",
+    "content.delivery.read",
+    "content.preview",
+];
+
+/// The organization principals of the C9 tests, as identity builds them:
+/// `key_a` and `key_b` are API keys pinned to organization A or B, each
+/// listing every content permission over an owner's tenant grants;
+/// `member_a` is a session of a member of A with those grants; `app_key`
+/// an application-scoped key with every content permission and no
+/// tenant.
+fn organization_principal(name: &str) -> Option<Principal> {
+    let tenant = match name {
+        "key_a" | "member_a" => Some(id(ORG_A)),
+        "key_b" | "member_b" => Some(id(ORG_B)),
+        "app_key" => None,
+        _ => return None,
+    };
+    let all = set(&CONTENT_ALL);
+    let grants = match &tenant {
+        Some(_) => GrantSnapshot::empty().with_tenant(Grants::new(vec![id("owner")], all.clone())),
+        None => {
+            GrantSnapshot::empty().with_application(Grants::new(vec![id("editor")], all.clone()))
+        }
+    };
+    let key = name.starts_with("key_") || name == "app_key";
+    let grants = if key {
+        grants.with_key_limit(KeyLimit::new(all, tenant.clone()))
+    } else {
+        grants
+    };
+    Some(Principal {
+        subject: id(&format!("{}_{name}", if key { "key" } else { "usr" })),
+        kind: if key {
+            PrincipalKind::ApiKey
+        } else {
+            PrincipalKind::User
+        },
+        user: Some(id(&format!("usr_{name}"))),
+        service_account: None,
+        tenant,
+        grants: Arc::new(grants),
+        session: None,
+    })
+}
+
 /// The principals tests send through the `x-test-principal` header.
 pub fn principal(name: &str) -> Principal {
+    if let Some(principal) = organization_principal(name) {
+        return principal;
+    }
     let grants = match name {
         "editor" => {
             GrantSnapshot::empty().with_application(Grants::new(vec![id("editor")], set(&EDITOR)))
@@ -323,7 +386,22 @@ pub async fn start_in(
     test: &TestDatabase,
     policy: Arc<dyn Authorizer>,
 ) -> Fixture {
-    start_with_options(dir, test, policy, HostOptions::default()).await
+    start_with_options(dir, test, policy, HostOptions::default(), false).await
+}
+
+/// A migrating host on `model` with `settings` whose content module
+/// accepts organization types, as beside identity (C9).
+pub async fn start_organizations(test: &TestDatabase, settings: &str, model: &str) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    project(dir.path(), true, settings, model);
+    start_with_options(
+        dir,
+        test,
+        Arc::new(FixturePolicy),
+        HostOptions::default(),
+        true,
+    )
+    .await
 }
 
 /// A migrating host on `model` whose pool records its statements in
@@ -340,7 +418,7 @@ pub async fn start_metered(
         meters: harness.telemetry().meters(),
         ..HostOptions::default()
     };
-    start_with_options(dir, test, Arc::new(FixturePolicy), options).await
+    start_with_options(dir, test, Arc::new(FixturePolicy), options, false).await
 }
 
 async fn start_with_options(
@@ -348,8 +426,9 @@ async fn start_with_options(
     test: &TestDatabase,
     policy: Arc<dyn Authorizer>,
     options: HostOptions,
+    organizations: bool,
 ) -> Fixture {
-    let module = ContentModule::with_options(fast());
+    let module = ContentModule::with_options(fast()).with_organizations(organizations);
     let handle = module.handle();
     let input = ConfigInput {
         path: dir.path().join("merezha.toml"),

@@ -1,0 +1,65 @@
+# A content model with organization scope (CT-C9, section 8): the shared
+# site in the application scope and one help center per organization.
+# It is the seam for the content section of the stage 3 example
+# application, which reuses it as written.
+version = 1
+
+locales = [
+  { code = "en", default = true },
+  { code = "fr", fallback = "en" },
+]
+
+# Application scope: the marketing site every organization shares.
+[types.page]
+access = "public"
+title_field = "title"
+fields = [
+  { name = "title", type = "string", required = true },
+  { name = "slug", type = "slug", from = "title" },
+  # An application entry may not point into an organization: saves refuse
+  # every `handbook` target with `reference_not_found`.
+  { name = "see_also", type = "reference", to = ["page", "handbook"], cardinality = "many" },
+  { name = "image", type = "asset" },
+]
+
+# Each organization's help center, for its members only.
+[types.handbook]
+scope = "organization"
+access = "authenticated"
+title_field = "title"
+fields = [
+  { name = "title", type = "string", required = true },
+  { name = "slug", type = "slug", from = "title" },
+  { name = "code", type = "string", unique = true },
+  # Organization entries may reference application entries.
+  { name = "page", type = "reference", to = ["page"], localized = false },
+  { name = "related", type = "reference", to = ["handbook"], cardinality = "many" },
+  { name = "image", type = "asset" },
+]
+
+# Public announcements, readable by anyone on the organization's path.
+[types.notice]
+scope = "organization"
+access = "public"
+title_field = "title"
+fields = [
+  { name = "title", type = "string", required = true },
+  { name = "slug", type = "slug", from = "title" },
+  { name = "page", type = "reference", to = ["page"] },
+  { name = "related", type = "reference", to = ["notice"], cardinality = "many" },
+  { name = "image", type = "asset" },
+]
+
+# Briefs for the organization's partners.
+[types.brief]
+scope = "organization"
+access = { permission = "content.delivery.read" }
+title_field = "title"
+fields = [{ name = "title", type = "string", required = true }]
+
+# One settings document per organization.
+[types.org_settings]
+kind = "singleton"
+scope = "organization"
+access = "authenticated"
+fields = [{ name = "name", type = "string", required = true }]

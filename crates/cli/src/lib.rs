@@ -121,6 +121,8 @@ fn blocks_with(
     content: merezha_content::ContentModule,
     identity: merezha_identity::IdentityModule,
 ) -> Vec<Box<dyn merezha_platform::Module>> {
+    // Organization content types need identity's organizations (CT-C9).
+    let content = content.with_organizations(identity_configured(input));
     vec![
         Box::new(identity),
         Box::new(content),
@@ -128,6 +130,15 @@ fn blocks_with(
             merezha_notifications::HostFacts::load(input),
         )),
     ]
+}
+
+/// Whether `[modules.identity]` is present, which enables the identity
+/// block and with it the organizations content's organization types are
+/// scoped to. A configuration that does not load enables nothing; the
+/// kernel reports why.
+fn identity_configured(input: &merezha_platform::ConfigInput) -> bool {
+    merezha_platform::ProjectConfig::load(input)
+        .is_ok_and(|config| config.modules.contains_key(merezha_identity::NAME))
 }
 
 /// Read, validate and open an application configuration with the runtime as

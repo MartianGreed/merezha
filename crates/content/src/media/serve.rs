@@ -13,7 +13,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
 };
-use merezha_domain::Failure;
+use merezha_domain::{Failure, Identity};
 use merezha_platform::ports::{Authorizer, BlobError, BlobKey, BlobStore, Principal};
 use std::ops::Range;
 
@@ -286,26 +286,42 @@ impl Assets {
         Ok(response)
     }
 
-    /// The live asset `id` of `scope` named `filename`, when a published
-    /// variant of a type `principal` may read references it, with whether
-    /// a `public` type does. Anything else is `asset_not_found`, so a
-    /// draft-only upload stays unreachable even with its id.
+    /// The live asset `id` named `filename`, when a published variant of
+    /// a type `principal` may read on this path references it, with
+    /// whether a `public` type does. On the application path (`org` is
+    /// `None`) that is an application asset referenced from the
+    /// application scope. On an organization's path it is an asset of that
+    /// organization, or an application asset its entries reference, and
+    /// only that organization's published refs count, read under the
+    /// path's access rules (section 8, C9): another organization's assets
+    /// and references never reach the answer. Anything else is
+    /// `asset_not_found`, so a draft-only upload stays unreachable even
+    /// with its id.
     pub(crate) async fn deliverable(
         &self,
-        scope: &str,
+        org: Option<&Identity>,
         id: &str,
         filename: &str,
         principal: Option<&Principal>,
         policy: &dyn Authorizer,
     ) -> Result<(AssetView, bool), Rejection> {
-        let asset = self.live(scope, id).await?.ok_or_else(not_found)?;
+        // The scope whose published refs decide: the path's.
+        let refs_scope = match org {
+            Some(org) => format!("org:{}", org.as_str()),
+            None => "app".to_owned(),
+        };
+        let asset = match self.live(&refs_scope, id).await? {
+            Some(asset) => asset,
+            None if org.is_some() => self.live("app", id).await?.ok_or_else(not_found)?,
+            None => return Err(not_found()),
+        };
         if asset.filename != filename {
             return Err(not_found());
         }
         let db = self.db().clone();
         let client = db.acquire(self.deadline()).await?;
         let types: Vec<String> = db
-            .query(&client, &sql::ASSET_PUBLISHED_TYPES, &[&id, &scope])
+            .query(&client, &sql::ASSET_PUBLISHED_TYPES, &[&id, &refs_scope])
             .await
             .map_err(|e| sql_error(&e))?
             .iter()
@@ -319,8 +335,8 @@ impl Assets {
             let Some(content_type) = model.content_type(name) else {
                 continue;
             };
-            // The entries' own delivery rule (C5's), on the application path.
-            let allowed = crate::delivery::access(policy, principal, content_type, None).is_ok();
+            // The entries' own delivery rule (C5's) on this path.
+            let allowed = crate::delivery::access(policy, principal, content_type, org).is_ok();
             public |= allowed && content_type.access == Access::Public;
             readable |= allowed;
         }

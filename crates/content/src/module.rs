@@ -306,6 +306,7 @@ impl ContentHandle {
 pub struct ContentModule {
     handle: ContentHandle,
     options: ActivationOptions,
+    organizations: bool,
 }
 impl ContentModule {
     pub fn new() -> Self {
@@ -316,7 +317,18 @@ impl ContentModule {
         Self {
             handle: ContentHandle::default(),
             options,
+            organizations: false,
         }
+    }
+    /// Accept `scope = "organization"` types (section 8, C9): the host
+    /// runs the identity block, whose organizations are the tenants that
+    /// management takes from `Principal.tenant` and delivery from
+    /// `/o/{organization}`. Without it the model refuses them
+    /// (`organizations_required`). `merezha run` sets it when
+    /// `[modules.identity]` is present.
+    pub fn with_organizations(mut self, organizations: bool) -> Self {
+        self.organizations = organizations;
+        self
     }
     pub fn handle(&self) -> ContentHandle {
         self.handle.clone()
@@ -444,12 +456,13 @@ fn all_errors() -> &'static [ErrorCode] {
 
 /// The model options the host provides: the content permissions only (the
 /// RBAC catalog arrives with identity), media when
-/// `[modules.content.media]` is configured, and no organizations (C9).
-fn model_options(media: bool) -> ModelOptions<'static> {
+/// `[modules.content.media]` is configured, and organization types when
+/// the host runs identity ([`ContentModule::with_organizations`], C9).
+fn model_options(media: bool, organizations: bool) -> ModelOptions<'static> {
     ModelOptions {
         permissions: &CONTENT_PERMISSIONS,
         media,
-        organizations: false,
+        organizations,
     }
 }
 
@@ -485,17 +498,22 @@ pub fn resolve_model_path(base: &Path, value: &str) -> Result<PathBuf, &'static 
 }
 
 /// Read and parse the model file at `path`, `asset` fields accepted only
-/// with `media` (`[modules.content.media]` configured). Model problems
+/// with `media` (`[modules.content.media]` configured) and organization
+/// types only with `organizations` (the host runs identity). Model problems
 /// become one issue each, keyed `modules.content.model:<toml path>` with
 /// code `content_model_invalid`; their messages are the model's, printed
 /// by `merezha content diff`.
-pub fn load_model(path: &Path, media: bool) -> Result<ContentModel, LoadError> {
+pub fn load_model(
+    path: &Path,
+    media: bool,
+    organizations: bool,
+) -> Result<ContentModel, LoadError> {
     let file = std::fs::File::open(path).map_err(|_| LoadError::Unreadable)?;
     let mut text = String::new();
     file.take(MAX_MODEL_BYTES as u64 + 1)
         .read_to_string(&mut text)
         .map_err(|_| LoadError::Unreadable)?;
-    ContentModel::parse(&text, &model_options(media)).map_err(LoadError::Invalid)
+    ContentModel::parse(&text, &model_options(media, organizations)).map_err(LoadError::Invalid)
 }
 
 /// Why the model file could not be loaded.
@@ -537,7 +555,11 @@ impl Module for ContentModule {
         if let Some(path) = path {
             // The section's presence enables asset fields, even when one
             // of its keys is wrong: the model is judged on its own.
-            match load_model(&path, section.table.contains_key("media")) {
+            match load_model(
+                &path,
+                section.table.contains_key("media"),
+                self.organizations,
+            ) {
                 Ok(model) if issues.is_empty() => {
                     let media = settings
                         .media

@@ -7,8 +7,11 @@
 //! Every statement here is a registered [`STATEMENTS`] constant. Every
 //! write transaction starts with [`ContentState::check_writable`]; asset,
 //! blob and ref statements filter on `scope` (only `asset_in_use` counts
-//! referrers in every scope). C7 serves the application scope; C9 adds
-//! organization scopes with their `org-<hash>` key tags ([`blob_key`]).
+//! referrers in every scope). Management works in the principal's active
+//! organization, or the application scope without one; delivery serves an
+//! organization's assets under `/v1/content/o/{organization}` (C9), each
+//! scope with its own `org-<hash>` key tag ([`blob_key`]), so identical
+//! bytes in two organizations are two blobs and two objects.
 mod cleanup;
 mod http;
 mod serve;
@@ -41,7 +44,7 @@ use crate::{
     store::{Actor, Rejection, Store, Target, transaction},
 };
 use merezha_blob::ObjectBlobStore;
-use merezha_domain::{Classification, Failure};
+use merezha_domain::{Classification, Failure, Identity};
 use merezha_platform::{
     AppContext, Database, ErrorCode, Tx,
     ports::{BlobKey, SourceOutbox},
@@ -198,6 +201,8 @@ pub struct AssetView {
     pub storage_key: String,
     /// `created_at` with microseconds, the list cursor's key.
     pub(crate) cursor_at: String,
+    /// `app` or `org:<organization id>` (C9).
+    pub scope: String,
 }
 impl AssetView {
     fn from_row(row: &Row) -> Self {
@@ -217,11 +222,16 @@ impl AssetView {
             deleted_at: row.get(12),
             storage_key: row.get(13),
             cursor_at: row.get(14),
+            scope: row.get(15),
         }
     }
-    /// The delivery path of the asset's bytes.
+    /// The delivery path of the asset's bytes: under
+    /// `/v1/content/o/{organization}` for an organization's asset.
     pub fn url(&self) -> String {
-        format!("/v1/content/assets/{}/{}", self.id, self.filename)
+        match self.scope.strip_prefix("org:") {
+            Some(org) => format!("/v1/content/o/{org}/assets/{}/{}", self.id, self.filename),
+            None => format!("/v1/content/assets/{}/{}", self.id, self.filename),
+        }
     }
     /// The asset JSON of section 6, in its documented order, with `usage`
     /// when given.
@@ -298,13 +308,21 @@ pub(crate) fn not_found() -> Rejection {
     Rejection::new(Failure::permanent(ASSET_NOT_FOUND))
 }
 
-/// The application scope's target: C7's assets live there; C9 derives an
-/// organization's from the principal's tenant.
-pub(crate) fn app_target() -> Target {
-    Target {
-        content_type: String::new(),
-        scope: "app".to_owned(),
-        tenant: None,
+/// The scope assets of a management request live in (section 8, C9): the
+/// principal's active organization (`org:<id>`, its events' tenant), or
+/// the application scope without one.
+pub(crate) fn asset_target(tenant: Option<Identity>) -> Target {
+    match tenant {
+        Some(tenant) => Target {
+            content_type: String::new(),
+            scope: format!("org:{}", tenant.as_str()),
+            tenant: Some(tenant),
+        },
+        None => Target {
+            content_type: String::new(),
+            scope: "app".to_owned(),
+            tenant: None,
+        },
     }
 }
 
@@ -419,12 +437,13 @@ impl Assets {
         ))
     }
 
-    /// Merge-patch `title` and `focal_point` of a live asset (`None`
-    /// keeps a member, `Some(None)` clears it), bump the scope's generation
-    /// and append `content.asset_updated`.
+    /// Merge-patch `title` and `focal_point` of a live asset of `target`'s
+    /// scope (`None` keeps a member, `Some(None)` clears it), bump the
+    /// scope's generation and append `content.asset_updated` with the
+    /// target's organization as its tenant.
     pub async fn patch(
         &self,
-        scope: &str,
+        target: &Target,
         id: &str,
         title: Option<Option<String>>,
         focal_point: Option<Option<String>>,
@@ -432,7 +451,8 @@ impl Assets {
     ) -> Result<AssetView, Rejection> {
         let db = self.db().clone();
         let work = self.store.work();
-        let (scope, id, actor) = (scope.to_owned(), id.to_owned(), actor.clone());
+        let (target, id, actor) = (target.clone(), id.to_owned(), actor.clone());
+        let scope = target.scope.clone();
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
                 work.state.check_writable(&db, tx).await?;
@@ -447,7 +467,6 @@ impl Assets {
                 .await
                 .map_err(|e| sql_error(&e))?;
                 bump_generation(&db, tx, &scope).await?;
-                let target = app_target();
                 let record = work.event(
                     &target,
                     ASSET_UPDATED,
@@ -465,21 +484,23 @@ impl Assets {
         .await
     }
 
-    /// Delete an asset (section 6): `asset_in_use` while refs in any scope
-    /// point at it, unless `force`; soft by default, at once with `purge`
-    /// (trashed assets included). Appends `content.asset_deleted` and bumps
-    /// the generation when a live asset goes; a purge marks the blob
-    /// `orphaned` when no other asset uses it.
+    /// Delete an asset of `target`'s scope (section 6): `asset_in_use`
+    /// while refs in any scope point at it, unless `force`; soft by
+    /// default, at once with `purge` (trashed assets included). Appends
+    /// `content.asset_deleted`, with the target's organization as its
+    /// tenant, and bumps the generation when a live asset goes; a purge
+    /// marks the blob `orphaned` when no other asset uses it.
     pub async fn delete(
         &self,
-        scope: &str,
+        target: &Target,
         id: &str,
         options: AssetDelete,
         actor: &Actor,
     ) -> Result<(), Rejection> {
         let db = self.db().clone();
         let work = self.store.work();
-        let (scope, id, actor) = (scope.to_owned(), id.to_owned(), actor.clone());
+        let (target, id, actor) = (target.clone(), id.to_owned(), actor.clone());
+        let scope = target.scope.clone();
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
                 work.state.check_writable(&db, tx).await?;
@@ -516,7 +537,7 @@ impl Assets {
                 if live {
                     bump_generation(&db, tx, &scope).await?;
                     let record = work.event(
-                        &app_target(),
+                        &target,
                         ASSET_DELETED,
                         json!({"scope": scope, "id": id, "actor": actor.json(),
                                "forced": options.force}),
