@@ -1299,3 +1299,276 @@ mod timing {
         ready_within(&router, StatusCode::OK, Duration::from_secs(6)).await;
     }
 }
+
+/// Provides a notifier factory, as the notifications block does.
+struct Provider {
+    name: &'static str,
+    factory: Arc<merezha_platform::ports::CaptureNotifications>,
+}
+/// Delivers, unlike the capture fallback.
+struct Delivering(Arc<merezha_platform::ports::CaptureNotifications>);
+impl merezha_platform::ports::NotifierFactory for Delivering {
+    fn bind(
+        &self,
+        source: &merezha_platform::Source,
+    ) -> Arc<dyn merezha_platform::ports::Notifier> {
+        self.0.bind(source)
+    }
+}
+impl Module for Provider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn notifier(&self) -> Option<Arc<dyn merezha_platform::ports::NotifierFactory>> {
+        Some(Arc::new(Delivering(self.factory.clone())))
+    }
+}
+/// Records whether its context delivers notifications.
+struct Requester(Arc<AtomicBool>);
+impl Module for Requester {
+    fn name(&self) -> &'static str {
+        "requester"
+    }
+    fn start(&self, ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
+        self.0.store(ctx.notifications_deliver(), Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn a_module_provides_the_notifier_of_every_context_and_only_one_may() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let factory = Arc::new(merezha_platform::ports::CaptureNotifications::default());
+    let delivers = Arc::new(AtomicBool::new(false));
+    // The requester starts before the provider and still gets its factory.
+    Host::start(
+        config(&test, true, ""),
+        vec![
+            Box::new(Requester(delivers.clone())),
+            Box::new(Provider {
+                name: "notifications",
+                factory: factory.clone(),
+            }),
+        ],
+        parts(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        delivers.load(Ordering::SeqCst),
+        "the provided factory is installed"
+    );
+    // Without a provider the capture fallback stays, which does not deliver.
+    let fallback = Arc::new(AtomicBool::new(true));
+    Host::start(
+        config(&test, true, ""),
+        vec![Box::new(Requester(fallback.clone()))],
+        parts(),
+    )
+    .await
+    .unwrap();
+    assert!(!fallback.load(Ordering::SeqCst));
+    let error = Host::start(
+        config(&test, true, ""),
+        vec![
+            Box::new(Provider {
+                name: "notifications",
+                factory: factory.clone(),
+            }),
+            Box::new(Provider {
+                name: "other",
+                factory,
+            }),
+        ],
+        parts(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        (error.failure.code.as_str(), error.module),
+        ("notifier_conflict", Some("other"))
+    );
+}
+
+/// Answers whether its handler saw a principal, on a credential-free route
+/// and on an ordinary one.
+struct Callback;
+impl Module for Callback {
+    fn name(&self) -> &'static str {
+        "callback"
+    }
+    fn credential_free_routes(&self) -> Vec<merezha_platform::CredentialFreeRoute> {
+        vec![merezha_platform::CredentialFreeRoute {
+            method: axum::http::Method::POST,
+            path: "/open",
+        }]
+    }
+    fn routes(&self, _: &AppContext) -> Router {
+        let seen = |principal: Option<Extension<merezha_platform::edge::Authenticated>>| async move {
+            axum::Json(json!({
+                "extension": principal.is_some(),
+                "principal": principal.and_then(|p| p.0.0.clone()).is_some(),
+            }))
+        };
+        Router::new()
+            .route("/open", post(seen))
+            .route("/closed", post(seen))
+    }
+}
+/// `Bearer good` is a principal, anything else is refused.
+struct Strict;
+impl merezha_platform::ports::Authenticator for Strict {
+    fn authenticate<'a>(
+        &'a self,
+        request: &'a merezha_platform::ports::RequestHead,
+    ) -> BoxFuture<'a, Result<Option<Arc<merezha_platform::ports::Principal>>, Failure>> {
+        let header = request
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        Box::pin(async move {
+            match header.as_deref() {
+                None => Ok(None),
+                Some("Bearer good") => {
+                    Ok(Some(Arc::new(merezha_platform::ports::Principal::system(
+                        "tester",
+                        merezha_platform::ports::GrantSnapshot::empty(),
+                    )?)))
+                }
+                Some(_) => Err(Failure::permanent("unauthenticated")),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn credential_free_routes_skip_the_authenticator_and_see_no_principal() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let mut parts = parts();
+    parts.authorizer = Arc::new(merezha_platform::ports::DenyAll);
+    let host = Host::start_with(
+        config(&test, true, ""),
+        vec![Box::new(Callback)],
+        parts,
+        merezha_platform::HostOptions {
+            authenticator: Some(Arc::new(Strict)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let router = host.router();
+    let post_with = |path: &str, auth: Option<&str>| {
+        let mut request = Request::post(path);
+        if let Some(auth) = auth {
+            request = request.header("authorization", auth);
+        }
+        request.body(Body::empty()).unwrap()
+    };
+    // A stale credential does not refuse the credential-free route, and a
+    // valid one is never handed to it.
+    for auth in [None, Some("Bearer stale"), Some("Bearer good")] {
+        let (status, body, _) = call(&router, post_with("/v1/callback/open", auth)).await;
+        assert_eq!(status, StatusCode::OK, "{auth:?}");
+        assert_eq!(
+            body,
+            json!({"extension": true, "principal": false}),
+            "{auth:?}"
+        );
+    }
+    let (status, _, _) = call(
+        &router,
+        post_with("/v1/callback/closed", Some("Bearer stale")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (_, body, _) = call(
+        &router,
+        post_with("/v1/callback/closed", Some("Bearer good")),
+    )
+    .await;
+    assert_eq!(body["principal"], true);
+    // Only the exact method and path: GET on the open path is not exempt.
+    let get = Request::get("/v1/callback/open")
+        .header("authorization", "Bearer stale")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(call(&router, get).await.0, StatusCode::UNAUTHORIZED);
+}
+
+/// Declares one credential-free path, valid or not.
+struct Declares(&'static str, &'static str);
+impl Module for Declares {
+    fn name(&self) -> &'static str {
+        self.0
+    }
+    fn credential_free_routes(&self) -> Vec<merezha_platform::CredentialFreeRoute> {
+        vec![merezha_platform::CredentialFreeRoute {
+            method: axum::http::Method::POST,
+            path: self.1,
+        }]
+    }
+}
+
+#[tokio::test]
+async fn a_credential_free_path_cannot_reach_outside_its_module() {
+    // `/v1/call` + `back/closed` would exempt another module's route.
+    let error = Host::start(
+        ProjectConfig::parse(
+            "[app]\nid = \"notes-app\"\n[database]\nurl = { env = \"NOTES_DATABASE_URL\" }\n[runtime]\nmanifest = \"runtime.toml\"\n",
+            std::env::temp_dir(),
+            &[("NOTES_DATABASE_URL".into(), "postgres://127.0.0.1:1/none".into())],
+            &[],
+        )
+        .unwrap(),
+        vec![Box::new(Callback), Box::new(Declares("call", "back/closed"))],
+        parts(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        (error.failure.code.as_str(), error.module),
+        ("invalid_credential_free_route", Some("call"))
+    );
+    for bad in [
+        "back/closed",
+        "/a/../b",
+        "/a%2fb",
+        "//x",
+        "/a?b",
+        "/a#b",
+        "",
+    ] {
+        assert!(
+            !merezha_platform::host::valid_credential_free_path(bad),
+            "{bad}"
+        );
+    }
+    assert!(merezha_platform::host::valid_credential_free_path(
+        "/unsubscribe"
+    ));
+    // A valid one still works beside the other module.
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let host = Host::start(
+        config(&test, true, ""),
+        vec![Box::new(Callback), Box::new(Declares("call", "/back"))],
+        parts(),
+    )
+    .await
+    .unwrap();
+    let (status, _, _) = call(
+        &host.router(),
+        Request::post("/v1/callback/open")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}

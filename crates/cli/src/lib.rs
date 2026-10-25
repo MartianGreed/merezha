@@ -106,10 +106,7 @@ pub fn identity_module(input: &merezha_platform::ConfigInput) -> merezha_identit
     let added = identity
         .add_block_permissions("content", &merezha_content::CONTENT_PERMISSIONS)
         .and_then(|()| {
-            identity.add_block_permissions(
-                "notifications",
-                &[merezha_notifications::PREVIEW_PERMISSION],
-            )
+            identity.add_block_permissions("notifications", &merezha_notifications::PERMISSIONS)
         });
     debug_assert!(added.is_ok(), "block permissions follow the grammar");
     identity.add_resource_kinds(&[merezha_content::RESOURCE_KIND]);

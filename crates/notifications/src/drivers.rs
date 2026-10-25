@@ -364,7 +364,8 @@ mod tests {
         assert_eq!(
             merezha_postgres::check_registry(&[
                 merezha_postgres::KERNEL_STATEMENTS,
-                super::STATEMENTS
+                super::STATEMENTS,
+                crate::sql::STATEMENTS,
             ]),
             Ok(())
         );

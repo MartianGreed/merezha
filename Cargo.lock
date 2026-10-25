@@ -1880,16 +1880,24 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
+ "hmac",
  "jiff",
  "merezha-application",
  "merezha-domain",
+ "merezha-jobs",
+ "merezha-notifications",
  "merezha-platform",
  "merezha-postgres",
+ "merezha-telemetry",
  "minijinja",
+ "opentelemetry",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
+ "subtle",
  "tempfile",
  "tokio",
+ "tokio-postgres",
  "toml",
  "tower",
  "tracing",
@@ -3050,6 +3058,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3823,6 +3837,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
 dependencies = [
  "js-sys",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

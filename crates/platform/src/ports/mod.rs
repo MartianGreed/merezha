@@ -148,7 +148,8 @@ mod tests {
         ];
         request.tenant = Some(id("org_1"));
         request.members = vec![id("usr_1")];
-        for source in ["application", "api"] {
+        // Fails closed: every source but identity is checked.
+        for source in ["application", "api", "notifications", "content"] {
             assert_eq!(
                 check_members(&Source::new(source).unwrap(), &request),
                 Err(NotifyError::RecipientNotInTenant)
@@ -243,6 +244,7 @@ mod tests {
     #[tokio::test]
     async fn the_empty_directory_resolves_nothing() {
         let directory = EmptyDirectory;
+        assert!(!directory.resolves());
         assert!(directory.users(&[id("usr_1")]).await.unwrap().is_empty());
         let too_many = vec![id("usr_1"); MAX_USERS_PER_CALL + 1];
         assert_eq!(

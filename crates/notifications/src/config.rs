@@ -257,6 +257,16 @@ impl KeyMaterial {
     pub fn expose(&self) -> &[u8] {
         &self.0
     }
+    /// Key material from decoded bytes: at least 32, as `secret_key`
+    /// requires; `None` otherwise. For tools and tests that sign tokens
+    /// the block verifies.
+    pub fn from_bytes(bytes: Vec<u8>) -> Option<Self> {
+        (bytes.len() >= 32).then_some(Self(bytes))
+    }
+    #[cfg(test)]
+    pub(crate) fn for_tests(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
 }
 impl std::fmt::Debug for KeyMaterial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

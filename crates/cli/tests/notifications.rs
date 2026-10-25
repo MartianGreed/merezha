@@ -85,6 +85,30 @@ fn check_accepts_a_valid_section_and_summarises_it() {
     assert_eq!(report["templates"], 10);
     assert_eq!(report["locales"], serde_json::json!(["en", "fr"]));
     assert_eq!(report["email"], "capture");
+    assert_eq!(report["warnings"], serde_json::json!([]));
+}
+
+/// NT-N1 review: with the email driver disabled, built-in security mail is
+/// recorded as skipped (`channel_disabled`) and never sent, so the check
+/// warns while still answering ok.
+#[test]
+fn check_warns_when_security_mail_is_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = project(
+        dir.path(),
+        "[modules.notifications]\nsecret_key = { env = \"NOTIFY_KEY\" }\n\
+         [modules.notifications.email]\ndriver = \"disabled\"\n",
+    );
+    let (code, report) = check(&config, &[("NOTIFY_KEY", KEY)]);
+    assert_eq!(code, Some(0), "{report}");
+    assert_eq!(report["status"], "ok");
+    assert_eq!(
+        report["warnings"],
+        serde_json::json!([{
+            "key": "modules.notifications.email.driver",
+            "code": "security_mail_disabled"
+        }])
+    );
 }
 
 #[test]

@@ -331,6 +331,7 @@ pub struct EdgeSettings {
     metrics: HttpMetrics,
     starting: bool,
     body_limits: Vec<(Method, String, usize)>,
+    credential_free: Vec<(Method, String)>,
 }
 impl std::fmt::Debug for EdgeSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -353,7 +354,17 @@ impl EdgeSettings {
             metrics: HttpMetrics::noop(),
             starting: false,
             body_limits: Vec::new(),
+            credential_free: Vec::new(),
         }
+    }
+    /// Routes that take no credential (`Module::credential_free_routes`),
+    /// as `(method, full path)`: for an exact match the edge never calls the
+    /// authenticator (no session lookup, no Origin or CSRF check, no
+    /// rejection of a stale cookie) and inserts `Authenticated(None)`, so
+    /// the route cannot see a principal even when the request carries one.
+    pub fn credential_free_routes(mut self, routes: Vec<(Method, String)>) -> Self {
+        self.credential_free = routes;
+        self
     }
     /// Routes that bound their own body (`Module::body_limits`), as
     /// `(method, full path, limit)`: for an exact match the edge stops the
@@ -389,6 +400,7 @@ struct EdgeState {
     trusted: Arc<[Cidr]>,
     body_limit: usize,
     route_limits: Arc<[(Method, String, usize)]>,
+    credential_free: Arc<[(Method, String)]>,
     authenticator: Option<Arc<dyn Authenticator>>,
     errors: Arc<ErrorRegistry>,
     trust: TrustInbound,
@@ -405,6 +417,7 @@ pub fn apply(router: Router, settings: EdgeSettings) -> Router {
         trusted: http.trusted_proxies.clone().into(),
         body_limit: http.body_limit,
         route_limits: settings.body_limits.clone().into(),
+        credential_free: settings.credential_free.clone().into(),
         authenticator: settings.authenticator.clone(),
         errors: settings.errors.clone(),
         trust: settings.trust,
@@ -936,6 +949,16 @@ async fn limit_body(State(state): State<EdgeState>, request: Request, next: Next
 }
 
 async fn authenticate(State(state): State<EdgeState>, request: Request, next: Next) -> Response {
+    // A credential-free route never sees the authenticator or a principal.
+    if state
+        .credential_free
+        .iter()
+        .any(|(method, path)| request.method() == method && request.uri().path() == path)
+    {
+        let mut request = request;
+        request.extensions_mut().insert(Authenticated(None));
+        return next.run(request).await;
+    }
     let Some(authenticator) = state.authenticator.clone() else {
         return next.run(request).await;
     };

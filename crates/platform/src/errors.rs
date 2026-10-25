@@ -153,6 +153,8 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("http_client_config", 422),
     ErrorCode::new("module_start_failed", 422),
     ErrorCode::new("blob_store_conflict", 422),
+    ErrorCode::new("notifier_conflict", 422),
+    ErrorCode::new("invalid_credential_free_route", 422),
     ErrorCode::new("telemetry_initialized", 422),
     ErrorCode::new("invalid_telemetry_ca", 422),
     ErrorCode::new("telemetry_exporter_failed", 422),

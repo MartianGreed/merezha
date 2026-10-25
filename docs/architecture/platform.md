@@ -799,6 +799,8 @@ Guest calls, dispatch and projections are instrumented (TE-T3; TE §1.2,
 | `routes(&AppContext)` | an axum `Router` nested under `/v1/<name>` |
 | `ready()` | readiness contribution, answered within 1 s |
 | `blob_store()` | the `BlobStore` it provides to every context, opened from its settings; `Ok(None)` (default) provides none. Asked once after `configure`, before any module starts; a failure stops startup naming the module, a second provider stops it with `blob_store_conflict`. Content provides the store `[modules.content.media]` configures |
+| `notifier()` | the `NotifierFactory` it provides to every context in place of the capture fallback; `None` (default) provides none. Asked once after `configure`, before any module starts, so a module that starts earlier already binds it; a second provider stops startup with `notifier_conflict`. The factory answers `unavailable` until its module started. The notifications block provides it |
+| `credential_free_routes()` | `CredentialFreeRoute { method, path }` for routes that take no credential (a signed link, a provider callback): for an exact match the edge never runs the authenticator (no session lookup, Origin or CSRF check, no refusal of a stale cookie) and inserts `Authenticated(None)`, so such a route cannot see a principal and must never act on one; default none. A path must start with `/` and hold no `..`, `%`, `//`, query or fragment; the host prefixes `/v1/<name>` and refuses any other path at startup with `invalid_credential_free_route`. Notifications declares `GET` and `POST /unsubscribe` |
 | `body_limits()` | `RouteBodyLimit { method, path, limit }` for routes that bound their own body (the upload route): the edge reads such a body up to `limit` instead of `http.body_limit` and leaves a declared length to the route; default none |
 | `shutdown(deadline)` | stop and drain background work after the listener drained |
 
@@ -860,7 +862,8 @@ register blocks.
 `AppContext::builder` starts from the disabled-block fallbacks; blocks replace
 them through the builder (`outbox`, `jobs`, `notifications`, `directory`,
 `authenticator`, `blobs`, `telemetry`). `Host::start` installs the blob
-store a module provides (`Module::blob_store`) in every context.
+store a module provides (`Module::blob_store`) and the notifier factory a
+module provides (`Module::notifier`) in every context.
 
 ## Ports
 
@@ -879,8 +882,8 @@ pass what they learned in (`NotificationRequest::members`).
 | `Authorizer` | extends the application `Authorizer` with `check(Option<&Principal>, permission, scope) -> Result<Allowed, AccessDenied>`; synchronous and I/O-free. Without a principal it denies `Unauthenticated` (401), otherwise `unauthorized` (403). Identity's `RbacAuthorizer` evaluates the principal's snapshot | `LoopbackAllowAll` on a private listener (constructible only for loopback addresses), `DenyAll` otherwise (401 anonymous, 403 with a principal) |
 | `Outbox` | `append(tx, source, &[OutboxRecord], OnDuplicate) -> Appended` (AP §B.3); records carry a `DedupeKey` (at most 160 bytes, R4a; `DedupeKey::api(subject, key)` namespaces HTTP keys), an `OutboxTarget` (`Event { topic }` or `Job { queue, kind }`), a JSON payload of at most 64 KiB, `contains_secret`, `run_at`, `priority` and a `MessageContext`; at most 256 records per call. `OutboxRecord::event(source, topic, NewEvent)` (or `SourceOutbox::event`) builds an event record whose payload is the `IntegrationEvent` envelope (R11). `JobFailure` carries the code, classification and `retry_after` job handlers report | `UnavailableOutbox`: fails `outbox_unavailable`, so the caller's transaction rolls back. `merezha_jobs::PgOutbox` is the PostgreSQL implementation |
 | `Jobs` | through `JobsHandle`: `enqueue(NewJob) -> Enqueued` in its own transaction, idempotent on the queue and `{source}:{key}`; `cancel(id)`; `register(kind, queue, Arc<dyn JobHandler>, KindOptions)` and `subscribe(topic, kind)` before the jobs runtime starts; `queue_status() -> QueueStatus` (per queue `ready`, `delayed`, `leased`, `dead`, `oldest_ready_age_s` and slots, plus the outbox backlog and up to 100 quarantined records), the read behind `GET /v1/jobs/admin/queues` and `outbox` and TE's status and gauges (R10). `JobHandler`, `JobContext`, `KindOptions` and `Reissue` are AP §B.3's; `NewJob` hides its payload from `Debug` | `UnavailableJobs`: every call fails `jobs_unavailable` |
-| `Notifier` | `validate(&request)` (pure), `request(tx, NotificationRequest)` and `emit_webhook(tx, WebhookEvent)` (NT §3.1); a webhook's `source_event_id` is an `EventId` of up to 225 bytes, room for `{source}:{dedupe_key}`. Requests carry topic, 1 to 100 recipients (`User`, `Tenant`, `Application { roles }`, `Address`), channels, template, `data`, `secret_data`, locale, dedupe key, tenant, `members`, `not_before`, `expires_at`, collapse key and correlation. For sources `application` and `api` with a tenant every user recipient must be in `members` (`recipient_not_in_tenant`). `Debug` never shows data, secret data or addresses. `NotifierFactory::bind(source)` hands out bound notifiers | `CaptureNotifications`: validates structurally, logs a redacted `notification.captured` warning, keeps the last 64 redacted records (never `data`, `secret_data` or addresses) and delivers nothing |
-| `Directory` | `users(ids)` (at most 100) to verified `Contact`s, `tenant_members(tenant, roles?, PageRequest)` and `application_members(roles?, PageRequest)` (pages of at most 500, keyset by user id), `is_member(user, tenant)` (R7). Installed through `HostOptions::directory`; identity's implements it | `EmptyDirectory`: resolves nothing; nobody is a member |
+| `Notifier` | `validate(&request)` (pure), `request(tx, NotificationRequest)` and `emit_webhook(tx, WebhookEvent)` (NT §3.1); a webhook's `source_event_id` is an `EventId` of up to 225 bytes, room for `{source}:{dedupe_key}`. Requests carry topic, 1 to 100 recipients (`User`, `Tenant`, `Application { roles }`, `Address`), channels, template, `data`, `secret_data`, locale, dedupe key, tenant, `members`, `not_before`, `expires_at`, collapse key and correlation. With a tenant every user recipient must be in `members` (`recipient_not_in_tenant`) for every source but `identity` (`MEMBERSHIP_EXEMPT_SOURCES`; the rule fails closed). `Debug` never shows data, secret data or addresses. `NotifierFactory::bind(source)` hands out bound notifiers | `CaptureNotifications`: validates structurally, logs a redacted `notification.captured` warning, keeps the last 64 redacted records (never `data`, `secret_data` or addresses) and delivers nothing. With `[modules.notifications]` the block's `BlockNotifiers` replaces it (`Module::notifier`) |
+| `Directory` | `users(ids)` (at most 100) to verified `Contact`s, `tenant_members(tenant, roles?, PageRequest)` and `application_members(roles?, PageRequest)` (pages of at most 500, keyset by user id), `is_member(user, tenant)` (R7). Installed through `HostOptions::directory`; identity's implements it. `resolves()` is `true` except for the fallback, so notifications can tell "no such user" from "no directory" | `EmptyDirectory`: resolves nothing; nobody is a member; `resolves()` is `false` |
 | `BlobStore` | `put(key, BlobBody, attrs) -> BlobStat` streaming, `get(key, range?) -> BlobRead` streaming, `head`, idempotent `delete`, `signed_get_url(key, ttl) -> Option<String>` (CT §6); `BlobKey` is 1 to 1024 bytes of `[A-Za-z0-9._-]` segments; `BlobError` maps to classified failures | `UnavailableBlobStore`: fails permanent `blob_store_unavailable`. `merezha_blob::ObjectBlobStore` is the local and S3 implementation |
 
 ## Identity block
@@ -961,10 +964,15 @@ runs is a registered `Statement` (`merezha_identity::sql::STATEMENTS`).
 
 At start the block refuses to run without a notification delivery path
 (`notifications_required`, logged as `module.start_failed`): verification
-and reset mail would be dropped by the capture fallback. Until the
-notifications block delivers (NT-N2), only `dev_print_links = true` on a
-private loopback listener starts it, and every link then appears on stderr
-as `identity.dev_link` (stderr only, never exported). It also registers the
+and reset mail would be dropped by the capture fallback. With
+`[modules.notifications]` present the block's notifier delivers (NT-N2:
+with the default capture driver, mail lands in `merezha_notify.captures`
+and `GET /v1/notifications/dev/captures`; a plain-http development
+`app_origin` needs `templates.allow_http_links = true`, since the `url`
+filter accepts `http:` only for loopback with it). Without the block, only
+`dev_print_links = true` on a private loopback listener starts it, and
+every link then appears on stderr as `identity.dev_link` (stderr only,
+never exported). It also registers the
 `identity.cleanup` and `identity.link_request` kinds on queue `identity` and
 the cleanup schedule (UTC), which
 deletes expired sessions and tokens, drained rate-limit buckets, audit rows
@@ -1120,10 +1128,11 @@ Aim for about 60 to 120 ms per hash on production cores.
 `merezha run` registers the notifications block (`crates/notifications`,
 [design](../design/notifications.md)). It stays off until
 `[modules.notifications]` is present. Slice NT-N1 ships its configuration,
-templates, previews and capture drivers; the `Notifier` (requests from other
-blocks), expansion, delivery workers and the other channels arrive with
-NT-N2 to NT-N8, so until then other blocks still get the kernel's capture
-fallback and nothing is sent.
+templates, previews and capture drivers. Slice NT-N2 adds the `Notifier`
+other blocks request through, expansion, the email and SMS delivery worker
+over the capture drivers, the inbox REST routes, preferences, suppressions,
+unsubscribe, `send`, `status` and `redeliver`. Brevo (NT-N3, NT-N4), the
+SSE stream (NT-N5), push (NT-N6) and webhook fan-out (NT-N7) come later.
 
 ```toml
 [modules.notifications]
@@ -1141,7 +1150,9 @@ cargo run --locked -p merezha-cli -- notifications check --config merezha.toml
 
 It loads the whole configuration as `merezha run` does and prints one JSON
 object on stdout: `status` `ok` with the topic and template counts, the
-locales and the channel drivers, and exit code 0; or `status` `invalid` with
+locales, the channel drivers and `warnings` (`[{key, code}]`, such as
+`security_mail_disabled` when `email.driver = "disabled"` drops identity's
+mail to `skipped`), and exit code 0; or `status` `invalid` with
 `issues: [{key, code, origin}]` and exit code 2. `merezha run` refuses to start on the same issues
 (`invalid_config`). Issues name settings and template files, never values.
 
@@ -1150,7 +1161,13 @@ locales and the channel drivers, and exit code 0; or `status` `invalid` with
 - Migration 1 (`core`) creates the schema `merezha_notify` with the core
   tables of NT §2.4: `notifications`, `deliveries`, `delivery_attempts`,
   `provider_events`, `preferences`, `user_settings`, `suppressions` and
-  `captures`. Its checksum is pinned by a test; later slices add migrations.
+  `captures`. Migration 2 (`inbox`, NT-N2) adds `inbox_counters` and
+  `inbox_items`, stores user and tenant ids as text and adds the deliveries'
+  recipient `name`. Both checksums are pinned by a test; later slices add
+  migrations.
+- At start the block registers `notify.expand` (queue `notify.expand`),
+  the delivery kinds of its capture drivers and the maintenance kinds and
+  schedules with the jobs runtime.
 - The block claims the `api` source (`Module::extra_sources`) for its HTTP
   send route.
 - Routes under `/v1/notifications/`:
@@ -1172,6 +1189,128 @@ locales and the channel drivers, and exit code 0; or `status` `invalid` with
   idempotency key makes a second capture of the same generation answer
   duplicate, as Brevo does. Captures hold rendered
   secret data, which is why `http.public = true` refuses a capture driver.
+
+### Requests, expansion and delivery
+
+The block provides the `Notifier` of every context (`Module::notifier`),
+bound to the caller's source; without the block the kernel's capture
+fallback stays. `validate` checks the topic, template, channels (a subset
+of the topic's), 1 to `limits.max_recipients` recipients, reserved data keys
+and `limits.max_data_bytes` (data plus secret data), then dry-renders every
+requested channel in the default locale with strict undefined. `request`
+adds the membership rule (with a tenant, every user recipient in
+`members`, else `recipient_not_in_tenant`, for every source but `identity`)
+and
+appends one job record (`notify.expand`, outbox source `notifications`, key
+`request:{notification_id}`, flagged `contains_secret` when the request has
+`secret_data`, `run_at = not_before`) in the caller's transaction. It makes
+no Directory call and takes no other connection, so it completes on a pool
+whose only connection the caller holds. The notification id is
+`UUIDv5(source, dedupe_key)`, so the same key twice names one notification
+(`duplicate: true` while the outbox row is retained). `emit_webhook`
+appends a `notify.webhook_event` record for a declared event type
+(`[modules.notifications.webhooks]` present, else `webhooks_disabled`); its
+fan-out handler arrives with NT-N7, so these jobs wait unleased until then.
+Metrics label only declared topics; any other `notify.topic` is
+`unknown`.
+
+The `notify.expand` job resolves recipients through the `Directory` before
+it opens its transaction: `users` in batches of 100, tenant and application
+members a page at a time up to `limits.max_targets + 1`. It reads
+preferences, suppressions and time zones, then writes in one transaction
+the notification, one delivery per channel and target (the same mailbox
+from a user and an explicit address is one delivery), the inbox items
+numbered from the users' `inbox_counters` (locked in ascending user order),
+`pg_notify('merezha_notify_inbox', user)` and one job record per email or
+SMS delivery (`notify.deliver.<channel>`, key `deliver:{id}:g{generation}`,
+flagged when the request had secret data), at most 256 per append. A
+second run of the same job writes nothing. Deliveries that are not sent
+get `skipped` with a reason:
+
+| Reason | When |
+| --- | --- |
+| `unknown_user` | the Directory did not return the user |
+| `no_directory` | no identity block (`EmptyDirectory`): user, tenant and application recipients; addresses still work |
+| `channel_disabled` | the channel's driver is `disabled` or its section absent; with `email.driver = "disabled"` built-in security mail is recorded this way and `merezha notifications check` warns `security_mail_disabled` |
+| `preference` | the user's `(topic, channel)` or `('*', channel)` preference is off, or the channel is outside a transactional topic's `default_channels` without an opt-in; security topics ignore preferences |
+| `not_opted_in` | a marketing topic without the user's explicit `enabled = true` for the topic and channel |
+| `suppressed` | a suppression covers the address: `invalid` for every topic, the other reasons for non-security topics (topic-scoped ones for their topic only) |
+| `no_subscription` | push targets, until NT-N6 adds subscriptions |
+
+More targets than `limits.max_targets` (or `max_marketing_targets` for a
+marketing topic) reject the notification (`status = rejected`,
+`status_reason = too_many_targets`) with no deliveries. A request past
+`expires_at` expands its deliveries as `expired`. Inbox items are rendered
+during expansion and stored with `expires_at = now + inbox.retention`;
+inbox deliveries are created `delivered`.
+
+The delivery worker (`notify.deliver.email`, `notify.deliver.sms`)
+registers only for a `capture` driver in this slice; with a `brevo` driver
+the delivery jobs wait in `notify.email` / `notify.sms` until NT-N3/N4
+deploys. Per attempt it locks the delivery (another generation or a
+settled delivery is done; past `expires_at` it becomes `expired`;
+suppressions and preferences are checked again), commits attempt `n + 1`
+as `started`, renders from the stored data and the job's secret data, sends
+before `min(10 s, job deadline - 2 s)` and records the outcome: `accepted`
+(capture), `retrying` with the job retried, `failed` with a reason
+(`render_failed`, `data_purged`, `secret_purged`, `invalid_address`,
+`retries_exhausted` on the last attempt), or `unknown` for an ambiguous SMS
+(never resent, NT1). A last attempt still `started` is ambiguous: email
+resends with the same idempotency key (`UUIDv5(delivery_id,
+"g{generation}")`, which the capture driver answers as duplicate), SMS
+becomes `unknown`. Non-security email carries an unsubscribe link when
+`public_base_url` is set.
+
+Secret data is rendered into email and SMS, never into the inbox, never
+stored in a `merezha_notify` table other than the development `captures`,
+never logged; it lives only in the flagged expansion and delivery job
+payloads, which the relay and the jobs runtime null (R3). Identity's user
+and tenant ids are stored as text (migration 2).
+
+Maintenance, each a cron schedule on queue `notify.maintenance` (UTC):
+
+| Task (kind `notify.maintenance.<task>`) | Cron | Work |
+| --- | --- | --- |
+| `settle_notifications` | every minute | sets `settled_at` on notifications whose deliveries all settled, 1,000 per batch |
+| `purge_data` | every 5 minutes | nulls `data` (and the deliveries' recipient names) of notifications settled more than `retention.data_after_settled` ago; counts `merezha.notification.data_purged` |
+| `inbox_expire` | hourly | deletes items past `expires_at` or archived more than `inbox.archived_retention` ago, 100 users per transaction in ascending order, raising each user's `purged_through` |
+
+### Routes of NT-N2
+
+Under `/v1/notifications/`. Self routes need a principal of kind `user`
+(401 without one, 403 for API keys) and act on its user; application routes
+check their permission at `Application` scope.
+
+| Method and path | Access | Answer |
+| --- | --- | --- |
+| `POST send` | `notifications.send` | body: `topic`, `recipients` (`{user: "usr_.." \| {id}}`, `{tenant: {id, roles?}}`, `{application: {roles}}`, `{address: {email, name?, locale?}}`, `{address: {phone, locale?}}`), `channels?`, `template?`, `data?`, `secret_data?`, `locale?`, `dedupe_key` (stored as `api:{subject}:{key}`, at most 160 bytes in all, R4a), `tenant?`, `not_before?` (at most 30 days ahead, else 422 `validation_failed` at `/not_before`), `expires_at?` (after `not_before`, else at `/expires_at`), `collapse_key?`. With a tenant, user recipients are checked with `Directory::is_member` before the transaction. 202 `{notification_id, duplicate}`; 422 `invalid_dedupe_key`, `unknown_topic`, `unknown_template`, `channel_not_allowed`, `too_many_recipients`, `invalid_recipient`, `recipient_not_in_tenant`, `reserved_data_key`, `data_too_large`, `render_failed`; 503 `unavailable` (Directory) |
+| `GET status/{notification_id}` | `notifications.status.read` for the caller's own sends (source `api`, key `api:{subject}:…`); `notifications.admin` for every notification; 404 otherwise | `{id, topic, status, status_reason, created_at, settled_at, deliveries: [{id, channel, status, status_reason, attempt_count, target, accepted_at, settled_at}]}`, targets masked (`a***@example.com`, `+33•••••••78`, `push`, `inbox`), at most 1,000 deliveries; 404 |
+| `POST deliveries/{id}/redeliver` | `notifications.admin` | 202 `{generation}`: a new generation and job; 409 `not_redeliverable` (not `failed`, `unknown` or `expired`, or an inbox or push delivery), 409 `secret_purged` (the request had secret data), 410 `data_purged`; 404 |
+| `GET inbox?cursor=&limit=&state=unread\|all&topic=&tenant=` | self | `{items: [InboxItem], next_cursor}`, newest first, 1 to 100 (default 30), archived items hidden; 400 `invalid_cursor` |
+| `GET inbox/unread-count?tenant=` | self | `{unread}` |
+| `POST inbox/{id}/read`, `…/unread`, `…/archive` | self | the `InboxItem`; a change takes the next number of the user's counter as `change_seq`; a no-op takes none. 404 for another user's item |
+| `POST inbox/read-all` | self | `{up_to_seq?, tenant?}`: `{updated}`, at most 10,000 items |
+| `GET preferences` | self | `{topics: [{topic, category, description, channels: [{channel, enabled, configurable}]}], settings: {timezone}}`; security and other non-configurable topics are hidden |
+| `PUT preferences` | self | `{preferences: [{topic \| "*", channel, enabled}], settings?: {timezone}}`, at most 200 entries, upserted; 422 `topic_not_configurable` (with `details`), `invalid_timezone` |
+| `POST unsubscribe` | token | the RFC 8058 form `List-Unsubscribe=One-Click` with `?token=`, or JSON `{token}`: a user token writes `(user, topic, email, false)`, an address token a topic-scoped `unsubscribed` suppression; 200 `{}`; 400 `token_invalid` |
+| `GET unsubscribe?token=` | token | changes nothing: 303 to `links.unsubscribe_page?token=…` when set, else a page with one POST button; 400 `token_invalid` |
+| `GET suppressions?channel=&address=&cursor=` | `notifications.suppressions.manage` | `{items: [{id, channel, address, topic, reason, created_at}], next_cursor}`, 100 per page |
+| `POST suppressions`, `DELETE suppressions/{id}` | same | `{channel: email\|sms, address, topic?, reason: "manual"}`: 201 with the suppression (an existing one for the same key is returned); 204; 404 |
+
+`InboxItem` is `{id, topic, title, body, link, payload, tenant_id, seq,
+change_seq, created_at, read_at, archived_at}`. Every inbox route sees the
+items without a tenant plus those of the principal's active tenant; a
+principal without an active tenant sees only the tenantless ones. A
+`tenant` parameter naming another tenant than the active one answers 403
+`unauthorized`, and another tenant's item answers 404. Unsubscribe tokens are
+`v1.<b64url(claims)>.<b64url(HMAC-SHA256(k_unsub, "v1." + b64url(claims)))>`
+with `k_unsub = HKDF-SHA256(secret_key, "merezha-notify/unsubscribe/v1")`;
+tokens signed with `secret_key_previous` still verify and never expire.
+A token must name exactly one of a user and an address, the `email`
+channel and a configured, user-configurable topic. Both unsubscribe routes
+are credential-free (`Module::credential_free_routes`): a browser holding a
+session cookie without its CSRF header, or a stale cookie, unsubscribes
+like a mail client.
 
 ### Templates
 

@@ -111,6 +111,168 @@ fn run_refuses_email_flows_without_a_delivery_path() {
     );
 }
 
+/// NT-N2 through the binary: with the notifications block present the host
+/// installs its notifier in every context, so identity starts without
+/// printed links and its verification mail is expanded, delivered through
+/// the capture driver and listed on loopback.
+#[test]
+fn run_delivers_identity_mail_through_the_notifications_block() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let config = project(
+        dir.path(),
+        // The development origin is plain http on loopback.
+        "\n[modules.notifications]\nsecret_key = { env = \"NOTIFY_KEY\" }\n\
+         [modules.notifications.templates]\nallow_http_links = true\n\
+         [modules.notifications.topics.\"tasks.assigned\"]\ncategory = \"transactional\"\n\
+         channels = [\"email\"]\ntemplate = \"identity.password_changed\"\n",
+    );
+    let mut host = Host::spawn(
+        &config,
+        &[
+            ("IDENTITY_TEST_DATABASE_URL", test.url()),
+            ("IDENTITY_SECRET", SECRET),
+            ("NOTIFY_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="),
+        ],
+        "notify",
+    );
+    let address = host.ready();
+    let registered = call(
+        address,
+        "POST",
+        "/v1/identity/registrations",
+        &[("Origin", "http://localhost:5173")],
+        &json!({"email": "ada@example.com", "password": "correct horse battery staple"})
+            .to_string(),
+    );
+    assert_eq!(registered.status, 202, "{}", registered.body);
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let capture = loop {
+        let listed = call(address, "GET", "/v1/notifications/dev/captures", &[], "");
+        assert_eq!(listed.status, 200, "{}", listed.body);
+        if let Some(first) = listed.body.as_array().and_then(|a| a.first()) {
+            break first.clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "no mail captured");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(capture["channel"], "email");
+    assert_eq!(capture["target"], "ada@example.com");
+    assert_eq!(capture["rendered"]["topic"], "identity.verify_email");
+    assert!(
+        capture["rendered"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("http://localhost:5173/auth/verify-email#token="),
+        "{capture}"
+    );
+    let text = std::fs::read_to_string(&host.log).unwrap();
+    assert!(!text.contains("#token="), "the link is never logged");
+    assert!(
+        !host
+            .events()
+            .iter()
+            .any(|e| e["event"] == "notification.captured"),
+        "not the kernel capture fallback"
+    );
+
+    // A signed-in browser unsubscribes: the route is credential-free, so
+    // neither its session cookie without a CSRF header nor a stale cookie
+    // stops it (the identity authenticator never runs there).
+    let token = capture["rendered"]["text"]
+        .as_str()
+        .unwrap()
+        .split_once("#token=")
+        .unwrap()
+        .1
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let origin = [("Origin", "http://localhost:5173")];
+    let confirmed = call(
+        address,
+        "POST",
+        "/v1/identity/email-verifications/confirm",
+        &origin,
+        &json!({"token": token}).to_string(),
+    );
+    assert_eq!(confirmed.status, 201, "{}", confirmed.body);
+    let user = confirmed.body["user"]["id"].as_str().unwrap().to_owned();
+    let cookie = confirmed
+        .headers
+        .lines()
+        .find(|l| {
+            l.to_ascii_lowercase()
+                .starts_with("set-cookie: merezha_session=")
+        })
+        .and_then(|l| l.split_once(": "))
+        .map(|(_, v)| v.split(';').next().unwrap().to_owned())
+        .expect("the session cookie");
+    let keys = merezha_notifications::keys::Keys::new(
+        &merezha_notifications::config::KeyMaterial::from_bytes(
+            b"0123456789abcdef0123456789abcdef".to_vec(),
+        )
+        .unwrap(),
+        None,
+    );
+    let unsubscribe = keys.unsubscribe_token(&merezha_notifications::keys::Unsubscribe {
+        u: Some(user),
+        a: None,
+        t: "tasks.assigned".into(),
+        c: "email".into(),
+        iat: 1,
+    });
+    // Without the exemption a cookie request lacking its CSRF header fails.
+    let refused = call(
+        address,
+        "POST",
+        "/v1/notifications/inbox/read-all",
+        &[("Cookie", &cookie), ("Origin", "http://localhost:5173")],
+        "{}",
+    );
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    for cookie in [
+        cookie.as_str(),
+        "merezha_session=mzs_stale0000000000000000000000000000000000000",
+    ] {
+        let done = call(
+            address,
+            "POST",
+            "/v1/notifications/unsubscribe",
+            &[("Cookie", cookie), ("Origin", "http://localhost:5173")],
+            &json!({"token": unsubscribe}).to_string(),
+        );
+        assert_eq!(done.status, 200, "{cookie}: {}", done.body);
+        let page = call(
+            address,
+            "GET",
+            &format!("/v1/notifications/unsubscribe?token={unsubscribe}"),
+            &[("Cookie", cookie)],
+            "",
+        );
+        assert_eq!(page.status, 200, "{cookie}");
+    }
+    let preferences = call(
+        address,
+        "GET",
+        "/v1/notifications/preferences",
+        &[("Cookie", &cookie)],
+        "",
+    );
+    assert_eq!(preferences.status, 200, "{}", preferences.body);
+    let assigned = preferences.body["topics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["topic"] == "tasks.assigned")
+        .cloned()
+        .unwrap();
+    assert_eq!(assigned["channels"][0]["enabled"], false, "{assigned}");
+}
+
 #[test]
 fn run_serves_identity_with_printed_links_on_loopback() {
     let Some(test) = TestDatabase::create() else {

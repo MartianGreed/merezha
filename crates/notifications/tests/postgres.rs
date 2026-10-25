@@ -35,6 +35,8 @@ use uuid::Uuid;
 /// every database it already ran on (`migration_checksum_mismatch`), so the
 /// text is frozen: later slices add migrations instead.
 const CORE_CHECKSUM: &str = "40f9a70cd7cacfcc33d316f559a3cf499925152663fe5a1ad271add029cfdb70";
+/// SHA-256 of migration 2 (NT-N2, the inbox), frozen the same way.
+const INBOX_CHECKSUM: &str = "1198acd9b4ea2b7011fde9c174ec04e77b9d0d9a8aeeecc1b35af244a9dd9bf8";
 
 /// A distinct id per call.
 fn fresh() -> Uuid {
@@ -53,9 +55,11 @@ fn soon() -> Instant {
 
 #[test]
 fn migration_checksum_is_pinned() {
-    assert_eq!(MIGRATIONS.len(), 1);
+    assert_eq!(MIGRATIONS.len(), 2);
     assert_eq!((MIGRATIONS[0].version, MIGRATIONS[0].name), (1, "core"));
     assert_eq!(checksum(MIGRATIONS[0].sql), CORE_CHECKSUM);
+    assert_eq!((MIGRATIONS[1].version, MIGRATIONS[1].name), (2, "inbox"));
+    assert_eq!(checksum(MIGRATIONS[1].sql), INBOX_CHECKSUM);
 }
 
 async fn migrated() -> Option<(TestDatabase, Database)> {
@@ -68,12 +72,12 @@ async fn migrated() -> Option<(TestDatabase, Database)> {
     let report = run_migrations(&db, &declared, MigrationMode::Apply, soon())
         .await
         .unwrap();
-    assert_eq!(report.applied.len(), 1);
+    assert_eq!(report.applied.len(), 2);
     Some((test, db))
 }
 
 #[tokio::test]
-async fn migration_one_creates_the_core_tables() {
+async fn migrations_create_the_core_and_inbox_tables() {
     let Some((_test, db)) = migrated().await else {
         return;
     };
@@ -101,6 +105,8 @@ async fn migration_one_creates_the_core_tables() {
             "captures",
             "deliveries",
             "delivery_attempts",
+            "inbox_counters",
+            "inbox_items",
             "notifications",
             "preferences",
             "provider_events",
@@ -262,6 +268,9 @@ async fn the_host_starts_the_block_with_its_migration_source_and_routes() {
     let (config, modules) = host::configure(&input, modules).unwrap();
     assert_eq!(modules.len(), 1);
     assert_eq!(modules[0].extra_sources(), ["api"]);
+    // The block registers its job handlers and schedules with the jobs
+    // runtime, which `merezha run` always installs.
+    let jobs = Arc::new(merezha_jobs::PgJobs::new(&config.jobs));
     let host = Host::start(
         config,
         modules,
@@ -269,12 +278,26 @@ async fn the_host_starts_the_block_with_its_migration_source_and_routes() {
             routes: axum::Router::new(),
             authorizer: Arc::new(LoopbackAllowAll::new("127.0.0.1:8080".parse().unwrap()).unwrap()),
             timeouts: Timeouts::default(),
-            jobs: None,
+            jobs: Some(jobs.clone()),
         },
     )
     .await
     .unwrap();
     assert!(host.migrations().is_current());
+    let kinds: Vec<String> = jobs
+        .registrations()
+        .iter()
+        .map(|r| r.kind.as_str().to_owned())
+        .collect();
+    for kind in [
+        "notify.expand",
+        "notify.deliver.email",
+        "notify.maintenance.settle_notifications",
+        "notify.maintenance.purge_data",
+        "notify.maintenance.inbox_expire",
+    ] {
+        assert!(kinds.iter().any(|k| k == kind), "{kind} not in {kinds:?}");
+    }
     assert_eq!(
         host.errors().status_of("render_failed").map(|s| s.as_u16()),
         Some(422)

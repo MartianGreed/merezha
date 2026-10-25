@@ -216,8 +216,8 @@ pub struct NotificationRequest {
     pub tenant: Option<TenantId>,
     /// `User` recipients the caller confirmed as members of `tenant` through
     /// `Directory::is_member` before it opened its transaction (NT §3.2).
-    /// For sources `application` and `api` with a tenant, every `User`
-    /// recipient must be listed, else `recipient_not_in_tenant`. Identity
+    /// With a tenant, every `User` recipient must be listed, else
+    /// `recipient_not_in_tenant`, for every source but identity, which
     /// leaves it empty: an invitation targets a non-member.
     pub members: Vec<UserId>,
     pub not_before: Option<Timestamp>,
@@ -377,13 +377,16 @@ pub trait Notifier: Send + Sync {
     ) -> BoxFuture<'a, Result<WebhookEventHandle, NotifyError>>;
 }
 
-/// Sources whose tenant requests must list every user recipient in
-/// [`NotificationRequest::members`] (R4).
-pub const MEMBERSHIP_CHECKED_SOURCES: [&str; 2] = ["application", "api"];
+/// The only sources whose tenant requests may name users outside
+/// [`NotificationRequest::members`]: identity, whose invitations address
+/// users who are not members yet (R4). Every other source fails closed.
+pub const MEMBERSHIP_EXEMPT_SOURCES: [&str; 1] = ["identity"];
 
-/// The membership rule of R4 for `source`, from the request alone.
+/// The membership rule of R4 for `source`, from the request alone: with a
+/// tenant, every `User` recipient must be listed in `members`, unless the
+/// source is exempt ([`MEMBERSHIP_EXEMPT_SOURCES`]).
 pub fn check_members(source: &Source, request: &NotificationRequest) -> Result<(), NotifyError> {
-    if request.tenant.is_none() || !MEMBERSHIP_CHECKED_SOURCES.contains(&source.as_str()) {
+    if request.tenant.is_none() || MEMBERSHIP_EXEMPT_SOURCES.contains(&source.as_str()) {
         return Ok(());
     }
     let outsider = request
