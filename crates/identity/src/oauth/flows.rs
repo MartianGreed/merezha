@@ -94,6 +94,9 @@ pub struct Callback {
     /// The registration binding cookie of an account created unverified:
     /// its verification link, clicked in this browser, keeps the identity.
     pub verify_binding: Option<SecretString>,
+    /// Clear the flow binding cookie: the callback was this browser's and
+    /// no other flow of it is pending.
+    pub clear_binding: bool,
 }
 impl std::fmt::Debug for Callback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -124,6 +127,22 @@ struct Linked {
     /// Committed, but the browser lands on the error page with this code
     /// (an account created unverified while verification is required).
     refused: Option<&'static str>,
+}
+
+/// A failed callback: its fragment code, and whether it named a live
+/// flow (only those are audited).
+#[derive(Clone, Copy, Debug)]
+struct Failed {
+    code: &'static str,
+    audit: bool,
+}
+impl Failed {
+    fn known(code: &'static str) -> Self {
+        Self { code, audit: true }
+    }
+    fn unknown(code: &'static str) -> Self {
+        Self { code, audit: false }
+    }
 }
 
 fn provider_unavailable(_: ProviderError) -> ApiError {
@@ -195,8 +214,14 @@ impl Core {
             .get(name)
             .cloned()
             .ok_or_else(|| ApiError::code("not_found"))?;
+        // Linking adds a way into the account: a recent session, as for
+        // passkey registration.
         let linking = match intent {
-            Intent::Link => Some(caller.ok_or_else(|| ApiError::code("unauthenticated"))?),
+            Intent::Link => {
+                let caller = caller.ok_or_else(|| ApiError::code("unauthenticated"))?;
+                self.require_recent(&caller)?;
+                Some(caller)
+            }
             Intent::SignIn => None,
         };
         self.charge(gcra::OAUTH_IP, Subject::Ip(client.ip), client)
@@ -223,6 +248,7 @@ impl Core {
                 pkce_verifier: verifier.expose_secret(),
                 nonce: nonce.as_ref().map(|n| n.expose_secret()),
             },
+            self.now(),
         )
         .await
         .map_err(provider_unavailable)?;
@@ -269,49 +295,79 @@ impl Core {
     /// binding cookie and `iss`, exchange the code, verify the ID token and
     /// apply the linking rules. Always a redirect: to `return_to` or
     /// `links.sign_in_redirect`, or to `links.oauth_error#error=<code>`.
+    /// Failed callbacks are charged to `oauth_callback.ip`, checked first.
+    /// `registration` is the registration binding cookie the browser
+    /// presents, reused by a sign-up that waits for verification.
     pub async fn oauth_callback(
         self: &Arc<Self>,
         client: &Client,
         name: &str,
         query: Option<CallbackQuery>,
         binding: Option<&str>,
+        registration: Option<&str>,
     ) -> Callback {
         let provider = self.oauth.get(name).cloned();
+        if self
+            .peek(gcra::OAUTH_CALLBACK_IP, Subject::Ip(client.ip), client)
+            .await
+            .is_err()
+        {
+            self.metrics.login_with(
+                "oauth",
+                "rate_limited",
+                provider.as_ref().map_or("unknown", |p| p.name()),
+            );
+            return Callback {
+                location: self.oauth_error("rate_limited"),
+                session: None,
+                verify_binding: None,
+                clear_binding: false,
+            };
+        }
+        let mut clear = false;
         let result = match (&provider, query) {
             (Some(provider), Some(query)) => {
-                self.callback_with(client, provider, query, binding).await
+                self.callback_with(client, provider, query, binding, registration, &mut clear)
+                    .await
             }
-            _ => Err("invalid_state"),
+            _ => Err(Failed::unknown("invalid_state")),
         };
         let label = provider.as_ref().map_or("unknown", |p| p.name());
         match result {
-            Ok((callback, None)) => {
+            Ok((mut callback, None)) => {
                 self.metrics.login_with("oauth", "success", label);
+                callback.clear_binding = clear;
                 callback
             }
-            Ok((callback, Some(code))) => {
-                self.failed_callback(client, provider.as_deref(), code)
+            Ok((mut callback, Some(code))) => {
+                self.failed_callback(client, provider.as_deref(), Failed::known(code))
                     .await;
+                callback.clear_binding = clear;
                 callback
             }
-            Err(code) => {
-                self.failed_callback(client, provider.as_deref(), code)
+            Err(failed) => {
+                self.failed_callback(client, provider.as_deref(), failed)
                     .await;
                 Callback {
-                    location: self.oauth_error(code),
+                    location: self.oauth_error(failed.code),
                     session: None,
                     verify_binding: None,
+                    clear_binding: clear,
                 }
             }
         }
     }
+    /// The metric always; the audit row only for a callback that named a
+    /// live flow (an unknown or forged `state` is noise an attacker makes
+    /// for free, so it stays a counter); the charge of the IP's budget.
     async fn failed_callback(
         self: &Arc<Self>,
         client: &Client,
         provider: Option<&Provider>,
-        code: &'static str,
+        failed: Failed,
     ) {
         let label = provider.map_or("unknown", |p| p.name());
+        let code = failed.code;
         self.metrics.login_with("oauth", outcome(code), label);
         merezha_telemetry::event!(
             DEBUG,
@@ -319,6 +375,11 @@ impl Core {
             method = "oauth",
             outcome = outcome(code)
         );
+        self.charge_failure(gcra::OAUTH_CALLBACK_IP, Subject::Ip(client.ip))
+            .await;
+        if !failed.audit {
+            return;
+        }
         let mut audit = Audit::new("oauth.sign_in_failed", Actor::Anonymous)
             .failed()
             .detail("reason", code);
@@ -334,25 +395,24 @@ impl Core {
         provider: &Arc<Provider>,
         query: CallbackQuery,
         binding: Option<&str>,
-    ) -> Result<(Callback, Option<&'static str>), &'static str> {
+        registration: Option<&str>,
+        clear: &mut bool,
+    ) -> Result<(Callback, Option<&'static str>), Failed> {
         let state = query
             .state
             .as_deref()
             .and_then(RawToken::decode)
-            .ok_or("invalid_state")?;
+            .ok_or(Failed::unknown("invalid_state"))?;
         // Consumed first, in its own transaction: a replayed or parallel
         // callback with the same `state` finds nothing.
         let flow = self
             .consume_flow(&state)
             .await
-            .map_err(|_| "oauth_failed")?
-            .ok_or("invalid_state")?;
-        if flow.provider != provider.name() || flow.expires_at <= self.now() {
-            return Err("invalid_state");
-        }
+            .map_err(|_| Failed::known("oauth_failed"))?
+            .ok_or(Failed::unknown("invalid_state"))?;
         // The browser that started the flow presents its binding cookie;
         // a callback finished in another browser (login CSRF, code
-        // injection) does not.
+        // injection) does not, and leaves that browser's cookie alone.
         let presented = binding.and_then(RawToken::decode).map(|b| b.digest());
         let bound = presented.is_some_and(|digest| {
             bool::from(subtle::ConstantTimeEq::ct_eq(
@@ -361,22 +421,41 @@ impl Core {
             ))
         });
         if !bound {
-            return Err("invalid_state");
+            return Err(Failed::known("invalid_state"));
+        }
+        // Cleared once no other flow of this browser is pending, so two
+        // tabs both complete.
+        *clear = self
+            .pending_flows(&flow.binding_hash)
+            .await
+            .is_ok_and(|n| n == 0);
+        if flow.provider != provider.name() || flow.expires_at <= self.now() {
+            return Err(Failed::known("invalid_state"));
         }
         if let Some(error) = &query.error {
-            return Err(if error == "access_denied" {
+            return Err(Failed::known(if error == "access_denied" {
                 "oauth_denied"
             } else {
                 "oauth_failed"
-            });
+            }));
         }
-        // RFC 9207: an `iss` naming another issuer is a mix-up.
-        if let (Some(iss), Some(issuer)) = (&query.iss, provider.issuer())
-            && iss != issuer
-        {
-            return Err("oauth_failed");
+        // RFC 9207: an `iss` naming another issuer is a mix-up, and a
+        // provider that advertises the parameter must send it.
+        match (&query.iss, provider.issuer()) {
+            (Some(iss), Some(issuer)) if iss != issuer => {
+                return Err(Failed::known("oauth_failed"));
+            }
+            (None, Some(_)) => {
+                let required = adapter::requires_iss(provider, &self.oauth_http(), self.now())
+                    .await
+                    .map_err(|e| Failed::known(e.code()))?;
+                if required {
+                    return Err(Failed::known("oauth_failed"));
+                }
+            }
+            _ => {}
         }
-        let code = query.code.as_deref().ok_or("oauth_failed")?;
+        let code = query.code.as_deref().ok_or(Failed::known("oauth_failed"))?;
         let redirect = redirect_uri(&self.settings.api_base_url, provider.name());
         let profile = adapter::exchange(
             provider,
@@ -391,15 +470,25 @@ impl Core {
             self.now(),
         )
         .await
-        .map_err(ProviderError::code)?;
-        let intent = Intent::parse(&flow.intent).ok_or("invalid_state")?;
+        .map_err(|e| Failed::known(e.code()))?;
+        let intent = Intent::parse(&flow.intent).ok_or(Failed::known("invalid_state"))?;
         let linked = self
-            .link_profile(client, provider, &flow, intent, profile)
+            .link_profile(
+                client,
+                provider,
+                &flow,
+                intent,
+                profile,
+                registration.map(str::to_owned),
+            )
             .await
-            .map_err(|e| match e.failure.code.as_str() {
-                "invalid_state" => "invalid_state",
-                _ => "oauth_failed",
-            })??;
+            .map_err(|e| {
+                Failed::known(match e.failure.code.as_str() {
+                    "invalid_state" => "invalid_state",
+                    _ => "oauth_failed",
+                })
+            })?
+            .map_err(Failed::known)?;
         let location = match linked.refused {
             Some(code) => self.oauth_error(code),
             None => self.landing(flow.return_to.as_deref()),
@@ -410,9 +499,25 @@ impl Core {
                 location,
                 session: linked.session,
                 verify_binding: linked.verify_binding.map(|b| b.encode()),
+                clear_binding: false,
             },
             linked.refused,
         ))
+    }
+
+    /// Live flows of a browser binding.
+    async fn pending_flows(&self, binding: &[u8]) -> Result<i64, Failure> {
+        let client = self.db().acquire(self.deadline()).await?;
+        Ok(self
+            .db()
+            .query_one(
+                &client,
+                &crate::sql::OAUTH_FLOWS_OF_BINDING,
+                &[&binding, &self.now()],
+            )
+            .await
+            .map_err(sql)?
+            .get(0))
     }
 
     async fn consume_flow(self: &Arc<Self>, state: &RawToken) -> Result<Option<FlowRow>, ApiError> {
@@ -452,6 +557,7 @@ impl Core {
         flow: &FlowRow,
         intent: Intent,
         profile: Profile,
+        registration: Option<String>,
     ) -> Result<Result<Linked, &'static str>, ApiError> {
         let email = profile
             .email
@@ -483,6 +589,7 @@ impl Core {
                     profile: &profile,
                     email: email.as_ref(),
                     asserted,
+                    registration: registration.as_deref(),
                 };
                 for _ in 0..3 {
                     if let Some(outcome) = link.attempt(tx, signed_in).await? {
@@ -636,6 +743,8 @@ struct LinkCtx<'a> {
     profile: &'a Profile,
     email: Option<&'a Email>,
     asserted: AssertedEmail,
+    /// The registration binding cookie the browser presents.
+    registration: Option<&'a str>,
 }
 impl LinkCtx<'_> {
     /// The trusted assertion names exactly this user's address.
@@ -645,7 +754,8 @@ impl LinkCtx<'_> {
                 .email
                 .is_some_and(|e| e.normalized() == user.email_normalized)
     }
-    async fn identity(&self, tx: &mut Tx<'_>) -> Result<Option<(Uuid, Uuid)>, Failure> {
+    /// The identity of `(provider, subject)`: its id, user and issuer.
+    async fn identity(&self, tx: &mut Tx<'_>) -> Result<Option<(Uuid, Uuid, String)>, Failure> {
         Ok(self
             .core
             .db()
@@ -656,7 +766,7 @@ impl LinkCtx<'_> {
             )
             .await
             .map_err(sql)?
-            .map(|r| (r.get(0), r.get(1))))
+            .map(|r| (r.get(0), r.get(1), r.get(2))))
     }
     /// Refresh the stored assertion of the identity of `user`; `false`
     /// when it is not (or no longer) theirs.
@@ -675,6 +785,7 @@ impl LinkCtx<'_> {
                     &(self.asserted == AssertedEmail::Trusted),
                     &now,
                     &user,
+                    &self.provider.identity_issuer(),
                 ],
             )
             .await
@@ -682,8 +793,14 @@ impl LinkCtx<'_> {
             .is_some())
     }
     /// Link the identity to `user` (locked by the caller); `false` when
-    /// `(provider, subject)` or `(user, provider)` is taken.
-    async fn insert(&self, tx: &mut Tx<'_>, user: Uuid) -> Result<bool, Failure> {
+    /// `(provider, subject)` or `(user, provider)` is taken. `notify`, the
+    /// existing account, gets the `identity.sign_in_method_added` notice.
+    async fn insert(
+        &self,
+        tx: &mut Tx<'_>,
+        user: Uuid,
+        notify: Option<&UserRow>,
+    ) -> Result<bool, Failure> {
         let id = self.core.new_id()?;
         let now = self.core.now();
         let inserted = self
@@ -700,6 +817,7 @@ impl LinkCtx<'_> {
                     &self.email.map(Email::normalized),
                     &(self.asserted == AssertedEmail::Trusted),
                     &now,
+                    &self.provider.identity_issuer(),
                 ],
             )
             .await
@@ -715,6 +833,17 @@ impl LinkCtx<'_> {
                     self.client,
                 )
                 .await?;
+            if let Some(owner) = notify {
+                self.core
+                    .method_added(
+                        tx,
+                        owner,
+                        "oauth",
+                        Some(&self.provider.settings.display_name),
+                        self.client,
+                    )
+                    .await?;
+            }
         }
         Ok(inserted)
     }
@@ -757,13 +886,21 @@ impl LinkCtx<'_> {
     ) -> Result<Option<Result<Linked, &'static str>>, ApiError> {
         let core = self.core;
         let linked = self.identity(tx).await?;
+        // An identity linked under another issuer is another principal:
+        // a changed issuer never re-maps its subjects onto accounts.
+        if linked
+            .as_ref()
+            .is_some_and(|(_, _, issuer)| *issuer != self.provider.identity_issuer())
+        {
+            return Ok(Some(Err("oauth_failed")));
+        }
         let existing = match self.email {
             Some(email) => core.user_by_email(tx, email.normalized(), false).await?,
             None => None,
         };
         let settings = &core.settings;
         let input = LinkInput {
-            linked_user: linked.map(|(_, user)| user),
+            linked_user: linked.as_ref().map(|(_, user, _)| *user),
             signed_in_user: signed_in.map(|(user, _)| user),
             email: self.asserted,
             existing_user: existing.as_ref().map(|u| (u.id, u.verified())),
@@ -801,7 +938,7 @@ impl LinkCtx<'_> {
                     return Ok(Some(Err("invalid_state")));
                 };
                 // The session that started the link must still be alive.
-                match core.session(tx, session_id).await? {
+                match core.hold_session(tx, session_id).await? {
                     Some(s) if s.user_id == user.id && s.alive(core.now()) => {}
                     _ => return Ok(Some(Err("invalid_state"))),
                 }
@@ -812,7 +949,7 @@ impl LinkCtx<'_> {
                     if !self.touch(tx, user.id).await? {
                         return Ok(None);
                     }
-                } else if !self.insert(tx, user.id).await? {
+                } else if !self.insert(tx, user.id, Some(&user)).await? {
                     // Still unlinked: the user holds another identity of
                     // this provider (one per provider per user).
                     return Ok(match self.identity(tx).await? {
@@ -849,7 +986,7 @@ impl LinkCtx<'_> {
                     core.claim_unverified(tx, &mut user, self.client).await?;
                     core.mark_verified(tx, &mut user, self.client).await?;
                 }
-                if !self.insert(tx, user.id).await? {
+                if !self.insert(tx, user.id, Some(&user)).await? {
                     return Ok(None);
                 }
                 let session = self.session(tx, &user).await?;
@@ -860,10 +997,15 @@ impl LinkCtx<'_> {
                     return Ok(Some(Err("email_unverified")));
                 };
                 let verified = self.asserted == AssertedEmail::Trusted;
+                // A browser that already holds a well-formed registration
+                // binding keeps it.
                 let binding = if verified {
                     None
                 } else {
-                    Some(RawToken::generate(core.ctx.random())?)
+                    Some(match self.registration.and_then(RawToken::decode) {
+                        Some(binding) => binding,
+                        None => RawToken::generate(core.ctx.random())?,
+                    })
                 };
                 let display_name = self
                     .profile
@@ -883,7 +1025,7 @@ impl LinkCtx<'_> {
                     // Registered meanwhile: decide again.
                     return Ok(None);
                 };
-                if !self.insert(tx, id).await? {
+                if !self.insert(tx, id, None).await? {
                     // The identity was linked meanwhile: roll the new
                     // account back.
                     return Err(Failure::conflict("conflict").into());

@@ -121,6 +121,23 @@ impl Provider {
     }
 }
 
+impl Provider {
+    /// What scopes this provider's subjects, stored with each identity:
+    /// the OIDC issuer, or GitHub's API base. An identity linked under
+    /// another issuer never signs in, so changing a provider's issuer never
+    /// re-maps subjects onto accounts.
+    pub fn identity_issuer(&self) -> String {
+        match self.issuer() {
+            Some(issuer) => issuer.to_owned(),
+            None => self
+                .endpoints
+                .api
+                .clone()
+                .unwrap_or_else(|| GITHUB_API.to_owned()),
+        }
+    }
+}
+
 /// The configured providers by name.
 #[derive(Clone, Debug, Default)]
 pub struct Providers {

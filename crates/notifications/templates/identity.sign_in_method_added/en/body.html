@@ -1,0 +1,6 @@
+{% extends "_layouts/email.html" %}
+{% block content %}
+<p>Hello{% if recipient.name %} {{ recipient.name }}{% endif %},</p>
+<p>A new way to sign in{% if method == "passkey" %} (a passkey){% elif provider is defined %} ({{ provider }}){% endif %} was added to your {{ app.name }} account.</p>
+<p>If this was you, there is nothing to do. If not, remove it from your account settings and reset your password now.</p>
+{% endblock %}

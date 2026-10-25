@@ -5,6 +5,7 @@
 //! provider outages.
 mod support;
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use serde_json::{Value, json};
 use std::time::{Duration, UNIX_EPOCH};
 use support::{idp::*, *};
@@ -1063,19 +1064,29 @@ async fn provider_outages_answer_provider_unavailable() {
     let mut browser = Browser::new("198.51.100.50");
     for mode in [Discovery::Broken, Discovery::Huge, Discovery::Redirect] {
         env.idp.with(|s| s.discovery = mode);
+        let hits = env.idp.with(|s| s.discovery_hits);
         let answer = browser
             .post(&env.node, "/oauth/acme/start", json!({"intent": "sign_in"}))
             .await;
         assert_eq!(answer.status, 503, "{mode:?}: {answer:?}");
         assert_eq!(answer.code(), "provider_unavailable", "{mode:?}");
         assert!(env.node.module.ready().await.is_ok(), "{mode:?}");
+        assert_eq!(env.idp.with(|s| s.discovery_hits), hits + 1, "{mode:?}");
+        // The failure is shared for 30 s: the next start does not wait on
+        // the provider again.
+        let again = browser
+            .post(&env.node, "/oauth/acme/start", json!({"intent": "sign_in"}))
+            .await;
+        assert_eq!(again.code(), "provider_unavailable", "{mode:?}");
+        assert_eq!(env.idp.with(|s| s.discovery_hits), hits + 1, "{mode:?}");
+        env.world.clock.advance(Duration::from_secs(31));
     }
     assert_eq!(
         env.idp.with(|s| s.redirect_target_hits),
         0,
         "redirects are not followed"
     );
-    // Recovered: the next start works (failures are not cached).
+    // Recovered: once the 30 s are over, the next start works.
     env.idp.with(|s| s.discovery = Discovery::Normal);
     env.start(&mut browser, "acme", "sign_in").await;
     // GitHub refuses the code at the callback.
@@ -1274,6 +1285,13 @@ async fn google_checks_its_hosted_domain_and_verified_address() {
         error_page("email_unverified"),
         "an unverified Google address is no address"
     );
+    assert_eq!(
+        env.world
+            .scalar("SELECT count(*) FROM merezha_identity.users")
+            .await,
+        0,
+        "and creates no account"
+    );
     let answer = env
         .oidc(&mut browser, "google", "sign_in", json!({"sub": "g1", "email": "g@example.com", "email_verified": true, "hd": "example.com"}))
         .await;
@@ -1340,4 +1358,454 @@ async fn oauth_secrets_stay_out_of_telemetry() {
         harness.assert_no_canary(canary);
     }
     harness.assert_catalogued();
+}
+
+// ----- security review of PR #55 -----
+
+/// Linking adds a way into the account: it needs a recent session, and a
+/// successful link sends the `identity.sign_in_method_added` notice.
+#[tokio::test]
+async fn linking_needs_a_recent_session_and_sends_a_notice() {
+    let Some(env) = env().await else { return };
+    let mut ada = signed_up(&env.world, &env.node, "ada@example.com", PASSWORD).await;
+    let user = ada.get(&env.node, "/me").await.body["user"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    env.world.clock.advance(Duration::from_secs(11 * 60));
+    let answer = ada
+        .post(&env.node, "/oauth/acme/start", json!({"intent": "link"}))
+        .await;
+    assert_eq!(answer.code(), "reauthentication_required");
+    assert_eq!(
+        env.world
+            .scalar("SELECT count(*) FROM merezha_identity.oauth_flows")
+            .await,
+        0
+    );
+    let answer = ada
+        .post(
+            &env.node,
+            "/session/reauthenticate",
+            json!({"password": PASSWORD}),
+        )
+        .await;
+    assert_eq!(answer.status, 200, "{answer:?}");
+    let answer = env
+        .oidc(&mut ada, "loose", "link", json!({"sub": "loose-ada"}))
+        .await;
+    assert_eq!(answer.location(), SIGNED_IN);
+    let notices = env
+        .world
+        .mail
+        .to("identity.sign_in_method_added", &format!("user:{user}"));
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].data["method"], "oauth");
+    assert_eq!(notices[0].data["provider"], "loose");
+    // A sign-up creates an account, not a method on one: no notice.
+    let mut other = Browser::new("198.51.100.70");
+    env.oidc(
+        &mut other,
+        "acme",
+        "sign_in",
+        json!({"sub": "new", "email": "new@example.com", "email_verified": true}),
+    )
+    .await;
+    assert_eq!(
+        env.world
+            .mail
+            .sent()
+            .iter()
+            .filter(|m| m.topic == "identity.sign_in_method_added")
+            .count(),
+        1
+    );
+}
+
+/// Callbacks with unknown or forged states cost the IP's
+/// `oauth_callback.ip` budget and are counted, not audited; a callback
+/// that named a live flow is audited.
+#[tokio::test]
+async fn failed_callbacks_are_throttled_and_unknown_states_not_audited() {
+    let Some(env) = env_with("", "", &[("oauth_callback_ip", 3, "10m")]).await else {
+        return;
+    };
+    let mut attacker = Browser::new("203.0.113.80");
+    for n in 0..2 {
+        let state = B64.encode([n as u8; 32]);
+        let answer = env
+            .callback(&mut attacker, "acme", &format!("code=x&state={state}"))
+            .await;
+        assert_eq!(answer.location(), error_page("invalid_state"));
+        assert!(
+            answer.oauth_cookie().is_none(),
+            "a forged callback clears nothing"
+        );
+    }
+    let audited = || {
+        env.world.scalar(
+            "SELECT count(*) FROM merezha_identity.audit_events WHERE action = 'oauth.sign_in_failed'",
+        )
+    };
+    assert_eq!(audited().await, 0);
+    // A live flow finished without its binding cookie is audited.
+    let mut victim = Browser::new("198.51.100.71");
+    let auth = env.start(&mut victim, "acme", "sign_in").await;
+    let answer = env
+        .callback(
+            &mut attacker,
+            "acme",
+            &format!("code=x&state={}", auth.state),
+        )
+        .await;
+    assert_eq!(answer.location(), error_page("invalid_state"));
+    assert_eq!(audited().await, 1);
+    // The budget is spent: even a good callback from that IP is refused
+    // before any work.
+    let mut same_ip = Browser::new("203.0.113.80");
+    let auth = env.start(&mut same_ip, "acme", "sign_in").await;
+    let code = env.idp.grant(
+        &auth,
+        env.idp.claims(&auth, env.now(), json!({"sub": "t"})),
+        Token::Signed,
+    );
+    let answer = env
+        .callback(
+            &mut same_ip,
+            "acme",
+            &format!("code={code}&state={}", auth.state),
+        )
+        .await;
+    assert_eq!(answer.location(), error_page("rate_limited"));
+    assert_eq!(env.idp.with(|s| s.token_hits), 0);
+    // Another IP is unaffected.
+    let mut elsewhere = Browser::new("198.51.100.72");
+    let answer = env
+        .oidc(
+            &mut elsewhere,
+            "acme",
+            "sign_in",
+            json!({"sub": "t", "email": "t@example.com", "email_verified": true}),
+        )
+        .await;
+    assert_eq!(answer.location(), SIGNED_IN);
+}
+
+/// Two tabs of one browser share the binding cookie; the first callback
+/// keeps it while the second flow is pending, the last one clears it.
+#[tokio::test]
+async fn two_tabs_both_complete() {
+    let Some(env) = env().await else { return };
+    let mut browser = Browser::new("198.51.100.73");
+    let first = env.start(&mut browser, "acme", "sign_in").await;
+    let binding = browser.oauth.clone().unwrap();
+    let second = env.start(&mut browser, "acme", "sign_in").await;
+    assert_eq!(
+        browser.oauth.as_deref(),
+        Some(binding.as_str()),
+        "the binding is kept"
+    );
+    let now = env.now();
+    let claims = json!({"sub": "tabs", "email": "tabs@example.com", "email_verified": true});
+    let code = env.idp.grant(
+        &first,
+        env.idp.claims(&first, now, claims.clone()),
+        Token::Signed,
+    );
+    let mut tab = browser.clone();
+    let answer = env
+        .callback(
+            &mut tab,
+            "acme",
+            &format!("code={code}&state={}", first.state),
+        )
+        .await;
+    assert_eq!(answer.location(), SIGNED_IN);
+    assert!(answer.oauth_cookie().is_none(), "a flow is still pending");
+    let code = env
+        .idp
+        .grant(&second, env.idp.claims(&second, now, claims), Token::Signed);
+    let mut tab = browser.clone();
+    let answer = env
+        .callback(
+            &mut tab,
+            "acme",
+            &format!("code={code}&state={}", second.state),
+        )
+        .await;
+    assert_eq!(answer.location(), SIGNED_IN);
+    assert!(answer.oauth_cookie().unwrap().contains("Max-Age=0"));
+}
+
+/// Rule 4 keeps a well-formed registration binding the browser holds.
+#[tokio::test]
+async fn an_untrusted_sign_up_keeps_the_presented_registration_binding() {
+    let Some(env) = env().await else { return };
+    let mut browser = Browser::new("198.51.100.74");
+    let held = B64.encode([42u8; 32]);
+    browser.binding = Some(held.clone());
+    let answer = env
+        .oidc(
+            &mut browser,
+            "loose",
+            "sign_in",
+            json!({"sub": "keep", "email": "keep@example.com"}),
+        )
+        .await;
+    assert_eq!(answer.location(), error_page("email_unverified"));
+    let set = answer.binding_cookie().unwrap();
+    assert!(set.starts_with(&format!("{BINDING}={held};")), "{set}");
+    let token = env
+        .world
+        .mail
+        .token("identity.verify_email", "keep@example.com");
+    let answer = browser
+        .post(
+            &env.node,
+            "/email-verifications/confirm",
+            json!({"token": token}),
+        )
+        .await;
+    assert_eq!(
+        answer.body["user"]["credentials"]["oauth"],
+        json!(["loose"]),
+        "no claim"
+    );
+}
+
+/// Identities carry their issuer: one linked under another issuer never
+/// signs in, so changing a provider's issuer never re-maps subjects.
+#[tokio::test]
+async fn an_identity_of_another_issuer_never_signs_in() {
+    let Some(env) = env().await else { return };
+    let mut browser = Browser::new("198.51.100.75");
+    let claims = json!({"sub": "iss-1", "email": "iss@example.com", "email_verified": true});
+    env.oidc(&mut browser, "acme", "sign_in", claims.clone())
+        .await;
+    let stored = env
+        .world
+        .scalar(&format!(
+            "SELECT count(*) FROM merezha_identity.oauth_identities WHERE issuer = '{}'",
+            env.idp.base
+        ))
+        .await;
+    assert_eq!(stored, 1);
+    env.world
+        .execute(
+            "UPDATE merezha_identity.oauth_identities SET issuer = 'https://old-issuer.example'",
+        )
+        .await;
+    let mut other = Browser::new("198.51.100.76");
+    let answer = env.oidc(&mut other, "acme", "sign_in", claims).await;
+    assert_eq!(answer.location(), error_page("oauth_failed"));
+    assert!(answer.set_cookie().is_none());
+}
+
+/// A provider that advertises RFC 9207 must send `iss`.
+#[tokio::test]
+async fn iss_is_required_when_advertised() {
+    let Some(env) = env().await else { return };
+    env.idp.with(|s| s.iss_supported = true);
+    let mut browser = Browser::new("198.51.100.77");
+    let auth = env.start(&mut browser, "acme", "sign_in").await;
+    let claims = env.idp.claims(
+        &auth,
+        env.now(),
+        json!({"sub": "r", "email": "r@example.com", "email_verified": true}),
+    );
+    let code = env.idp.grant(&auth, claims.clone(), Token::Signed);
+    let answer = env
+        .callback(
+            &mut browser,
+            "acme",
+            &format!("code={code}&state={}", auth.state),
+        )
+        .await;
+    assert_eq!(answer.location(), error_page("oauth_failed"));
+    let auth = env.start(&mut browser, "acme", "sign_in").await;
+    let claims = env.idp.claims(
+        &auth,
+        env.now(),
+        json!({"sub": "r", "email": "r@example.com", "email_verified": true}),
+    );
+    let code = env.idp.grant(&auth, claims, Token::Signed);
+    let iss =
+        oauth2::url::form_urlencoded::byte_serialize(env.idp.base.as_bytes()).collect::<String>();
+    let answer = env
+        .callback(
+            &mut browser,
+            "acme",
+            &format!("code={code}&state={}&iss={iss}", auth.state),
+        )
+        .await;
+    assert_eq!(answer.location(), SIGNED_IN);
+}
+
+/// An identity of a provider removed from configuration is no credential:
+/// with it the only other method, the last identity cannot go.
+#[tokio::test]
+async fn identities_of_removed_providers_are_no_credential() {
+    let idp = Idp::start().await;
+    let tables = providers(&idp.base, "");
+    let text = section("", &[], &tables).replace("[modules.identity.magic_links]\n", "");
+    let Some(world) = World::new(&text).await else {
+        return;
+    };
+    let node = world.instance().await;
+    let env = Env { world, node, idp };
+    let mut browser = Browser::new("198.51.100.78");
+    env.oidc(
+        &mut browser,
+        "acme",
+        "sign_in",
+        json!({"sub": "two", "email": "two@example.com", "email_verified": true}),
+    )
+    .await;
+    let answer = env
+        .oidc(&mut browser, "loose", "link", json!({"sub": "two-loose"}))
+        .await;
+    assert_eq!(answer.location(), SIGNED_IN);
+    // The same database without `loose` in the configuration.
+    let without = text.replace(
+        &format!(
+            "[modules.identity.oauth.providers.loose]\nkind = \"oidc\"\nissuer = \"{}\"\n\
+             client_id = \"{CLIENT_ID}\"\nclient_secret = {{ env = \"OAUTH_SECRET\" }}\n",
+            env.idp.base
+        ),
+        "",
+    );
+    assert!(!without.contains("providers.loose"));
+    let Env {
+        world,
+        node: _,
+        idp,
+    } = env;
+    let later = World {
+        test: world.test,
+        db: world.db.clone(),
+        clock: world.clock.clone(),
+        mail: world.mail.clone(),
+        section: without,
+        endpoints: Default::default(),
+    };
+    let node = later.instance().await;
+    let env = Env {
+        world: later,
+        node,
+        idp,
+    };
+    let mut fresh = Browser::new("198.51.100.79");
+    env.oidc(&mut fresh, "acme", "sign_in", json!({"sub": "two"}))
+        .await;
+    let items = fresh.get(&env.node, "/me/oauth-identities").await.body["items"].clone();
+    let acme = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["provider"] == "acme")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let answer = fresh
+        .delete(&env.node, &format!("/me/oauth-identities/{acme}"))
+        .await;
+    assert_eq!(answer.code(), "last_credential");
+}
+
+/// Rule 2: a link whose starting session expired meanwhile is refused.
+#[tokio::test]
+async fn a_link_needs_its_session_alive_at_the_callback() {
+    let Some(env) = env().await else { return };
+    let mut ada = signed_up(&env.world, &env.node, "ada@example.com", PASSWORD).await;
+    let auth = env.start(&mut ada, "acme", "link").await;
+    let code = env.idp.grant(
+        &auth,
+        env.idp.claims(&auth, env.now(), json!({"sub": "late"})),
+        Token::Signed,
+    );
+    env.world
+        .execute("UPDATE merezha_identity.sessions SET idle_expires_at = created_at, absolute_expires_at = created_at")
+        .await;
+    // The browser's own cookie is dead too; it comes back without it.
+    let mut browser = ada.clone();
+    browser.cookie = None;
+    browser.csrf = None;
+    let answer = env
+        .callback(
+            &mut browser,
+            "acme",
+            &format!("code={code}&state={}", auth.state),
+        )
+        .await;
+    assert_eq!(answer.location(), error_page("invalid_state"));
+    assert_eq!(env.identities().await, 0);
+}
+
+/// Rule 1 on an unverified account: a trusted provider asserting its exact
+/// address verifies it, without the claim (its password stays); while
+/// verification is not required an untrusted one signs in unverified.
+#[tokio::test]
+async fn rule_one_verifies_through_a_trusted_assertion() {
+    let Some(env) = env_with("require_verified_email = false", "", &[]).await else {
+        return;
+    };
+    let mut ada = Browser::new("198.51.100.80");
+    ada.post(
+        &env.node,
+        "/registrations",
+        json!({"email": "ada@example.com", "password": PASSWORD}),
+    )
+    .await;
+    let answer = ada
+        .post(
+            &env.node,
+            "/sessions",
+            json!({"email": "ada@example.com", "password": PASSWORD}),
+        )
+        .await;
+    assert_eq!(answer.status, 201);
+    // Linked while the provider asserts another address: still unverified.
+    let answer = env
+        .oidc(
+            &mut ada,
+            "acme",
+            "link",
+            json!({"sub": "r1", "email": "other@example.com", "email_verified": true}),
+        )
+        .await;
+    assert_eq!(answer.location(), SIGNED_IN);
+    assert_eq!(
+        ada.get(&env.node, "/me").await.body["user"]["email_verified"],
+        false
+    );
+    // An untrusted identity signs in unverified here.
+    let answer = env
+        .oidc(&mut ada, "loose", "link", json!({"sub": "r1-loose"}))
+        .await;
+    assert_eq!(answer.location(), SIGNED_IN);
+    let mut phone = Browser::new("198.51.100.81");
+    let answer = env
+        .oidc(&mut phone, "loose", "sign_in", json!({"sub": "r1-loose"}))
+        .await;
+    assert_eq!(answer.location(), SIGNED_IN);
+    assert_eq!(
+        phone.get(&env.node, "/me").await.body["user"]["email_verified"],
+        false
+    );
+    // Now the trusted provider asserts the account's own address.
+    let mut laptop = Browser::new("198.51.100.82");
+    let answer = env
+        .oidc(
+            &mut laptop,
+            "acme",
+            "sign_in",
+            json!({"sub": "r1", "email": "ada@example.com", "email_verified": true}),
+        )
+        .await;
+    assert_eq!(answer.location(), SIGNED_IN);
+    let user = laptop.get(&env.node, "/me").await.body["user"].clone();
+    assert_eq!(user["email_verified"], true);
+    assert_eq!(user["credentials"]["password"], true, "no claim");
+    assert_eq!(user["credentials"]["oauth"], json!(["acme", "loose"]));
 }

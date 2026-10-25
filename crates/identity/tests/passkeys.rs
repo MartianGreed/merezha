@@ -743,3 +743,182 @@ async fn passkeys_off_without_their_table() {
         .await;
     assert_eq!(answer.status, 404);
 }
+
+// ----- security review of PR #55 -----
+
+/// Hold the row lock of `email`'s user in an open transaction on its own
+/// connection, as a concurrent claim or revocation does.
+async fn hold_user(world: &World, email: &str) -> merezha_postgres::PooledClient {
+    let client = world.db.acquire(soon()).await.unwrap();
+    client.batch_execute("BEGIN").await.unwrap();
+    client
+        .execute(
+            "SELECT 1 FROM merezha_identity.users WHERE email_normalized = $1 FOR UPDATE",
+            &[&email],
+        )
+        .await
+        .unwrap();
+    client
+}
+/// Until a request waits on a row lock.
+async fn until_waiting(world: &World) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let waiting = world
+            .scalar("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()")
+            .await;
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the request never waited"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A registration racing the ownership claim: the ceremony was consumed,
+/// then the claim removed the session before the passkey was stored.
+/// Nothing the attacker's session asked for may land.
+#[tokio::test]
+async fn a_registration_racing_the_claim_does_not_survive_it() {
+    let Some((world, node)) = world("require_verified_email = false", &[]).await else {
+        return;
+    };
+    let mut attacker = Browser::new("203.0.113.90");
+    attacker
+        .post(
+            &node,
+            "/registrations",
+            json!({"email": "victim@example.com", "password": "attacker chosen passphrase"}),
+        )
+        .await;
+    let answer = attacker
+        .post(
+            &node,
+            "/sessions",
+            json!({"email": "victim@example.com", "password": "attacker chosen passphrase", "transport": "bearer"}),
+        )
+        .await;
+    assert_eq!(answer.status, 201);
+    let options = attacker
+        .send(&node, "POST", "/passkeys/registrations/options", None)
+        .await;
+    let challenge: CreationChallengeResponse =
+        serde_json::from_value(json!({"publicKey": options.body["public_key"]})).unwrap();
+    let credential = authenticator()
+        .do_registration(origin(), challenge)
+        .unwrap();
+    let body = json!({"ceremony_id": options.body["ceremony_id"], "credential": credential});
+    let lock = hold_user(&world, "victim@example.com").await;
+    let request = {
+        let node = node.clone();
+        let mut attacker = attacker.clone();
+        tokio::spawn(async move {
+            attacker
+                .post(&node, "/passkeys/registrations/verify", body)
+                .await
+        })
+    };
+    until_waiting(&world).await;
+    // The claim's work, under the user lock: every session goes.
+    lock.execute("DELETE FROM merezha_identity.sessions", &[])
+        .await
+        .unwrap();
+    lock.batch_execute("COMMIT").await.unwrap();
+    let answer = request.await.unwrap();
+    assert_eq!(answer.code(), "unauthenticated", "{answer:?}");
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_identity.passkeys")
+            .await,
+        0
+    );
+}
+
+/// A passkey removed while its assertion is verified signs nobody in.
+#[tokio::test]
+async fn a_passkey_removed_mid_sign_in_creates_no_session() {
+    let Some((world, node)) = world("", &[]).await else {
+        return;
+    };
+    let mut ada = user(&world, &node, "ada@example.com").await;
+    let mut key = authenticator();
+    register(&node, &mut ada, &mut key, None).await;
+    let mut browser = Browser::new("198.51.100.90");
+    let (ceremony, credential) =
+        assertion(&node, &mut browser, &mut key, Some("ada@example.com"), None).await;
+    let sessions = world
+        .scalar("SELECT count(*) FROM merezha_identity.sessions")
+        .await;
+    let lock = hold_user(&world, "ada@example.com").await;
+    let request = {
+        let node = node.clone();
+        let mut browser = browser.clone();
+        tokio::spawn(async move { sign_in(&node, &mut browser, ceremony, credential).await })
+    };
+    until_waiting(&world).await;
+    lock.execute("DELETE FROM merezha_identity.passkeys", &[])
+        .await
+        .unwrap();
+    lock.batch_execute("COMMIT").await.unwrap();
+    let answer = request.await.unwrap();
+    assert_eq!(answer.code(), "invalid_credentials", "{answer:?}");
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_identity.sessions")
+            .await,
+        sessions
+    );
+}
+
+/// A reauthentication ceremony belongs to the session that asked for it.
+#[tokio::test]
+async fn a_reauthentication_ceremony_is_bound_to_its_session() {
+    let Some((world, node)) = world("", &[]).await else {
+        return;
+    };
+    let mut ada = user(&world, &node, "ada@example.com").await;
+    let mut key = authenticator();
+    register(&node, &mut ada, &mut key, None).await;
+    let options = ada
+        .send(
+            &node,
+            "POST",
+            "/session/reauthenticate/passkey/options",
+            None,
+        )
+        .await;
+    let challenge: RequestChallengeResponse =
+        serde_json::from_value(json!({"publicKey": options.body["public_key"]})).unwrap();
+    let credential = key.do_authentication(origin(), challenge).unwrap();
+    let mut other = support::sign_in(&node, "ada@example.com").await;
+    let answer = other
+        .post(
+            &node,
+            "/session/reauthenticate/passkey/verify",
+            json!({"ceremony_id": options.body["ceremony_id"], "credential": credential}),
+        )
+        .await;
+    assert_eq!(answer.code(), "invalid_ceremony");
+}
+
+/// A registered passkey sends the `identity.sign_in_method_added` notice.
+#[tokio::test]
+async fn a_registered_passkey_sends_a_notice() {
+    let Some((world, node)) = world("", &[]).await else {
+        return;
+    };
+    let mut ada = user(&world, &node, "ada@example.com").await;
+    let id = ada.get(&node, "/me").await.body["user"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    register(&node, &mut ada, &mut authenticator(), None).await;
+    let notices = world
+        .mail
+        .to("identity.sign_in_method_added", &format!("user:{id}"));
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].data["method"], "passkey");
+}

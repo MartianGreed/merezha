@@ -164,14 +164,26 @@ impl Keys {
         self.audit_subject.mac(&[email_normalized.as_bytes()])
     }
     /// One or two decoy credential ids of `email_normalized`, stable
-    /// across requests, shaped like real ones (section 4).
-    pub fn passkey_decoys(&self, email_normalized: &str) -> Vec<[u8; 32]> {
-        let first = self.passkey_decoy.mac(&[b"1", email_normalized.as_bytes()]);
-        let mut ids = vec![first];
-        if first[0] & 1 == 1 {
-            ids.push(self.passkey_decoy.mac(&[b"2", email_normalized.as_bytes()]));
-        }
-        ids
+    /// across requests, shaped like real ones (section 4): 16, 32 or 64
+    /// bytes, the lengths common authenticators use.
+    pub fn passkey_decoys(&self, email_normalized: &str) -> Vec<Vec<u8>> {
+        let seed = self.passkey_decoy.mac(&[b"0", email_normalized.as_bytes()]);
+        let count = 1 + usize::from(seed[0] & 1);
+        (0..count)
+            .map(|i| {
+                let len = [16, 32, 64][usize::from(seed[1 + i]) % 3];
+                let mut id = self
+                    .passkey_decoy
+                    .mac(&[&[b'1' + i as u8], email_normalized.as_bytes()])
+                    .to_vec();
+                id.extend(
+                    self.passkey_decoy
+                        .mac(&[&[b'a' + i as u8], email_normalized.as_bytes()]),
+                );
+                id.truncate(len);
+                id
+            })
+            .collect()
     }
 }
 
@@ -226,6 +238,19 @@ mod tests {
             keys.passkey_decoys("ada@example.com")[0],
             keys.passkey_decoys("bob@example.com")[0]
         );
+        // Decoys take the common real lengths, and vary by address.
+        let mut lengths = std::collections::BTreeSet::new();
+        let mut counts = std::collections::BTreeSet::new();
+        for n in 0..64 {
+            let decoys = keys.passkey_decoys(&format!("user{n}@example.com"));
+            counts.insert(decoys.len());
+            for id in decoys {
+                assert!([16, 32, 64].contains(&id.len()));
+                lengths.insert(id.len());
+            }
+        }
+        assert_eq!(lengths.len(), 3);
+        assert_eq!(counts, [1, 2].into_iter().collect());
     }
 
     #[test]

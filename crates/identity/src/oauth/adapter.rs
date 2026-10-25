@@ -25,7 +25,7 @@ use openidconnect::{
     TokenResponse, TokenUrl,
     core::{
         CoreAuthenticationFlow, CoreClient, CoreIdTokenClaims, CoreIdTokenVerifier,
-        CoreJsonWebKeySet, CoreJwsSigningAlgorithm, CoreProviderMetadata,
+        CoreJsonWebKeySet, CoreJwsSigningAlgorithm,
     },
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -76,44 +76,98 @@ impl<'c> AsyncHttpClient<'c> for Http<'_> {
     }
 }
 
+/// The RFC 9207 field of a discovery document: a provider that sets it
+/// sends `iss` with every authorization response, and the callback then
+/// requires it.
+#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+pub struct Rfc9207 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization_response_iss_parameter_supported: Option<bool>,
+}
+impl openidconnect::AdditionalProviderMetadata for Rfc9207 {}
+
+/// Core provider metadata with the RFC 9207 field.
+type Metadata = openidconnect::ProviderMetadata<
+    Rfc9207,
+    openidconnect::core::CoreAuthDisplay,
+    openidconnect::core::CoreClientAuthMethod,
+    openidconnect::core::CoreClaimName,
+    openidconnect::core::CoreClaimType,
+    openidconnect::core::CoreGrantType,
+    openidconnect::core::CoreJweContentEncryptionAlgorithm,
+    openidconnect::core::CoreJweKeyManagementAlgorithm,
+    openidconnect::core::CoreJsonWebKey,
+    openidconnect::core::CoreResponseMode,
+    openidconnect::core::CoreResponseType,
+    openidconnect::core::CoreSubjectIdentifierType,
+>;
+
 /// A provider's discovery document with its key set, as last fetched.
 struct Cached {
-    metadata: CoreProviderMetadata,
-    fetched: Instant,
+    metadata: Metadata,
+    fetched: Timestamp,
     /// The last key set refetch an unknown `kid` forced.
     forced: Option<Instant>,
 }
 
+#[derive(Default)]
+struct CacheState {
+    cached: Option<Cached>,
+    /// The last failed discovery: callers within [`DISCOVERY_RETRY`] get
+    /// `provider_unavailable` at once instead of each waiting out the
+    /// timeout again.
+    failed: Option<Timestamp>,
+}
+
+/// How long a failed discovery is remembered.
+pub const DISCOVERY_RETRY: Duration = Duration::from_secs(30);
+
 /// The per-provider cache. Fetches are serialized, so a cold cache costs
-/// one round trip however many sign-ins wait on it.
+/// one round trip however many sign-ins wait on it: the waiters share the
+/// result, a success for [`DISCOVERY_TTL`] and a failure for
+/// [`DISCOVERY_RETRY`]. Times come from the platform clock.
 #[derive(Default)]
 pub(crate) struct Cache {
-    state: tokio::sync::Mutex<Option<Cached>>,
+    state: tokio::sync::Mutex<CacheState>,
 }
 impl Cache {
     async fn metadata(
         &self,
         provider: &Provider,
         http: &Http<'_>,
-    ) -> Result<CoreProviderMetadata, ProviderError> {
+        now: Timestamp,
+    ) -> Result<Metadata, ProviderError> {
         let mut state = self.state.lock().await;
-        if let Some(cached) = state.as_ref()
-            && cached.fetched.elapsed() < DISCOVERY_TTL
+        if let Some(cached) = state.cached.as_ref()
+            && now < crate::core::plus(cached.fetched, DISCOVERY_TTL)
         {
             return Ok(cached.metadata.clone());
+        }
+        if state
+            .failed
+            .is_some_and(|at| now < crate::core::plus(at, DISCOVERY_RETRY))
+        {
+            return Err(ProviderError::Unavailable);
         }
         let issuer = IssuerUrl::new(provider.issuer().unwrap_or_default().to_owned())
             .map_err(|_| ProviderError::Unavailable)?;
         // Discovery checks the document's `issuer` against the configured
         // one, then fetches `jwks_uri`.
-        let metadata = CoreProviderMetadata::discover_async(issuer, http)
-            .await
-            .map_err(|_| ProviderError::Unavailable)?;
-        *state = Some(Cached {
-            metadata: metadata.clone(),
-            fetched: Instant::now(),
-            forced: None,
-        });
+        let metadata = match Metadata::discover_async(issuer, http).await {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                state.failed = Some(now);
+                return Err(ProviderError::Unavailable);
+            }
+        };
+        *state = CacheState {
+            cached: Some(Cached {
+                metadata: metadata.clone(),
+                fetched: now,
+                forced: None,
+            }),
+            failed: None,
+        };
         Ok(metadata)
     }
     /// Refetch the key set after an unknown `kid`, at most once per
@@ -123,7 +177,7 @@ impl Cache {
         http: &Http<'_>,
     ) -> Result<Option<CoreJsonWebKeySet>, ProviderError> {
         let mut state = self.state.lock().await;
-        let Some(cached) = state.as_mut() else {
+        let Some(cached) = state.cached.as_mut() else {
             return Ok(None);
         };
         if cached
@@ -167,6 +221,23 @@ fn scopes(provider: &Provider) -> impl Iterator<Item = Scope> + '_ {
         .map(|s| Scope::new(s.clone()))
 }
 
+/// Whether the provider's discovery document advertises RFC 9207, so its
+/// callbacks must carry `iss`. GitHub has none.
+pub async fn requires_iss(
+    provider: &Provider,
+    http: &Http<'_>,
+    now: Timestamp,
+) -> Result<bool, ProviderError> {
+    if provider.kind() == ProviderKind::Github {
+        return Ok(false);
+    }
+    let metadata = provider.cache.metadata(provider, http, now).await?;
+    Ok(metadata
+        .additional_metadata()
+        .authorization_response_iss_parameter_supported
+        == Some(true))
+}
+
 /// The provider's authorization URL for a new flow. OIDC providers need
 /// their discovery document (`provider_unavailable` when unreachable).
 pub async fn authorization_url(
@@ -174,6 +245,7 @@ pub async fn authorization_url(
     http: &Http<'_>,
     redirect_uri: &str,
     flow: FlowSecrets<'_>,
+    now: Timestamp,
 ) -> Result<String, ProviderError> {
     let challenge = PkceCodeChallenge::from_code_verifier_sha256(&PkceCodeVerifier::new(
         flow.pkce_verifier.to_owned(),
@@ -190,7 +262,7 @@ pub async fn authorization_url(
             Ok(url.to_string())
         }
         ProviderKind::Google | ProviderKind::Oidc => {
-            let metadata = provider.cache.metadata(provider, http).await?;
+            let metadata = provider.cache.metadata(provider, http, now).await?;
             let nonce = Nonce::new(flow.nonce.unwrap_or_default().to_owned());
             let client = CoreClient::from_provider_metadata(
                 metadata,
@@ -280,7 +352,7 @@ pub async fn exchange(
             let Some(nonce) = flow.nonce else {
                 return Err(ProviderError::Failed);
             };
-            let metadata = provider.cache.metadata(provider, http).await?;
+            let metadata = provider.cache.metadata(provider, http, now).await?;
             let issuer = metadata.issuer().clone();
             let keys = metadata.jwks().clone();
             let client = CoreClient::from_provider_metadata(
@@ -371,13 +443,13 @@ fn oidc_profile(
     claims: &CoreIdTokenClaims,
     compact: &str,
 ) -> Result<Profile, ProviderError> {
-    // `azp`, which `openidconnect` leaves to the client: present means
-    // ours, and several audiences require it.
+    // `azp`, which `openidconnect` leaves to the client: when present it
+    // must name this client. (Extra audiences never get here:
+    // `openidconnect` refuses audiences other than this client.)
     match claims.authorized_party() {
         Some(azp) if azp.as_str() != provider.settings.client_id => {
             return Err(ProviderError::Failed);
         }
-        None if claims.audiences().len() > 1 => return Err(ProviderError::Failed),
         _ => {}
     }
     let subject = claims.subject().as_str();

@@ -102,7 +102,7 @@ fn builtin_templates_render_in_en_and_fr_as_the_golden_files() {
             seen += 1;
         }
     }
-    assert_eq!(seen, 20, "ten built-in templates in two locales");
+    assert_eq!(seen, 22, "eleven built-in templates in two locales");
 }
 
 #[test]

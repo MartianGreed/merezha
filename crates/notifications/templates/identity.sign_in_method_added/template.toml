@@ -1,0 +1,5 @@
+description = "A new sign-in method (OAuth identity or passkey) was added to the account"
+
+[preview]
+method = "oauth"
+provider = "GitHub"

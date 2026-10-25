@@ -292,6 +292,18 @@ pub const SESSION_BY_ID: Statement = Statement::new(
         " FROM merezha_identity.sessions s WHERE s.id = $1"
     ),
 );
+/// The session, share-locked: a concurrent revocation (sign-out, revoke
+/// all, the ownership claim) waits for the caller's transaction, and the
+/// caller sees a revocation that committed first.
+pub const SESSION_HOLD: Statement = Statement::new(
+    "identity.sessions.hold",
+    "SELECT merezha_identity.sessions",
+    concat!(
+        "SELECT ",
+        session_columns!(),
+        " FROM merezha_identity.sessions s WHERE s.id = $1 FOR SHARE"
+    ),
+);
 pub const SESSION_LIST: Statement = Statement::new(
     "identity.sessions.list",
     "SELECT merezha_identity.sessions",
@@ -1194,6 +1206,13 @@ pub const OAUTH_FLOW_CONSUME: Statement = Statement::new(
      RETURNING binding_hash, provider, intent, user_id, session_id, pkce_verifier, nonce,
                return_to, expires_at",
 );
+/// Flows still pending for a browser binding: the binding cookie is
+/// cleared only once none is left, so two tabs both complete.
+pub const OAUTH_FLOWS_OF_BINDING: Statement = Statement::new(
+    "identity.oauth_flows.of_binding",
+    "SELECT merezha_identity.oauth_flows",
+    "SELECT count(*) FROM merezha_identity.oauth_flows WHERE binding_hash = $1 AND expires_at > $2",
+);
 pub const OAUTH_FLOWS_DELETE_OF_USER: Statement = Statement::new(
     "identity.oauth_flows.delete_of_user",
     "DELETE merezha_identity.oauth_flows",
@@ -1202,15 +1221,17 @@ pub const OAUTH_FLOWS_DELETE_OF_USER: Statement = Statement::new(
 pub const OAUTH_IDENTITY_BY_SUBJECT: Statement = Statement::new(
     "identity.oauth_identities.by_subject",
     "SELECT merezha_identity.oauth_identities",
-    "SELECT id, user_id FROM merezha_identity.oauth_identities WHERE provider = $1 AND subject = $2",
+    "SELECT id, user_id, issuer FROM merezha_identity.oauth_identities
+      WHERE provider = $1 AND subject = $2",
 );
 /// `None` when `(provider, subject)` or `(user, provider)` is taken.
 pub const OAUTH_IDENTITY_INSERT: Statement = Statement::new(
     "identity.oauth_identities.insert",
     "INSERT merezha_identity.oauth_identities",
     "INSERT INTO merezha_identity.oauth_identities
-        (id, user_id, provider, subject, email_normalized, email_verified, created_at, last_used_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+        (id, user_id, provider, subject, email_normalized, email_verified, created_at, last_used_at,
+         issuer)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
      ON CONFLICT DO NOTHING RETURNING id",
 );
 /// Refresh the stored assertion of an identity of user `$6`.
@@ -1219,7 +1240,7 @@ pub const OAUTH_IDENTITY_TOUCH: Statement = Statement::new(
     "UPDATE merezha_identity.oauth_identities",
     "UPDATE merezha_identity.oauth_identities
         SET email_normalized = $3, email_verified = $4, last_used_at = $5
-      WHERE provider = $1 AND subject = $2 AND user_id = $6
+      WHERE provider = $1 AND subject = $2 AND user_id = $6 AND issuer = $7
      RETURNING id",
 );
 pub const OAUTH_IDENTITIES_OF_USER: Statement = Statement::new(
@@ -1535,6 +1556,7 @@ pub const STATEMENTS: &[Statement] = &[
     SESSION_EVICT,
     SESSION_TAKE,
     SESSION_BY_ID,
+    SESSION_HOLD,
     SESSION_LIST,
     SESSION_AUTHENTICATE,
     SESSION_TOUCH,
@@ -1634,6 +1656,7 @@ pub const STATEMENTS: &[Statement] = &[
     CLEANUP_AUDIT,
     OAUTH_FLOW_INSERT,
     OAUTH_FLOW_CONSUME,
+    OAUTH_FLOWS_OF_BINDING,
     OAUTH_FLOWS_DELETE_OF_USER,
     OAUTH_IDENTITY_BY_SUBJECT,
     OAUTH_IDENTITY_INSERT,

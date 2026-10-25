@@ -56,8 +56,10 @@ pub mod topic {
     pub const EMAIL_CHANGE_NOTICE: &str = "identity.email_change_notice";
     pub const INVITATION: &str = "identity.invitation";
     pub const NEW_SIGN_IN: &str = "identity.new_sign_in";
+    /// An OAuth identity was linked or a passkey registered (security).
+    pub const SIGN_IN_METHOD_ADDED: &str = "identity.sign_in_method_added";
     /// Every topic, NT predeclares them (R2).
-    pub const ALL: [&str; 9] = [
+    pub const ALL: [&str; 10] = [
         VERIFY_EMAIL,
         PASSWORD_RESET,
         MAGIC_LINK,
@@ -67,6 +69,7 @@ pub mod topic {
         EMAIL_CHANGE_NOTICE,
         INVITATION,
         NEW_SIGN_IN,
+        SIGN_IN_METHOD_ADDED,
     ];
 }
 
@@ -1362,6 +1365,49 @@ impl Core {
             created.row.active_organization = Some(org);
         }
         Ok(Some(created))
+    }
+    /// The session row by id, share-locked against a concurrent
+    /// revocation (`sql::SESSION_HOLD`).
+    pub async fn hold_session(
+        &self,
+        tx: &mut Tx<'_>,
+        id: Uuid,
+    ) -> Result<Option<SessionRow>, Failure> {
+        Ok(self
+            .db()
+            .query_opt(&*tx, &crate::sql::SESSION_HOLD, &[&id])
+            .await
+            .map_err(sql)?
+            .map(|r| session_row(&r, 0)))
+    }
+    /// A `identity.sign_in_method_added` notice to `user`: `method` is
+    /// `oauth` (with the provider's display name) or `passkey`.
+    pub async fn method_added(
+        &self,
+        tx: &mut Tx<'_>,
+        user: &UserRow,
+        method: &'static str,
+        provider: Option<&str>,
+        client: &Client,
+    ) -> Result<(), Failure> {
+        let mut data = Core::data(Some(user), None);
+        data.insert("method".into(), Value::String(method.into()));
+        if let Some(provider) = provider {
+            data.insert("provider".into(), Value::String(provider.into()));
+        }
+        self.notify(
+            tx,
+            topic::SIGN_IN_METHOD_ADDED,
+            Recipient::User {
+                id: user.identity(),
+            },
+            data,
+            None,
+            self.new_id()?,
+            None,
+            client,
+        )
+        .await
     }
     /// The session row by id.
     pub async fn session(&self, tx: &mut Tx<'_>, id: Uuid) -> Result<Option<SessionRow>, Failure> {

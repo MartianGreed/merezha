@@ -150,6 +150,8 @@ pub struct IdpState {
     pub signer: usize,
     pub codes: HashMap<String, Grant>,
     pub discovery: Discovery,
+    /// Advertise RFC 9207 (`authorization_response_iss_parameter_supported`).
+    pub iss_supported: bool,
     pub jwks_delay: Duration,
     pub discovery_hits: usize,
     pub jwks_hits: usize,
@@ -211,6 +213,7 @@ impl Idp {
             signer: 0,
             codes: HashMap::new(),
             discovery: Discovery::Normal,
+            iss_supported: false,
             jwks_delay: Duration::ZERO,
             discovery_hits: 0,
             jwks_hits: 0,
@@ -293,10 +296,10 @@ impl Idp {
 }
 
 async fn discovery(State(state): State<Arc<Mutex<IdpState>>>) -> Response {
-    let (mode, issuer) = {
+    let (mode, issuer, iss_supported) = {
         let mut s = state.lock().unwrap();
         s.discovery_hits += 1;
-        (s.discovery, s.issuer.clone())
+        (s.discovery, s.issuer.clone(), s.iss_supported)
     };
     let base = issuer.clone();
     match mode {
@@ -319,6 +322,9 @@ async fn discovery(State(state): State<Arc<Mutex<IdpState>>>) -> Response {
                 "subject_types_supported": ["public"],
                 "id_token_signing_alg_values_supported": ["RS256", "EdDSA"],
             });
+            if iss_supported {
+                document["authorization_response_iss_parameter_supported"] = Value::Bool(true);
+            }
             if mode == Discovery::Huge {
                 document["padding"] = Value::String("x".repeat(1024 * 1024 + 1));
             }

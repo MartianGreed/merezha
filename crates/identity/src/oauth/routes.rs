@@ -88,8 +88,9 @@ async fn callback(State(core): Shared, Path(provider): Path<String>, request: Re
     let ctx = Ctx::new(parts);
     let query = CallbackQuery::parse(ctx.parts.uri.query());
     let binding = cookie(&ctx.parts.headers, core.settings.oauth_cookie_name());
+    let registration = cookie(&ctx.parts.headers, core.settings.binding_cookie_name());
     let outcome = core
-        .oauth_callback(&ctx.client, &provider, query, binding)
+        .oauth_callback(&ctx.client, &provider, query, binding, registration)
         .instrument(tracing::info_span!(
             target: merezha_telemetry::TARGET,
             "identity oauth.callback",
@@ -106,7 +107,11 @@ async fn callback(State(core): Shared, Path(provider): Path<String>, request: Re
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    if let Some(clear) = core.oauth_binding_cookie(None) {
+    // Only this browser's own callback clears its binding, once no other
+    // tab's flow is pending; a forged callback leaves it alone.
+    if outcome.clear_binding
+        && let Some(clear) = core.oauth_binding_cookie(None)
+    {
         headers.append(header::SET_COOKIE, clear);
     }
     if let Some(session) = outcome.session

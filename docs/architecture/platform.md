@@ -934,7 +934,7 @@ secret_key = { env = "MEREZHA_IDENTITY_SECRET_KEY" }   # at least 32 bytes
 | `sessions.max_per_user`, `sessions.bearer` | `50`, `true` | 1 to 1000 | The least recently seen session is evicted past the cap; `bearer` allows `"transport": "bearer"` |
 | `tokens.email_verification_ttl`, `magic_link_ttl`, `password_reset_ttl`, `email_change_ttl` | `24h`, `15m`, `30m`, `1h` | | One-time token lifetimes |
 | `magic_links.sign_up` | `true` | | Unknown addresses get a sign-up link while registration is open |
-| `rate_limits.<policy>.limit`, `.period` | identity §7 | 1 to 1000000, 1 s to 30 d | Policies `sign_in_ip`, `sign_in_account_ip`, `sign_in_account`, `registration_ip`, `email_address_ip`, `email_address`, `email_ip`, `token_ip`, `reauth_session`, `invitation_organization` (100 per day, per organization, on arrival), `api_key_invalid_ip` (60 per minute, on failure), `passkey_ip` (60 per 10 min, on arrival, the passkey options routes), `oauth_ip` (30 per 10 min, on arrival, `oauth/{provider}/start`) |
+| `rate_limits.<policy>.limit`, `.period` | identity §7 | 1 to 1000000, 1 s to 30 d | Policies `sign_in_ip`, `sign_in_account_ip`, `sign_in_account`, `registration_ip`, `email_address_ip`, `email_address`, `email_ip`, `token_ip`, `reauth_session`, `invitation_organization` (100 per day, per organization, on arrival), `api_key_invalid_ip` (60 per minute, on failure), `passkey_ip` (60 per 10 min, on arrival, the passkey options routes), `oauth_ip` (30 per 10 min, on arrival, `oauth/{provider}/start`), `oauth_callback_ip` (30 per 10 min, on failure, the callback, checked first) |
 | `links.invitation`, `tokens.invitation_ttl` | `/auth/invitation`, `7d` | 1 h to 30 d | The invitation page and lifetime |
 | `organizations.user_can_create`, `max_per_user`, `max_members` | `true`, `50`, `10000` | 1 to 10000, 1 to 1000000 | `false` gives an application without organizations (`POST /organizations` answers 403); organizations one user may create (`organization_limit`); members per organization |
 | `rbac.cache_entries`, `max_custom_roles`, `max_resource_assignments` | `10000`, `100`, `500` | 2 to 1000000, 1 to 1000, 1 to 10000 | Grant snapshots cached per instance; custom roles per organization (`role_limit`); resource grants per holder and scope kept in a snapshot (more are ignored, `identity.grants_truncated`) |
@@ -1171,7 +1171,7 @@ it. The feature pulls `webauthn-rs`, MPL-2.0, and OpenSSL, built vendored
 
 Routes (identity §4 has the bodies and errors): `GET oauth/providers`,
 `POST oauth/{provider}/start` (`{intent: "sign_in" | "link", return_to?}`,
-a link needs a session), `GET oauth/{provider}/callback`,
+a link needs a recent session), `GET oauth/{provider}/callback`,
 `GET me/oauth-identities`, `DELETE me/oauth-identities/{id}` (recent),
 `POST passkeys/registrations/options` and `/verify` (recent),
 `POST passkeys/authentications/options` and `/verify`,
@@ -1193,25 +1193,36 @@ an `iss` equal to the issuer when one is sent, exchanges the code, checks
 the ID token (signature against the provider's key set, refetched once on
 an unknown `kid` and at most once a minute; `RS256`, `ES256`, `EdDSA` only;
 `iss`, `aud`, `azp`, `exp`, `iat` within five minutes, `nonce`), drops the
-provider's tokens, and applies the linking rules of identity §6. It always
+provider's tokens, and applies the linking rules of identity §6. A
+provider whose discovery document advertises RFC 9207 must send `iss`.
+Identities store the issuer they were linked under, and one whose issuer
+differs from the provider's current one never signs in (`oauth_failed`).
+Failed callbacks are charged to `oauth_callback_ip`, checked first
+(`#error=rate_limited`); one naming no live flow is counted, not audited.
+The binding cookie is cleared only by its own browser's callback once no
+other flow of it is pending, so two tabs both complete. It always
 answers `303`: to `return_to` (resolved on `app_origin`) or
 `links.sign_in_redirect` with the session cookie on a sign-in, or to
 `links.oauth_error#error=<code>`, codes `invalid_state`, `oauth_denied`,
-`oauth_failed`, `provider_unavailable`, `account_exists`,
+`oauth_failed`, `provider_unavailable`, `rate_limited`, `account_exists`,
 `identity_already_linked`, `registration_closed`, `email_unverified`,
 `account_disabled`; `Referrer-Policy: no-referrer` keeps the code out of the
 next page's `Referer`. An account created through a provider not trusted
 for its address stays unverified: while verification is required the
 callback lands on `email_unverified`, sets the registration binding cookie
 and mails the verification link, which, clicked in that browser, keeps the
-identity. A sign-in through a trusted provider onto an unverified account
+identity (a registration binding the browser already holds is reused).
+Turning a provider's `trust_email` on later verifies nothing it created
+before. A link onto an existing account and a passkey registration send
+`identity.sign_in_method_added` (security, email and inbox); both re-check
+their session under the user lock before storing anything. A sign-in through a trusted provider onto an unverified account
 runs the ownership claim first (its password, passkeys, OAuth identities,
 sessions and keys go). Discovery documents and key sets are cached for an
-hour per instance; an unreachable or broken provider answers
-`503 provider_unavailable` and never affects readiness.
+hour per instance, a failure for 30 s; an unreachable or broken provider
+answers `503 provider_unavailable` and never affects readiness.
 
 Passkey options for an email return its credential ids, or one or two
-decoy ids derived from `secret_key` for an unknown address or a user
+decoy ids (16, 32 or 64 bytes) derived from `secret_key` for an unknown address or a user
 without passkeys, in the same shape; without an email, a discoverable
 ceremony with `mediation: "conditional"`. Ceremonies are stored server-side,
 consumed before verification, bound to their user and session, and live

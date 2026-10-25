@@ -1,0 +1,3 @@
+title = "Nouveau moyen de connexion sur votre compte"
+body = "Un nouveau moyen de connexion a été ajouté à votre compte. Si ce n’était pas vous, supprimez-le et réinitialisez votre mot de passe."
+link = "{% if links.app %}{{ links.app }}{% endif %}"

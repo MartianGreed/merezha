@@ -38,11 +38,11 @@ fn a_minimal_section_takes_the_documented_defaults() {
     assert!(s.capture_active());
     assert!(s.channel_available(Channel::Inbox) && !s.channel_available(Channel::Push));
     // Every identity topic of R2 and the block's alert are predeclared.
-    assert_eq!(s.topics.len(), 10);
+    assert_eq!(s.topics.len(), 11);
     let reset = &s.topics["identity.password_reset"];
     assert_eq!(reset.category, Category::Security);
     assert!(!reset.user_configurable && reset.builtin && !reset.declared);
-    assert_eq!(checked.registry.templates().count(), 10);
+    assert_eq!(checked.registry.templates().count(), 11);
 }
 
 #[test]

@@ -297,13 +297,15 @@ impl Core {
     /// Write the authenticator's new counter and backup flags back with a
     /// compare-and-swap on `revision`; a lost race merges into a fresh
     /// read (counters only ever grow) and retries once. The caller holds
-    /// the user lock, which every passkey writer takes.
+    /// the user lock, which every passkey writer takes. `false` when the
+    /// passkey is gone (removed, or stripped by a claim, while the
+    /// assertion was verified): the sign-in must fail.
     async fn record_use(
         &self,
         tx: &mut Tx<'_>,
         row: &PasskeyRow,
         result: &AuthenticationResult,
-    ) -> Result<(), Failure> {
+    ) -> Result<bool, Failure> {
         let mut current = row.clone();
         for _ in 0..2 {
             let mut passkey = current.passkey.clone();
@@ -328,7 +330,7 @@ impl Core {
                 .await
                 .map_err(sql)?;
             if written == 1 {
-                return Ok(());
+                return Ok(true);
             }
             let fresh = self
                 .db()
@@ -337,8 +339,7 @@ impl Core {
                 .map_err(sql)?;
             match fresh {
                 Some(fresh) => current = passkey_row(&fresh)?,
-                // Removed meanwhile: nothing to update.
-                None => return Ok(()),
+                None => return Ok(false),
             }
         }
         Err(Failure::conflict("conflict"))
@@ -445,8 +446,17 @@ impl Core {
         let outcome: Result<PasskeyRow, ApiError> = self
             .in_tx(move |tx| {
                 Box::pin(async move {
-                    if core.user_by_id(tx, caller.user, true).await?.is_none() {
+                    let Some(user) = core.user_by_id(tx, caller.user, true).await? else {
                         return Ok(Err(ApiError::code("unauthenticated")));
+                    };
+                    // The ceremony was consumed before this lock: an
+                    // ownership claim or a revocation that ran meanwhile
+                    // removed the session, and nothing it asked for may
+                    // land. The share lock keeps a later revocation behind
+                    // this commit, which then deletes what it adds.
+                    match core.hold_session(tx, caller.session).await? {
+                        Some(s) if s.user_id == user.id && s.alive(core.now()) => {}
+                        _ => return Ok(Err(ApiError::code("unauthenticated"))),
                     }
                     let count: i64 = core
                         .db()
@@ -506,6 +516,8 @@ impl Core {
                         &client,
                     )
                     .await?;
+                    core.method_added(tx, &user, "passkey", None, &client)
+                        .await?;
                     Ok(Ok(row))
                 })
             })
@@ -742,7 +754,9 @@ impl Core {
                     if core.settings.require_verified_email && !user.verified() {
                         return Ok(Err(ApiError::code("email_unverified")));
                     }
-                    core.record_use(tx, &row, &result).await?;
+                    if !core.record_use(tx, &row, &result).await? {
+                        return Ok(Err(invalid_credentials()));
+                    }
                     let session = core
                         .create_session(
                             tx,
@@ -866,7 +880,9 @@ impl Core {
                     {
                         return Ok(Err(ApiError::code("unauthenticated")));
                     }
-                    core.record_use(tx, &row, &result).await?;
+                    if !core.record_use(tx, &row, &result).await? {
+                        return Ok(Err(invalid_credentials()));
+                    }
                     let Some(new) = core
                         .rotate_session(tx, caller.session, Method::Passkey, &client)
                         .await?

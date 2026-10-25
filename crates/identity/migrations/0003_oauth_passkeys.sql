@@ -3,6 +3,7 @@ CREATE TABLE merezha_identity.oauth_identities (
     user_id           uuid NOT NULL REFERENCES merezha_identity.users (id) ON DELETE CASCADE,
     provider          text NOT NULL CHECK (provider ~ '^[a-z][a-z0-9_]{0,31}$'),
     subject           text NOT NULL CHECK (octet_length(subject) BETWEEN 1 AND 255),
+    issuer            text NOT NULL CHECK (octet_length(issuer) BETWEEN 1 AND 512),  -- subjects are scoped by it
     email_normalized  text CHECK (octet_length(email_normalized) <= 254),  -- as asserted at last sign-in
     email_verified    boolean NOT NULL,
     created_at        timestamptz NOT NULL,
@@ -27,6 +28,7 @@ CREATE TABLE merezha_identity.oauth_flows (
     CHECK ((intent = 'link') = (session_id IS NOT NULL))
 );
 CREATE INDEX oauth_flows_expiry_idx ON merezha_identity.oauth_flows (expires_at);
+CREATE INDEX oauth_flows_binding_idx ON merezha_identity.oauth_flows (binding_hash);
 CREATE INDEX oauth_flows_user_idx ON merezha_identity.oauth_flows (user_id) WHERE user_id IS NOT NULL;
 CREATE INDEX oauth_flows_session_idx ON merezha_identity.oauth_flows (session_id) WHERE session_id IS NOT NULL;
 
