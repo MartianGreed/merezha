@@ -23,6 +23,7 @@ fn metadata() -> Metadata {
         correlation_id: id("corr-1"),
         causation_id: None,
         actor: None,
+        principal: None,
     }
 }
 
@@ -77,6 +78,7 @@ fn project(state: Value, events: Vec<StoredEvent>) -> Result<Value, Failure> {
         state,
         events,
         live: true,
+        partition: None,
     })? {
         Reply::Projected { state } => Ok(state),
         other => panic!("unexpected reply {other:?}"),
@@ -238,6 +240,7 @@ fn unknown_events_and_states_are_rejected() {
         state: empty(),
         events: vec![],
         live: true,
+        partition: None,
     });
     assert_eq!(other, Err(Failure::permanent("unknown_projection")));
 }

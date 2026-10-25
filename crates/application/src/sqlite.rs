@@ -1081,6 +1081,7 @@ initial=0
                                 .sum::<i64>()
                     ),
                 },
+                Operation::Describe {} => unreachable!("a version 1 fake is never described"),
                 Operation::Query { state, .. } => Reply::Queried { value: state },
             })
         }

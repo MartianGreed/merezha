@@ -98,13 +98,16 @@ impl ApplicationModule {
             PostgresStore::connect(ctx.database(), &self.config, self.options.clone(), deadline)
                 .await?;
         let policy: Arc<dyn merezha_application::Authorizer> = self.policy.clone();
-        Application::with_postgres(
-            self.config.clone(),
-            self.guest.clone(),
-            policy,
-            Arc::new(store),
-        )
-        .map(|application| application.with_meters(ctx.telemetry()))
+        // Construction asks every version 2 guest `describe`: guest calls
+        // run on a blocking thread.
+        let (config, guest) = (self.config.clone(), self.guest.clone());
+        let meters = ctx.telemetry().clone();
+        merezha_telemetry::spawn_blocking_in_span(move || {
+            Application::with_postgres(config, guest, policy, Arc::new(store))
+                .map(|application| application.with_meters(&meters))
+        })
+        .await
+        .map_err(|_| Failure::transient("internal"))?
     }
 }
 impl Module for ApplicationModule {

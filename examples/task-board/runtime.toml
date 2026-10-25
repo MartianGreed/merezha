@@ -13,6 +13,9 @@ max_concurrent_invocations = 8
 [[services]]
 id = "task-domain"
 path = "components/task-domain.wasm"
+# Protocol version 2: the decider receives the host-established principal
+# and records task owners. Every other service speaks version 1.
+application_protocol = 2
 
 [[services]]
 id = "task-view"

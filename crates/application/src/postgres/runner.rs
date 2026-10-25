@@ -558,14 +558,17 @@ impl Session<'_> {
             .hard
             .min(Instant::now() + Duration::from_millis(limits.timeout_ms));
         let session = app.guest().session()?;
-        let reply = session
-            .invoke_until(
+        let reply = app
+            .call_guest(
+                session.as_ref(),
                 projection.service.as_str(),
                 Operation::Project {
                     projection: projection.name.clone(),
                     state,
                     events,
                     live,
+                    // Partitioned projections are AP-C2's.
+                    partition: None,
                 },
                 deadline,
             )

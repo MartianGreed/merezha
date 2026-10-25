@@ -111,7 +111,7 @@ installed by the binary; tests use scoped dispatchers (§8).
 | Query dispatch | `query {tag}` | INTERNAL | HTTP span |
 | Projection catch-up | `projection {name}` | INTERNAL | the command span (post-commit catch-up), otherwise root (interval, background, admin), with links |
 | Reactor batch | `react {reactor}` | INTERNAL | root, with links to the source events' traces (reactors never run inside a request) |
-| Guest call | `guest {service} {operation}` (`validate`, `decide`, `project`, `query`, `react`, `raw`) | INTERNAL | dispatch span |
+| Guest call | `guest {service} {operation}` (`validate`, `decide`, `project`, `query`, `react`, `describe`, `raw`) | INTERNAL | dispatch span |
 | Raw pipeline | `pipeline {id}`, with one `guest {service} raw` child per step | INTERNAL | HTTP span |
 | DB transaction | `transaction {module}` | INTERNAL | caller |
 | DB statement | `{db.query.summary}`, for example `INSERT merezha_app.events` | CLIENT | transaction or caller |

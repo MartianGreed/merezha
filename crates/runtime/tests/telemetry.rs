@@ -199,7 +199,10 @@ fn application_operations_name_the_span_and_the_series() {
     // The memory series is per service only.
     let memory = harness.metric(metric::GUEST_MEMORY_PEAK.name);
     assert_eq!(memory.points().len(), 1);
-    assert_eq!(memory.value(&[(key::GUEST_SERVICE, "echo")]), Some(6.0));
+    assert_eq!(
+        memory.value(&[(key::GUEST_SERVICE, "echo")]),
+        Some(GuestOperation::ALL.len() as f64)
+    );
 }
 
 #[test]

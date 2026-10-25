@@ -52,6 +52,16 @@ Paths are relative to the manifest's parent directory, cannot contain parent
 traversal, and must resolve to regular files within that directory. Pipeline
 steps refer to existing services. Repeated steps are allowed.
 
+A service may set `application_protocol = 1` (the default) or `2`; any other
+value is an invalid manifest. It names the [application protocol](application.md)
+version the host speaks to the service. The runtime only records it per
+generation (`Catalog::protocols`, `Session::protocol`); raw invocations and
+pipelines never interpret it, and `/v1/services` does not list it. On the
+loopback `serve` listener, `/v1/services/{id}/invoke` lets a local caller
+hand-craft any version 2 request, principal included: the guarantee that only
+the host sets the principal covers the application path
+(`/v1/application/...`), not raw invocation.
+
 | Setting | Range and meaning |
 | --- | --- |
 | `memory_bytes` | 65536 through 268435456, multiple of 65536, per fresh store |

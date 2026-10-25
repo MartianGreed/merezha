@@ -3,10 +3,12 @@ use crate::{
     config::Config,
     durable::{CommitCommand, DurableStore, ProjectionRef},
     instrument::{Dispatch, Instruments, Sample, SampledProjection, Settled},
+    protocol::{self, Described},
     store::{EventStore, MemoryEventStore},
 };
 use merezha_domain::{
-    Command, Failure, Identity, MessageKind, Operation, Query, Receipt, Reply, compatible_json,
+    Command, Failure, Identity, MessageKind, Operation, Principal, Query, Receipt, Reply,
+    compatible_json,
 };
 use merezha_telemetry::names::dispatch::Trigger;
 use serde::{Deserialize, Serialize};
@@ -61,6 +63,8 @@ struct Inner {
     active: AtomicUsize,
     /// Spans, instruments and the lag cache (TE §1.3).
     instruments: Instruments,
+    /// The version 2 services whose `describe` answered, per generation.
+    described: Described,
     /// The typed PostgreSQL store behind `store`, for background runs,
     /// explicit catch-ups and the admin API.
     #[cfg(feature = "postgres")]
@@ -247,6 +251,12 @@ impl Application {
         #[cfg(feature = "postgres")] postgres: Option<Arc<crate::postgres::PostgresStore>>,
     ) -> Result<Self, Failure> {
         validate_services(&config, guest.as_ref())?;
+        // Every version 2 service must speak it before any request.
+        let described = Described::default();
+        described.check_all(
+            guest.as_ref(),
+            std::time::Instant::now() + std::time::Duration::from_millis(config.limits.timeout_ms),
+        )?;
         let retain_receipts = !matches!(
             config.storage,
             crate::config::StorageConfig::Postgres { .. }
@@ -303,6 +313,7 @@ impl Application {
             retain_receipts,
             active: AtomicUsize::new(0),
             instruments,
+            described,
             #[cfg(feature = "postgres")]
             postgres,
         })))
@@ -430,6 +441,18 @@ impl Application {
     pub(crate) fn postgres(&self) -> Option<Arc<crate::postgres::PostgresStore>> {
         self.0.postgres.clone()
     }
+    /// One guest call fitted to the service's protocol, after its
+    /// `describe` check (AP §C.1).
+    #[cfg(feature = "postgres")]
+    pub(crate) fn call_guest(
+        &self,
+        session: &dyn GuestSession,
+        service: &str,
+        operation: Operation,
+        deadline: std::time::Instant,
+    ) -> Result<Reply, Failure> {
+        self.0.described.call(session, service, operation, deadline)
+    }
     /// Reserve before reading an HTTP body or submitting a blocking task.
     pub fn admit(&self) -> Result<Admission, Failure> {
         self.0
@@ -444,11 +467,23 @@ impl Application {
                 + std::time::Duration::from_millis(self.0.config.limits.timeout_ms),
         })
     }
+    /// An anonymous command; see [`Admission::command`].
     pub fn command(&self, command: Command) -> Result<Receipt, Failure> {
         self.admit()?.command(command)
     }
+    /// A command for a host-established principal; see
+    /// [`Admission::command_as`].
+    pub fn command_as(&self, principal: Principal, command: Command) -> Result<Receipt, Failure> {
+        self.admit()?.command_as(principal, command)
+    }
+    /// An anonymous query; see [`Admission::query`].
     pub fn query(&self, query: Query) -> Result<QueryResult, Failure> {
         self.admit()?.query(query)
+    }
+    /// A query for a host-established principal; see
+    /// [`Admission::query_as`].
+    pub fn query_as(&self, principal: Principal, query: Query) -> Result<QueryResult, Failure> {
+        self.admit()?.query_as(principal, query)
     }
     pub fn catch_up(&self, name: &str) -> Result<ProjectionState, Failure> {
         self.admit()?.project(name, false)
@@ -509,6 +544,7 @@ impl Admission {
     ) -> Result<Value, Failure> {
         self.check_value(&payload, self.inner.config.limits.max_payload_bytes)?;
         match invoke(
+            &self.inner,
             session,
             self.deadline,
             service,
@@ -544,15 +580,33 @@ impl Admission {
             .map_err(|_| Failure::transient("internal"))?;
         Ok(records.get(key).map(|record| replay(record, fingerprint)))
     }
-    /// Dispatch a command inside its `command {tag}` span, recording its
-    /// outcome, duration and appended events (TE §1.2, §1.3).
+    /// Dispatch an anonymous command inside its `command {tag}` span,
+    /// recording its outcome, duration and appended events (TE §1.2,
+    /// §1.3). Its metadata must carry no principal: one supplied by the
+    /// caller fails `principal_not_trusted`.
     pub fn command(self, command: Command) -> Result<Receipt, Failure> {
+        self.dispatch_command(None, command)
+    }
+    /// [`Admission::command`] for `principal`, which the host established
+    /// (the edge's authenticator, or a system principal). The guest's
+    /// metadata carries it (version 2 guests only), `actor` becomes its
+    /// subject (another caller-supplied actor fails `actor_mismatch`) and
+    /// stored events keep it without its roles. A principal already in
+    /// the command's metadata fails `principal_not_trusted`.
+    pub fn command_as(self, principal: Principal, command: Command) -> Result<Receipt, Failure> {
+        self.dispatch_command(Some(principal), command)
+    }
+    fn dispatch_command(
+        self,
+        principal: Option<Principal>,
+        command: Command,
+    ) -> Result<Receipt, Failure> {
         let inner = self.inner.clone();
         let trace = inner
             .instruments
             .command(command.tag.as_str(), &command.metadata);
         let span = trace.span().clone();
-        let result = span.in_scope(|| self.decide(command, &trace));
+        let result = span.in_scope(|| self.decide(principal, command, &trace));
         trace.finish(match &result {
             Ok((receipt, true)) => Ok(Settled::Replayed {
                 position: receipt.position,
@@ -566,7 +620,13 @@ impl Admission {
         result.map(|(receipt, _)| receipt)
     }
     /// The command flow; `true` with a stored receipt replayed.
-    fn decide(self, command: Command, trace: &Dispatch<'_>) -> Result<(Receipt, bool), Failure> {
+    fn decide(
+        self,
+        principal: Option<Principal>,
+        mut command: Command,
+        trace: &Dispatch<'_>,
+    ) -> Result<(Receipt, bool), Failure> {
+        protocol::establish(&mut command.metadata, principal)?;
         let route = self
             .inner
             .config
@@ -666,6 +726,7 @@ impl Admission {
             return Err(Failure::conflict("concurrency_conflict"));
         }
         let reply = invoke(
+            &self.inner,
             session.as_ref(),
             self.deadline,
             route.service.as_str(),
@@ -687,6 +748,7 @@ impl Admission {
         if events.len() > self.inner.config.limits.batch_size {
             return Err(Failure::permanent("event_batch_limit"));
         }
+        let metadata = protocol::stored(&command.metadata);
         let (receipt, replayed) = match &self.inner.store {
             Storage::Durable(store) => store.commit(
                 CommitCommand {
@@ -694,27 +756,39 @@ impl Admission {
                     tenant: None,
                     expected,
                     events,
-                    metadata: &command.metadata,
+                    metadata: &metadata,
                     claim: claim.as_ref().map(|c| (&c.key, c.fingerprint.as_str())),
                 },
                 self.deadline,
             )?,
-            Storage::Volatile(store) => (
-                store.append(&stream, expected, events, &command.metadata)?,
-                false,
-            ),
+            Storage::Volatile(store) => {
+                (store.append(&stream, expected, events, &metadata)?, false)
+            }
         };
         if let Some(claim) = claim {
             claim.complete(&receipt);
         }
         Ok((receipt, replayed))
     }
-    /// Dispatch a query inside its `query {tag}` span (TE §1.2, §1.3).
+    /// Dispatch an anonymous query inside its `query {tag}` span (TE §1.2,
+    /// §1.3). A principal in its metadata fails `principal_not_trusted`.
     pub fn query(self, query: Query) -> Result<QueryResult, Failure> {
+        self.dispatch_query(None, query)
+    }
+    /// [`Admission::query`] for a host-established `principal`, with the
+    /// rules of [`Admission::command_as`].
+    pub fn query_as(self, principal: Principal, query: Query) -> Result<QueryResult, Failure> {
+        self.dispatch_query(Some(principal), query)
+    }
+    fn dispatch_query(
+        self,
+        principal: Option<Principal>,
+        query: Query,
+    ) -> Result<QueryResult, Failure> {
         let inner = self.inner.clone();
         let trace = inner.instruments.query(query.tag.as_str(), &query.metadata);
         let span = trace.span().clone();
-        let result = span.in_scope(|| self.answer(query, &trace));
+        let result = span.in_scope(|| self.answer(principal, query, &trace));
         trace.finish(match &result {
             Ok(answer) => Ok(Settled::Answered {
                 checkpoint: answer.checkpoint,
@@ -723,7 +797,13 @@ impl Admission {
         });
         result
     }
-    fn answer(self, query: Query, trace: &Dispatch<'_>) -> Result<QueryResult, Failure> {
+    fn answer(
+        self,
+        principal: Option<Principal>,
+        mut query: Query,
+        trace: &Dispatch<'_>,
+    ) -> Result<QueryResult, Failure> {
+        protocol::establish(&mut query.metadata, principal)?;
         let route = self
             .inner
             .config
@@ -769,6 +849,7 @@ impl Admission {
             return Err(Failure::transient("projection_behind"));
         }
         let reply = invoke(
+            &self.inner,
             session.as_ref(),
             self.deadline,
             route.service.as_str(),
@@ -889,6 +970,7 @@ impl Admission {
             let reply = span
                 .in_scope(|| {
                     invoke(
+                        &self.inner,
                         session.as_ref(),
                         self.deadline,
                         projection.service.as_str(),
@@ -897,6 +979,8 @@ impl Admission {
                             state: pending.state.clone(),
                             events,
                             live: !rebuild,
+                            // Partitioned projections are AP-C2's.
+                            partition: None,
                         },
                         None,
                     )
@@ -1140,14 +1224,17 @@ fn validate_services(config: &Config, guest: &dyn Guest) -> Result<(), Failure> 
     }
     Ok(())
 }
+/// One guest call through [`Described::call`], recording a failure on the
+/// dispatch span.
 fn invoke(
+    inner: &Inner,
     session: &dyn GuestSession,
     deadline: std::time::Instant,
     service: &str,
     operation: Operation,
     trace: Option<&Dispatch<'_>>,
 ) -> Result<Reply, Failure> {
-    let result = session.invoke_until(service, operation, deadline);
+    let result = inner.described.call(session, service, operation, deadline);
     if let (Err(failure), Some(trace)) = (&result, trace) {
         trace.guest_failed(failure);
     }

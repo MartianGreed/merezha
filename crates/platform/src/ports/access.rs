@@ -305,6 +305,38 @@ impl Principal {
     pub fn is_system(&self) -> bool {
         self.kind == PrincipalKind::System && self.subject.as_str().starts_with(SYSTEM_PREFIX)
     }
+    /// The limited projection a version 2 guest receives (AP §C.2):
+    /// subject, kind, active tenant and the role keys held at `scope`,
+    /// the application roles for `Application` and tenant-less resources,
+    /// the tenant roles otherwise, sorted and deduplicated. Never the
+    /// session, the permission sets or the break-glass flag. The bounds (16
+    /// roles of 64 bytes, [`merezha_domain::Principal::check`]) are checked
+    /// only when a version 2 guest would receive it (`invalid_principal`),
+    /// so an oversize principal never fails a call no guest sees it in.
+    pub fn guest(&self, scope: &ResourceScope) -> merezha_domain::Principal {
+        let roles: &[RoleKey] = match scope {
+            ResourceScope::Application | ResourceScope::Resource { tenant: None, .. } => {
+                self.grants.application.roles()
+            }
+            ResourceScope::Tenant(_)
+            | ResourceScope::Resource {
+                tenant: Some(_), ..
+            } => self.grants.tenant.as_ref().map_or(&[], |g| g.roles()),
+        };
+        let mut roles = roles.to_vec();
+        roles.sort();
+        roles.dedup();
+        merezha_domain::Principal {
+            subject: self.subject.clone(),
+            kind: match self.kind {
+                PrincipalKind::User => merezha_domain::PrincipalKind::User,
+                PrincipalKind::ApiKey => merezha_domain::PrincipalKind::ApiKey,
+                PrincipalKind::System => merezha_domain::PrincipalKind::System,
+            },
+            tenant: self.tenant.clone(),
+            roles,
+        }
+    }
     /// [`GrantSnapshot::evaluate`] with this principal's active tenant.
     pub fn check(
         &self,
@@ -553,6 +585,51 @@ mod tests {
     }
     fn reason(result: Result<Allowed, AccessDenied>) -> Option<DenyReason> {
         result.err().map(|d| d.reason)
+    }
+
+    #[test]
+    fn guests_see_subject_kind_tenant_and_scope_roles_only() {
+        let grants = GrantSnapshot::empty()
+            .with_break_glass()
+            .with_application(Grants::new(
+                vec![id("user"), id("admin")],
+                set(&["tasks.create"]),
+            ))
+            .with_tenant(Grants::new(vec![id("member")], set(&["tasks.read"])));
+        let principal = user(Some("org_1"), grants);
+        let application = principal.guest(&ResourceScope::Application);
+        let encoded = serde_json::to_string(&application).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"subject":"usr_1","kind":"user","tenant":"org_1","roles":["admin","user"]}"#
+        );
+        assert!(!encoded.contains("ses_") && !encoded.contains("tasks."));
+        let tenant = principal.guest(&ResourceScope::Tenant(id("org_1")));
+        assert_eq!(tenant.roles, vec![id("member")]);
+        assert_eq!(
+            principal
+                .guest(&resource(Some("org_1"), "task", "t-1"))
+                .roles,
+            vec![id("member")]
+        );
+        let system = Principal::system("reactor_notifier", GrantSnapshot::empty()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&system.guest(&ResourceScope::Tenant(id("org_1")))).unwrap(),
+            r#"{"subject":"sys_reactor_notifier","kind":"system"}"#
+        );
+        let crowded = user(
+            None,
+            GrantSnapshot::empty().with_application(Grants::new(
+                (0..17).map(|i| id(&format!("r{i}"))).collect(),
+                set(&[]),
+            )),
+        );
+        // Sorted and deduplicated; its bounds are checked only where a
+        // version 2 guest would receive it.
+        let crowded = crowded.guest(&ResourceScope::Application);
+        assert_eq!(crowded.roles.len(), 17);
+        assert!(crowded.roles.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(crowded.check().unwrap_err().code, "invalid_principal");
     }
 
     #[test]

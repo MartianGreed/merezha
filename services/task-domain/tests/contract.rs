@@ -34,6 +34,7 @@ fn metadata() -> Metadata {
         correlation_id: id("corr-1"),
         causation_id: None,
         actor: Some(id("ada")),
+        principal: None,
     }
 }
 
@@ -145,6 +146,7 @@ fn queries_and_projections_are_not_this_component() {
         state: json!({}),
         events: vec![],
         live: true,
+        partition: None,
     });
     assert_eq!(project, Err(Failure::permanent("unsupported_operation")));
 }
@@ -314,7 +316,8 @@ fn corrupt_history_is_rejected() {
     assert_eq!(complete(&unknown), rejected("unknown_event"));
 
     let mut newer = good.clone();
-    newer[0].event.schema_version = 2;
+    // Version 2 is the owned `TaskCreated`; 3 is newer than this schema.
+    newer[0].event.schema_version = 3;
     assert_eq!(complete(&newer), rejected("unsupported_schema_version"));
 
     let mut malformed = good;

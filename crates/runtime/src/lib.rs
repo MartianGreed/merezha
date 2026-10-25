@@ -83,6 +83,7 @@ struct Service {
     pre: InstancePre<StoreState>,
     function: ComponentExportIndex,
     labels: Labels,
+    protocol: u16,
 }
 struct Pipeline {
     steps: Vec<String>,
@@ -158,6 +159,18 @@ impl Session {
     pub fn invoke_service(&self, id: &str, input: &str) -> Result<Output, Error> {
         self.invoke_operation_until(id, GuestOperation::Raw, input, Instant::now() + MAX_WAIT)
     }
+    /// The pinned generation.
+    pub fn generation(&self) -> u64 {
+        self.registry.generation
+    }
+    /// The `application_protocol` service `id` declares in the pinned
+    /// generation: 1 by default and for an unknown service.
+    pub fn protocol(&self, id: &str) -> u16 {
+        self.registry
+            .services
+            .get(id)
+            .map_or(1, |service| service.protocol)
+    }
 }
 /// Longer than any generation's `timeout_ms`: the generation's own deadline
 /// always comes first.
@@ -167,6 +180,10 @@ pub struct Catalog {
     pub generation: u64,
     pub services: Vec<String>,
     pub pipelines: Vec<String>,
+    /// Every service's `application_protocol`. Not part of the
+    /// `/v1/services` listing.
+    #[serde(skip)]
+    pub protocols: BTreeMap<String, u16>,
 }
 #[derive(Debug)]
 pub struct Output {
@@ -267,6 +284,11 @@ impl Runtime {
             generation: registry.generation,
             services: registry.services.keys().cloned().collect(),
             pipelines: registry.pipelines.keys().cloned().collect(),
+            protocols: registry
+                .services
+                .iter()
+                .map(|(id, service)| (id.clone(), service.protocol))
+                .collect(),
         })
     }
     /// Refuse later reloads whose `max_concurrent_invocations` is below
@@ -532,6 +554,7 @@ fn load_registry(engine: &Engine, path: &Path, generation: u64) -> Result<Regist
             pre,
             function,
             labels: Labels::service(&spec.id),
+            protocol: spec.application_protocol,
         };
         let deadline = Instant::now() + Duration::from_millis(manifest.limits.timeout_ms);
         let mut store = create_store(engine, &manifest.limits, manifest.limits.fuel, deadline)?;

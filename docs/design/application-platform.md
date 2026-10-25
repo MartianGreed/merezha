@@ -2045,6 +2045,35 @@ description (not gated).
    `service_protocol_mismatch`.
 5. SDK golden JSON exists for every new type, and `describe` is answered automatically.
 
+**C1 delivery notes.** As built in AP-C1:
+
+- `Operation::Describe {}` is an empty struct variant, so `deny_unknown_fields` refuses
+  `{"op":"describe","x":1}` (a unit variant would accept it). `react` and the effect types
+  (`Effect`, `Recipient`, `Channel`, `Reaction`, `Reply::Reacted`) are C3's; `Operation::fits(version)`
+  is the seam C3 extends.
+- `Principal` omits a missing `tenant` and empty `roles` from JSON; stored metadata is
+  `{subject, kind, tenant?}`. `Principal::new` sorts and deduplicates roles and fails
+  `invalid_principal` past 16 roles or 64 bytes. The platform builds it with
+  `merezha_platform::ports::Principal::guest(&ResourceScope)` (the roles of that scope, sorted,
+  unchecked), and the host checks the bounds only before a call to a version 2 guest, so an
+  oversize principal never fails an administrative route or a version 1 service.
+- `handle` answers a request that fails to decode in the version it names (1 or 2), so a
+  version 2 host sees the real code; anything else answers in version 1.
+- The `describe` check lives in `merezha-application`: `GuestSession::protocol(service)` and
+  `generation()` (defaults 1 and 0 for in-process guests), one cache holding the newest
+  generation's described services. A permanent failure or another reply is
+  `service_protocol_mismatch`; a transient one (timeout, overload) is returned as is and not
+  recorded. Both outcomes are recorded per generation and service, so a mismatched guest is asked
+  once per generation. It is a guest call of its own, `guest {service} describe` (TE catalog row
+  added).
+- `Catalog::protocols` is not serialized, so `/v1/services` is unchanged.
+- The HTTP adapter calls `command_as`/`query_as` with the edge's principal at
+  `ResourceScope::Application` until C2 brings route scopes; with identity enabled every
+  application route still answers 401/403 until C2.
+- `TaskCreated` schema version 2 always carries `owner`; a task created without a principal is
+  still written as schema version 1, so the version 1 demos stay byte-identical. Ownership is
+  checked before the state rules on an existing task.
+
 **C2 tests.**
 
 1. An unauthenticated request gets 401 with zero guest fuel spent.
@@ -2059,6 +2088,13 @@ description (not gated).
 7. A client-supplied `actor` that differs from the principal gets `403 actor_mismatch`. An
    application-scoped route passes with an application-level grant and no tenant; `platform_admin`
    passes every route; `resource = "task"` checks the stream's resource grant.
+
+**C2 notes (from C1).** The anonymous `actor` idempotency seam: an anonymous command still takes its
+`actor` from the body, and the receipt key is `(tag, tenant, actor, key)`
+(`application.rs`, the `Key` built in `decide`). So an anonymous caller naming a principal's
+subject as `actor` shares that principal's idempotency scope and can replay its receipt. C2
+must close it: refuse a caller-supplied `actor` on anonymous routes, or add the principal's
+presence and subject to the key scope.
 
 **C3 tests.**
 

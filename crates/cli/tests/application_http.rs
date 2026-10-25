@@ -35,6 +35,7 @@ impl GuestSession for GuestFixture {
             Operation::Project { state, events, .. } => Reply::Projected {
                 state: json!(state.as_u64().unwrap() + events.len() as u64),
             },
+            Operation::Describe {} => unreachable!("a version 1 fake is never described"),
             Operation::Query { state, .. } => Reply::Queried { value: state },
         })
     }

@@ -59,6 +59,7 @@ fn metadata() -> Metadata {
         correlation_id: id("correlation-1"),
         causation_id: None,
         actor: Some(id("alice")),
+        principal: None,
     }
 }
 fn command(stream: &str, payload: Value, key: Option<&str>) -> Command {
@@ -191,6 +192,7 @@ impl GuestSession for Fake {
                 })
             }
             // `{"len":true}` asks for the state's encoded size instead.
+            Operation::Describe {} => unreachable!("a version 1 fake is never described"),
             Operation::Query { state, payload, .. } if payload["len"] == true => {
                 Ok(Reply::Queried {
                     value: json!(state.to_string().len()),

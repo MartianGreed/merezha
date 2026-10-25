@@ -40,7 +40,7 @@ fn host_failure(error: Error) -> bool {
 pub(crate) struct Labels {
     id: Arc<str>,
     service: KeyValue,
-    spans: [Arc<str>; 6],
+    spans: [Arc<str>; GuestOperation::ALL.len()],
 }
 impl Labels {
     pub(crate) fn service(id: &str) -> Self {

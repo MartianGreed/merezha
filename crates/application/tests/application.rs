@@ -23,6 +23,7 @@ fn metadata(actor: &str) -> Metadata {
         correlation_id: id("correlation-1"),
         causation_id: Some(id("cause-1")),
         actor: Some(id(actor)),
+        principal: None,
     }
 }
 fn command(amount: i64, key: Option<&str>) -> Command {
@@ -177,6 +178,7 @@ impl GuestSession for Fake {
                     state: json!(state.as_i64().unwrap() + added),
                 })
             }
+            Operation::Describe {} => unreachable!("a version 1 fake is never described"),
             Operation::Query { state, .. } => Ok(Reply::Queried { value: state }),
         }
     }
