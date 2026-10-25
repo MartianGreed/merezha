@@ -1,4 +1,4 @@
-//! Every statement of NT-N2, registered with the TE-T4 statement registry
+//! Every statement of NT-N2 and NT-N3, registered with the TE-T4 statement registry
 //! (one constant per statement; [`STATEMENTS`] lists them for the registry
 //! check). Values always travel as parameters.
 use merezha_postgres::Statement;
@@ -408,6 +408,44 @@ pub const PURGED_THROUGH: Statement = s(
      FROM unnest($1::text[], $2::bigint[]) AS t(u, m) WHERE c.user_id = t.u",
 );
 
+// ----- provider events (NT-N3) -----
+
+/// The delivery an event names by id, locked, with its notification's
+/// topic.
+pub const EVENT_DELIVERY_BY_ID: Statement = s(
+    "notify.event.delivery_by_id",
+    "SELECT merezha_notify.deliveries",
+    "SELECT d.id, d.status, d.address, n.topic FROM merezha_notify.deliveries d \
+     JOIN merezha_notify.notifications n ON n.id = d.notification_id \
+     WHERE d.id = $1 AND d.channel = $2 FOR UPDATE OF d",
+);
+/// The delivery that got provider message id `$2`, locked.
+pub const EVENT_DELIVERY_BY_MESSAGE: Statement = s(
+    "notify.event.delivery_by_message",
+    "SELECT merezha_notify.deliveries",
+    "SELECT d.id, d.status, d.address, n.topic FROM merezha_notify.deliveries d \
+     JOIN merezha_notify.notifications n ON n.id = d.notification_id \
+     WHERE d.provider = $1 AND d.provider_message_id = $2 AND d.channel = $3 \
+     ORDER BY d.updated_at DESC LIMIT 1 FOR UPDATE OF d",
+);
+/// One provider event, unless its key was stored already.
+pub const PROVIDER_EVENT_INSERT: Statement = s(
+    "notify.event.insert",
+    "INSERT merezha_notify.provider_events",
+    "INSERT INTO merezha_notify.provider_events (provider, channel, event, event_key, \
+     delivery_id, provider_message_id, reason, occurred_at, received_at) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+     ON CONFLICT (provider, event_key) DO NOTHING RETURNING id",
+);
+/// An event's status change, only from the statuses `$5` it may leave.
+pub const DELIVERY_EVENT_SET: Statement = s(
+    "notify.event.delivery_set",
+    "UPDATE merezha_notify.deliveries",
+    "UPDATE merezha_notify.deliveries SET status = $2, status_reason = $3, updated_at = $4, \
+     settled_at = COALESCE(settled_at, $4) \
+     WHERE id = $1 AND status = ANY($5::text[])",
+);
+
 /// Every statement of this module.
 pub const STATEMENTS: &[Statement] = &[
     NOTIFICATION_EXISTS,
@@ -457,4 +495,8 @@ pub const STATEMENTS: &[Statement] = &[
     COUNTERS_LOCK,
     INBOX_EXPIRE,
     PURGED_THROUGH,
+    EVENT_DELIVERY_BY_ID,
+    EVENT_DELIVERY_BY_MESSAGE,
+    PROVIDER_EVENT_INSERT,
+    DELIVERY_EVENT_SET,
 ];

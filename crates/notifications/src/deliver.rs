@@ -12,8 +12,10 @@
 //! 3. The driver sends it before `min(channel timeout, deadline - 2 s)`.
 //! 4. Tx B records the outcome.
 //!
-//! This slice delivers through the capture drivers; the Brevo drivers of
-//! NT-N3 and NT-N4 implement the same traits.
+//! Drivers are the capture drivers and Brevo email (NT-N3), whose call
+//! deadline is `brevo.timeout`; an account problem (`provider_account`) is
+//! logged at error level and counted, a rate limit at warn. Brevo SMS
+//! (NT-N4) implements the same trait.
 use crate::{
     drivers::{EmailMessage, SendOutcome, SmsMessage},
     faults,
@@ -140,10 +142,13 @@ async fn deliver(
     let rendered = core
         .registry
         .render(&locked.template, channel, &locked.locale, &context);
-    let send_by = deadline
-        .checked_sub(RECORD_MARGIN)
-        .unwrap_or(deadline)
-        .min(Instant::now() + CHANNEL_TIMEOUT);
+    // `min(channel timeout, deadline - 2 s)` (NT §5.1 step 3).
+    let send_by = |timeout: Option<Duration>| {
+        deadline
+            .checked_sub(RECORD_MARGIN)
+            .unwrap_or(deadline)
+            .min(Instant::now() + timeout.unwrap_or(CHANNEL_TIMEOUT))
+    };
     let started = Instant::now();
     let (outcome, provider) = match (channel, rendered) {
         (Channel::Email, Ok(Rendered::Email(content))) => {
@@ -178,7 +183,10 @@ async fn deliver(
                 content,
                 unsubscribe,
             };
-            (driver.send(&message, send_by).await, driver.provider())
+            (
+                driver.send(&message, send_by(driver.timeout())).await,
+                driver.provider(),
+            )
         }
         (Channel::Sms, Ok(Rendered::Sms(content))) => {
             let (Some(driver), Some(address)) = (&core.sms, &locked.address) else {
@@ -210,7 +218,10 @@ async fn deliver(
                 content,
                 marketing: locked.category == Category::Marketing,
             };
-            (driver.send(&message, send_by).await, driver.provider())
+            (
+                driver.send(&message, send_by(driver.timeout())).await,
+                driver.provider(),
+            )
         }
         _ => {
             core.metrics.render_failure(channel, &locked.topic);
@@ -720,6 +731,27 @@ async fn record(
     tracing::Span::current().record("notify.outcome", attempt_outcome);
     core.metrics
         .attempt(channel, provider_name, attempt_outcome, took);
+    match outcome {
+        // Mail stays queued while an operator fixes the key or the credits.
+        SendOutcome::Transient { code, .. } if code == crate::brevo::PROVIDER_ACCOUNT => {
+            merezha_telemetry::event!(
+                ERROR,
+                "notification.provider_account_error",
+                provider = provider_name,
+                channel = channel.as_str(),
+                code = code.as_str()
+            );
+            core.metrics.provider_account_error(provider_name, channel);
+        }
+        SendOutcome::RateLimited { .. } => merezha_telemetry::event!(
+            WARN,
+            "notification.provider_rate_limited",
+            provider = provider_name,
+            channel = channel.as_str(),
+            code = "rate_limited"
+        ),
+        _ => {}
+    }
     let delivery = id.to_string();
     match status {
         "accepted" => {

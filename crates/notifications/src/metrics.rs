@@ -1,6 +1,7 @@
 //! The notification rows of TE §1.3 this slice records (NT §9, TE-T6):
 //! requests, deliveries, attempts, attempt duration, latency, render
-//! failures and purged data. Attribute values come from closed sets
+//! failures, purged data, and (NT-N3) provider events and provider account
+//! errors. Attribute values come from closed sets
 //! (sources and topics are declared, channels, statuses, reasons, providers
 //! and outcomes are enums); ids, addresses and templates never become
 //! attributes.
@@ -23,6 +24,8 @@ struct Instruments {
     latency: Histogram<f64>,
     render_failures: Counter<u64>,
     data_purged: Counter<u64>,
+    provider_events: Counter<u64>,
+    provider_account_errors: Counter<u64>,
     /// Declared topics; any other is labelled [`UNKNOWN_TOPIC`].
     topics: BTreeSet<String>,
 }
@@ -62,6 +65,11 @@ impl Metrics {
             latency: instruments::histogram(meter, &metric::NOTIFICATION_LATENCY),
             render_failures: instruments::counter(meter, &metric::NOTIFICATION_RENDER_FAILURES),
             data_purged: instruments::counter(meter, &metric::NOTIFICATION_DATA_PURGED),
+            provider_events: instruments::counter(meter, &metric::NOTIFICATION_PROVIDER_EVENTS),
+            provider_account_errors: instruments::counter(
+                meter,
+                &metric::NOTIFICATION_PROVIDER_ACCOUNT_ERRORS,
+            ),
             topics: topics.into_iter().collect(),
         })))
     }
@@ -126,6 +134,38 @@ impl Metrics {
                 &[
                     KeyValue::new("notify.channel", channel.as_str()),
                     KeyValue::new("notify.topic", i.topic(topic)),
+                ],
+            );
+        }
+    }
+    /// One stored provider event (NT-N3): `event` is a normalized name.
+    pub fn provider_event(
+        &self,
+        provider: &'static str,
+        channel: &'static str,
+        event: &'static str,
+        correlated: bool,
+    ) {
+        if let Some(i) = &self.0 {
+            i.provider_events.add(
+                1,
+                &[
+                    KeyValue::new("notify.provider", provider),
+                    KeyValue::new("notify.channel", channel),
+                    KeyValue::new("notify.event", event),
+                    KeyValue::new("notify.correlated", correlated),
+                ],
+            );
+        }
+    }
+    /// A provider refused the account (key, credits, permission).
+    pub fn provider_account_error(&self, provider: &'static str, channel: Channel) {
+        if let Some(i) = &self.0 {
+            i.provider_account_errors.add(
+                1,
+                &[
+                    KeyValue::new("notify.provider", provider),
+                    KeyValue::new("notify.channel", channel.as_str()),
                 ],
             );
         }
