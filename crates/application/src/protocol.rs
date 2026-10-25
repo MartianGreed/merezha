@@ -5,7 +5,7 @@ use crate::{Guest, GuestSession};
 use merezha_domain::{
     Failure, Metadata, Operation, PROTOCOL_V1, PROTOCOL_V2, Principal, Reply, StoredEvent,
 };
-use std::{collections::BTreeSet, sync::Mutex, time::Instant};
+use std::{collections::BTreeMap, sync::Mutex, time::Instant};
 
 /// The code of a service whose declared protocol its guest does not speak.
 pub(crate) const MISMATCH: &str = "service_protocol_mismatch";
@@ -62,7 +62,6 @@ pub(crate) fn establish(
     let Some(principal) = principal else {
         return Ok(());
     };
-    principal.check()?;
     if metadata
         .actor
         .as_ref()
@@ -85,15 +84,31 @@ pub(crate) fn stored(metadata: &Metadata) -> Metadata {
     stored
 }
 
-/// The version 2 services whose `describe` answered in one generation:
-/// checked at startup and again on the first call after each reload. Only
-/// the newest generation seen is kept, so the set holds at most one
-/// catalog's services.
+/// The bounds of the principal a version 2 guest is about to receive
+/// ([`Principal::check`]): `invalid_principal` past 16 roles or 64 bytes.
+/// Checked here rather than where the host establishes the principal, so a
+/// principal no guest sees (version 1 services, stored metadata, which
+/// keeps no roles) never fails a call.
+fn bounded(operation: &Operation) -> Result<(), Failure> {
+    match operation {
+        Operation::Decide { metadata, .. } | Operation::Query { metadata, .. } => {
+            metadata.principal.as_ref().map_or(Ok(()), Principal::check)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The `describe` outcome of each version 2 service in one generation:
+/// `true` when it answered, `false` for `service_protocol_mismatch`.
+/// Checked at startup and again on the first call after each reload; a
+/// transient failure is not recorded. Only the newest generation seen is
+/// kept, so the map holds at most one catalog's services.
 #[derive(Default)]
-pub(crate) struct Described(Mutex<(u64, BTreeSet<String>)>);
+pub(crate) struct Described(Mutex<(u64, BTreeMap<String, bool>)>);
 impl Described {
     /// Call `service` with `operation` fitted to its protocol, after
-    /// checking a version 2 service's `describe` once per generation.
+    /// checking a version 2 service's `describe` once per generation and
+    /// the principal's bounds.
     pub(crate) fn call(
         &self,
         session: &dyn GuestSession,
@@ -104,6 +119,7 @@ impl Described {
         let protocol = session.protocol(service);
         if protocol == PROTOCOL_V2 {
             self.ensure(session, service, deadline)?;
+            bounded(&operation)?;
         }
         session.invoke_until(service, fit(operation, protocol)?, deadline)
     }
@@ -114,22 +130,37 @@ impl Described {
         deadline: Instant,
     ) -> Result<(), Failure> {
         let generation = session.generation();
-        if self.known(generation, service)? {
-            return Ok(());
+        let answered = match self.known(generation, service)? {
+            Some(answered) => answered,
+            None => {
+                let answered = match describe(session, service, deadline) {
+                    Ok(()) => true,
+                    Err(failure) if failure.code == MISMATCH => false,
+                    // Transient: not recorded, the next call asks again.
+                    Err(failure) => return Err(failure),
+                };
+                let mut cache = self.0.lock().map_err(|_| Failure::transient("internal"))?;
+                if cache.0 < generation {
+                    *cache = (generation, BTreeMap::new());
+                }
+                if cache.0 == generation {
+                    cache.1.insert(service.to_owned(), answered);
+                }
+                answered
+            }
+        };
+        if answered {
+            Ok(())
+        } else {
+            Err(Failure::permanent(MISMATCH))
         }
-        describe(session, service, deadline)?;
-        let mut cache = self.0.lock().map_err(|_| Failure::transient("internal"))?;
-        if cache.0 < generation {
-            *cache = (generation, BTreeSet::new());
-        }
-        if cache.0 == generation {
-            cache.1.insert(service.to_owned());
-        }
-        Ok(())
     }
-    fn known(&self, generation: u64, service: &str) -> Result<bool, Failure> {
+    /// The recorded outcome for `service` in `generation`, if any.
+    fn known(&self, generation: u64, service: &str) -> Result<Option<bool>, Failure> {
         let cache = self.0.lock().map_err(|_| Failure::transient("internal"))?;
-        Ok(cache.0 == generation && cache.1.contains(service))
+        Ok((cache.0 == generation)
+            .then(|| cache.1.get(service).copied())
+            .flatten())
     }
     /// The startup check: every service the guest declares as version 2
     /// answers `describe`, else `service_protocol_mismatch`.
@@ -210,12 +241,22 @@ mod tests {
         let mut same = metadata();
         same.actor = Some(id("usr_1"));
         establish(&mut same, Some(principal())).unwrap();
+        // Bounds are checked only for a version 2 guest.
         let mut unsorted = principal();
         unsorted.roles = vec![id("b"), id("a")];
+        let mut held = metadata();
+        establish(&mut held, Some(unsorted)).unwrap();
+        let query = Operation::Query {
+            tag: id("Q"),
+            payload: json!({}),
+            state: json!({}),
+            metadata: held,
+        };
         assert_eq!(
-            establish(&mut metadata(), Some(unsorted)),
+            bounded(&query),
             Err(Failure::permanent("invalid_principal"))
         );
+        assert!(fit(query, PROTOCOL_V1).is_ok_and(|op| bounded(&op).is_ok()));
     }
 
     #[test]

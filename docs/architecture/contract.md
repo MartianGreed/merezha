@@ -56,7 +56,11 @@ A service may set `application_protocol = 1` (the default) or `2`; any other
 value is an invalid manifest. It names the [application protocol](application.md)
 version the host speaks to the service. The runtime only records it per
 generation (`Catalog::protocols`, `Session::protocol`); raw invocations and
-pipelines never interpret it, and `/v1/services` does not list it.
+pipelines never interpret it, and `/v1/services` does not list it. On the
+loopback `serve` listener, `/v1/services/{id}/invoke` lets a local caller
+hand-craft any version 2 request, principal included: the guarantee that only
+the host sets the principal covers the application path
+(`/v1/application/...`), not raw invocation.
 
 | Setting | Range and meaning |
 | --- | --- |

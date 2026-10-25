@@ -251,14 +251,15 @@ async fn dispatch(state: Routes, request: Request, action: Action) -> Response {
             // The edge's principal reaches the guest's metadata (version 2
             // guests only) through the trusted entry points; route scopes
             // are AP-C2's, so the roles are the application-scope ones.
-            let guest = principal
-                .as_deref()
-                .map(|principal| principal.guest(&ResourceScope::Application))
-                .transpose()?;
+            let guest = || {
+                principal
+                    .as_deref()
+                    .map(|principal| principal.guest(&ResourceScope::Application))
+            };
             Ok(match action {
                 Action::Command => {
                     let command = merezha_domain::decode(&with_host_ids(input)?)?;
-                    let receipt = match guest {
+                    let receipt = match guest() {
                         Some(principal) => admission.command_as(principal, command)?,
                         None => admission.command(command)?,
                     };
@@ -266,7 +267,7 @@ async fn dispatch(state: Routes, request: Request, action: Action) -> Response {
                 }
                 Action::Query => {
                     let query = merezha_domain::decode(&with_host_ids(input)?)?;
-                    let answer = match guest {
+                    let answer = match guest() {
                         Some(principal) => admission.query_as(principal, query)?,
                         None => admission.query(query)?,
                     };

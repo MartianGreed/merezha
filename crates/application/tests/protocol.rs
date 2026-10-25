@@ -493,3 +493,72 @@ fn postgres_history_keeps_the_principal_without_roles_and_downgrades_it() {
         );
     }
 }
+
+/// A mismatch is recorded like a success: a guest that fails `describe`
+/// is asked once per generation, not on every call.
+#[test]
+fn a_mismatched_guest_is_described_once_per_generation() {
+    use merezha_telemetry::testing::Harness;
+    let harness = Harness::new();
+    let dir = tempfile::tempdir().unwrap();
+    components(dir.path());
+    let runtime =
+        Runtime::load(manifest(dir.path(), ("owner.wasm", 2), ("legacy.wasm", 1))).unwrap();
+    let app = Application::in_memory(config(), Arc::new(runtime.clone()), Arc::new(AllowAll))
+        .unwrap()
+        .with_meters(&harness.telemetry().meters());
+    let describes = || {
+        harness
+            .spans()
+            .iter()
+            .filter(|s| s.name == "guest owner describe")
+            .count()
+    };
+    assert_eq!(describes(), 1);
+    manifest(dir.path(), ("legacy.wasm", 2), ("legacy.wasm", 1));
+    runtime.reload().unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            code(app.command_as(principal(), command("Add", None))),
+            "service_protocol_mismatch"
+        );
+    }
+    assert_eq!(describes(), 2, "one describe for the mismatched generation");
+    runtime.reload().unwrap();
+    assert_eq!(
+        code(app.query_as(principal(), query("Who"))),
+        "service_protocol_mismatch"
+    );
+    assert_eq!(describes(), 3, "asked again after the next reload");
+}
+
+/// The principal's bounds bind only where a version 2 guest receives it:
+/// an oversize principal still reaches version 1 services.
+#[test]
+fn an_oversize_principal_fails_only_version_2_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    components(dir.path());
+    let runtime =
+        Runtime::load(manifest(dir.path(), ("owner.wasm", 2), ("legacy.wasm", 1))).unwrap();
+    let app = Application::in_memory(config(), Arc::new(runtime), Arc::new(AllowAll)).unwrap();
+    let mut crowded = principal();
+    crowded.roles = (0..17).map(|i| id(&format!("r{i:02}"))).collect();
+    assert_eq!(
+        code(app.command_as(crowded.clone(), command("Add", None))),
+        "invalid_principal"
+    );
+    assert_eq!(
+        code(app.query_as(crowded.clone(), query("Who"))),
+        "invalid_principal"
+    );
+    assert_eq!(
+        app.command_as(crowded.clone(), command("Legacy", None))
+            .unwrap()
+            .version,
+        1
+    );
+    assert_eq!(
+        app.query_as(crowded, query("Total")).unwrap().value,
+        json!(1)
+    );
+}

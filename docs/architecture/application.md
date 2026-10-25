@@ -49,7 +49,8 @@ echo the version (`protocol_version` otherwise). Version 2 adds:
 
 - `metadata.principal`, set only by the host: `{subject, kind, tenant?,
   roles?}` with `kind` one of `user`, `api_key` or `system` and at most 16
-  sorted role keys of at most 64 bytes, the roles held at the route's scope.
+  sorted role keys of at most 64 bytes, the roles held at the route's scope
+  (checked before each call to a version 2 guest, `invalid_principal`).
   When it is present, `actor` is its subject. It never carries sessions,
   grants or secrets. Guests use it for ownership rules
   (`Metadata::principal`, `Metadata::require_subject`, `Principal::has_role`,

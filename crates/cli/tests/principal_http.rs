@@ -99,13 +99,16 @@ fn router(recorder: &Recorder, principal: Option<Arc<Principal>>) -> Router {
     ))
 }
 async fn post(app: &Router, path: &str, body: Value) -> (u16, Value) {
+    send(app, path, body.to_string()).await
+}
+async fn send(app: &Router, path: &str, body: String) -> (u16, Value) {
     let response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri(path)
-                .body(Body::from(body.to_string()))
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await
@@ -195,4 +198,46 @@ async fn a_principal_in_the_body_is_never_trusted() {
     .await;
     assert_eq!(status, 200);
     assert!(recorder.0.lock().unwrap()[0].get("principal").is_none());
+}
+
+/// The guest projection is built only for commands and queries, and its
+/// bounds bind only for a version 2 guest: an oversize principal never
+/// fails an administrative route.
+#[tokio::test]
+async fn an_oversize_principal_fails_only_the_version_2_call() {
+    let crowded = {
+        let mut principal = (*principal()).clone();
+        principal.grants = Arc::new(GrantSnapshot::empty().with_application(Grants::new(
+            (0..17).map(|i| id(&format!("r{i:02}"))).collect(),
+            Default::default(),
+        )));
+        Arc::new(principal)
+    };
+    let recorder = Recorder::default();
+    let app = router(&recorder, Some(crowded));
+    let (status, body) = post(
+        &app,
+        "/v1/application/commands",
+        json!({"tag":"Add","stream":"one","payload":1}),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["code"].clone()),
+        (422, json!("invalid_principal"))
+    );
+    let (status, _) = send(
+        &app,
+        "/v1/application/projections/total/catch-up",
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (status, _) = send(
+        &app,
+        "/v1/application/projections/total/rebuild",
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(recorder.0.lock().unwrap().is_empty(), "no guest decided");
 }
