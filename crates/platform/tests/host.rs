@@ -1500,3 +1500,75 @@ async fn credential_free_routes_skip_the_authenticator_and_see_no_principal() {
         .unwrap();
     assert_eq!(call(&router, get).await.0, StatusCode::UNAUTHORIZED);
 }
+
+/// Declares one credential-free path, valid or not.
+struct Declares(&'static str, &'static str);
+impl Module for Declares {
+    fn name(&self) -> &'static str {
+        self.0
+    }
+    fn credential_free_routes(&self) -> Vec<merezha_platform::CredentialFreeRoute> {
+        vec![merezha_platform::CredentialFreeRoute {
+            method: axum::http::Method::POST,
+            path: self.1,
+        }]
+    }
+}
+
+#[tokio::test]
+async fn a_credential_free_path_cannot_reach_outside_its_module() {
+    // `/v1/call` + `back/closed` would exempt another module's route.
+    let error = Host::start(
+        ProjectConfig::parse(
+            "[app]\nid = \"notes-app\"\n[database]\nurl = { env = \"NOTES_DATABASE_URL\" }\n[runtime]\nmanifest = \"runtime.toml\"\n",
+            std::env::temp_dir(),
+            &[("NOTES_DATABASE_URL".into(), "postgres://127.0.0.1:1/none".into())],
+            &[],
+        )
+        .unwrap(),
+        vec![Box::new(Callback), Box::new(Declares("call", "back/closed"))],
+        parts(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        (error.failure.code.as_str(), error.module),
+        ("invalid_credential_free_route", Some("call"))
+    );
+    for bad in [
+        "back/closed",
+        "/a/../b",
+        "/a%2fb",
+        "//x",
+        "/a?b",
+        "/a#b",
+        "",
+    ] {
+        assert!(
+            !merezha_platform::host::valid_credential_free_path(bad),
+            "{bad}"
+        );
+    }
+    assert!(merezha_platform::host::valid_credential_free_path(
+        "/unsubscribe"
+    ));
+    // A valid one still works beside the other module.
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let host = Host::start(
+        config(&test, true, ""),
+        vec![Box::new(Callback), Box::new(Declares("call", "/back"))],
+        parts(),
+    )
+    .await
+    .unwrap();
+    let (status, _, _) = call(
+        &host.router(),
+        Request::post("/v1/callback/open")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}

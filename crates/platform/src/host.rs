@@ -272,6 +272,41 @@ fn blob_store(modules: &[Arc<dyn Module>]) -> Result<Option<Arc<dyn BlobStore>>,
     Ok(found)
 }
 
+/// Whether `path` may name a credential-free route under its module's
+/// prefix: it starts with `/` and holds no `..`, `%`, `//`, query or
+/// fragment, so it cannot reach outside `/v1/<name>` (`/v1/call` plus
+/// `back/closed` would otherwise exempt `/v1/callback/closed`).
+pub fn valid_credential_free_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.contains("..")
+        && !path.contains('%')
+        && !path.contains("//")
+        && !path.contains('?')
+        && !path.contains('#')
+}
+
+/// Every module's credential-free routes as `(method, /v1/<name><path>)`;
+/// an invalid path stops startup with `invalid_credential_free_route`.
+fn credential_free_routes(
+    modules: &[Box<dyn Module>],
+) -> Result<Vec<(axum::http::Method, String)>, StartupError> {
+    let mut routes = Vec::new();
+    for module in modules {
+        for route in module.credential_free_routes() {
+            if !valid_credential_free_path(route.path) {
+                return Err(StartupError {
+                    failure: Failure::permanent("invalid_credential_free_route"),
+                    migration: None,
+                    module: Some(module.name()),
+                });
+            }
+            let prefix = format!("/v1/{}", module.name());
+            routes.push((route.method, format!("{prefix}{}", route.path)));
+        }
+    }
+    Ok(routes)
+}
+
 /// The one notifier factory a module provides ([`Module::notifier`]), or
 /// `None` for the capture fallback; two fail `notifier_conflict`.
 fn notifier_factory(
@@ -382,6 +417,7 @@ impl Host {
                 });
             }
         }
+        let credential_free = credential_free_routes(&modules)?;
         let meter = options.meters.meter(merezha_postgres::METER_SCOPE);
         let database =
             Database::connect_with_meter(&config.database, &meter).map_err(|failure| {
@@ -615,15 +651,6 @@ impl Host {
                         limit.limit,
                     )
                 })
-            })
-            .collect();
-        let credential_free = modules
-            .iter()
-            .flat_map(|module| {
-                module
-                    .credential_free_routes()
-                    .into_iter()
-                    .map(|route| (route.method, format!("/v1/{}{}", module.name(), route.path)))
             })
             .collect();
         let router = edge::apply(
