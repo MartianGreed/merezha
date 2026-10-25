@@ -13,7 +13,7 @@ mod sqlite;
 pub mod status;
 pub mod store;
 pub use access::{Anonymous, Caller, Scope};
-pub use application::{Application, ProjectionState, QueryResult};
+pub use application::{Admission, Application, ProjectionState, QueryResult};
 pub use instrument::SCOPE;
 
 use merezha_domain::{Failure, MessageKind, Metadata, Operation, Reply};
