@@ -76,11 +76,26 @@ pub struct OutboundResponse {
 pub struct OutboundHttp {
     client: reqwest::Client,
 }
+/// A failed outbound exchange and whether the request may have reached the
+/// server: `false` only when no connection was made (connect, DNS or TLS
+/// failure, or a deadline already passed), so a caller can resend without
+/// risking a duplicate. A timeout or read error after connecting is
+/// `maybe_sent`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboundFailure {
+    pub failure: Failure,
+    pub maybe_sent: bool,
+}
 impl OutboundHttp {
     pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
     pub fn new() -> Result<Self, Failure> {
+        Self::with_connect_timeout(Self::CONNECT_TIMEOUT)
+    }
+    /// The client with another connect timeout, for a provider setting
+    /// such as `brevo.connect_timeout`; every other property is the same.
+    pub fn with_connect_timeout(connect_timeout: Duration) -> Result<Self, Failure> {
         let client = reqwest::Client::builder()
-            .connect_timeout(Self::CONNECT_TIMEOUT)
+            .connect_timeout(connect_timeout)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .user_agent(concat!("merezha/", env!("CARGO_PKG_VERSION")))
@@ -98,14 +113,30 @@ impl OutboundHttp {
     /// `upstream_body_limit`; the request is never retried here.
     pub async fn send(
         &self,
-        mut request: reqwest::Request,
+        request: reqwest::Request,
         deadline: Instant,
         max_body: usize,
         trace: Option<&TraceContext>,
     ) -> Result<OutboundResponse, Failure> {
+        self.exchange(request, deadline, max_body, trace)
+            .await
+            .map_err(|e| e.failure)
+    }
+    /// [`OutboundHttp::send`], with the failure telling whether the request
+    /// may have reached the server ([`OutboundFailure::maybe_sent`]).
+    pub async fn exchange(
+        &self,
+        mut request: reqwest::Request,
+        deadline: Instant,
+        max_body: usize,
+        trace: Option<&TraceContext>,
+    ) -> Result<OutboundResponse, OutboundFailure> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(Failure::transient("upstream_timeout"));
+            return Err(OutboundFailure {
+                failure: Failure::transient("upstream_timeout"),
+                maybe_sent: false,
+            });
         }
         *request.timeout_mut() = Some(remaining);
         if let Some(trace) = trace
@@ -121,7 +152,10 @@ impl OutboundHttp {
             let mut body = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(transport)? {
                 if body.len() + chunk.len() > max_body {
-                    return Err(Failure::permanent("upstream_body_limit"));
+                    return Err(OutboundFailure {
+                        failure: Failure::permanent("upstream_body_limit"),
+                        maybe_sent: true,
+                    });
                 }
                 body.extend_from_slice(&chunk);
             }
@@ -133,15 +167,23 @@ impl OutboundHttp {
         };
         match tokio::time::timeout_at(at, exchange).await {
             Ok(result) => result,
-            Err(_) => Err(Failure::transient("upstream_timeout")),
+            Err(_) => Err(OutboundFailure {
+                failure: Failure::transient("upstream_timeout"),
+                maybe_sent: true,
+            }),
         }
     }
 }
-fn transport(error: reqwest::Error) -> Failure {
-    if error.is_timeout() {
+fn transport(error: reqwest::Error) -> OutboundFailure {
+    let failure = if error.is_timeout() {
         Failure::transient("upstream_timeout")
     } else {
         Failure::transient("upstream_unavailable")
+    };
+    // A connect error (DNS, TCP or TLS) never wrote the request.
+    OutboundFailure {
+        failure,
+        maybe_sent: !error.is_connect(),
     }
 }
 
@@ -523,6 +565,59 @@ mod tests {
             !seen[0].contains("b7ad6b7169203331"),
             "a child span id is sent"
         );
+    }
+
+    /// Only a failure before any connection says the request was not sent:
+    /// a refused connection is safe to resend, a dropped reply is not.
+    #[tokio::test]
+    async fn outbound_failures_tell_whether_the_request_was_sent() {
+        use tokio::io::AsyncReadExt;
+        let http = OutboundHttp::with_connect_timeout(Duration::from_secs(1)).unwrap();
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refused_url = format!("http://{}/x", closed.local_addr().unwrap());
+        drop(closed);
+        let soon = || Instant::now() + Duration::from_secs(5);
+        let refused = http
+            .exchange(
+                http.client().post(&refused_url).build().unwrap(),
+                soon(),
+                16,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (refused.failure.code.as_str(), refused.maybe_sent),
+            ("upstream_unavailable", false)
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/x", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0; 4096];
+            let _ = socket.read(&mut buffer).await;
+            // Read the request, then drop the connection without a reply.
+        });
+        let dropped = http
+            .exchange(
+                http.client().post(&url).body("{}").build().unwrap(),
+                soon(),
+                16,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(dropped.maybe_sent, "{dropped:?}");
+        let late = http
+            .exchange(
+                http.client().post(&url).build().unwrap(),
+                Instant::now(),
+                16,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(!late.maybe_sent);
     }
 
     #[test]

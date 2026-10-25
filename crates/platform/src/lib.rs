@@ -17,7 +17,10 @@ pub mod ports;
 pub mod status;
 
 pub use config::{ConfigErrors, ConfigInput, ConfigIssue, ModuleSection, ProjectConfig};
-pub use context::{AppContext, Clock, OsRandom, OutboundHttp, Random, SystemClock};
+pub use context::{
+    AppContext, Clock, OsRandom, OutboundFailure, OutboundHttp, OutboundResponse, Random,
+    SystemClock,
+};
 pub use edge::{EDGE_SCOPE, ErrorReply, error_response};
 pub use errors::{ErrorCode, ErrorRegistry, FieldError};
 pub use host::{EarlyListener, Host, HostOptions, HostParts, StartupError, Timeouts};
