@@ -217,28 +217,31 @@ pub fn check_registry(sets: &[&[Statement]]) -> Result<(), Vec<&'static str>> {
 }
 
 /// Driver methods that take SQL text, a driver statement or a portal
-/// first: a call to one of them is unregistered unless its second argument
-/// is a registered [`Statement`] (the registry's own methods take the
-/// session first and the statement second).
-pub const DRIVER_METHODS: &[&str] = &[
-    "query",
-    "query_one",
-    "query_opt",
-    "query_raw",
-    "query_typed",
-    "query_typed_raw",
-    "query_portal",
-    "execute",
-    "execute_raw",
-    "batch_execute",
-    "simple_query",
-    "prepare",
-    "prepare_typed",
-    "prepare_cached",
-    "prepare_typed_cached",
-    "bind",
-    "copy_in",
-    "copy_out",
+/// first, with their argument count: a call to one of them with exactly
+/// that many arguments is unregistered unless its second argument is a
+/// registered [`Statement`] (the registry's own methods take the session
+/// first and the statement second). The count keeps same-named methods of
+/// other types (`Application::query(query)`, a runtime's `prepare` of four
+/// arguments, an HTTP client's `execute(request)`) out of the scan.
+pub const DRIVER_METHODS: &[(&str, usize)] = &[
+    ("query", 2),
+    ("query_one", 2),
+    ("query_opt", 2),
+    ("query_raw", 2),
+    ("query_typed", 2),
+    ("query_typed_raw", 2),
+    ("query_portal", 2),
+    ("execute", 2),
+    ("execute_raw", 2),
+    ("batch_execute", 1),
+    ("simple_query", 1),
+    ("prepare", 1),
+    ("prepare_typed", 2),
+    ("prepare_cached", 1),
+    ("prepare_typed_cached", 2),
+    ("bind", 2),
+    ("copy_in", 1),
+    ("copy_out", 1),
 ];
 
 /// `source` with comments blanked and string and character literal
@@ -389,18 +392,18 @@ fn statement_argument(argument: &str) -> bool {
 }
 
 /// Calls in `source` that hand SQL to the driver instead of a registered
-/// [`Statement`], as `(line, method)`: a [`DRIVER_METHODS`] call with
-/// arguments whose second argument is not `&A_STATEMENT`. Comments and
-/// string contents are ignored. A block lists its own violations in a test
-/// with [`scan_sources`].
+/// [`Statement`], as `(line, method)`: a [`DRIVER_METHODS`] call with the
+/// method's argument count whose second argument is not `&A_STATEMENT`.
+/// Comments and string contents are ignored. The workspace scan
+/// (`crates/postgres/tests/statement_scan.rs`) runs it over every crate.
 pub fn unregistered_calls(source: &str) -> Vec<(usize, &'static str)> {
     let code = code_only(source);
     let mut found = Vec::new();
-    for method in DRIVER_METHODS {
+    for (method, arity) in DRIVER_METHODS {
         let needle = format!(".{method}(");
         for (at, _) in code.match_indices(&needle) {
             let args = arguments(&code, at + needle.len());
-            if args.is_empty() {
+            if args.len() != *arity {
                 continue;
             }
             if args.get(1).is_some_and(|a| statement_argument(a)) {
@@ -632,6 +635,43 @@ impl Database {
         params: &[&(dyn ToSql + Sync)],
     ) -> Result<Vec<Row>, tokio_postgres::Error> {
         let fut = on_driver!(session, |c| c.query(sql, params));
+        self.telemetry.observe(statement, fut).await
+    }
+    /// [`Database::query_text`] expecting exactly one row, with the
+    /// driver's `query_one` contract.
+    pub async fn query_one_text(
+        &self,
+        session: &impl Session,
+        statement: &Statement,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Row, tokio_postgres::Error> {
+        let fut = on_driver!(session, |c| c.query_one(sql, params));
+        self.telemetry.observe(statement, fut).await
+    }
+    /// [`Database::query_text`] expecting at most one row, with the
+    /// driver's `query_opt` contract.
+    pub async fn query_opt_text(
+        &self,
+        session: &impl Session,
+        statement: &Statement,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<Row>, tokio_postgres::Error> {
+        let fut = on_driver!(session, |c| c.query_opt(sql, params));
+        self.telemetry.observe(statement, fut).await
+    }
+    /// [`Database::execute`] for text built at run time under a registered
+    /// name, with parameters: the number of rows affected. The text is
+    /// never recorded.
+    pub async fn execute_text(
+        &self,
+        session: &impl Session,
+        statement: &Statement,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<u64, tokio_postgres::Error> {
+        let fut = on_driver!(session, |c| c.execute(sql, params));
         self.telemetry.observe(statement, fut).await
     }
 }
@@ -910,16 +950,6 @@ mod tests {
             )
         );
     }
-    /// Every SQL call of the kernel's runtime goes through the registry:
-    /// no source file of the crate hands SQL to the driver. `statement.rs`
-    /// is the registry's own dispatch, and the test harness (`testing.rs`)
-    /// runs administrative SQL on its own connection outside any pool.
-    #[test]
-    fn kernel_sources_call_no_driver_method_directly() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let found = scan_sources(&dir, &["statement.rs", "testing.rs"]).unwrap();
-        assert!(found.is_empty(), "unregistered SQL: {found:?}");
-    }
     #[test]
     fn the_scan_flags_every_bypass_form() {
         let bypasses = [
@@ -950,6 +980,12 @@ mod tests {
             "let doc = \"call .query(\\\"x\\\", &[]) here\";",
             "let quote = b'\"'; let other = 'a';",
             "let raw = r#\"client.execute(\"x\", &[])\"#;",
+            // Same-named methods of other arities are not the driver's.
+            "app.query(query)",
+            "self.client.execute(request)",
+            "outbox.bind(&source)",
+            "runtime.prepare(registry, ids, operation, None)",
+            "client.batch_execute(sql, extra)",
         ];
         for source in fine {
             assert_eq!(unregistered_calls(source), vec![], "{source}");

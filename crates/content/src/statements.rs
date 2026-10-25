@@ -302,20 +302,4 @@ mod tests {
             assert!(statement.name.starts_with("content."), "{}", statement.name);
         }
     }
-
-    /// The C5 sources hand no SQL to the driver outside the registry.
-    #[test]
-    fn delivery_sources_have_no_unregistered_sql() {
-        for (name, source) in [
-            ("delivery.rs", include_str!("delivery.rs")),
-            ("populate.rs", include_str!("populate.rs")),
-            ("statements.rs", include_str!("statements.rs")),
-        ] {
-            assert_eq!(
-                merezha_postgres::statement::unregistered_calls(source),
-                Vec::<(usize, &str)>::new(),
-                "{name}"
-            );
-        }
-    }
 }
