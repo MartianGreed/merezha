@@ -131,7 +131,12 @@ inbox: created directly as delivered.
 `accepted` is settled but not terminal: provider events can still move it to
 `delivered`, `bounced`, `complained` or `failed`. The other statuses are
 terminal, with one exception: a provider event can move `unknown` to
-`delivered`, `bounced` or `failed`.
+`delivered`, `bounced` or `failed`. A bounce or a spam complaint can also
+follow `delivered` (an asynchronous bounce, a complaint after reading), so
+`hard_bounce` and `invalid_email` may move `delivered` to `bounced` and
+`spam` may move it to `complained` (N3). An event never moves a delivery
+that is still `queued`, `sending` or `retrying`; its worker records the
+outcome.
 
 ### 2.4 Schema `merezha_notify`
 
@@ -838,6 +843,7 @@ Each callback request is processed in one transaction:
    | `spam` | `complained`, plus a `spam_complaint` suppression |
    | `blocked`, `error`, SMS `rejected` | `failed` |
    | SMS `blacklisted`, `unsubscribed` | an `unsubscribed` suppression for SMS |
+   | email `unsubscribed` | an `unsubscribed` suppression for the delivery's topic, as an address unsubscribe token writes (N3); none when uncorrelated |
    | `soft_bounce`, `deferred` | recorded only (Brevo retries) |
 
    `hard_bounce` and `spam_complaint` suppressions cover every non-security
@@ -1396,14 +1402,20 @@ reaches Brevo or a real push service.
 **Test kit** (feature `testkit`, dev-dependencies only). It is built on the
 workspace's axum and adds no mock-server dependency.
 
-- `FakeBrevo` listens on `127.0.0.1:0` and serves both send endpoints. It
-  checks `api-key`, records requests, and enforces `idempotencyKey` for 30
-  minutes on an injectable clock: a reused key gets 400
-  `{"code":"duplicate_parameter"}`. Scripted behaviours are `fail_next(n,
-  status)`, `rate_limit(headers)`, `delay(d)` and `close_after_accept()`,
-  which processes the request and then drops the connection without
-  replying. `emit_event(…)` posts Brevo webhooks to the callback with the
-  bearer token.
+- `FakeBrevo` listens on `127.0.0.1:0` and serves both send endpoints and
+  `POST /v3/webhooks`. It checks `api-key`, records requests, and enforces
+  `idempotencyKey` for 30 minutes on its own clock (`advance(d)`): a
+  reused key gets 400 `{"code":"duplicate_parameter"}`. Scripted
+  behaviours are `fail_next(n, status)`, `rate_limit(headers)`, `delay(d)`
+  and `close_after_accept()`, which processes the request and then drops
+  the connection without replying. Because a server framework cannot drop
+  a connection from a handler, it is a small HTTP/1.1 server over a tokio
+  listener rather than axum (N3). `event(name, message)` builds a Brevo
+  webhook payload and `event_request(path, token, payload)` the callback
+  request with the bearer token. It assumes, as the block does, that the
+  duplicate answer is HTTP 400, that only a processed request takes its key
+  (a refused one leaves it free) and that single-recipient sends are
+  covered; see section 12.
 - `FakePushService` decrypts with `web_push_native::decrypt` under a test
   user-agent key, verifies the VAPID JWT (`aud`, `exp` at most 24 h, the
   signature) and answers with a scripted 201, 404, 410, 413 or 429.
@@ -1675,7 +1687,13 @@ The owner answered this design's open questions on 2026-10-24. The record is
 ### What could not be verified
 
 - How Brevo answers a duplicate `idempotencyKey` (HTTP status), and whether a
-  failed request consumes the key (verified before N3, section 12).
+  failed request consumes the key. N3 found no sandbox: Brevo's
+  documentation (developers.brevo.com, "Idempotency in batch emails") says
+  the key is a UUID in `headers`, held 30 minutes, and that a reuse gets
+  `duplicate_parameter` without processing; it names neither the status
+  nor the fate of a failed request's key. N3 assumes 400 and "only a
+  processed request takes the key", as `FakeBrevo` models; a real-account
+  check is still owed before production use.
 - Whether Brevo SMS accepts a leading `+` in `recipient`.
 - Whether `error` is an accepted event name for webhook creation, and the
   exact SMS webhook event set for `channel: "sms"`.
