@@ -1,5 +1,6 @@
 //! The content block as a platform [`Module`]: `[modules.content]`, the
 //! model file, migration 1, activation at start and readiness.
+use crate::statements;
 use crate::store::Store;
 use crate::{
     ERRORS,
@@ -125,8 +126,8 @@ impl ContentState {
     /// stays as it is. C3 onward call
     /// it first in every write; content job handlers do too and stop
     /// leasing once [`ContentState::is_outdated`].
-    pub async fn check_writable(&self, tx: &mut Tx<'_>) -> Result<(), Failure> {
-        match lock_model_version(tx, self.model.version()).await {
+    pub async fn check_writable(&self, db: &Database, tx: &mut Tx<'_>) -> Result<(), Failure> {
+        match lock_model_version(db, tx, self.model.version()).await {
             Err(failure) if failure.code == SUPERSEDED => {
                 self.mark_outdated();
                 Err(failure)
@@ -167,11 +168,8 @@ impl ContentState {
             let client = database.acquire(deadline).await?;
             if self.current.load(Ordering::SeqCst) {
                 // Current already: only a newer activation can change that.
-                let row = client
-                    .query_opt(
-                        "SELECT version FROM merezha_content.models WHERE state = 'active'",
-                        &[],
-                    )
+                let row = database
+                    .query_opt(&client, &statements::MODEL_ACTIVE_VERSION, &[])
                     .await
                     .map_err(|e| merezha_postgres::classify(&e))?;
                 return match row.map(|r| r.get::<_, i32>(0)) {
@@ -183,7 +181,7 @@ impl ContentState {
                     _ => Err(Failure::transient("content_model_pending")),
                 };
             }
-            match verify(&**client, &self.model).await {
+            match verify(database, &**client, &self.model).await {
                 Ok(Verified::Ready) => {
                     self.current.store(true, Ordering::SeqCst);
                     Ok(())
@@ -243,23 +241,21 @@ const PENDING: &str = "content_model_pending";
 /// `content_model_superseded`; an older one (or none), meaning `version`
 /// is pending activation by a migrating host, fails transient
 /// `content_model_pending`. Both are 503 with `Retry-After`.
-pub async fn lock_model_version(tx: &mut Tx<'_>, version: u32) -> Result<(), Failure> {
+pub async fn lock_model_version(
+    db: &Database,
+    tx: &mut Tx<'_>,
+    version: u32,
+) -> Result<(), Failure> {
     let version = i32::try_from(version).map_err(|_| Failure::permanent("invalid_input"))?;
-    let row = tx
-        .query_opt(
-            "SELECT 1 FROM merezha_content.models WHERE version = $1 AND state = 'active' FOR SHARE",
-            &[&version],
-        )
+    let row = db
+        .query_opt(&*tx, &statements::MODEL_VERSION_LOCK, &[&version])
         .await
         .map_err(|e| merezha_postgres::classify(&e))?;
     if row.is_some() {
         return Ok(());
     }
-    let active = tx
-        .query_opt(
-            "SELECT version FROM merezha_content.models WHERE state = 'active'",
-            &[],
-        )
+    let active = db
+        .query_opt(&*tx, &statements::MODEL_ACTIVE_VERSION, &[])
         .await
         .map_err(|e| merezha_postgres::classify(&e))?
         .map(|row| row.get::<_, i32>(0));
@@ -661,7 +657,7 @@ impl Module for ContentModule {
                     // host's ping is only briefly unavailable.
                     Err(_) => return self.register_jobs(&ctx, &state),
                 };
-                match verify(&**client, &model).await {
+                match verify(ctx.database(), &**client, &model).await {
                     Ok(Verified::Ready) => state.current.store(true, Ordering::SeqCst),
                     Ok(Verified::NotReady("content_model_outdated")) => state.mark_outdated(),
                     // Pending work for a host that migrates; readiness says which.

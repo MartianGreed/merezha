@@ -592,7 +592,7 @@ async fn the_host_activates_the_model_at_start_and_on_restart() {
     let mut client = db.acquire(soon()).await.unwrap();
     let mut tx = client.transaction().await.unwrap();
     assert_eq!(
-        state.check_writable(&mut tx).await.unwrap_err().code,
+        state.check_writable(&db, &mut tx).await.unwrap_err().code,
         "content_model_superseded"
     );
 }
@@ -687,7 +687,7 @@ async fn check_writable_marks_the_host_outdated_only_when_a_newer_model_is_activ
     let mut client = db.acquire(soon()).await.unwrap();
     let mut tx = client.transaction().await.unwrap();
     assert_eq!(
-        state.check_writable(&mut tx).await.unwrap_err().code,
+        state.check_writable(&db, &mut tx).await.unwrap_err().code,
         "content_model_pending"
     );
     drop(tx);
@@ -695,7 +695,7 @@ async fn check_writable_marks_the_host_outdated_only_when_a_newer_model_is_activ
     // v2 activates: its writes pass.
     run(&db, &model(&v2)).await.unwrap();
     let mut tx = client.transaction().await.unwrap();
-    state.check_writable(&mut tx).await.unwrap();
+    state.check_writable(&db, &mut tx).await.unwrap();
     drop(tx);
     // v3 activates: the v2 host is superseded for good.
     run(&db, &model(&V1.replace("version = 1", "version = 3")))
@@ -703,7 +703,7 @@ async fn check_writable_marks_the_host_outdated_only_when_a_newer_model_is_activ
         .unwrap();
     let mut tx = client.transaction().await.unwrap();
     assert_eq!(
-        state.check_writable(&mut tx).await.unwrap_err().code,
+        state.check_writable(&db, &mut tx).await.unwrap_err().code,
         "content_model_superseded"
     );
     assert!(state.is_outdated());

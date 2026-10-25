@@ -36,8 +36,10 @@
 //! preview of drafts with `content.preview`, `fields`, `populate`
 //! (also on management draft reads), by-slug lookups, weak ETags from
 //! the scope generations with 304 answered from `generations` alone,
-//! cache headers, and the model endpoints. Its statements are registered
-//! ([`STATEMENTS`]).
+//! cache headers, and the model endpoints.
+//!
+//! Every statement of the block is registered with the TE-T4 statement
+//! registry: [`STATEMENTS`], and the assets' [`media::STATEMENTS`].
 //!
 //! CT-C7, assets ([`media`]): `[modules.content.media]`, the blob store
 //! provided to every context, uploads streamed through a spool file with
@@ -109,7 +111,7 @@ pub use settings::{
     DEFAULT_PURGE_CRON, DEFAULT_TRASH_RETENTION, Delivery, Limits, MAX_CACHE_CONTROL, Trash,
 };
 pub use slug::slugify;
-pub use statements::STATEMENTS;
+pub use statements::{DIFF_READ_ONLY, STATEMENTS};
 pub use store::{
     Actor, BATCH_ITEMS_PER_TIMEOUT, Content, DRAFT_SAVED, EntrySummary, Page, Referrer, Rejection,
     RevisionItem, RevisionView, Saved, Store, Target, VariantView, WriteKind,

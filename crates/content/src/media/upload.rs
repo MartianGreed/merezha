@@ -226,7 +226,7 @@ impl Assets {
             );
             let claim = transaction(self.db(), self.deadline(), move |tx| {
                 Box::pin(async move {
-                    state.check_writable(tx).await?;
+                    state.check_writable(&db, tx).await?;
                     if let Some(row) = db
                         .query_opt(
                             &*tx,
@@ -322,7 +322,7 @@ impl Assets {
         let (width, height) = (dimensions.map(|d| d.0), dimensions.map(|d| d.1));
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
-                work.state.check_writable(tx).await?;
+                work.state.check_writable(&db, tx).await?;
                 let stored = db
                     .query_opt(&*tx, &sql::BLOB_STORE, &[&scope, &sha256, &put])
                     .await
@@ -408,7 +408,7 @@ impl Assets {
         let (scope, sha256, token) = (scope.to_owned(), sha256.to_owned(), token.to_owned());
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
-                state.check_writable(tx).await?;
+                state.check_writable(&db, tx).await?;
                 let changed = match step {
                     GiveUp::Release => {
                         return Ok(db

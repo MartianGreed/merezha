@@ -728,6 +728,7 @@ async fn a_publish_changes_the_etag_and_an_unchanged_scope_answers_304_from_gene
     // The 304 path: one statement on `generations`, none on entries.
     let published_before = statements_on(&harness, "merezha_content.published");
     let generations_before = statements_on(&harness, "merezha_content.generations");
+    let variants_before = statements_on(&harness, "merezha_content.variants");
     assert!(published_before >= 2.0);
     let reply = fx
         .get(&uri)
@@ -744,7 +745,10 @@ async fn a_publish_changes_the_etag_and_an_unchanged_scope_answers_304_from_gene
         statements_on(&harness, "merezha_content.published"),
         published_before
     );
-    assert_eq!(statements_on(&harness, "merezha_content.variants"), 0.0);
+    assert_eq!(
+        statements_on(&harness, "merezha_content.variants"),
+        variants_before
+    );
     assert_eq!(
         statements_on(&harness, "merezha_content.generations"),
         generations_before + 1.0

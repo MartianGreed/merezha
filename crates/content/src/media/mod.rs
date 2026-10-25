@@ -435,7 +435,7 @@ impl Assets {
         let (scope, id, actor) = (scope.to_owned(), id.to_owned(), actor.clone());
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
-                work.state.check_writable(tx).await?;
+                work.state.check_writable(&db, tx).await?;
                 lock_live(&db, tx, &scope, &id).await?;
                 let (set_title, set_focal) = (title.is_some(), focal_point.is_some());
                 let (title, focal_point) = (title.flatten(), focal_point.flatten());
@@ -482,7 +482,7 @@ impl Assets {
         let (scope, id, actor) = (scope.to_owned(), id.to_owned(), actor.clone());
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
-                work.state.check_writable(tx).await?;
+                work.state.check_writable(&db, tx).await?;
                 let row = db
                     .query_opt(&*tx, &sql::ASSET_LOCK, &[&id, &scope])
                     .await
@@ -538,7 +538,7 @@ impl Assets {
         let (scope, id) = (scope.to_owned(), id.to_owned());
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
-                work.state.check_writable(tx).await?;
+                work.state.check_writable(&db, tx).await?;
                 db.query_opt(&*tx, &sql::ASSET_LOCK, &[&id, &scope])
                     .await
                     .map_err(|e| sql_error(&e))?
@@ -571,7 +571,7 @@ impl Assets {
             i64::try_from(self.state().settings().trash.retention.as_millis()).unwrap_or(i64::MAX);
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
-                work.state.check_writable(tx).await?;
+                work.state.check_writable(&db, tx).await?;
                 let rows = db
                     .query(
                         &*tx,

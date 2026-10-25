@@ -6,6 +6,7 @@
 //! `draft_revision`. The same transaction writes the revision, the draft
 //! refs, retention pruning, shared-field copies and the
 //! `content.entry_draft_saved` outbox record.
+use crate::statements;
 use crate::{
     indexes::{DerivedIndex, derived_indexes},
     json::{encoded_len, merge_patch},
@@ -488,8 +489,12 @@ impl Store {
     ) -> Result<VariantView, Rejection> {
         let target = target.clone();
         let locale = locale.to_owned();
+        let db = self.database().clone();
         transaction(self.database(), self.deadline(), move |tx| {
-            Box::pin(async move { read_view(tx, &target, id, &locale, true).await })
+            Box::pin(async move {
+                let db = &db;
+                read_view(db, tx, &target, id, &locale, true).await
+            })
         })
         .await
     }
@@ -504,10 +509,14 @@ impl Store {
             .map(|l| l.code.clone())
             .collect();
         let id_text = id.hyphenated().to_string();
+        let db = self.database().clone();
         transaction(self.database(), self.deadline(), move |tx| {
             Box::pin(async move {
-                let row = tx
-                    .query_opt(
+                let db = &db;
+                let row = db
+                    .query_opt_text(
+                        &*tx,
+                        &statements::ENTRY_SUMMARY,
                         &format!(
                             "SELECT id::text, content_type, {}, {} FROM merezha_content.entries \
                               WHERE id = $1::text::uuid AND scope = $2 AND content_type = $3",
@@ -519,8 +528,10 @@ impl Store {
                     .await
                     .map_err(|e| sql(&e))?
                     .ok_or_else(Rejection::not_found)?;
-                let rows = tx
-                    .query(
+                let rows = db
+                    .query_text(
+                        &*tx,
+                        &statements::ENTRY_VARIANTS,
                         &format!(
                             "SELECT locale, draft_revision, published_revision, {} \
                                FROM merezha_content.variants \
@@ -551,13 +562,14 @@ impl Store {
     /// The id of the scope's singleton entry of `target`'s type.
     pub async fn singleton(&self, target: &Target) -> Result<Option<Uuid>, Rejection> {
         let target = target.clone();
+        let db = self.database().clone();
         transaction(self.database(), self.deadline(), move |tx| {
             Box::pin(async move {
-                let row = tx
+                let db = &db;
+                let row = db
                     .query_opt(
-                        "SELECT id::text FROM merezha_content.entries \
-                          WHERE scope = $1 AND content_type = $2 AND singleton \
-                            AND deleted_at IS NULL",
+                        &*tx,
+                        &statements::SINGLETON_ID,
                         &[&target.scope, &target.content_type],
                     )
                     .await
@@ -585,11 +597,15 @@ impl Store {
             .and_then(|t| t.title_field.clone());
         let id_text = id.hyphenated().to_string();
         let fetch = i64::from(limit) + 1;
+        let db = self.database().clone();
         transaction(self.database(), self.deadline(), move |tx| {
             Box::pin(async move {
-                variant_exists(tx, &target, &id_text, &locale).await?;
-                let rows = tx
-                    .query(
+                let db = &db;
+                variant_exists(db, tx, &target, &id_text, &locale).await?;
+                let rows = db
+                    .query_text(
+                        &*tx,
+                        &statements::REVISION_LIST,
                         &format!(
                             "SELECT r.revision, r.kind, r.restored_from, r.model_version, {}, \
                                     r.created_by, r.data->>$5, \
@@ -646,11 +662,15 @@ impl Store {
             .content_type(&target.content_type)
             .and_then(|t| t.title_field.clone());
         let id_text = id.hyphenated().to_string();
+        let db = self.database().clone();
         transaction(self.database(), self.deadline(), move |tx| {
             Box::pin(async move {
-                variant_exists(tx, &target, &id_text, &locale).await?;
-                let row = tx
-                    .query_opt(
+                let db = &db;
+                variant_exists(db, tx, &target, &id_text, &locale).await?;
+                let row = db
+                    .query_opt_text(
+                        &*tx,
+                        &statements::REVISION_READ,
                         &format!(
                             "SELECT r.revision, r.kind, r.restored_from, r.model_version, {}, \
                                     r.created_by, r.data->>$5, \
@@ -703,11 +723,13 @@ impl Store {
         let id_text = id.hyphenated().to_string();
         let fetch = i64::from(limit) + 1;
         let title = self.title_case();
+        let db = self.database().clone();
         transaction(self.database(), self.deadline(), move |tx| {
             Box::pin(async move {
-                tx.query_opt(
-                    "SELECT 1 FROM merezha_content.entries \
-                      WHERE id = $1::text::uuid AND scope = $2 AND content_type = $3",
+                let db = &db;
+                db.query_opt(
+                    &*tx,
+                    &statements::ENTRY_EXISTS,
                     &[&id_text, &target.scope, &target.content_type],
                 )
                 .await
@@ -717,8 +739,10 @@ impl Store {
                     Some((e, l, p)) => (Some(e), Some(l), Some(p)),
                     None => (None, None, None),
                 };
-                let rows = tx
-                    .query(
+                let rows = db
+                    .query_text(
+                        &*tx,
+                        &statements::REFERRERS,
                         &format!(
                             "SELECT f.from_entry::text, e.content_type, f.from_locale, f.stage, \
                                     f.path, {title} \
@@ -805,24 +829,29 @@ impl Store {
         keys: usize,
         limit: u32,
     ) -> Result<Page<VariantView>, Rejection> {
+        let db = self.database().clone();
         transaction(self.database(), self.deadline(), move |tx| {
             Box::pin(async move {
+                let db = &db;
                 let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
                     .iter()
                     .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
                     .collect();
                 // A data exception (class 22) can only come from a cursor
                 // value cast back to its key's type.
-                let rows = tx.query(&statement, &refs).await.map_err(|e| {
-                    if e.code().is_some_and(|c| c.code().starts_with("22")) {
-                        Rejection {
-                            failure: Failure::permanent("invalid_cursor"),
-                            details: vec![crate::query::detail("/cursor", "invalid_value")],
+                let rows = db
+                    .query_text(&*tx, &statements::MANAGE_LIST, &statement, &refs)
+                    .await
+                    .map_err(|e| {
+                        if e.code().is_some_and(|c| c.code().starts_with("22")) {
+                            Rejection {
+                                failure: Failure::permanent("invalid_cursor"),
+                                details: vec![crate::query::detail("/cursor", "invalid_value")],
+                            }
+                        } else {
+                            sql(&e)
                         }
-                    } else {
-                        sql(&e)
-                    }
-                })?;
+                    })?;
                 let mut items = Vec::with_capacity(rows.len());
                 let mut last_keys = Vec::new();
                 for (index, row) in rows.iter().enumerate() {
@@ -860,15 +889,15 @@ fn revision_item(row: &tokio_postgres::Row) -> RevisionItem {
 }
 
 async fn variant_exists(
+    db: &Database,
     tx: &mut Tx<'_>,
     target: &Target,
     id: &str,
     locale: &str,
 ) -> Result<(), Rejection> {
-    tx.query_opt(
-        "SELECT 1 FROM merezha_content.variants \
-          WHERE entry_id = $1::text::uuid AND locale = $2 AND scope = $3 \
-            AND content_type = $4 AND NOT deleted",
+    db.query_opt(
+        &*tx,
+        &statements::VARIANT_EXISTS,
         &[&id, &locale, &target.scope, &target.content_type],
     )
     .await
@@ -878,6 +907,7 @@ async fn variant_exists(
 }
 
 pub(crate) async fn read_view(
+    db: &Database,
     tx: &mut Tx<'_>,
     target: &Target,
     id: Uuid,
@@ -890,8 +920,10 @@ pub(crate) async fn read_view(
     } else {
         ""
     };
-    let row = tx
-        .query_opt(
+    let row = db
+        .query_opt_text(
+            &*tx,
+            &statements::VARIANT_VIEW,
             &format!(
                 "SELECT {} FROM {VARIANT_FROM} \
                   WHERE v.entry_id = $1::text::uuid AND v.locale = $2 \
@@ -918,8 +950,9 @@ impl Work {
         content: Content,
         actor: &Actor,
     ) -> Result<Saved, Rejection> {
+        let db = self.ctx.database();
         // Section 2: nothing validated against a superseded model commits.
-        self.state.check_writable(tx).await?;
+        self.state.check_writable(db, tx).await?;
         let model = self.model.clone();
         let Some(content_type) = model.content_type(&target.content_type) else {
             return Err(Failure::permanent("content_type_not_found").into());
@@ -933,20 +966,18 @@ impl Work {
 
         match &kind {
             WriteKind::NewEntry { singleton, .. } => {
-                tx.execute(
-                    "INSERT INTO merezha_content.entries \
-                         (id, scope, content_type, singleton, created_at, created_by) \
-                     VALUES ($1::text::uuid, $2, $3, $4, now(), $5)",
+                db.execute(
+                    &*tx,
+                    &statements::ENTRY_INSERT,
                     &[&id_text, &scope, &type_name, singleton, &actor.subject],
                 )
                 .await
                 .map_err(|e| write_error(&e, &self.indexes))?;
             }
             WriteKind::NewVariant | WriteKind::Update { .. } => {
-                tx.query_opt(
-                    "SELECT 1 FROM merezha_content.entries \
-                      WHERE id = $1::text::uuid AND scope = $2 AND content_type = $3 \
-                        AND deleted_at IS NULL FOR SHARE",
+                db.query_opt(
+                    &*tx,
+                    &statements::ENTRY_SHARE,
                     &[&id_text, &scope, &type_name],
                 )
                 .await
@@ -955,11 +986,10 @@ impl Work {
             }
         }
         // The current draft, under the same predicates.
-        let current = tx
+        let current = db
             .query_opt(
-                "SELECT draft_revision, draft_data::text FROM merezha_content.variants \
-                  WHERE entry_id = $1::text::uuid AND locale = $2 AND scope = $3 \
-                    AND content_type = $4 AND NOT deleted",
+                &*tx,
+                &statements::DRAFT_CURRENT,
                 &[&id_text, &locale, &scope, &type_name],
             )
             .await
@@ -1004,11 +1034,10 @@ impl Work {
         // variant and be overwritten by the stale ones read here. Locking
         // the default row before this variant's keeps one lock order.
         let shared_values: Map<String, Value> = if !owns_shared && !shared.is_empty() {
-            let row = tx
+            let row = db
                 .query_opt(
-                    "SELECT draft_data::text FROM merezha_content.variants \
-                      WHERE entry_id = $1::text::uuid AND locale = $2 AND scope = $3 \
-                        AND content_type = $4 AND NOT deleted FOR SHARE",
+                    &*tx,
+                    &statements::DEFAULT_DRAFT_SHARE,
                     &[&id_text, &default_locale, &scope, &type_name],
                 )
                 .await
@@ -1054,13 +1083,10 @@ impl Work {
                 base
             }
             Content::Restore(n) => {
-                let row = tx
+                let row = db
                     .query_opt(
-                        "SELECT r.data::text FROM merezha_content.revisions r \
-                           JOIN merezha_content.variants v \
-                             ON v.entry_id = r.entry_id AND v.locale = r.locale \
-                          WHERE r.entry_id = $1::text::uuid AND r.locale = $2 \
-                            AND v.scope = $3 AND v.content_type = $4 AND r.revision = $5",
+                        &*tx,
+                        &statements::REVISION_DATA,
                         &[&id_text, &locale, &scope, &type_name, &n],
                     )
                     .await
@@ -1092,7 +1118,7 @@ impl Work {
                 (own, references, details)
             }
         };
-        let resolution = refs::resolve(tx, scope, &references).await?;
+        let resolution = refs::resolve(db, tx, scope, &references).await?;
         problems.extend(resolution.problems);
         if !problems.is_empty() && !restoring {
             return Err(Rejection::invalid(problems));
@@ -1122,11 +1148,9 @@ impl Work {
 
         let revision: i64 = match expected {
             None => {
-                tx.execute(
-                    "INSERT INTO merezha_content.variants \
-                         (entry_id, locale, scope, content_type, draft_revision, draft_data, \
-                          draft_slug, draft_updated_at, draft_updated_by) \
-                     VALUES ($1::text::uuid, $2, $3, $4, 1, $5::text::jsonb, $6, now(), $7)",
+                db.execute(
+                    &*tx,
+                    &statements::VARIANT_INSERT,
                     &[
                         &id_text,
                         &locale,
@@ -1142,15 +1166,10 @@ impl Work {
                 1
             }
             Some(expected) => {
-                let row = tx
+                let row = db
                     .query_opt(
-                        "UPDATE merezha_content.variants \
-                            SET draft_revision = draft_revision + 1, \
-                                draft_data = $6::text::jsonb, draft_slug = $7, \
-                                draft_updated_at = now(), draft_updated_by = $8 \
-                          WHERE entry_id = $1::text::uuid AND locale = $2 AND scope = $3 \
-                            AND content_type = $4 AND draft_revision = $5 AND NOT deleted \
-                         RETURNING draft_revision",
+                        &*tx,
+                        &statements::DRAFT_UPDATE,
                         &[
                             &id_text,
                             &locale,
@@ -1178,11 +1197,9 @@ impl Work {
         };
         let model_version =
             i32::try_from(model.version()).map_err(|_| Failure::permanent("invalid_input"))?;
-        tx.execute(
-            "INSERT INTO merezha_content.revisions \
-                 (entry_id, locale, revision, model_version, kind, restored_from, data, \
-                  created_at, created_by) \
-             VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7::text::jsonb, now(), $8)",
+        db.execute(
+            &*tx,
+            &statements::REVISION_INSERT,
             &[
                 &id_text,
                 &locale,
@@ -1197,22 +1214,17 @@ impl Work {
         .await
         .map_err(|e| sql(&e))?;
         // Retention: the newest `revisions.retain` plus the published one.
-        tx.execute(
-            "DELETE FROM merezha_content.revisions r USING merezha_content.variants v \
-              WHERE r.entry_id = $1::text::uuid AND r.locale = $2 \
-                AND v.entry_id = r.entry_id AND v.locale = r.locale \
-                AND v.scope = $3 AND v.content_type = $4 \
-                AND r.revision <= v.draft_revision - $5 \
-                AND r.revision IS DISTINCT FROM v.published_revision",
+        db.execute(
+            &*tx,
+            &statements::REVISION_PRUNE,
             &[&id_text, &locale, &scope, &type_name, &self.retain],
         )
         .await
         .map_err(|e| sql(&e))?;
         // The variant's draft refs.
-        tx.execute(
-            "DELETE FROM merezha_content.refs \
-              WHERE from_entry = $1::text::uuid AND from_locale = $2 AND stage = 'draft' \
-                AND scope = $3",
+        db.execute(
+            &*tx,
+            &statements::REFS_DELETE_DRAFT,
             &[&id_text, &locale, &scope],
         )
         .await
@@ -1225,12 +1237,9 @@ impl Work {
                 .iter()
                 .map(|r| r.2.hyphenated().to_string())
                 .collect();
-            tx.execute(
-                "INSERT INTO merezha_content.refs \
-                     (scope, from_entry, from_locale, stage, path, target_kind, target_id) \
-                 SELECT $1, $2::text::uuid, $3, 'draft', path, kind, target::uuid \
-                   FROM unnest($4::text[], $5::text[], $6::text[]) AS t(path, kind, target) \
-                 ON CONFLICT DO NOTHING",
+            db.execute(
+                &*tx,
+                &statements::REFS_INSERT_DRAFT,
                 &[&scope, &id_text, &locale, &paths, &kinds, &targets],
             )
             .await
@@ -1245,12 +1254,9 @@ impl Work {
                 .collect();
             let values = Value::Object(values).to_string();
             let slug_shared = slug.is_some_and(|f| !f.localized);
-            tx.execute(
-                "UPDATE merezha_content.variants \
-                    SET draft_data = (draft_data - $5::text[]) || $6::text::jsonb, \
-                        draft_slug = CASE WHEN $7 THEN $8 ELSE draft_slug END \
-                  WHERE entry_id = $1::text::uuid AND scope = $2 AND content_type = $3 \
-                    AND locale <> $4 AND NOT deleted",
+            db.execute(
+                &*tx,
+                &statements::SHARED_COPY,
                 &[
                     &id_text,
                     &scope,
@@ -1267,7 +1273,7 @@ impl Work {
         }
         self.append_event(tx, target, &id_text, locale, revision, actor)
             .await?;
-        let view = read_view(tx, target, id, locale, true).await?;
+        let view = read_view(db, tx, target, id, locale, true).await?;
         Ok(Saved {
             view,
             created: expected.is_none(),

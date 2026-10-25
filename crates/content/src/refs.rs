@@ -10,9 +10,10 @@
 //! unpublish of a target (`FOR UPDATE`) waits for the save and then sees
 //! its refs, and a save that meets a delete in flight waits for it and
 //! then finds the target trashed (`reference_not_found`).
+use crate::statements;
 use crate::value::{ReferenceTarget, ValueReference};
 use merezha_domain::Failure;
-use merezha_platform::{FieldError, Tx};
+use merezha_platform::{Database, FieldError, Tx};
 use merezha_postgres::classify;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -46,6 +47,7 @@ fn detail(path: &str, code: &str) -> FieldError {
 
 /// Resolve `references` of an entry in `scope`.
 pub(crate) async fn resolve(
+    db: &Database,
     tx: &mut Tx<'_>,
     scope: &str,
     references: &[ValueReference],
@@ -69,14 +71,8 @@ pub(crate) async fn resolve(
     let mut entries: HashMap<Uuid, Found> = HashMap::new();
     let mut elsewhere: HashSet<Uuid> = HashSet::new();
     if !entry_ids.is_empty() {
-        let rows = tx
-            .query(
-                "SELECT id::text, scope, content_type, deleted_at IS NOT NULL \
-                   FROM merezha_content.entries \
-                  WHERE id = ANY($1::text[]::uuid[]) AND (scope = $2 OR scope = 'app') \
-                  ORDER BY id FOR KEY SHARE",
-                &[&entry_ids, &scope],
-            )
+        let rows = db
+            .query(&*tx, &statements::REF_ENTRIES, &[&entry_ids, &scope])
             .await
             .map_err(|e| classify(&e))?;
         for row in rows {
@@ -99,12 +95,8 @@ pub(crate) async fn resolve(
         if !missing.is_empty() {
             // Only whether a live entry of another scope has the id; none of
             // its columns leave the statement.
-            let rows = tx
-                .query(
-                    "SELECT id::text FROM merezha_content.entries \
-                      WHERE id = ANY($1::text[]::uuid[]) AND deleted_at IS NULL",
-                    &[&missing],
-                )
+            let rows = db
+                .query(&*tx, &statements::REF_LIVE_ENTRIES, &[&missing])
                 .await
                 .map_err(|e| classify(&e))?;
             elsewhere.extend(
@@ -115,13 +107,8 @@ pub(crate) async fn resolve(
     }
     let mut assets: HashMap<Uuid, String> = HashMap::new();
     if !asset_ids.is_empty() {
-        let rows = tx
-            .query(
-                "SELECT id::text, content_type FROM merezha_content.assets \
-                  WHERE id = ANY($1::text[]::uuid[]) AND (scope = $2 OR scope = 'app') \
-                    AND deleted_at IS NULL ORDER BY id FOR KEY SHARE",
-                &[&asset_ids, &scope],
-            )
+        let rows = db
+            .query(&*tx, &statements::REF_ASSETS, &[&asset_ids, &scope])
             .await
             .map_err(|e| classify(&e))?;
         for row in rows {

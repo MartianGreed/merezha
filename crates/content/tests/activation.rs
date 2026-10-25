@@ -479,7 +479,7 @@ async fn each_refused_change_fails_with_content_model_breaking_and_changes_nothi
         assert_eq!(indexes(&db).await, indexes_before, "{case}");
         // A host that only verifies refuses the same model at startup.
         let client = db.acquire(soon()).await.unwrap();
-        let error = verify(&**client, &refused).await.expect_err(case);
+        let error = verify(&db, &**client, &refused).await.expect_err(case);
         assert_eq!(error.failure.code, "content_model_breaking", "{case}");
     }
 }
@@ -497,7 +497,7 @@ async fn the_same_version_with_a_new_fingerprint_fails() {
     assert_eq!(error.failure.code, "content_model_version_unchanged");
     assert_eq!(models(&db).await, [(1, "active".to_owned())]);
     let client = db.acquire(soon()).await.unwrap();
-    let error = verify(&**client, &changed).await.unwrap_err();
+    let error = verify(&db, &**client, &changed).await.unwrap_err();
     assert_eq!(error.failure.code, "content_model_version_unchanged");
 }
 
@@ -595,7 +595,7 @@ async fn an_invalid_index_from_a_crashed_build_is_rebuilt() {
     // A host that only verifies is not ready.
     let client = db.acquire(soon()).await.unwrap();
     assert_eq!(
-        verify(&**client, &v1).await.unwrap(),
+        verify(&db, &**client, &v1).await.unwrap(),
         Verified::NotReady("index_build_pending")
     );
     drop(client);
@@ -613,7 +613,7 @@ async fn an_invalid_index_from_a_crashed_build_is_rebuilt() {
     .await;
     assert!(definition[0].contains("reading_minutes"), "{definition:?}");
     let client = db.acquire(soon()).await.unwrap();
-    assert_eq!(verify(&**client, &v1).await.unwrap(), Verified::Ready);
+    assert_eq!(verify(&db, &**client, &v1).await.unwrap(), Verified::Ready);
 }
 
 #[tokio::test]
@@ -688,7 +688,7 @@ async fn a_build_killed_mid_way_leaves_the_host_not_ready_and_the_next_start_rep
     // Restarted without migrating, the host is not ready.
     let client = db.acquire(soon()).await.unwrap();
     assert_eq!(
-        verify(&**client, &v2).await.unwrap(),
+        verify(&db, &**client, &v2).await.unwrap(),
         Verified::NotReady("content_model_pending")
     );
     drop(client);
@@ -700,7 +700,7 @@ async fn a_build_killed_mid_way_leaves_the_host_not_ready_and_the_next_start_rep
     let after = indexes(&db).await;
     assert!(after.values().all(|valid| *valid), "{after:?}");
     let client = db.acquire(soon()).await.unwrap();
-    assert_eq!(verify(&**client, &v2).await.unwrap(), Verified::Ready);
+    assert_eq!(verify(&db, &**client, &v2).await.unwrap(), Verified::Ready);
 }
 
 #[tokio::test]
@@ -724,7 +724,7 @@ async fn a_build_failing_three_times_stops_activation_with_index_build_failed() 
     let client = db.acquire(soon()).await.unwrap();
     // Hosts on the active model keep writing.
     assert_eq!(
-        verify(&**client, &v1).await.unwrap(),
+        verify(&db, &**client, &v1).await.unwrap(),
         Verified::Ready,
         "the previous model is still served"
     );
@@ -758,7 +758,7 @@ async fn readiness_stays_false_until_every_expected_index_is_valid() {
     let v1 = model(V1);
     let client = db.acquire(soon()).await.unwrap();
     assert_eq!(
-        verify(&**client, &v1).await.unwrap(),
+        verify(&db, &**client, &v1).await.unwrap(),
         Verified::NotReady("content_model_pending"),
         "nothing active yet"
     );
@@ -768,7 +768,7 @@ async fn readiness_stays_false_until_every_expected_index_is_valid() {
         execute(&db, &index.drop_statement()).await;
         let client = db.acquire(soon()).await.unwrap();
         assert_eq!(
-            verify(&**client, &v1).await.unwrap(),
+            verify(&db, &**client, &v1).await.unwrap(),
             Verified::NotReady("index_build_pending"),
             "{} missing",
             index.name
@@ -777,13 +777,13 @@ async fn readiness_stays_false_until_every_expected_index_is_valid() {
         run(&db, &v1).await.unwrap();
     }
     let client = db.acquire(soon()).await.unwrap();
-    assert_eq!(verify(&**client, &v1).await.unwrap(), Verified::Ready);
+    assert_eq!(verify(&db, &**client, &v1).await.unwrap(), Verified::Ready);
     // An older host after v2 activated reports outdated.
     drop(client);
     run(&db, &model(V2)).await.unwrap();
     let client = db.acquire(soon()).await.unwrap();
     assert_eq!(
-        verify(&**client, &v1).await.unwrap(),
+        verify(&db, &**client, &v1).await.unwrap(),
         Verified::NotReady("content_model_outdated")
     );
 }
@@ -835,7 +835,7 @@ async fn the_write_check_refuses_once_a_newer_model_is_active() {
     // A write in flight holds the share lock: activation waits for it.
     let mut client = db.acquire(soon()).await.unwrap();
     let mut tx = client.transaction().await.unwrap();
-    lock_model_version(&mut tx, 1).await.unwrap();
+    lock_model_version(&db, &mut tx, 1).await.unwrap();
     // v2 adds a field and no index, so it reaches the activation commit at once.
     let v2 = model(&V1.replace("version = 1", "version = 2").replace(
         "  { name = \"seo\", type = \"component\", component = \"seo\" },\n",
@@ -852,7 +852,7 @@ async fn the_write_check_refuses_once_a_newer_model_is_active() {
     assert!(activation.await.unwrap().unwrap().activated);
     // From now on writes validated against v1 are refused.
     let mut tx = client.transaction().await.unwrap();
-    let refused = lock_model_version(&mut tx, 1).await.unwrap_err();
+    let refused = lock_model_version(&db, &mut tx, 1).await.unwrap_err();
     assert_eq!(refused.code, "content_model_superseded");
     assert_eq!(
         refused.classification,
@@ -860,7 +860,7 @@ async fn the_write_check_refuses_once_a_newer_model_is_active() {
     );
     drop(tx);
     let mut tx = client.transaction().await.unwrap();
-    lock_model_version(&mut tx, 2).await.unwrap();
+    lock_model_version(&db, &mut tx, 2).await.unwrap();
 }
 
 #[tokio::test]
@@ -1063,7 +1063,7 @@ async fn the_write_check_tells_a_pending_model_from_a_superseded_one() {
     let mut client = db.acquire(soon()).await.unwrap();
     // A v2 host before v2 is active: pending, not superseded.
     let mut tx = client.transaction().await.unwrap();
-    let pending = lock_model_version(&mut tx, 2).await.unwrap_err();
+    let pending = lock_model_version(&db, &mut tx, 2).await.unwrap_err();
     assert_eq!(pending.code, "content_model_pending");
     assert_eq!(
         pending.classification,
@@ -1076,7 +1076,7 @@ async fn the_write_check_tells_a_pending_model_from_a_superseded_one() {
         .unwrap();
     let mut tx = client.transaction().await.unwrap();
     assert_eq!(
-        lock_model_version(&mut tx, 2).await.unwrap_err().code,
+        lock_model_version(&db, &mut tx, 2).await.unwrap_err().code,
         "content_model_superseded"
     );
 }

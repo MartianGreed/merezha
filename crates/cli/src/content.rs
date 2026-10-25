@@ -112,17 +112,21 @@ pub async fn diff(input: &ConfigInput) -> Result<(String, u8), u8> {
             .transaction()
             .await
             .map_err(|e| unavailable(merezha_postgres::classify(&e)))?;
-        transaction
-            .batch_execute("SET TRANSACTION READ ONLY")
+        database
+            .batch(&*transaction, &merezha_content::DIFF_READ_ONLY)
             .await
             .map_err(|e| unavailable(merezha_postgres::classify(&e)))?;
-        let stored = read_active(&*transaction).await.map_err(unavailable)?;
+        let stored = read_active(&database, &*transaction)
+            .await
+            .map_err(unavailable)?;
         let existing = if stored == StoredModel::NoSchema {
             Default::default()
         } else {
-            existing_indexes(&*transaction).await.map_err(unavailable)?
+            existing_indexes(&database, &*transaction)
+                .await
+                .map_err(unavailable)?
         };
-        let rebuild = merezha_content::pending_rebuild(&*transaction)
+        let rebuild = merezha_content::pending_rebuild(&database, &*transaction)
             .await
             .map_err(unavailable)?;
         (stored, existing, rebuild)

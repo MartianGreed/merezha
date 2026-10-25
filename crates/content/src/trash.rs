@@ -8,6 +8,7 @@
 //! bumps the scope's generation and appends one
 //! `content.entry_unpublished` (reason `delete`) per published locale
 //! plus one `content.entry_deleted`.
+use crate::statements;
 use crate::{
     publish::{bump_generation, write_refs},
     refs,
@@ -69,12 +70,13 @@ impl Work {
         options: DeleteOptions,
         actor: &Actor,
     ) -> Result<(), Rejection> {
-        self.state.check_writable(tx).await?;
+        let db = self.ctx.database();
+        self.state.check_writable(db, tx).await?;
         let id = id.hyphenated().to_string();
-        let live: bool = tx
+        let live: bool = db
             .query_opt(
-                "SELECT deleted_at IS NULL FROM merezha_content.entries \
-                  WHERE id = $1::text::uuid AND scope = $2 AND content_type = $3 FOR UPDATE",
+                &*tx,
+                &statements::ENTRY_LOCK_ANY,
                 &[&id, &target.scope, &target.content_type],
             )
             .await
@@ -85,13 +87,8 @@ impl Work {
             .ok_or_else(Rejection::not_found)?;
         if options.if_unreferenced {
             // Referrers in every scope count, without being returned.
-            let referenced = tx
-                .query_opt(
-                    "SELECT 1 FROM merezha_content.refs \
-                      WHERE target_kind = 'entry' AND target_id = $1::text::uuid \
-                        AND from_entry <> $1::text::uuid LIMIT 1",
-                    &[&id],
-                )
+            let referenced = db
+                .query_opt(&*tx, &statements::ENTRY_REFERENCED, &[&id])
                 .await
                 .map_err(|e| sql(&e))?;
             if referenced.is_some() {
@@ -103,11 +100,10 @@ impl Work {
         }
         let mut records = Vec::new();
         if live {
-            let rows = tx
+            let rows = db
                 .query(
-                    "SELECT locale FROM merezha_content.variants \
-                      WHERE entry_id = $1::text::uuid AND scope = $2 AND content_type = $3 \
-                        AND NOT deleted AND published_revision IS NOT NULL",
+                    &*tx,
+                    &statements::PUBLISHED_LOCALES,
                     &[&id, &target.scope, &target.content_type],
                 )
                 .await
@@ -119,54 +115,50 @@ impl Work {
                 records.push(self.unpublished(target, &id, locale, "delete", actor)?);
             }
             records.push(self.entry_event(target, &id, DELETED, Some(actor), actor)?);
-            bump_generation(tx, &target.scope).await?;
+            bump_generation(db, tx, &target.scope).await?;
         }
         if options.purge {
             // Variants, revisions, published rows and outgoing refs
             // cascade; incoming refs go too, in every scope, so an id
             // created again does not inherit stale referrers.
-            tx.execute(
-                "DELETE FROM merezha_content.entries \
-                  WHERE id = $1::text::uuid AND scope = $2 AND content_type = $3",
+            db.execute(
+                &*tx,
+                &statements::ENTRY_DELETE,
                 &[&id, &target.scope, &target.content_type],
             )
             .await
             .map_err(|e| sql(&e))?;
-            tx.execute(
-                "DELETE FROM merezha_content.refs \
-                  WHERE target_kind = 'entry' AND target_id = $1::text::uuid",
-                &[&id],
-            )
-            .await
-            .map_err(|e| sql(&e))?;
+            db.execute(&*tx, &statements::REFS_TO_ENTRY_DELETE, &[&id])
+                .await
+                .map_err(|e| sql(&e))?;
             records.push(self.entry_event(target, &id, PURGED, None, actor)?);
         } else {
-            tx.execute(
-                "UPDATE merezha_content.entries SET deleted_at = now(), deleted_by = $4 \
-                  WHERE id = $1::text::uuid AND scope = $2 AND content_type = $3",
+            db.execute(
+                &*tx,
+                &statements::ENTRY_TRASH,
                 &[&id, &target.scope, &target.content_type, &actor.subject],
             )
             .await
             .map_err(|e| sql(&e))?;
             // Deleted variants leave every unique index (they skip
             // `deleted`), which frees their values.
-            tx.execute(
-                "UPDATE merezha_content.variants \
-                    SET deleted = true, published_revision = NULL, published_at = NULL \
-                  WHERE entry_id = $1::text::uuid AND scope = $2 AND content_type = $3",
+            db.execute(
+                &*tx,
+                &statements::VARIANTS_TRASH,
                 &[&id, &target.scope, &target.content_type],
             )
             .await
             .map_err(|e| sql(&e))?;
-            tx.execute(
-                "DELETE FROM merezha_content.published \
-                  WHERE entry_id = $1::text::uuid AND scope = $2 AND content_type = $3",
+            db.execute(
+                &*tx,
+                &statements::PUBLISHED_DELETE,
                 &[&id, &target.scope, &target.content_type],
             )
             .await
             .map_err(|e| sql(&e))?;
-            tx.execute(
-                "DELETE FROM merezha_content.refs WHERE from_entry = $1::text::uuid AND scope = $2",
+            db.execute(
+                &*tx,
+                &statements::REFS_FROM_ENTRY_DELETE,
                 &[&id, &target.scope],
             )
             .await
@@ -203,12 +195,13 @@ impl Work {
         id: Uuid,
         actor: &Actor,
     ) -> Result<(), Rejection> {
-        self.state.check_writable(tx).await?;
+        let db = self.ctx.database();
+        self.state.check_writable(db, tx).await?;
         let id = id.hyphenated().to_string();
-        let trashed: bool = tx
+        let trashed: bool = db
             .query_opt(
-                "SELECT deleted_at IS NOT NULL FROM merezha_content.entries \
-                  WHERE id = $1::text::uuid AND scope = $2 AND content_type = $3 FOR UPDATE",
+                &*tx,
+                &statements::ENTRY_LOCK_TRASHED,
                 &[&id, &target.scope, &target.content_type],
             )
             .await
@@ -219,20 +212,19 @@ impl Work {
             // Already live: nothing to restore.
             return Ok(());
         }
-        tx.execute(
-            "UPDATE merezha_content.entries SET deleted_at = NULL, deleted_by = NULL \
-              WHERE id = $1::text::uuid AND scope = $2 AND content_type = $3",
+        db.execute(
+            &*tx,
+            &statements::ENTRY_RESTORE,
             &[&id, &target.scope, &target.content_type],
         )
         .await
         .map_err(|e| write_error(&e, &self.indexes))?;
         // Drafts only: the published pointers were cleared at delete time.
         // A unique value taken meanwhile fails with its field.
-        let rows = tx
+        let rows = db
             .query(
-                "UPDATE merezha_content.variants SET deleted = false \
-                  WHERE entry_id = $1::text::uuid AND scope = $2 AND content_type = $3 \
-                 RETURNING locale, draft_data::text",
+                &*tx,
+                &statements::VARIANTS_RESTORE,
                 &[&id, &target.scope, &target.content_type],
             )
             .await
@@ -272,8 +264,17 @@ impl Work {
                         &mut keys,
                     )?,
                 };
-            let resolution = refs::resolve(tx, &target.scope, &references).await?;
-            write_refs(tx, &target.scope, &id, &locale, "draft", &resolution.rows).await?;
+            let resolution = refs::resolve(db, tx, &target.scope, &references).await?;
+            write_refs(
+                db,
+                tx,
+                &target.scope,
+                &id,
+                &locale,
+                "draft",
+                &resolution.rows,
+            )
+            .await?;
         }
         let record = self.entry_event(target, &id, UNDELETED, Some(actor), actor)?;
         self.append(tx, vec![record]).await
@@ -287,16 +288,12 @@ impl Work {
         retention: Duration,
         actor: &Actor,
     ) -> Result<usize, Rejection> {
-        self.state.check_writable(tx).await?;
+        let db = self.ctx.database();
+        self.state.check_writable(db, tx).await?;
         let seconds = i64::try_from(retention.as_secs()).unwrap_or(i64::MAX);
         let limit = PURGE_BATCH as i64;
-        let rows = tx
-            .query(
-                "SELECT id::text, scope, content_type FROM merezha_content.entries \
-                  WHERE deleted_at < now() - $1::bigint * interval '1 second' \
-                  ORDER BY deleted_at, id LIMIT $2 FOR UPDATE SKIP LOCKED",
-                &[&seconds, &limit],
-            )
+        let rows = db
+            .query(&*tx, &statements::TRASH_EXPIRED, &[&seconds, &limit])
             .await
             .map_err(|e| sql(&e))?;
         if rows.is_empty() {
@@ -305,22 +302,12 @@ impl Work {
         let ids: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
         let scopes: Vec<String> = rows.iter().map(|r| r.get(1)).collect();
         let types: Vec<String> = rows.iter().map(|r| r.get(2)).collect();
-        tx.execute(
-            "DELETE FROM merezha_content.entries e \
-              USING unnest($1::text[], $2::text[], $3::text[]) AS t(id, scope, content_type) \
-              WHERE e.id = t.id::uuid AND e.scope = t.scope AND e.content_type = t.content_type \
-                AND e.deleted_at IS NOT NULL",
-            &[&ids, &scopes, &types],
-        )
-        .await
-        .map_err(|e| sql(&e))?;
-        tx.execute(
-            "DELETE FROM merezha_content.refs \
-              WHERE target_kind = 'entry' AND target_id = ANY($1::text[]::uuid[])",
-            &[&ids],
-        )
-        .await
-        .map_err(|e| sql(&e))?;
+        db.execute(&*tx, &statements::ENTRIES_PURGE, &[&ids, &scopes, &types])
+            .await
+            .map_err(|e| sql(&e))?;
+        db.execute(&*tx, &statements::REFS_TO_ENTRIES_DELETE, &[&ids])
+            .await
+            .map_err(|e| sql(&e))?;
         let mut records = Vec::with_capacity(ids.len());
         for ((id, scope), content_type) in ids.iter().zip(&scopes).zip(&types) {
             let target = Target {
@@ -425,10 +412,17 @@ impl Store {
               ORDER BY e.deleted_at DESC, e.id DESC LIMIT $6",
             ts("e.deleted_at")
         );
+        let db = self.database().clone();
         transaction(self.database(), self.deadline(), move |tx| {
             Box::pin(async move {
-                let rows = tx
-                    .query(&statement, &[&default, &scopes, &types, &at, &id, &fetch])
+                let db = &db;
+                let rows = db
+                    .query_text(
+                        &*tx,
+                        &statements::TRASH_LIST,
+                        &statement,
+                        &[&default, &scopes, &types, &at, &id, &fetch],
+                    )
                     .await
                     .map_err(|e| sql(&e))?;
                 let mut items = Vec::with_capacity(rows.len());
