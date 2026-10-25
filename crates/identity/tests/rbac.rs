@@ -93,7 +93,9 @@ fn expected(role: &str, scope: &str) -> BTreeSet<&'static str> {
 
 /// Acceptance 2: the permission matrix, asserted cell by cell through the
 /// host's `Authorizer` and rendered into the docs.
-#[tokio::test]
+// Multi-threaded: the host `Authorizer` writes a break-glass audit in
+// place before allowing the use (`block_in_place`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_permission_matrix_holds_and_is_documented() {
     let Some(world) = World::new(&rbac_section("")).await else {
         return;

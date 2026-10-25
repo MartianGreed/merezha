@@ -100,7 +100,7 @@ impl Core {
         cursor: Option<Uuid>,
         limit: i64,
     ) -> Result<Reply, ApiError> {
-        self.in_application(who, "identity.users.read")?;
+        self.in_application(who, "identity.users.read").await?;
         let client = self.db().acquire(self.deadline()).await?;
         let rows = self
             .db()
@@ -138,7 +138,7 @@ impl Core {
         target: Uuid,
         status: String,
     ) -> Result<Reply, ApiError> {
-        self.in_application(who, "identity.users.manage")?;
+        self.in_application(who, "identity.users.manage").await?;
         self.recent(who)?;
         let session = self.db().acquire(self.deadline()).await?;
         let version: Option<i64> = self
@@ -236,7 +236,7 @@ impl Core {
     /// `GET /application/roles`: `platform_admin`, the implicit `user` and
     /// the declared roles.
     pub async fn list_application_roles(self: &Arc<Self>, who: &Who) -> Result<Reply, ApiError> {
-        self.in_application(who, "identity.roles.read")?;
+        self.in_application(who, "identity.roles.read").await?;
         let client = self.db().acquire(self.deadline()).await?;
         let rows = self
             .db()
@@ -268,7 +268,7 @@ impl Core {
         cursor: Option<Uuid>,
         limit: i64,
     ) -> Result<Reply, ApiError> {
-        self.in_application(who, "identity.roles.read")?;
+        self.in_application(who, "identity.roles.read").await?;
         let client = self.db().acquire(self.deadline()).await?;
         let rows = self
             .db()
@@ -333,7 +333,7 @@ impl Core {
         who: &Who,
         input: crate::tenancy::AssignmentInput,
     ) -> Result<Reply, ApiError> {
-        self.in_application(who, "identity.roles.assign")?;
+        self.in_application(who, "identity.roles.assign").await?;
         self.recent(who)?;
         if input.role == PLATFORM_ADMIN_ID {
             return Err(ApiError::code("builtin_role"));
@@ -481,7 +481,7 @@ impl Core {
         who: &Who,
         assignment: Uuid,
     ) -> Result<Reply, ApiError> {
-        self.in_application(who, "identity.roles.assign")?;
+        self.in_application(who, "identity.roles.assign").await?;
         self.recent(who)?;
         let core = self.clone();
         let who = who.clone();

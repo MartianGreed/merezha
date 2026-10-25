@@ -108,9 +108,10 @@ fn permission(name: &str) -> Result<Identity, ApiError> {
 }
 
 impl Core {
-    /// Check `name` at `scope` for `who`, audit a break-glass allow and a
-    /// denial (once per principal and permission per instance).
-    pub fn require(
+    /// Check `name` at `scope` for `who`. A break-glass allow is used only
+    /// once its audit row is written (`503 audit_unavailable` otherwise); a
+    /// denial is audited once per principal and permission per instance.
+    pub async fn require(
         self: &Arc<Self>,
         who: &Who,
         name: &str,
@@ -120,7 +121,7 @@ impl Core {
         match who.principal.check(&permission, scope) {
             Ok(allowed) => {
                 if allowed == Allowed::BreakGlass {
-                    self.break_glass(&who.principal, &permission);
+                    self.audit_break_glass(&who.principal, &permission).await?;
                 }
                 Ok(allowed)
             }
@@ -161,7 +162,10 @@ impl Core {
         name: &str,
     ) -> Result<Who, ApiError> {
         let scoped = self.scoped(who, org).await?;
-        match self.require(&scoped, name, &Scope::Tenant(org).resource_scope()) {
+        match self
+            .require(&scoped, name, &Scope::Tenant(org).resource_scope())
+            .await
+        {
             Ok(_) => Ok(scoped),
             Err(error) if !self.standing(&scoped, org) => {
                 let _ = error;
@@ -184,8 +188,9 @@ impl Core {
         who.principal.tenant.as_ref() == Some(&ids::identity(ids::ORGANIZATION, org))
     }
     /// The application check of `name`.
-    pub fn in_application(self: &Arc<Self>, who: &Who, name: &str) -> Result<(), ApiError> {
+    pub async fn in_application(self: &Arc<Self>, who: &Who, name: &str) -> Result<(), ApiError> {
         self.require(who, name, &ResourceScope::Application)
+            .await
             .map(|_| ())
     }
     /// A session authenticated within the reauthentication window. Keys
@@ -257,5 +262,6 @@ fn reason(reason: DenyReason) -> &'static str {
         DenyReason::TenantMismatch => "tenant_mismatch",
         DenyReason::KeyScope => "key_scope",
         DenyReason::KeyLimit => "key_limit",
+        DenyReason::AuditUnavailable => "audit_unavailable",
     }
 }

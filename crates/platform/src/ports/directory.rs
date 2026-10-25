@@ -74,7 +74,8 @@ impl<T> Page<T> {
 /// simply missing. `users` takes at most [`MAX_USERS_PER_CALL`] ids
 /// (`too_many_ids`); pages hold at most the requested limit. Role filters
 /// match tenant roles or application roles, `None` meaning everyone.
-/// Service accounts never appear. `is_member` counts memberships only, not
+/// Service accounts never appear. `is_member` counts memberships of the
+/// users `users` would return (active, verified) only, not
 /// application grants. Every call uses its own pooled connection, so callers
 /// resolve recipients and memberships before they open a transaction (R4);
 /// no port waits on a second connection while a caller transaction is open.

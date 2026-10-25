@@ -136,7 +136,8 @@ CREATE TABLE merezha_identity.invitations (
     email             text NOT NULL,
     email_normalized  text NOT NULL,
     token_hash        bytea NOT NULL CHECK (octet_length(token_hash) = 32),
-    invited_by        uuid,
+    invited_by        uuid,                 -- the inviting user (a user key's owner); no FK
+    invited_by_key    uuid,                 -- the inviting API key, when a key invited; no FK
     created_at        timestamptz NOT NULL,
     expires_at        timestamptz NOT NULL,
     CONSTRAINT invitations_token_hash_key UNIQUE (token_hash),
@@ -144,6 +145,7 @@ CREATE TABLE merezha_identity.invitations (
     CONSTRAINT invitations_id_org_key UNIQUE (id, organization_id)
 );
 CREATE INDEX invitations_expiry_idx ON merezha_identity.invitations (expires_at);
+CREATE INDEX invitations_inviter_idx ON merezha_identity.invitations (organization_id, invited_by);
 
 -- The 1 to 16 roles an invitation grants, same rule as role_assignments.
 CREATE TABLE merezha_identity.invitation_roles (
@@ -181,6 +183,7 @@ CREATE TABLE merezha_identity.api_keys (
 CREATE INDEX api_keys_org_idx ON merezha_identity.api_keys (organization_id, created_at);
 CREATE INDEX api_keys_user_idx ON merezha_identity.api_keys (user_id);
 CREATE INDEX api_keys_service_account_idx ON merezha_identity.api_keys (service_account_id);
+CREATE INDEX api_keys_created_by_idx ON merezha_identity.api_keys (organization_id, created_by);
 CREATE INDEX api_keys_revoked_idx ON merezha_identity.api_keys (revoked_at) WHERE revoked_at IS NOT NULL;
 CREATE INDEX api_keys_expiry_idx ON merezha_identity.api_keys (expires_at);
 

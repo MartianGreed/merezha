@@ -250,6 +250,38 @@ impl Core {
         }
     }
 
+    /// The live principal of key `key` acting in `organization`, read in
+    /// the caller's transaction; `None` when the key no longer
+    /// authenticates there (revoked, expired, owner inactive, membership
+    /// gone, another organization).
+    pub(crate) async fn live_key(
+        self: &Arc<Self>,
+        session: &impl Session,
+        key: Uuid,
+        organization: Uuid,
+    ) -> Result<Option<Principal>, Failure> {
+        let row = self
+            .db()
+            .query_opt(
+                session,
+                &crate::sql::KEY_RESOLVE,
+                &[&key, &Some(organization)],
+            )
+            .await
+            .map_err(sql)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        match self
+            .key_principal_from(session, &key_row(&row), Some(organization))
+            .await
+        {
+            Ok(principal) => Ok(Some(principal)),
+            Err(Ok(_)) => Ok(None),
+            Err(Err(failure)) => Err(failure),
+        }
+    }
+
     /// Every rule of section 3 on a key row, then its principal.
     async fn key_principal_from(
         self: &Arc<Self>,

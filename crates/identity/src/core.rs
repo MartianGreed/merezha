@@ -38,6 +38,9 @@ pub const MAX_USER_AGENT: usize = 512;
 /// Background audit writes in flight at most (break-glass, organization
 /// entry).
 pub const AUDIT_SLOTS: usize = 64;
+/// Break-glass audit writes running in the background at most (current-
+/// thread runtimes only); they share nothing with [`AUDIT_SLOTS`].
+pub const BREAK_GLASS_SLOTS: usize = 8;
 
 /// The module name: section, route prefix, ledger key, outbox source.
 pub const NAME: &str = "identity";
@@ -531,6 +534,11 @@ pub struct Core {
     pub grants: crate::rbac::GrantCache,
     pub audited: crate::rbac::Once,
     pub audit_slots: Arc<tokio::sync::Semaphore>,
+    /// Break-glass uses whose audit row is committed (section 5).
+    pub break_glass: crate::rbac::Once,
+    /// Break-glass audit writes in flight in the background.
+    pub break_glass_pending: crate::rbac::Once,
+    pub break_glass_slots: Arc<tokio::sync::Semaphore>,
     /// Resource kinds assignments may target (`unknown_resource_kind`).
     pub resource_kinds: std::collections::BTreeSet<String>,
 }

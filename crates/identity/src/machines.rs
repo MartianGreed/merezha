@@ -37,6 +37,7 @@ fn key_json(row: &Row) -> Value {
         "service_account_id": row.get::<_, Option<Uuid>>(3).map(|s| ids::render(ids::SERVICE_ACCOUNT, s)),
         "name": row.get::<_, String>(4),
         "permissions": row.get::<_, Vec<String>>(5),
+        "created_by": row.get::<_, Option<Uuid>>(6).map(|u| ids::render(ids::USER, u)),
         "created_at": row.get::<_, Timestamp>(7).to_string(),
         "expires_at": row.get::<_, Timestamp>(8).to_string(),
         "last_used_at": row.get::<_, Option<Timestamp>>(9).map(|t| t.to_string()),
@@ -95,7 +96,7 @@ impl Core {
         match scope {
             Scope::Tenant(org) => self.in_org(who, org, name).await,
             Scope::Application => {
-                self.in_application(who, name)?;
+                self.in_application(who, name).await?;
                 Ok(who.clone())
             }
         }
@@ -545,7 +546,10 @@ impl Core {
                     let owner: Option<Uuid> = row.get(2);
                     let own = owner.is_some() && owner == who.user;
                     if !own {
-                        match core.require(&who, "identity.api_keys.revoke", &scope.resource_scope()) {
+                        match core
+                            .require(&who, "identity.api_keys.revoke", &scope.resource_scope())
+                            .await
+                        {
                             Ok(_) => {}
                             Err(_) if matches!(scope, Scope::Tenant(org) if !core.standing(&who, org)) => {
                                 return Ok(Err(ApiError::code("not_found")));

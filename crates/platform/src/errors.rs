@@ -158,6 +158,7 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("starting", 503),
     ErrorCode::new("migrations_pending", 503),
     ErrorCode::new("unavailable", 503),
+    ErrorCode::new("audit_unavailable", 503),
     ErrorCode::new("internal", 503),
     ErrorCode::new("database_unavailable", 503),
     ErrorCode::new("database_timeout", 503),

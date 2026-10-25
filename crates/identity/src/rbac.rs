@@ -423,12 +423,32 @@ impl Once {
         }
         seen.insert((who.to_owned(), what.to_owned()))
     }
+    /// Whether `(who, what)` was marked.
+    pub fn seen(&self, who: &str, what: &str) -> bool {
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.contains(&(who.to_owned(), what.to_owned()))
+    }
+    /// Mark `(who, what)`; a full set starts over, so a pair may be
+    /// marked again later.
+    pub fn mark(&self, who: &str, what: &str) {
+        let _ = self.first(who, what);
+    }
+    /// Forget `(who, what)`.
+    pub fn unmark(&self, who: &str, what: &str) {
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.remove(&(who.to_owned(), what.to_owned()));
+    }
 }
 
 /// The RBAC `Authorizer` (section 5), installed by the host when the
 /// identity block is on. Checks are the platform evaluation of the
-/// principal's snapshot; a break-glass allow is audited as
-/// `authorization.break_glass` once per session and permission per instance.
+/// principal's snapshot. A break-glass allow is refused
+/// (`audit_unavailable`, 503) unless its `authorization.break_glass` row is
+/// written first, once per session and permission per instance: on a
+/// multi-threaded runtime the check waits for the write
+/// (`tokio::task::block_in_place`); on a current-thread runtime, which
+/// cannot block, it refuses the first use and writes the row in the
+/// background so the next use passes.
 ///
 /// Application commands and queries (`ApplicationAuthorizer::authorize`)
 /// are refused `unauthorized`: their route permissions are AP-C2's, which
@@ -473,10 +493,14 @@ impl Authorizer for RbacAuthorizer {
             return Err(AccessDenied::new(DenyReason::Unauthenticated));
         };
         let allowed = principal.check(permission, scope)?;
-        if allowed == Allowed::BreakGlass
-            && let Some(core) = self.core.get()
-        {
-            core.break_glass(principal, permission);
+        if allowed == Allowed::BreakGlass {
+            let audited = self
+                .core
+                .get()
+                .is_some_and(|core| core.break_glass_now(principal, permission));
+            if !audited {
+                return Err(AccessDenied::new(DenyReason::AuditUnavailable));
+            }
         }
         Ok(allowed)
     }
@@ -736,6 +760,39 @@ mod tests {
         ] {
             assert!(cache.get(key, &changed).is_none());
         }
+        // A stale stamp is refused in the older half too.
+        let cache = GrantCache::new(4);
+        let old = (Uuid::from_u128(500), None);
+        cache.put(old, stamp, Arc::new(GrantSnapshot::empty()));
+        cache.put(
+            (Uuid::from_u128(501), None),
+            stamp,
+            Arc::new(GrantSnapshot::empty()),
+        );
+        // The newer half is full (capacity 4, halves of 2): `old` moves to
+        // the older half.
+        cache.put(
+            (Uuid::from_u128(502), None),
+            stamp,
+            Arc::new(GrantSnapshot::empty()),
+        );
+        let bumped = Stamp {
+            owner_version: 9,
+            ..stamp
+        };
+        assert!(cache.get(old, &bumped).is_none(), "stale in the older half");
+        assert!(cache.get(old, &stamp).is_none(), "and dropped from it");
+        cache.put(old, stamp, Arc::new(GrantSnapshot::empty()));
+        cache.put(
+            (Uuid::from_u128(503), None),
+            stamp,
+            Arc::new(GrantSnapshot::empty()),
+        );
+        assert!(
+            cache.get(old, &stamp).is_some(),
+            "a current stamp is promoted"
+        );
+        let cache = GrantCache::new(4);
         for i in 0..100 {
             cache.put(
                 (Uuid::from_u128(i), None),

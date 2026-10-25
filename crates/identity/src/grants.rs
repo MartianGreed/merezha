@@ -61,6 +61,33 @@ impl Core {
         org: Option<OrgFacts>,
         key: Option<&KeyFacts>,
     ) -> Result<Arc<GrantSnapshot>, Failure> {
+        self.snapshot_with(session, credential, owner, owner_version, org, key, true)
+            .await
+    }
+    /// [`Core::snapshot`] read from `session` without the cache, for a
+    /// transaction that may hold uncommitted grant changes (its snapshot
+    /// must never be cached under a version that could roll back).
+    pub(crate) async fn live_snapshot(
+        &self,
+        session: &impl Session,
+        owner: Owner,
+        org: Option<OrgFacts>,
+        key: Option<&KeyFacts>,
+    ) -> Result<Arc<GrantSnapshot>, Failure> {
+        self.snapshot_with(session, Uuid::nil(), owner, 0, org, key, false)
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn snapshot_with(
+        &self,
+        session: &impl Session,
+        credential: Uuid,
+        owner: Owner,
+        owner_version: i64,
+        org: Option<OrgFacts>,
+        key: Option<&KeyFacts>,
+        cached: bool,
+    ) -> Result<Arc<GrantSnapshot>, Failure> {
         let stamp = Stamp {
             owner_version,
             org_version: org.map(|o| o.version),
@@ -68,11 +95,13 @@ impl Core {
             membership: org.and_then(|o| o.holder),
         };
         let cache_key = (credential, org.map(|o| o.id));
-        if let Some(snapshot) = self.grants.get(cache_key, &stamp) {
-            self.metrics.authz_cache("hit");
-            return Ok(snapshot);
+        if cached {
+            if let Some(snapshot) = self.grants.get(cache_key, &stamp) {
+                self.metrics.authz_cache("hit");
+                return Ok(snapshot);
+            }
+            self.metrics.authz_cache("miss");
         }
-        self.metrics.authz_cache("miss");
         let max_resource = self.settings.rbac.max_resource_assignments as usize;
         let limit =
             i64::try_from(self.rbac.declared().count() + 2 + max_resource + 1).unwrap_or(i64::MAX);
@@ -165,7 +194,9 @@ impl Core {
             merezha_telemetry::event!(WARN, "identity.grants_truncated", count = truncated as u64);
         }
         let snapshot = Arc::new(snapshot);
-        self.grants.put(cache_key, stamp, snapshot.clone());
+        if cached {
+            self.grants.put(cache_key, stamp, snapshot.clone());
+        }
         Ok(snapshot)
     }
 
@@ -393,19 +424,23 @@ impl Core {
             self.audit_later(audit);
         }
     }
-    /// Audit `authorization.break_glass` once per session and permission
-    /// per instance (section 5).
-    pub(crate) fn break_glass(self: &Arc<Self>, principal: &Principal, permission: &Identity) {
-        let who = principal
-            .session
-            .as_ref()
-            .map_or(principal.subject.as_str(), |s| s.id.as_str())
-            .to_owned();
-        if !self.audited.first(&who, permission.as_str()) {
-            return;
+    /// Write `authorization.break_glass` for `principal` using
+    /// `permission`, before the use (section 5): once per session and
+    /// permission per instance, marked only once the row is committed. A
+    /// failed or slow write (over [`BREAK_GLASS_AUDIT_TIMEOUT`]) refuses
+    /// the use, transient `audit_unavailable`.
+    pub(crate) async fn audit_break_glass(
+        self: &Arc<Self>,
+        principal: &Principal,
+        permission: &Identity,
+    ) -> Result<(), Failure> {
+        let who = break_glass_holder(principal);
+        if self.break_glass.seen(&who, permission.as_str()) {
+            return Ok(());
         }
+        let refused = || Failure::transient("audit_unavailable");
         let Some(user) = principal_user(principal) else {
-            return;
+            return Err(refused());
         };
         let mut audit = Audit::new("authorization.break_glass", Actor::User(user))
             .detail("permission", permission.as_str());
@@ -416,19 +451,103 @@ impl Core {
         {
             audit = audit.organization(tenant);
         }
-        self.audit_later(audit);
+        let core = self.clone();
+        let deadline = std::time::Instant::now() + BREAK_GLASS_AUDIT_TIMEOUT;
+        let write = self.db().transaction(deadline, move |tx| {
+            Box::pin(async move { core.audit(tx, audit, &Client::default()).await })
+        });
+        // The transaction's own deadline bounds the statement; the outer
+        // bound only backs it up.
+        match tokio::time::timeout(
+            BREAK_GLASS_AUDIT_TIMEOUT + std::time::Duration::from_secs(1),
+            write,
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                self.break_glass.mark(&who, permission.as_str());
+                Ok(())
+            }
+            outcome => {
+                let code = match &outcome {
+                    Ok(Err(failure)) => failure.code.clone(),
+                    _ => "timeout".to_owned(),
+                };
+                self.metrics.audit_failure();
+                merezha_telemetry::event!(
+                    ERROR,
+                    "identity.audit_write_failed",
+                    code = code.as_str()
+                );
+                Err(refused())
+            }
+        }
     }
-    /// Write `audit` in its own transaction on a background task, for the
-    /// synchronous paths (the `Authorizer`). At most
-    /// [`crate::core::AUDIT_SLOTS`] writes run at once; past that the row is
-    /// dropped and counted as an audit write failure.
-    pub(crate) fn audit_later(self: &Arc<Self>, audit: Audit) {
+    /// [`Core::audit_break_glass`] for the synchronous `Authorizer`:
+    /// `true` once the row is written. On a multi-threaded runtime the
+    /// write is awaited in place (`block_in_place`); a current-thread
+    /// runtime cannot block, so the first use is refused and the row is
+    /// written in the background, at most [`crate::core::BREAK_GLASS_SLOTS`]
+    /// at once.
+    pub(crate) fn break_glass_now(
+        self: &Arc<Self>,
+        principal: &Principal,
+        permission: &Identity,
+    ) -> bool {
+        if self
+            .break_glass
+            .seen(&break_glass_holder(principal), permission.as_str())
+        {
+            return true;
+        }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            self.metrics.audit_failure();
+            return false;
+        };
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+            return tokio::task::block_in_place(|| {
+                handle.block_on(self.audit_break_glass(principal, permission))
+            })
+            .is_ok();
+        }
+        // One background write per use at a time.
+        let holder = break_glass_holder(principal);
+        if !self.break_glass_pending.first(&holder, permission.as_str()) {
+            return false;
+        }
+        match self.break_glass_slots.clone().try_acquire_owned() {
+            Ok(slot) => {
+                let core = self.clone();
+                let principal = principal.clone();
+                let permission = permission.clone();
+                handle.spawn(async move {
+                    let _ = core.audit_break_glass(&principal, &permission).await;
+                    core.break_glass_pending
+                        .unmark(&holder, permission.as_str());
+                    drop(slot);
+                });
+            }
+            Err(_) => self
+                .break_glass_pending
+                .unmark(&holder, permission.as_str()),
+        }
+        false
+    }
+    /// Write `audit` in its own transaction on a background task, for
+    /// best-effort rows (`authorization.denied`, `organization.entered`,
+    /// never break-glass). At most [`crate::core::AUDIT_SLOTS`] writes run
+    /// at once; past that the row is dropped, counted as an audit write
+    /// failure and logged `identity.audit_dropped`.
+    pub(crate) fn audit_later(self: &Arc<Self>, audit: Audit) {
+        let dropped = |core: &Core, action: &'static str| {
+            core.metrics.audit_failure();
+            merezha_telemetry::event!(WARN, "identity.audit_dropped", action);
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            dropped(self, audit.action);
             return;
         };
         let Ok(slot) = self.audit_slots.clone().try_acquire_owned() else {
-            self.metrics.audit_failure();
+            dropped(self, audit.action);
             return;
         };
         let core = self.clone();
@@ -437,6 +556,18 @@ impl Core {
             drop(slot);
         });
     }
+}
+
+/// How long a break-glass use waits for its audit row.
+pub const BREAK_GLASS_AUDIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// The session (or, without one, the subject) a break-glass use is
+/// audited for.
+fn break_glass_holder(principal: &Principal) -> String {
+    principal
+        .session
+        .as_ref()
+        .map_or(principal.subject.as_str(), |s| s.id.as_str())
+        .to_owned()
 }
 
 fn resource(kind: Option<String>, id: Option<String>) -> Option<(String, String)> {

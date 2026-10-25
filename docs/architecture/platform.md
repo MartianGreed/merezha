@@ -159,8 +159,9 @@ admin routes and `/v1/admin/status` then answer to real grants:
 `401 unauthenticated` without a principal, `403 unauthorized` without the
 permission at `Application` (`application.admin.read`, `jobs.admin.read`,
 `system.status.read` and the rest of identity §5's catalog), and a
-`platform_admin` session passes every check (audited
-`authorization.break_glass`). Application commands and queries stay refused
+`platform_admin` session passes every check once its
+`authorization.break_glass` audit row is written; when that write fails the
+use is refused, `503 audit_unavailable`. Application commands and queries stay refused
 (`unauthorized`) until AP-C2 checks their route permissions with the
 principal before any guest call. The raw runtime endpoints, which have no
 authentication of their own, are never mounted beside the authenticator,
@@ -535,7 +536,7 @@ registers:
 | 415 | `unsupported_media_type` |
 | 422 | `validation_failed` and every other permanent code the kernel emits (domain, application, port and startup codes) |
 | 429 | `rate_limited`, `database_busy` (with `Retry-After`) |
-| 503 | `overloaded`, `starting` (the early listener) and every transient code the kernel emits (`database_unavailable`, `database_timeout`, `commit_outcome_unknown`, `internal`, `storage_*`, ...), with `Retry-After` |
+| 503 | `overloaded`, `starting` (the early listener) and every transient code the kernel emits (`database_unavailable`, `database_timeout`, `commit_outcome_unknown`, `internal`, `storage_*`, `audit_unavailable` for a break-glass use whose audit row could not be written, ...), with `Retry-After` |
 | 504 | `timeout`, `upstream_timeout` |
 
 `errors::KERNEL_CODES` is the complete list. A unit test scans the kernel
@@ -919,7 +920,7 @@ secret_key = { env = "MEREZHA_IDENTITY_SECRET_KEY" }   # at least 32 bytes
 | `links.invitation`, `tokens.invitation_ttl` | `/auth/invitation`, `7d` | 1 h to 30 d | The invitation page and lifetime |
 | `organizations.user_can_create`, `max_per_user`, `max_members` | `true`, `50`, `10000` | 1 to 10000, 1 to 1000000 | `false` gives an application without organizations (`POST /organizations` answers 403); organizations one user may create (`organization_limit`); members per organization |
 | `rbac.cache_entries`, `max_custom_roles`, `max_resource_assignments` | `10000`, `100`, `500` | 2 to 1000000, 1 to 1000, 1 to 10000 | Grant snapshots cached per instance; custom roles per organization (`role_limit`); resource grants per holder and scope kept in a snapshot (more are ignored, `identity.grants_truncated`) |
-| `rbac.builtin_grants.user`, `.admin`, `.member` | `[]` | catalog permissions or trailing wildcards (`unknown_permission`) | Added to the implicit `user` role (every active user, every organization), `admin` and `member` |
+| `rbac.builtin_grants.user`, `.admin`, `.member` | `[]` | catalog permissions or trailing wildcards, for `user` never inside a block namespace (`unknown_permission`) | Added to the implicit `user` role (every active user, every organization), `admin` and `member` |
 | `rbac.application_roles.<key>.name`, `.description`, `.permissions` | none | key `[a-z][a-z0-9_]{0,62}`, not `owner`, `admin`, `member`, `platform_admin`, `user` (`reserved_role_key`); at most 64 roles; permissions from the catalog, wildcards only outside block namespaces | Declared application roles, synced into `roles` at start |
 | `service_accounts.max_per_scope` | `100` | 1 to 10000 | Per organization and for the application (`service_account_limit`) |
 | `api_keys.max_per_scope`, `max_ttl`, `touch_interval` | `100`, `365d`, `5m` | 1 to 10000, 1 h to 3650 d, 1 s to 1 d | Unrevoked keys per scope (`api_key_limit`); the furthest `expires_at`; `last_used_at` writes |
@@ -1039,7 +1040,11 @@ tenant, and a `platform_admin`'s key never breaks glass. A revoked (audited
 `api_key.used_after_revocation`) or expired key, an inactive owner, and a
 user's tenant key without its owner's live membership answer
 `401 unauthenticated`; removing a member revokes its keys for the
-organization. Failed key presentations spend `api_key_invalid_ip`
+organization, and so are the service account keys it minted there
+(listings show `created_by`); its pending invitations are deleted, and a
+role change that drops the authority behind them does the same. Accepting
+an invitation re-checks its inviter's live grants
+(`409 invitation_stale`). Failed key presentations spend `api_key_invalid_ip`
 (`429 rate_limited` with `Retry-After`). Revoked and expired keys are
 deleted by the cleanup job after 30 days, expired invitations at once.
 
@@ -1073,7 +1078,7 @@ organization): `identity.organization_created`, `_updated`, `_deleted`,
 
 Error codes PR 2 registers: `permission_escalation`, `email_mismatch`,
 `builtin_role` (403), `slug_taken`, `slug_reserved`, `role_key_taken`,
-`role_in_use`, `already_member` (409), `unknown_permission`,
+`role_in_use`, `already_member`, `invitation_stale` (409), `unknown_permission`,
 `unknown_resource_kind`, `organization_limit`, `role_limit`,
 `assignment_limit`, `service_account_limit`, `api_key_limit`,
 `declared_role_in_use` (422).

@@ -166,6 +166,37 @@ permissions = ["identity.*"]
     assert_eq!(found, expected);
 }
 
+/// The implicit `user` role holds in every organization, so it takes no
+/// wildcard inside a block namespace; `admin` and `member` may.
+#[test]
+fn builtin_user_grants_take_no_block_wildcard() {
+    let section = section(
+        "",
+        &[],
+        "[modules.identity.rbac.builtin_grants]\nuser = [\"identity.*\", \"content.*\"]\n\
+         admin = [\"content.*\"]\nmember = [\"content.entries.*\"]\n",
+    );
+    assert_eq!(
+        issues(&section, Some(HostFacts::loopback())),
+        vec![
+            (
+                "modules.identity.rbac.builtin_grants.user".to_owned(),
+                "unknown_permission".to_owned()
+            );
+            2
+        ]
+    );
+    let fine = section_with_user("[\"tasks.*\", \"content.entries.read\"]");
+    assert!(issues(&fine, Some(HostFacts::loopback())).is_empty());
+}
+fn section_with_user(user: &str) -> String {
+    section(
+        "",
+        &[],
+        &format!("[modules.identity.rbac.builtin_grants]\nuser = {user}\n"),
+    )
+}
+
 #[test]
 fn origins_secrets_and_methods_are_required() {
     let found = issues("[modules.identity]\n", Some(HostFacts::loopback()));

@@ -6,7 +6,9 @@ mod support;
 use serde_json::json;
 use support::*;
 
-#[tokio::test]
+// Multi-threaded: the host `Authorizer` writes a break-glass audit in
+// place before allowing the use (`block_in_place`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn grant_changes_are_seen_by_every_instance_on_the_next_request() {
     let Some(world) = World::new(&section(
         "",

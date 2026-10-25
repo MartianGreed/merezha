@@ -1042,13 +1042,20 @@ fn rbac(r: &mut Reader<'_>, catalog: &Catalog) -> RbacSettings {
                     r.issue(&format!("rbac.builtin_grants.{key}"), "unknown_key");
                 }
             }
+            // `user` holds in every organization and needs no grant at
+            // all to receive, so it follows the custom role rule: no
+            // wildcard inside a block namespace.
             let mut list = |name: &str| {
                 grants(
                     r,
                     table.get(name),
                     &format!("rbac.builtin_grants.{name}"),
                     catalog,
-                    Wildcards::Any,
+                    if name == "user" {
+                        Wildcards::Application
+                    } else {
+                        Wildcards::Any
+                    },
                 )
             };
             settings.builtin_grants = BuiltinGrants {

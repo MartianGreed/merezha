@@ -429,6 +429,21 @@ pub const KEY_AUTHENTICATE: Statement = Statement::new(
     "SELECT merezha_identity.api_keys",
     key_authenticate!("k.public_id = $1"),
 );
+/// [`KEY_AUTHENTICATE`] by key id, for re-checking an inviting key.
+pub const KEY_RESOLVE: Statement = Statement::new(
+    "identity.api_keys.resolve",
+    "SELECT merezha_identity.api_keys",
+    key_authenticate!("k.id = $1::uuid"),
+);
+/// Revoke the service account keys user `$1` minted in organization `$2`.
+pub const KEYS_REVOKE_MINTED: Statement = Statement::new(
+    "identity.api_keys.revoke_minted",
+    "UPDATE merezha_identity.api_keys",
+    "UPDATE merezha_identity.api_keys SET revoked_at = $3
+      WHERE created_by = $1 AND organization_id = $2 AND service_account_id IS NOT NULL
+        AND revoked_at IS NULL
+     RETURNING id",
+);
 pub const KEY_TOUCH: Statement = Statement::new(
     "identity.api_keys.touch",
     "UPDATE merezha_identity.api_keys",
@@ -660,6 +675,24 @@ pub const ORGS_OWNED_LOCK: Statement = Statement::new(
 );
 /// Members other than user `$2` holding `owner` at organization scope in
 /// organization `$1`.
+/// Whether user `$2` holds `owner` at organization scope in `$1` now.
+pub const USER_IS_OWNER: Statement = Statement::new(
+    "identity.role_assignments.user_is_owner",
+    "SELECT merezha_identity.role_assignments",
+    "SELECT EXISTS (SELECT 1 FROM merezha_identity.role_assignments a
+                      JOIN merezha_identity.memberships m ON m.id = a.membership_id
+                     WHERE a.organization_id = $1 AND m.user_id = $2
+                       AND a.builtin_role = 'owner' AND a.resource_kind IS NULL)",
+);
+/// Whether user `$1`, active, holds `platform_admin` now.
+pub const USER_IS_PLATFORM_ADMIN: Statement = Statement::new(
+    "identity.application_role_assignments.user_is_platform_admin",
+    "SELECT merezha_identity.application_role_assignments",
+    "SELECT EXISTS (SELECT 1 FROM merezha_identity.application_role_assignments a
+                      JOIN merezha_identity.users u ON u.id = a.user_id
+                     WHERE a.user_id = $1 AND u.status = 'active'
+                       AND a.role_id = '00000000-0000-7000-8000-000000000004')",
+);
 pub const OTHER_OWNERS: Statement = Statement::new(
     "identity.role_assignments.other_owners",
     "SELECT merezha_identity.role_assignments",
@@ -1052,8 +1085,8 @@ pub const INVITATION_INSERT: Statement = Statement::new(
     "INSERT merezha_identity.invitations",
     "INSERT INTO merezha_identity.invitations
         (id, organization_id, email, email_normalized, token_hash, invited_by, created_at,
-         expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+         expires_at, invited_by_key)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
 );
 pub const INVITATION_ROLE_INSERT: Statement = Statement::new(
     "identity.invitation_roles.insert",
@@ -1071,7 +1104,8 @@ macro_rules! invitation_columns {
                   WHEN 'owner' THEN '00000000-0000-7000-8000-000000000001'::uuid \
                   WHEN 'admin' THEN '00000000-0000-7000-8000-000000000002'::uuid \
                   ELSE '00000000-0000-7000-8000-000000000003'::uuid END) \
-                 FROM merezha_identity.invitation_roles x WHERE x.invitation_id = i.id)"
+                 FROM merezha_identity.invitation_roles x WHERE x.invitation_id = i.id), \
+         i.invited_by_key"
     };
 }
 pub const INVITATIONS_LIST: Statement = Statement::new(
@@ -1084,6 +1118,13 @@ pub const INVITATIONS_LIST: Statement = Statement::new(
           WHERE i.organization_id = $1 AND i.expires_at > $2
           ORDER BY i.id LIMIT 1000"
     ),
+);
+/// Pending invitations user `$2` sent in organization `$1`, deleted.
+pub const INVITATIONS_DELETE_BY_INVITER: Statement = Statement::new(
+    "identity.invitations.delete_by_inviter",
+    "DELETE merezha_identity.invitations",
+    "DELETE FROM merezha_identity.invitations WHERE organization_id = $1 AND invited_by = $2
+     RETURNING id",
 );
 pub const INVITATION_DELETE: Statement = Statement::new(
     "identity.invitations.delete",
@@ -1180,11 +1221,15 @@ pub const DIRECTORY_APPLICATION_MEMBERS: Statement = Statement::new(
                WHERE a.user_id = u.id AND a.resource_kind IS NULL AND r.key = ANY($1)))
       ORDER BY u.id LIMIT $3",
 );
+/// A membership of an active user with a verified address, like the
+/// other Directory calls.
 pub const DIRECTORY_IS_MEMBER: Statement = Statement::new(
     "identity.directory.is_member",
     "SELECT merezha_identity.memberships",
-    "SELECT EXISTS (SELECT 1 FROM merezha_identity.memberships
-                     WHERE user_id = $1 AND organization_id = $2)",
+    "SELECT EXISTS (SELECT 1 FROM merezha_identity.memberships m
+                      JOIN merezha_identity.users u ON u.id = m.user_id
+                     WHERE m.user_id = $1 AND m.organization_id = $2
+                       AND u.status = 'active' AND u.email_verified_at IS NOT NULL)",
 );
 
 // ----- audit listings -----

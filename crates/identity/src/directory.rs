@@ -2,7 +2,8 @@
 //! and memberships, which notifications reads to resolve `User`, `Tenant`
 //! and `Application` recipients. Users that are disabled or unverified are
 //! simply absent; service accounts never appear; pages are keyset-ordered
-//! by user id and bounded; `is_member` counts memberships only.
+//! by user id and bounded; `is_member` counts memberships only, of active
+//! users with a verified address, like the other calls.
 use crate::{core::Core, core::sql, ids, rbac::USER};
 use merezha_domain::Failure;
 use merezha_platform::{

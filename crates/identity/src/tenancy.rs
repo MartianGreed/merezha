@@ -95,6 +95,8 @@ fn invitation_json(row: &Row) -> Value {
         "organization_id": ids::render(ids::ORGANIZATION, row.get(1)),
         "email": row.get::<_, String>(2),
         "role_ids": roles.into_iter().map(|r| ids::render(ids::ROLE, r)).collect::<Vec<_>>(),
+        "invited_by": row.get::<_, Option<Uuid>>(4).map(|u| ids::render(ids::USER, u)),
+        "invited_by_key": row.get::<_, Option<Uuid>>(8).map(|k| ids::render(ids::API_KEY, k)),
         "created_at": row.get::<_, Timestamp>(5).to_string(),
         "expires_at": row.get::<_, Timestamp>(6).to_string(),
     })
@@ -186,18 +188,198 @@ impl Core {
     }
     /// The escalation rule for granting or removing `role` at `scope` in
     /// `org`: hold all of its permissions there, and be an owner for
-    /// `owner`.
-    pub(crate) fn may_grant(
+    /// `owner`, re-read under the organization lock the caller holds, so a
+    /// demotion racing the request is honoured.
+    pub(crate) async fn may_grant(
         &self,
+        tx: &mut Tx<'_>,
         who: &Who,
         org: Uuid,
         role: &RoleRef,
         scope: &merezha_platform::ports::ResourceScope,
     ) -> Result<(), ApiError> {
-        if role.builtin() == Some(OWNER) && !self.owner_in(who, org) {
+        if role.builtin() == Some(OWNER) && !self.owner_live(tx, who, org).await? {
             return Err(ApiError::code("permission_escalation"));
         }
         self.no_escalation(who, &self.role_permissions(role), scope)
+    }
+    /// Whether `who` is an owner of `org` right now (or a live platform
+    /// admin breaking glass); the caller holds the organization lock.
+    pub(crate) async fn owner_live(
+        &self,
+        tx: &mut Tx<'_>,
+        who: &Who,
+        org: Uuid,
+    ) -> Result<bool, Failure> {
+        if !self.owner_in(who, org) {
+            return Ok(false);
+        }
+        let Some(user) = who.user else {
+            return Ok(false);
+        };
+        let row = if who.principal.grants.is_break_glass() {
+            self.db()
+                .query_one(&*tx, &crate::sql::USER_IS_PLATFORM_ADMIN, &[&user])
+                .await
+        } else {
+            self.db()
+                .query_one(&*tx, &crate::sql::USER_IS_OWNER, &[&org, &user])
+                .await
+        };
+        Ok(row.map_err(sql)?.get(0))
+    }
+    /// The live grants of member `user` in `org`, read in the caller's
+    /// transaction without the cache; `None` without an active membership.
+    pub(crate) async fn live_member(
+        &self,
+        tx: &mut Tx<'_>,
+        org: Uuid,
+        user: Uuid,
+        client: &Client,
+    ) -> Result<Option<Who>, Failure> {
+        let row = self
+            .db()
+            .query_opt(&*tx, &crate::sql::USER_IN_ORGANIZATION, &[&user, &org])
+            .await
+            .map_err(sql)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let status: String = row.get(1);
+        let (Some(org_id), Some(version), Some(membership)) = (
+            row.get::<_, Option<Uuid>>(2),
+            row.get::<_, Option<i64>>(3),
+            row.get::<_, Option<Uuid>>(4),
+        ) else {
+            return Ok(None);
+        };
+        if status != "active" {
+            return Ok(None);
+        }
+        let grants = self
+            .live_snapshot(
+                &*tx,
+                crate::grants::Owner::User(user),
+                Some(crate::grants::OrgFacts {
+                    id: org_id,
+                    version,
+                    holder: Some(membership),
+                }),
+                None,
+            )
+            .await?;
+        let principal = Arc::new(self.user_principal(user, Some(org), grants, None));
+        Ok(Who::new(Some(principal), client.clone()))
+    }
+    /// The inviter of an invitation as it stands now: the inviting key, or
+    /// the inviting member; `None` when it can no longer act in `org`.
+    async fn live_inviter(
+        self: &Arc<Self>,
+        tx: &mut Tx<'_>,
+        org: Uuid,
+        user: Option<Uuid>,
+        key: Option<Uuid>,
+        client: &Client,
+    ) -> Result<Option<Who>, Failure> {
+        match (key, user) {
+            (Some(key), _) => Ok(self
+                .live_key(&*tx, key, org)
+                .await?
+                .and_then(|p| Who::new(Some(Arc::new(p)), client.clone()))),
+            (None, Some(user)) => self.live_member(tx, org, user, client).await,
+            (None, None) => Ok(None),
+        }
+    }
+    /// What a member keeps after losing authority in `org` (removed, or a
+    /// role change; the caller holds the organization lock): the service
+    /// account keys it minted are revoked unless it still holds
+    /// `identity.service_accounts.manage` there, its own keys unless it
+    /// still holds `identity.api_keys.create`, and the invitations it sent
+    /// are deleted unless it still holds `identity.members.invite`. A
+    /// removed member keeps none of them.
+    pub(crate) async fn after_authority_change(
+        &self,
+        tx: &mut Tx<'_>,
+        org: Uuid,
+        user: Uuid,
+        removed: bool,
+        who: &Who,
+    ) -> Result<(), Failure> {
+        let live = if removed {
+            None
+        } else {
+            self.live_member(tx, org, user, &who.client).await?
+        };
+        let scope = Scope::Tenant(org).resource_scope();
+        let holds = |name: &str| {
+            live.as_ref().is_some_and(|w| {
+                Identity::new(name).is_ok_and(|p| w.principal.check(&p, &scope).is_ok())
+            })
+        };
+        let reason = if removed {
+            "membership_removed"
+        } else {
+            "minter_demoted"
+        };
+        let now = self.now();
+        let mut revoked = Vec::new();
+        if !holds("identity.service_accounts.manage") {
+            revoked.extend(
+                self.db()
+                    .query(&*tx, &crate::sql::KEYS_REVOKE_MINTED, &[&user, &org, &now])
+                    .await
+                    .map_err(sql)?,
+            );
+        }
+        if !holds("identity.api_keys.create") {
+            revoked.extend(
+                self.db()
+                    .query(&*tx, &crate::sql::KEYS_REVOKE_MEMBER, &[&user, &org, &now])
+                    .await
+                    .map_err(sql)?,
+            );
+        }
+        for key in &revoked {
+            self.audit(
+                tx,
+                who.audit("api_key.revoked")
+                    .organization(org)
+                    .target_of("api_key", key.get(0))
+                    .detail("reason", reason),
+                &who.client,
+            )
+            .await?;
+        }
+        if !holds("identity.members.invite") {
+            let deleted = self
+                .db()
+                .query(
+                    &*tx,
+                    &crate::sql::INVITATIONS_DELETE_BY_INVITER,
+                    &[&org, &user],
+                )
+                .await
+                .map_err(sql)?;
+            for invitation in &deleted {
+                self.audit(
+                    tx,
+                    who.audit("invitation.revoked")
+                        .organization(org)
+                        .target_of("invitation", invitation.get(0))
+                        .detail(
+                            "reason",
+                            if removed {
+                                "inviter_removed"
+                            } else {
+                                "inviter_demoted"
+                            },
+                        ),
+                    &who.client,
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
     /// The organization-scope roles of a membership.
     async fn member_roles(
@@ -782,6 +964,11 @@ impl Core {
             .in_tx(move |tx| {
                 Box::pin(async move {
                     core.lock_org(tx, org).await?;
+                    // Re-read under the lock: an owner demoted meanwhile
+                    // transfers nothing.
+                    if !core.owner_live(tx, &who, org).await? {
+                        return Ok(Err(ApiError::code("permission_escalation")));
+                    }
                     let Some(target) = core
                         .db()
                         .query_opt(&*tx, &crate::sql::MEMBERSHIP_GET, &[&membership, &org])
@@ -832,6 +1019,8 @@ impl Core {
                             }
                         }
                         core.bump_user(tx, user).await?;
+                        core.after_authority_change(tx, org, user, false, &who)
+                            .await?;
                         core.publish_roles_changed(tx, org, mine, user, &who.client)
                             .await?;
                     }
@@ -996,7 +1185,7 @@ impl Core {
                             continue;
                         }
                         let role = core.tenant_role(tx, org, role.id).await?;
-                        core.may_grant(&who, org, &role, &scope)?;
+                        core.may_grant(tx, &who, org, &role, &scope).await?;
                         if role.builtin() == Some(OWNER) {
                             core.keep_an_owner(tx, org, user).await?;
                         }
@@ -1010,7 +1199,7 @@ impl Core {
                         if current.iter().any(|(_, c)| c.id == role.id) {
                             continue;
                         }
-                        core.may_grant(&who, org, role, &scope)?;
+                        core.may_grant(tx, &who, org, role, &scope).await?;
                         core.insert_assignment(
                             tx,
                             org,
@@ -1025,6 +1214,8 @@ impl Core {
                     }
                     if changed {
                         core.bump_user(tx, user).await?;
+                        core.after_authority_change(tx, org, user, false, &who)
+                            .await?;
                         let keys = core.role_keys_of(tx, org, membership).await?;
                         core.audit(
                             tx,
@@ -1075,11 +1266,14 @@ impl Core {
                         .is_some_and(|t| Some(t.get::<_, Uuid>(2)) == scoped.user)
                         && scoped.session.is_some();
                     if !own {
-                        match core.require(
-                            &scoped,
-                            "identity.members.remove",
-                            &Scope::Tenant(org).resource_scope(),
-                        ) {
+                        match core
+                            .require(
+                                &scoped,
+                                "identity.members.remove",
+                                &Scope::Tenant(org).resource_scope(),
+                            )
+                            .await
+                        {
                             Ok(_) => {}
                             Err(_) if !core.standing(&scoped, org) => {
                                 return Ok(Err(ApiError::code("not_found")));
@@ -1093,7 +1287,7 @@ impl Core {
                     let user: Uuid = target.get(2);
                     let roles = core.member_roles(tx, org, membership).await?;
                     if roles.iter().any(|(_, r)| r.builtin() == Some(OWNER)) {
-                        if !own && !core.owner_in(&scoped, org) {
+                        if !own && !core.owner_live(tx, &scoped, org).await? {
                             return Ok(Err(ApiError::code("permission_escalation")));
                         }
                         core.keep_an_owner(tx, org, user).await?;
@@ -1128,26 +1322,10 @@ impl Core {
             .execute(&*tx, &crate::sql::MEMBERSHIP_DELETE, &[&membership, &org])
             .await
             .map_err(sql)?;
-        let revoked = self
-            .db()
-            .query(
-                &*tx,
-                &crate::sql::KEYS_REVOKE_MEMBER,
-                &[&user, &org, &self.now()],
-            )
-            .await
-            .map_err(sql)?;
-        for key in &revoked {
-            self.audit(
-                tx,
-                who.audit("api_key.revoked")
-                    .organization(org)
-                    .target_of("api_key", key.get(0))
-                    .detail("reason", "membership_removed"),
-                &who.client,
-            )
+        // Its keys for the organization, the service account keys it
+        // minted there and its pending invitations go with it.
+        self.after_authority_change(tx, org, user, true, who)
             .await?;
-        }
         self.db()
             .execute(
                 &*tx,
@@ -1210,7 +1388,7 @@ impl Core {
                     let mut roles: Vec<RoleRef> = Vec::new();
                     for id in &role_ids {
                         let role = core.tenant_role(tx, org, *id).await?;
-                        core.may_grant(&who, org, &role, &scope)?;
+                        core.may_grant(tx, &who, org, &role, &scope).await?;
                         if !roles.iter().any(|r| r.id == role.id) {
                             roles.push(role);
                         }
@@ -1253,6 +1431,10 @@ impl Core {
                                 &who.creator(),
                                 &now,
                                 &expires,
+                                &match who.actor {
+                                    Actor::ApiKey(key) => Some(key),
+                                    _ => None,
+                                },
                             ],
                         )
                         .await
@@ -1297,6 +1479,11 @@ impl Core {
                         "organization_id": ids::render(ids::ORGANIZATION, org),
                         "email": email.display(),
                         "role_ids": roles.iter().map(|r| ids::render(ids::ROLE, r.id)).collect::<Vec<_>>(),
+                        "invited_by": who.creator().map(|u| ids::render(ids::USER, u)),
+                        "invited_by_key": match who.actor {
+                            Actor::ApiKey(key) => Some(ids::render(ids::API_KEY, key)),
+                            _ => None,
+                        },
                         "created_at": now.to_string(),
                         "expires_at": expires.to_string(),
                     }})))
@@ -1393,8 +1580,8 @@ impl Core {
             Ok(Reply::json(
                 200,
                 json!({
-                    "organization": {"name": row.get::<_, String>(8), "slug": row.get::<_, String>(9)},
-                    "inviter_display_name": row.get::<_, Option<String>>(10),
+                    "organization": {"name": row.get::<_, String>(9), "slug": row.get::<_, String>(10)},
+                    "inviter_display_name": row.get::<_, Option<String>>(11),
                     "email_masked": mask_email(&row.get::<_, String>(2)),
                     "expires_at": expires.to_string(),
                     "account_exists": account.is_some_and(|u| u.verified()),
@@ -1452,6 +1639,68 @@ impl Core {
                             return Ok(Err(ApiError::code("invalid_token")));
                         }
                         core.lock_org(tx, org).await?;
+                        let roles: Vec<RoleRef> = core
+                            .db()
+                            .query(&*tx, &crate::sql::INVITATION_ROLES, &[&id])
+                            .await
+                            .map_err(sql)?
+                            .iter()
+                            .filter_map(|r| {
+                                let builtin: Option<String> = r.get(0);
+                                let custom: Option<Uuid> = r.get(1);
+                                match (builtin, custom) {
+                                    (Some(key), None) => Some(RoleRef {
+                                        id: builtin_tenant_id(&key)?,
+                                        key,
+                                        custom: None,
+                                    }),
+                                    (None, Some(custom)) => Some(RoleRef {
+                                        id: custom,
+                                        key: String::new(),
+                                        custom: Some(Vec::new()),
+                                    }),
+                                    _ => None,
+                                }
+                            })
+                            .collect();
+                        let mut resolved = Vec::new();
+                        for role in roles {
+                            resolved.push(core.tenant_role(tx, org, role.id).await?);
+                        }
+                        // The inviter's authority as it stands now: an
+                        // invitation never grants what its inviter could no
+                        // longer grant (removed, demoted, key revoked).
+                        let invited_by: Option<Uuid> = invitation.get(4);
+                        let invited_by_key: Option<Uuid> = invitation.get(8);
+                        let scope = Scope::Tenant(org).resource_scope();
+                        let inviter = core
+                            .live_inviter(tx, org, invited_by, invited_by_key, &client)
+                            .await?;
+                        let mut still = inviter.is_some();
+                        if let Some(inviter) = &inviter {
+                            for role in &resolved {
+                                if core.may_grant(tx, inviter, org, role, &scope).await.is_err() {
+                                    still = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !still {
+                            core.db()
+                                .execute(&*tx, &crate::sql::INVITATION_DELETE, &[&id, &org])
+                                .await
+                                .map_err(sql)?;
+                            core.audit(
+                                tx,
+                                Audit::new("invitation.revoked", Actor::System)
+                                    .organization(org)
+                                    .target_of("invitation", id)
+                                    .detail("reason", "inviter_lacks_grant"),
+                                &client,
+                            )
+                            .await?;
+                            return Ok(Err(ApiError::conflict("invitation_stale")));
+                        }
                         let mut user = match caller {
                             Some(caller) => {
                                 let Some(user) = core.user_by_id(tx, caller.user, true).await? else {
@@ -1529,34 +1778,6 @@ impl Core {
                         if members >= i64::from(core.settings.organizations.max_members) {
                             return Ok(Err(ApiError::code("organization_limit")));
                         }
-                        let roles: Vec<RoleRef> = core
-                            .db()
-                            .query(&*tx, &crate::sql::INVITATION_ROLES, &[&id])
-                            .await
-                            .map_err(sql)?
-                            .iter()
-                            .filter_map(|r| {
-                                let builtin: Option<String> = r.get(0);
-                                let custom: Option<Uuid> = r.get(1);
-                                match (builtin, custom) {
-                                    (Some(key), None) => Some(RoleRef {
-                                        id: builtin_tenant_id(&key)?,
-                                        key,
-                                        custom: None,
-                                    }),
-                                    (None, Some(custom)) => Some(RoleRef {
-                                        id: custom,
-                                        key: String::new(),
-                                        custom: Some(Vec::new()),
-                                    }),
-                                    _ => None,
-                                }
-                            })
-                            .collect();
-                        let mut resolved = Vec::new();
-                        for role in roles {
-                            resolved.push(core.tenant_role(tx, org, role.id).await?);
-                        }
                         let consumed = core
                             .db()
                             .query_opt(&*tx, &crate::sql::INVITATION_CONSUME, &[&id, &d])
@@ -1566,7 +1787,6 @@ impl Core {
                             return Ok(Err(ApiError::code("invalid_token")));
                         }
                         core.mark_verified(tx, &mut user, &client).await?;
-                        let invited_by: Option<Uuid> = invitation.get(4);
                         let Some((membership, joined)) = core
                             .add_member(tx, org, user.id, &resolved, "invitation", invited_by, &client)
                             .await?
@@ -2007,7 +2227,7 @@ impl Core {
                             Scope::Tenant(org).resource(kind, id)
                         }
                     };
-                    core.may_grant(&who, org, &role, &scope)?;
+                    core.may_grant(tx, &who, org, &role, &scope).await?;
                     let held: i64 = core
                         .db()
                         .query_one(
@@ -2129,7 +2349,7 @@ impl Core {
                         }
                         _ => Scope::Tenant(org).resource_scope(),
                     };
-                    core.may_grant(&who, org, &role, &scope)?;
+                    core.may_grant(tx, &who, org, &role, &scope).await?;
                     let user: Option<Uuid> = row.get(10);
                     if role.builtin() == Some(OWNER)
                         && kind.is_none()
@@ -2143,6 +2363,8 @@ impl Core {
                         .map_err(sql)?;
                     if let (Some(user), Some(membership)) = (user, membership) {
                         core.bump_user(tx, user).await?;
+                        core.after_authority_change(tx, org, user, false, &who)
+                            .await?;
                         if kind.is_none() {
                             core.publish_roles_changed(tx, org, membership, user, &who.client)
                                 .await?;

@@ -32,7 +32,9 @@ async fn mint(i: &Instance, owner: &mut Browser, path: &str, permissions: &[&str
 }
 
 /// Acceptance 5.
-#[tokio::test]
+// Multi-threaded: the host `Authorizer` writes a break-glass audit in
+// place before allowing the use (`block_in_place`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_key_never_exceeds_its_owner() {
     let Some(world) = World::new(&section(
         "",

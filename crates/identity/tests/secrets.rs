@@ -510,11 +510,8 @@ async fn planted_keys_and_invitation_tokens_never_reach_telemetry() {
     user(&world, &node, "root@example.com").await;
     platform_admin(&node, "root@example.com").await;
     let mut root = sign_in(&node, "root@example.com").await;
-    assert!(
-        root.allowed(&node, "identity.users.manage", "application")
-            .await
-    );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Break-glass on identity's own route: its audit row is written first.
+    assert_eq!(root.get(&node, "/application/users").await.status, 200);
     let _ = harness.telemetry().meter("identity");
     for canary in [
         key.as_str(),
