@@ -31,6 +31,7 @@ fn metadata() -> Metadata {
         correlation_id: id("task-board"),
         causation_id: None,
         actor: Some(id("ada")),
+        principal: None,
     }
 }
 
@@ -110,6 +111,7 @@ fn catch_up(
                 state,
                 events: events.to_vec(),
                 live: true,
+                partition: None,
             },
         )?
         else {

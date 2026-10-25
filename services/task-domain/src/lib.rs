@@ -2,8 +2,10 @@
 //! component.
 //!
 //! The host owns routing, idempotency, event storage and versions; this
-//! component owns every rule. It answers two operations of the version 1
-//! application protocol (`merezha_domain`):
+//! component owns every rule. It speaks application protocol version 2
+//! (`merezha_domain`; declare `application_protocol = 2` in the runtime
+//! manifest) and still answers version 1 requests, which carry no
+//! principal. It answers two operations:
 //!
 //! - `validate` decodes a command payload into its typed shape, checks the
 //!   title and returns the canonical payload: surrounding whitespace is
@@ -17,10 +19,19 @@
 //! | `RenameTask` | `{"title":…}` | the task is open and the title changes | `TaskRenamed` |
 //! | `CompleteTask` | `{}` | the task is open | `TaskCompleted` |
 //!
+//! Ownership: when the host established a principal (version 2),
+//! `CreateTask` records its subject as the task's owner (`TaskCreated`
+//! schema version 2). `RenameTask` and `CompleteTask` on an owned task
+//! require the owner or the role `admin`, else `not_owner`. A task created
+//! without a principal, including all version 1 history, has no owner and
+//! stays open to every caller. Guests never authenticate: the principal is
+//! the host's.
+//!
 //! See `docs/services/README.md` for the full contract and failure codes.
 
 use merezha_domain::{
-    Decider, Event, Failure, Identity, MessageKind, Operation, Reply, StoredEvent, rehydrate,
+    Decider, Event, Failure, Identity, MessageKind, Operation, Principal, Reply, StoredEvent,
+    rehydrate,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -106,23 +117,51 @@ fn canonical_title(title: &str) -> Result<String, Failure> {
     }
 }
 
-/// The state of one task, rebuilt from its stream.
+/// The state of one task, rebuilt from its stream. `owner` is the
+/// creator's subject, `None` for a task created without a principal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Task {
     /// No event recorded yet.
     Absent,
     /// Created and not completed.
-    Open { title: String },
+    Open {
+        title: String,
+        owner: Option<Identity>,
+    },
     /// Completed; the task accepts no further change.
-    Completed { title: String },
+    Completed {
+        title: String,
+        owner: Option<Identity>,
+    },
 }
+
+/// The role that may change any task.
+pub const ADMIN_ROLE: &str = "admin";
 
 /// The decider of one task stream. `task_id` is the stream the host
 /// addresses, recorded in every event so the view needs no stream naming
-/// convention.
+/// convention. `principal` is who the host established for the command,
+/// `None` for an anonymous or version 1 call.
 #[derive(Debug, Clone)]
 pub struct TaskDecider {
     pub task_id: Identity,
+    pub principal: Option<Principal>,
+}
+
+impl TaskDecider {
+    /// `not_owner` unless the task is unowned, or the principal is its
+    /// owner or holds [`ADMIN_ROLE`].
+    fn check_owner(&self, owner: Option<&Identity>) -> Result<(), Failure> {
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        match &self.principal {
+            Some(principal) if principal.subject == *owner || principal.has_role(ADMIN_ROLE) => {
+                Ok(())
+            }
+            _ => Err(Failure::permanent("not_owner")),
+        }
+    }
 }
 
 impl Decider for TaskDecider {
@@ -136,9 +175,18 @@ impl Decider for TaskDecider {
 
     fn decide(&self, state: &Task, command: TaskCommand) -> Result<Vec<TaskEvent>, Failure> {
         let task_id = self.task_id.clone();
+        if let Task::Open { owner, .. } | Task::Completed { owner, .. } = state
+            && !matches!(command, TaskCommand::CreateTask(_))
+        {
+            self.check_owner(owner.as_ref())?;
+        }
         let event = match (state, command) {
             (Task::Absent, TaskCommand::CreateTask(CreateTask { title })) => {
-                TaskEvent::Created(TaskCreated { task_id, title })
+                TaskEvent::Created(TaskCreated {
+                    task_id,
+                    title,
+                    owner: self.principal.as_ref().map(|p| p.subject.clone()),
+                })
             }
             (_, TaskCommand::CreateTask(_)) => return Err(Failure::permanent("task_exists")),
             (Task::Absent, _) => return Err(Failure::permanent("task_not_found")),
@@ -148,7 +196,7 @@ impl Decider for TaskDecider {
             (Task::Completed { .. }, TaskCommand::CompleteTask(_)) => {
                 return Err(Failure::permanent("task_already_completed"));
             }
-            (Task::Open { title: current }, TaskCommand::RenameTask(RenameTask { title })) => {
+            (Task::Open { title: current, .. }, TaskCommand::RenameTask(RenameTask { title })) => {
                 if *current == title {
                     return Err(Failure::permanent("title_unchanged"));
                 }
@@ -166,13 +214,15 @@ impl Decider for TaskDecider {
             return Err(Failure::permanent("corrupt_history"));
         }
         match (state, event) {
-            (Task::Absent, TaskEvent::Created(TaskCreated { title, .. })) => {
-                Ok(Task::Open { title })
+            (Task::Absent, TaskEvent::Created(TaskCreated { title, owner, .. })) => {
+                Ok(Task::Open { title, owner })
             }
-            (Task::Open { .. }, TaskEvent::Renamed(TaskRenamed { title, .. })) => {
-                Ok(Task::Open { title })
+            (Task::Open { owner, .. }, TaskEvent::Renamed(TaskRenamed { title, .. })) => {
+                Ok(Task::Open { title, owner })
             }
-            (Task::Open { title }, TaskEvent::Completed(_)) => Ok(Task::Completed { title }),
+            (Task::Open { title, owner }, TaskEvent::Completed(_)) => {
+                Ok(Task::Completed { title, owner })
+            }
             _ => Err(Failure::permanent("corrupt_history")),
         }
     }
@@ -196,6 +246,7 @@ pub fn replay(task_id: &Identity, history: &[StoredEvent]) -> Result<Task, Failu
     rehydrate(
         &TaskDecider {
             task_id: task_id.clone(),
+            principal: None,
         },
         events,
     )
@@ -207,7 +258,7 @@ pub fn replay(task_id: &Identity, history: &[StoredEvent]) -> Result<Task, Failu
 ///
 /// `unsupported_operation` for `project` and `query`, `unknown_command` for
 /// a query tag, and the failures of [`TaskCommand::decode`], [`replay`] and
-/// [`TaskDecider::decide`].
+/// [`TaskDecider::decide`] (`not_owner` included).
 pub fn dispatch(operation: Operation) -> Result<Reply, Failure> {
     match operation {
         Operation::Validate {
@@ -223,11 +274,14 @@ pub fn dispatch(operation: Operation) -> Result<Reply, Failure> {
             stream,
             payload,
             history,
-            ..
+            metadata,
         } => {
             let command = TaskCommand::decode(tag.as_str(), payload)?;
             let state = replay(&stream, &history)?;
-            let decider = TaskDecider { task_id: stream };
+            let decider = TaskDecider {
+                task_id: stream,
+                principal: metadata.principal,
+            };
             let events = decider
                 .decide(&state, command)?
                 .iter()
@@ -235,14 +289,15 @@ pub fn dispatch(operation: Operation) -> Result<Reply, Failure> {
                 .collect::<Result<Vec<Event>, Failure>>()?;
             Ok(Reply::Decided { events })
         }
-        Operation::Project { .. } | Operation::Query { .. } => {
+        // `describe` never reaches a dispatcher: the SDK answers it.
+        Operation::Project { .. } | Operation::Query { .. } | Operation::Describe {} => {
             Err(Failure::permanent("unsupported_operation"))
         }
     }
 }
 
-/// The `handle` export: one version 1 application request in, one response
-/// out. Classified failures are successful responses; see
+/// The `handle` export: one version 1 or 2 application request in, one
+/// response out, in the request's version. Classified failures are successful responses; see
 /// [`merezha_domain::handle`].
 ///
 /// # Errors

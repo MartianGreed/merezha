@@ -248,19 +248,30 @@ async fn dispatch(state: Routes, request: Request, action: Action) -> Response {
                 value.map_err(|_| Failure::permanent("serialization_failed"))
             };
             let ok = StatusCode::OK;
+            // The edge's principal reaches the guest's metadata (version 2
+            // guests only) through the trusted entry points; route scopes
+            // are AP-C2's, so the roles are the application-scope ones.
+            let guest = principal
+                .as_deref()
+                .map(|principal| principal.guest(&ResourceScope::Application))
+                .transpose()?;
             Ok(match action {
-                Action::Command => (
-                    ok,
-                    encoded(serde_json::to_value(
-                        admission.command(merezha_domain::decode(&with_host_ids(input)?)?)?,
-                    ))?,
-                ),
-                Action::Query => (
-                    ok,
-                    encoded(serde_json::to_value(
-                        admission.query(merezha_domain::decode(&with_host_ids(input)?)?)?,
-                    ))?,
-                ),
+                Action::Command => {
+                    let command = merezha_domain::decode(&with_host_ids(input)?)?;
+                    let receipt = match guest {
+                        Some(principal) => admission.command_as(principal, command)?,
+                        None => admission.command(command)?,
+                    };
+                    (ok, encoded(serde_json::to_value(receipt))?)
+                }
+                Action::Query => {
+                    let query = merezha_domain::decode(&with_host_ids(input)?)?;
+                    let answer = match guest {
+                        Some(principal) => admission.query_as(principal, query)?,
+                        None => admission.query(query)?,
+                    };
+                    (ok, encoded(serde_json::to_value(answer))?)
+                }
                 Action::Project { name, rebuild } => (
                     ok,
                     encoded(serde_json::to_value(admission.project(&name, rebuild)?))?,

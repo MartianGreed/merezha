@@ -2045,6 +2045,31 @@ description (not gated).
    `service_protocol_mismatch`.
 5. SDK golden JSON exists for every new type, and `describe` is answered automatically.
 
+**C1 delivery notes.** As built in AP-C1:
+
+- `Operation::Describe {}` is an empty struct variant, so `deny_unknown_fields` refuses
+  `{"op":"describe","x":1}` (a unit variant would accept it). `react` and the effect types
+  (`Effect`, `Recipient`, `Channel`, `Reaction`, `Reply::Reacted`) are C3's; `Operation::fits(version)`
+  is the seam C3 extends.
+- `Principal` omits a missing `tenant` and empty `roles` from JSON; stored metadata is
+  `{subject, kind, tenant?}`. `Principal::new` sorts and deduplicates roles and fails
+  `invalid_principal` past 16 roles or 64 bytes; the platform builds it with
+  `merezha_platform::ports::Principal::guest(&ResourceScope)`, the roles of that scope.
+- `handle` answers a request that fails to decode in the version it names (1 or 2), so a
+  version 2 host sees the real code; anything else answers in version 1.
+- The `describe` check lives in `merezha-application`: `GuestSession::protocol(service)` and
+  `generation()` (defaults 1 and 0 for in-process guests), one cache holding the newest
+  generation's described services. A permanent failure or another reply is
+  `service_protocol_mismatch`; a transient one (timeout, overload) is returned as is and not
+  cached. It is a guest call of its own, `guest {service} describe` (TE catalog row added).
+- `Catalog::protocols` is not serialized, so `/v1/services` is unchanged.
+- The HTTP adapter calls `command_as`/`query_as` with the edge's principal at
+  `ResourceScope::Application` until C2 brings route scopes; with identity enabled every
+  application route still answers 401/403 until C2.
+- `TaskCreated` schema version 2 always carries `owner`; a task created without a principal is
+  still written as schema version 1, so the version 1 demos stay byte-identical. Ownership is
+  checked before the state rules on an existing task.
+
 **C2 tests.**
 
 1. An unauthenticated request gets 401 with zero guest fuel spent.

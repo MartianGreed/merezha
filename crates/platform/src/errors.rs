@@ -74,6 +74,10 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("invalid_response", 422),
     ErrorCode::new("invariant_violation", 422),
     ErrorCode::new("protocol_version", 422),
+    // Guest protocol version 2 (AP §C.1, §C.4).
+    ErrorCode::new("service_protocol_mismatch", 422),
+    ErrorCode::new("principal_not_trusted", 422),
+    ErrorCode::new("invalid_principal", 422),
     ErrorCode::new("serialization_failed", 422),
     ErrorCode::new("constraint_violation", 422),
     ErrorCode::new("database_error", 422),

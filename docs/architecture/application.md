@@ -12,14 +12,15 @@ dispatcher matches `Operation` and returns `Result<Reply, Failure>`. Classified
 application failures are encoded inside ABI `Ok`; ABI `Err` denotes a component
 or transport failure. Unknown operations, fields and protocol versions fail.
 
-Each request has `version: 1` and a `body` tagged by `op`:
+Each request has `version` 1 or 2 and a `body` tagged by `op`:
 
 | Operation | Input | Required reply |
 | --- | --- | --- |
 | `validate` | `kind`, `tag`, `payload` | `validated` with normalized `payload` |
 | `decide` | `tag`, `stream`, `payload`, `history`, `metadata` | `decided` with `events` |
-| `project` | `projection`, `state`, `events`, `live` | `projected` with new `state` |
+| `project` | `projection`, `state`, `events`, `live`; version 2: optional `partition` | `projected` with new `state` |
 | `query` | `tag`, `payload`, `state`, `metadata` | `queried` with `value` |
+| `describe` | version 2 only, no fields | `described` with `protocol` (answered by the SDK) |
 
 Use `validate_payload::<YourType>` to decode and re-encode typed commands and
 queries, with `#[serde(deny_unknown_fields)]` on domain payload types. Perform
@@ -28,7 +29,7 @@ payloads, verify event tag/schema, rehydrate and call the decider. Emit `Event`
 with `tag`, positive `schema_version` and JSON `payload`. The host assigns event
 identity, stream versions, global positions, acceptance time and metadata.
 
-Responses have `version: 1` and `outcome` tagged by `status`, either `ok` with
+Responses echo the request's `version` and have `outcome` tagged by `status`, either `ok` with
 `reply` tagged by `kind`, or `err` with an `error` containing `code` and
 `classification`. Classifications are `permanent`, `transient`, and `conflict`.
 Identifiers and error codes contain 1 to 128 ASCII alphanumeric characters or
@@ -38,6 +39,49 @@ Metadata has required `message_id` and `correlation_id` and optional
 `causation_id` and `actor`. Metadata is caller-supplied context, not proof of
 authentication. `Authorizer` is an embedding-host policy port; `AllowAll` is an
 explicit choice for trusted local demos.
+
+### Protocol version 2
+
+A service opts in with `application_protocol = 2` on its `[[services]]` entry
+in the runtime manifest ([contract](contract.md)); the default is 1. The host
+sends version 2 requests only to such services, and expects the response to
+echo the version (`protocol_version` otherwise). Version 2 adds:
+
+- `metadata.principal`, set only by the host: `{subject, kind, tenant?,
+  roles?}` with `kind` one of `user`, `api_key` or `system` and at most 16
+  sorted role keys of at most 64 bytes, the roles held at the route's scope.
+  When it is present, `actor` is its subject. It never carries sessions,
+  grants or secrets. Guests use it for ownership rules
+  (`Metadata::principal`, `Metadata::require_subject`, `Principal::has_role`,
+  `Principal::require_tenant`); they never authenticate.
+- `describe`: at startup, and on the first call after each reload (once per
+  catalog generation and service), the host sends
+  `{"version":2,"body":{"op":"describe"}}` to every version 2 service and
+  expects `{"kind":"described","protocol":2}`. `merezha_domain::handle`
+  answers it without calling the dispatcher. A guest that does not answer it
+  (a guest built on the version 1 SDK answers `protocol_version`) fails
+  startup with `service_protocol_mismatch`; after a reload, calls to that
+  service fail with the same permanent code and the history is untouched.
+- `project.partition` for partitioned projections (route permissions and
+  tenant scopes, a later slice; the host sends none yet).
+
+The host downgrades every request to a version 1 service: no `principal` in
+decide or query metadata nor in any history or projection event's metadata,
+no `partition`, no `describe`. A version 1 request carrying any of them fails
+`protocol_version` in the SDK, so guests built on the version 1 SDK keep
+working unchanged, and version 1 JSON is byte-identical to what it was before
+version 2. Rebuilding a guest on the new SDK is a source break only for code
+that matches `Operation` exhaustively (add a `Describe {}` arm) or builds
+`Metadata` or `Operation::Project` literals (add `principal: None` or
+`partition: None`).
+
+`Admission::command` and `query` (and `Application::command`, `query`) are
+anonymous: a `metadata.principal` supplied by the caller fails
+`principal_not_trusted`. The trusted entry points are `command_as(principal,
+command)` and `query_as(principal, query)`, called by the host with the
+principal it established; a caller-supplied `actor` other than the
+principal's subject fails `actor_mismatch`. Stored events keep the principal
+as `{subject, kind, tenant}` and drop its roles.
 
 JSON uses the locked Serde JSON i64/u64/f64 number representation. Integral
 values outside ±9,007,199,254,740,991 are rejected in application values.

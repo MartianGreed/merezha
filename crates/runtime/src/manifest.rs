@@ -37,6 +37,14 @@ pub struct Manifest {
 pub struct Service {
     pub id: String,
     pub path: PathBuf,
+    /// The application protocol the service speaks (AP §C.1): 1 (default)
+    /// or 2. The runtime only records it; the application host interprets
+    /// payloads.
+    #[serde(default = "default_protocol")]
+    pub application_protocol: u16,
+}
+fn default_protocol() -> u16 {
+    1
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +93,10 @@ impl Manifest {
             ensure!(
                 valid_id(&service.id) && services.insert(&service.id),
                 "invalid or duplicate service id"
+            );
+            ensure!(
+                matches!(service.application_protocol, 1 | 2),
+                "invalid application_protocol"
             );
             ensure!(
                 !service.path.as_os_str().is_empty()

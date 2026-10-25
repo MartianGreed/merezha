@@ -80,7 +80,7 @@ impl Board {
         match event {
             // Only the first event of a stream creates its task.
             TaskEvent::Created(_) if row.is_some() => return Err(gap()),
-            TaskEvent::Created(TaskCreated { task_id, title }) => {
+            TaskEvent::Created(TaskCreated { task_id, title, .. }) => {
                 let row = Row {
                     title,
                     status: Status::Open,
@@ -314,6 +314,8 @@ pub fn dispatch(operation: Operation) -> Result<Reply, Failure> {
             // The read model has no side effects, so replay during a
             // rebuild (`live: false`) is handled exactly like live delivery.
             live: _,
+            // Declared version 1: the host never sends a partition.
+            partition: _,
         } => {
             if projection.as_str() != PROJECTION {
                 return Err(Failure::permanent("unknown_projection"));
@@ -342,7 +344,10 @@ pub fn dispatch(operation: Operation) -> Result<Reply, Failure> {
                 value: query.answer(&board(state)?)?,
             })
         }
-        Operation::Decide { .. } => Err(Failure::permanent("unsupported_operation")),
+        // `describe` never reaches a dispatcher: the SDK answers it.
+        Operation::Decide { .. } | Operation::Describe {} => {
+            Err(Failure::permanent("unsupported_operation"))
+        }
     }
 }
 

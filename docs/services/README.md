@@ -220,7 +220,7 @@ Files in `examples/task-board/`:
 
 | File | Purpose |
 | --- | --- |
-| `runtime.toml` | Catalog: `task-domain`, `task-view`, and the stateless `normalize` and `greet` services with the `welcome` pipeline |
+| `runtime.toml` | Catalog: `task-domain` (`application_protocol = 2`), `task-view`, and the stateless `normalize` and `greet` services with the `welcome` pipeline |
 | `runtime-faulty.toml` | Same catalog with the faulty `task-view` revision |
 | `application.toml` | Command, query and projection routes and the store limits |
 | `fixtures/tasks.json` | The three tasks the scenario creates first |
@@ -260,14 +260,24 @@ aggregate `Task`; the host names it `Task/<stream>` and passes that name to
 
 | Command | Payload | Accepted when | Emits |
 | --- | --- | --- | --- |
-| `CreateTask` | `{"title":…}` | The task has no history | `TaskCreated` `{task_id,title}` |
+| `CreateTask` | `{"title":…}` | The task has no history | `TaskCreated` `{task_id,title,owner?}` |
 | `RenameTask` | `{"title":…}` | The task is open and the title changes | `TaskRenamed` `{task_id,title}` |
 | `CompleteTask` | `{}` | The task is open | `TaskCompleted` `{task_id}` |
 
 A title is 1 to 120 Unicode scalar values without control characters.
 Validation trims surrounding whitespace and returns that canonical payload,
 so `" Write docs "` and `"Write docs"` are the same command, including for
-idempotency. Unknown fields are rejected. Every event has schema version 1.
+idempotency. Unknown fields are rejected. Every event has schema version 1,
+except a `TaskCreated` that records an owner, which has schema version 2.
+
+`task-domain` speaks [application protocol](../architecture/application.md#protocol-version-2)
+version 2, declared in `runtime.toml`. When the host established a principal
+(`metadata.principal`), `CreateTask` records its subject as `owner`, and
+`RenameTask` and `CompleteTask` on an owned task require that subject or the
+role `admin`, else `not_owner`. A task created without a principal, which
+includes every task of the local demos (`serve` authenticates nobody) and all
+history written before version 2, has no owner and accepts every caller.
+Clients cannot set the owner: it is not part of any payload.
 
 `decide` checks the history before using it: every event belongs to the
 addressed stream, versions run 1, 2, 3… and each event can follow the
@@ -314,8 +324,9 @@ host codes such as `handler_not_found`, `idempotency_mismatch` and
 | `title_unchanged` | permanent | domain | `RenameTask` to the current title |
 | `task_completed` | permanent | domain | `RenameTask` after completion |
 | `task_already_completed` | permanent | domain | `CompleteTask` twice |
+| `not_owner` | permanent | domain | `RenameTask` or `CompleteTask` on an owned task by neither its owner nor an `admin` |
 | `corrupt_history` | permanent | domain | The history breaks the checks above |
-| `unknown_event`, `unsupported_schema_version`, `invalid_event` | permanent | both | A recorded event this schema does not define |
+| `unknown_event`, `unsupported_schema_version`, `invalid_event` | permanent | both | A recorded event this schema does not define (an owned `TaskCreated` must be schema version 2, an unowned one version 1) |
 | `projection_gap` | permanent | view | A batch skips or contradicts a task's versions |
 | `invalid_state`, `unknown_projection` | permanent | view | The state or projection name is not this component's |
 | `projection_failed` | transient | faulty view | The faulty revision met `TaskRenamed` |

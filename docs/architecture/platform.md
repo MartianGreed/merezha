@@ -81,7 +81,11 @@ and one `startup.failed` event carrying a stable `code`:
    memory or SQLite application as `serve` does. A PostgreSQL application
    (`[storage] backend = "postgres"`) is only validated here, including the
    refusal of total-capacity limits (`invalid_limits`); it opens in step 8
-   as the host module `application`.
+   as the host module `application`. Opening asks every service the runtime
+   manifest declares with `application_protocol = 2` for `describe`
+   ([application protocol](application.md#protocol-version-2)); a guest that
+   does not speak version 2 fails `service_protocol_mismatch` (in step 8 for
+   a PostgreSQL application, as the module's code).
 6. Register every enabled module's error codes (`error_code_conflict`, see
    [Errors](#errors)), then open the pool and prove it with `SELECT 1`
    (`database_unavailable`).
@@ -148,6 +152,16 @@ application's admin routes ([application storage](#application-storage)) need
 `application.admin.read` to read and `application.admin.write` to abandon a
 rebuild or delete a revision, checked the same way. A deployment exposes
 nothing unauthenticated by accident.
+
+The principal the edge authenticated reaches application guests through
+`command_as` and `query_as`, as the limited projection
+`Principal::guest(scope)` builds (subject, kind, tenant and the role keys at
+the scope; never the session, the grants or a secret), with the
+application-scope roles until route scopes exist (AP-C2). Only services
+declaring `application_protocol = 2` receive it. Without a principal the
+request is anonymous, and a `metadata.principal` in a request body fails
+`422 principal_not_trusted`; an `actor` other than the principal's subject
+fails `403 actor_mismatch`.
 
 With the identity block the edge authenticates every request through its
 `Authenticator` (sessions and `mzk_` API keys, `HostOptions::authenticator`),

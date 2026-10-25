@@ -1779,16 +1779,19 @@ pub mod dispatch {
         Project,
         Query,
         React,
+        /// The protocol handshake with a version 2 guest (AP §C.1).
+        Describe,
         /// The raw runtime transport and pipelines.
         Raw,
     }
     impl GuestOperation {
-        pub const ALL: [Self; 6] = [
+        pub const ALL: [Self; 7] = [
             Self::Validate,
             Self::Decide,
             Self::Project,
             Self::Query,
             Self::React,
+            Self::Describe,
             Self::Raw,
         ];
         pub fn as_str(self) -> &'static str {
@@ -1798,6 +1801,7 @@ pub mod dispatch {
                 Self::Project => "project",
                 Self::Query => "query",
                 Self::React => "react",
+                Self::Describe => "describe",
                 Self::Raw => "raw",
             }
         }
@@ -2320,7 +2324,7 @@ mod tests {
         );
         assert_eq!(source_event_link().key.as_str(), key::LINK_REASON);
         let operations: BTreeSet<_> = GuestOperation::ALL.iter().map(|o| o.as_str()).collect();
-        assert_eq!(operations.len(), 6);
+        assert_eq!(operations.len(), 7);
     }
 
     /// TE-T5: the jobs keys are the ones the metric rows and the allowlist

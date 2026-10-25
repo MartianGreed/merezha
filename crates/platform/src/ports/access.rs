@@ -305,6 +305,33 @@ impl Principal {
     pub fn is_system(&self) -> bool {
         self.kind == PrincipalKind::System && self.subject.as_str().starts_with(SYSTEM_PREFIX)
     }
+    /// The limited projection a version 2 guest receives (AP §C.2):
+    /// subject, kind, active tenant and the role keys held at `scope`,
+    /// the application roles for `Application` and tenant-less resources,
+    /// the tenant roles otherwise. Never the session, the permission sets
+    /// or the break-glass flag. Fails `invalid_principal` past 16 roles or
+    /// a role key longer than 64 bytes.
+    pub fn guest(&self, scope: &ResourceScope) -> Result<merezha_domain::Principal, Failure> {
+        let roles: &[RoleKey] = match scope {
+            ResourceScope::Application | ResourceScope::Resource { tenant: None, .. } => {
+                self.grants.application.roles()
+            }
+            ResourceScope::Tenant(_)
+            | ResourceScope::Resource {
+                tenant: Some(_), ..
+            } => self.grants.tenant.as_ref().map_or(&[], |g| g.roles()),
+        };
+        merezha_domain::Principal::new(
+            self.subject.clone(),
+            match self.kind {
+                PrincipalKind::User => merezha_domain::PrincipalKind::User,
+                PrincipalKind::ApiKey => merezha_domain::PrincipalKind::ApiKey,
+                PrincipalKind::System => merezha_domain::PrincipalKind::System,
+            },
+            self.tenant.clone(),
+            roles.to_vec(),
+        )
+    }
     /// [`GrantSnapshot::evaluate`] with this principal's active tenant.
     pub fn check(
         &self,
@@ -553,6 +580,53 @@ mod tests {
     }
     fn reason(result: Result<Allowed, AccessDenied>) -> Option<DenyReason> {
         result.err().map(|d| d.reason)
+    }
+
+    #[test]
+    fn guests_see_subject_kind_tenant_and_scope_roles_only() {
+        let grants = GrantSnapshot::empty()
+            .with_break_glass()
+            .with_application(Grants::new(
+                vec![id("user"), id("admin")],
+                set(&["tasks.create"]),
+            ))
+            .with_tenant(Grants::new(vec![id("member")], set(&["tasks.read"])));
+        let principal = user(Some("org_1"), grants);
+        let application = principal.guest(&ResourceScope::Application).unwrap();
+        let encoded = serde_json::to_string(&application).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"subject":"usr_1","kind":"user","tenant":"org_1","roles":["admin","user"]}"#
+        );
+        assert!(!encoded.contains("ses_") && !encoded.contains("tasks."));
+        let tenant = principal
+            .guest(&ResourceScope::Tenant(id("org_1")))
+            .unwrap();
+        assert_eq!(tenant.roles, vec![id("member")]);
+        assert_eq!(
+            principal
+                .guest(&resource(Some("org_1"), "task", "t-1"))
+                .unwrap()
+                .roles,
+            vec![id("member")]
+        );
+        let system = Principal::system("reactor_notifier", GrantSnapshot::empty()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&system.guest(&ResourceScope::Tenant(id("org_1"))).unwrap())
+                .unwrap(),
+            r#"{"subject":"sys_reactor_notifier","kind":"system"}"#
+        );
+        let crowded = user(
+            None,
+            GrantSnapshot::empty().with_application(Grants::new(
+                (0..17).map(|i| id(&format!("r{i}"))).collect(),
+                set(&[]),
+            )),
+        );
+        assert_eq!(
+            crowded.guest(&ResourceScope::Application).unwrap_err().code,
+            "invalid_principal"
+        );
     }
 
     #[test]

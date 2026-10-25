@@ -7,6 +7,7 @@ mod durable;
 mod instrument;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+mod protocol;
 mod sqlite;
 pub mod status;
 pub mod store;
@@ -18,8 +19,22 @@ use serde_json::Value;
 
 /// A pinned guest generation for a complete dispatch. Implementations must
 /// bound execution, input and output and create a fresh guest per call.
+///
+/// The application fits every operation to [`GuestSession::protocol`]
+/// before calling: a version 1 service never receives a principal, a
+/// partition or `describe`, and a version 2 service answers `describe`
+/// once per [`GuestSession::generation`] before its first call.
 pub trait GuestSession: Send + Sync {
     fn invoke(&self, service: &str, operation: Operation) -> Result<Reply, Failure>;
+    /// The application protocol `service` declares in this generation
+    /// (AP §C.1). Version 1 by default.
+    fn protocol(&self, _service: &str) -> u16 {
+        merezha_domain::PROTOCOL_V1
+    }
+    /// The pinned catalog generation, which keys the `describe` check.
+    fn generation(&self) -> u64 {
+        0
+    }
     fn invoke_until(
         &self,
         service: &str,
@@ -107,6 +122,8 @@ impl Guest for merezha_runtime::Runtime {
     }
 }
 impl GuestSession for merezha_runtime::Session {
+    /// Sends the request in the service's declared protocol version, the
+    /// operation fitted to it, and expects the response to echo it.
     fn invoke_until(
         &self,
         service: &str,
@@ -114,11 +131,20 @@ impl GuestSession for merezha_runtime::Session {
         deadline: std::time::Instant,
     ) -> Result<Reply, Failure> {
         let kind = guest_operation(&operation);
-        let input = merezha_domain::encode(&merezha_domain::Request::new(operation))?;
+        let version = merezha_runtime::Session::protocol(self, service);
+        let operation = protocol::fit(operation, version)?;
+        let input =
+            merezha_domain::encode(&merezha_domain::Request::with_version(version, operation))?;
         let output = self
             .invoke_operation_until(service, kind, &input, deadline)
             .map_err(runtime_failure)?;
-        reply(&output.output)
+        reply(&output.output, version)
+    }
+    fn protocol(&self, service: &str) -> u16 {
+        merezha_runtime::Session::protocol(self, service)
+    }
+    fn generation(&self) -> u64 {
+        merezha_runtime::Session::generation(self)
     }
     fn invoke(&self, service: &str, operation: Operation) -> Result<Reply, Failure> {
         // The generation's own timeout bounds the call.
@@ -126,15 +152,16 @@ impl GuestSession for merezha_runtime::Session {
         self.invoke_until(service, operation, deadline)
     }
 }
-/// The guest's protocol response. Output that is not a response (not JSON,
-/// another shape, another version or an invalid failure code) is
-/// `invalid_response`: the guest broke the protocol, which counts as
-/// `failed` (TE §1.3), unlike a payload the guest refused itself.
-fn reply(output: &str) -> Result<Reply, Failure> {
+/// The guest's protocol response, which must echo the request's `version`
+/// (`protocol_version` otherwise). Output that is not a response (not JSON,
+/// another shape or an invalid failure code) is `invalid_response`: the
+/// guest broke the protocol, which counts as `failed` (TE §1.3), unlike a
+/// payload the guest refused itself.
+fn reply(output: &str, version: u16) -> Result<Reply, Failure> {
     let invalid = || Failure::permanent("invalid_response");
     let response: merezha_domain::Response =
         merezha_domain::decode(output).map_err(|_| invalid())?;
-    if response.version != merezha_domain::PROTOCOL_VERSION {
+    if response.version != version {
         return Err(Failure::permanent("protocol_version"));
     }
     match response.outcome {
@@ -153,6 +180,7 @@ fn guest_operation(operation: &Operation) -> merezha_runtime::GuestOperation {
         Operation::Decide { .. } => GuestOperation::Decide,
         Operation::Project { .. } => GuestOperation::Project,
         Operation::Query { .. } => GuestOperation::Query,
+        Operation::Describe {} => GuestOperation::Describe,
     }
 }
 fn runtime_failure(error: merezha_runtime::Error) -> Failure {

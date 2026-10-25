@@ -40,6 +40,7 @@ impl GuestSession for Fake {
                 }],
             },
             Operation::Project { state, .. } => Reply::Projected { state },
+            Operation::Describe {} => unreachable!("a version 1 fake is never described"),
             Operation::Query { state, .. } => Reply::Queried { value: state },
         })
     }

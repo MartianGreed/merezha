@@ -74,6 +74,7 @@ fn metadata() -> Metadata {
         correlation_id: id("correlation-1"),
         causation_id: None,
         actor: None,
+        principal: None,
     }
 }
 /// A command deciding `events` events on `stream`.
@@ -181,6 +182,7 @@ impl GuestSession for Fake {
                 state,
                 events,
                 live,
+                ..
             } => {
                 let probe = &self.0;
                 let now = probe.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -214,6 +216,7 @@ impl GuestSession for Fake {
                     }),
                 })
             }
+            Operation::Describe {} => unreachable!("a version 1 fake is never described"),
             Operation::Query { state, .. } => Ok(Reply::Queried { value: state }),
         }
     }
