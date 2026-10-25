@@ -890,8 +890,8 @@ pass what they learned in (`NotificationRequest::members`).
 
 `merezha-identity` (`crates/identity`, [design](../design/identity.md)) is
 the identity block, a `Module` named `identity` with schema
-`merezha_identity` (ledger key `identity`, migrations 1 `identity_core` and
-2 `organizations_rbac_api_keys`). Slice ID PR 1 ships accounts with
+`merezha_identity` (ledger key `identity`, migrations 1 `identity_core`,
+2 `organizations_rbac_api_keys` and 3 `oauth_passkeys`). Slice ID PR 1 ships accounts with
 email and password, email verification, password sign-in, sessions (cookie
 and bearer), the Origin and CSRF checks, reauthentication, magic links,
 password reset and change, email change, account deletion, PostgreSQL rate
@@ -900,8 +900,9 @@ Slice ID PR 2 adds organizations, memberships, invitations, custom,
 built-in and declared roles at tenant and application scope, service
 accounts, API keys in the `Authenticator`, the RBAC `Authorizer`, the
 `Directory` and `merezha identity platform-admin` ([Organizations, RBAC and
-keys](#organizations-rbac-and-keys)). OAuth, OIDC and passkeys come with
-PR 3; their tables stay `unknown_key`.
+keys](#organizations-rbac-and-keys)). Slice ID PR 3 adds OAuth 2.0 and OIDC
+sign-in (Google, GitHub, generic OIDC) and WebAuthn passkeys ([OAuth, OIDC
+and passkeys](#oauth-oidc-and-passkeys)).
 
 ```toml
 [modules.identity]
@@ -933,7 +934,7 @@ secret_key = { env = "MEREZHA_IDENTITY_SECRET_KEY" }   # at least 32 bytes
 | `sessions.max_per_user`, `sessions.bearer` | `50`, `true` | 1 to 1000 | The least recently seen session is evicted past the cap; `bearer` allows `"transport": "bearer"` |
 | `tokens.email_verification_ttl`, `magic_link_ttl`, `password_reset_ttl`, `email_change_ttl` | `24h`, `15m`, `30m`, `1h` | | One-time token lifetimes |
 | `magic_links.sign_up` | `true` | | Unknown addresses get a sign-up link while registration is open |
-| `rate_limits.<policy>.limit`, `.period` | identity §7 | 1 to 1000000, 1 s to 30 d | Policies `sign_in_ip`, `sign_in_account_ip`, `sign_in_account`, `registration_ip`, `email_address_ip`, `email_address`, `email_ip`, `token_ip`, `reauth_session`, `invitation_organization` (100 per day, per organization, on arrival), `api_key_invalid_ip` (60 per minute, on failure) |
+| `rate_limits.<policy>.limit`, `.period` | identity §7 | 1 to 1000000, 1 s to 30 d | Policies `sign_in_ip`, `sign_in_account_ip`, `sign_in_account`, `registration_ip`, `email_address_ip`, `email_address`, `email_ip`, `token_ip`, `reauth_session`, `invitation_organization` (100 per day, per organization, on arrival), `api_key_invalid_ip` (60 per minute, on failure), `passkey_ip` (60 per 10 min, on arrival, the passkey options routes), `oauth_ip` (30 per 10 min, on arrival, `oauth/{provider}/start`) |
 | `links.invitation`, `tokens.invitation_ttl` | `/auth/invitation`, `7d` | 1 h to 30 d | The invitation page and lifetime |
 | `organizations.user_can_create`, `max_per_user`, `max_members` | `true`, `50`, `10000` | 1 to 10000, 1 to 1000000 | `false` gives an application without organizations (`POST /organizations` answers 403); organizations one user may create (`organization_limit`); members per organization |
 | `rbac.cache_entries`, `max_custom_roles`, `max_resource_assignments` | `10000`, `100`, `500` | 2 to 1000000, 1 to 1000, 1 to 10000 | Grant snapshots cached per instance; custom roles per organization (`role_limit`); resource grants per holder and scope kept in a snapshot (more are ignored, `identity.grants_truncated`) |
@@ -944,7 +945,9 @@ secret_key = { env = "MEREZHA_IDENTITY_SECRET_KEY" }   # at least 32 bytes
 | `audit.retention` | `400d` | 1 d to 3650 d | Audit rows older than this are deleted by the cleanup job |
 | `cleanup.interval`, `cleanup.batch_size` | `10m`, `1000` | minutes dividing an hour, hours dividing a day, or `1d`; 1 to 10000 | The `identity.cleanup` cron schedule and its delete batches |
 
-At least one sign-in method table is required (`no_sign_in_method`).
+At least one sign-in method is required: the `password` or `magic_links`
+table, or an OAuth provider (`no_sign_in_method`). Passkeys alone are none,
+since they are registered from a signed-in session (owner answer ID7).
 
 Registration sets a binding cookie,
 `__Host-merezha_verify` (`merezha_verify` with the development cookie,
@@ -1122,6 +1125,113 @@ test.
 "max_ms"}` with exit code 0; invalid arguments, configuration or cost below
 the floors print `{"status":"invalid","error":{"code"}}` with exit code 2.
 Aim for about 60 to 120 ms per hash on production cores.
+
+### OAuth, OIDC and passkeys
+
+```toml
+[modules.identity.oauth]
+link_by_verified_email = false              # owner answer ID1
+
+[modules.identity.oauth.providers.google]   # discovery at accounts.google.com
+client_id = "123.apps.googleusercontent.com"
+client_secret = { env = "GOOGLE_CLIENT_SECRET" }
+
+[modules.identity.oauth.providers.github]
+client_id = "Iv1.abc"
+client_secret = { env = "GITHUB_CLIENT_SECRET" }
+
+[modules.identity.oauth.providers.acme_sso]
+kind = "oidc"
+issuer = "https://sso.acme.example"
+client_id = "merezha"
+client_secret = { file = "/run/secrets/acme_sso" }
+
+[modules.identity.passkeys]                 # needs the `passkeys` build feature
+```
+
+| Key | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `links.sign_in_redirect`, `links.oauth_error` | `/`, `/auth/error` | as the other links | Where an OAuth callback lands without `return_to`, and where a failed one lands with `#error=<code>` |
+| `oauth.flow_ttl`, `oauth.http_timeout` | `10m`, `10s` | 1 min to 1 h, 1 s to 30 s | Lifetime of a started flow and its binding cookie; deadline of each call to a provider |
+| `oauth.link_by_verified_email` | `false` | | A trusted verified address of an existing verified account links instead of answering `account_exists` |
+| `oauth.providers.<name>` | none | at most 16; `name` `[a-z][a-z0-9_]{0,31}` (`invalid_provider_name`); `google` and `github` imply their kind, any other name needs `kind = "oidc"` | One provider; its redirect URI is `{api_base_url}/v1/identity/oauth/<name>/callback` |
+| `.issuer` | Google's for `google`, none for `github` (`unknown_key`) | `https://`, or `http://` on a loopback host on a private loopback listener (`insecure_origin`); required for `oidc` | The OIDC issuer: discovery, `iss` checks |
+| `.client_id`, `.client_secret` | required | 1 to 256 bytes; a `{ env }` or `{ file }` secret | The client registration |
+| `.display_name`, `.scopes` | `Google`, `GitHub` or the name; `openid email profile`, GitHub `read:user user:email` | 1 to 64 characters; 1 to 16 scope tokens, OIDC ones with `openid` (`missing_openid_scope`) | Shown by `GET oauth/providers`; requested scopes |
+| `.trust_email`, `.allow_sign_up` | `true` for Google and GitHub, `false` for `oidc`; `true` | | The provider's verified address counts as verified (section 6); new accounts may be created through it |
+| `.allowed_hosted_domains` | `[]` (any) | Google only, lowercase domains | Google's `hd` claim must be one of them |
+| `passkeys.rp_id`, `passkeys.rp_name` | the host of `app_origin`, `app.name` | `app_origin`'s host or a registrable suffix of it (`rp_id_mismatch`) | The WebAuthn relying party |
+| `passkeys.origins` | `[app_origin]` | each one of `allowed_origins` (`origin_not_allowed`) under the RP id | Accepted WebAuthn origins |
+| `passkeys.ceremony_ttl`, `passkeys.discoverable`, `passkeys.max_per_user` | `5m`, `true`, `20` | 30 s to 30 min, 1 to 100 | Ceremony lifetime; usernameless (conditional UI) sign-in; passkeys per user (`passkey_limit`) |
+
+A build without the `passkeys` feature of `merezha-identity` refuses the
+`passkeys` table (`passkeys_unavailable`); the prebuilt `merezha` host has
+it. The feature pulls `webauthn-rs`, MPL-2.0, and OpenSSL, built vendored
+(a C compiler and Perl at build time, no system OpenSSL at run time).
+
+Routes (identity §4 has the bodies and errors): `GET oauth/providers`,
+`POST oauth/{provider}/start` (`{intent: "sign_in" | "link", return_to?}`,
+a link needs a session), `GET oauth/{provider}/callback`,
+`GET me/oauth-identities`, `DELETE me/oauth-identities/{id}` (recent),
+`POST passkeys/registrations/options` and `/verify` (recent),
+`POST passkeys/authentications/options` and `/verify`,
+`POST session/reauthenticate/passkey/options` and `/verify`,
+`GET me/passkeys`, `PATCH me/passkeys/{id}` (`{label}`),
+`DELETE me/passkeys/{id}` (recent). The three `verify` routes take JSON
+bodies of up to 64 KiB, the others 16 KiB. Without a provider the OAuth
+routes answer `404 not_found`; without the `passkeys` table, the passkey
+routes do too.
+
+A start sets the flow binding cookie `__Host-merezha_oauth`
+(`merezha_oauth` with the development cookie, `HttpOnly`,
+`SameSite=Lax`, for `oauth.flow_ttl`; a well-formed one the browser
+already holds is kept, so two tabs can sign in at once) and answers the
+provider's authorization URL with `state`, a PKCE S256 challenge and, for
+OIDC, a `nonce`. The callback consumes the flow by `state` first (a replay
+finds nothing), requires the binding cookie, the provider of its path and
+an `iss` equal to the issuer when one is sent, exchanges the code, checks
+the ID token (signature against the provider's key set, refetched once on
+an unknown `kid` and at most once a minute; `RS256`, `ES256`, `EdDSA` only;
+`iss`, `aud`, `azp`, `exp`, `iat` within five minutes, `nonce`), drops the
+provider's tokens, and applies the linking rules of identity §6. It always
+answers `303`: to `return_to` (resolved on `app_origin`) or
+`links.sign_in_redirect` with the session cookie on a sign-in, or to
+`links.oauth_error#error=<code>`, codes `invalid_state`, `oauth_denied`,
+`oauth_failed`, `provider_unavailable`, `account_exists`,
+`identity_already_linked`, `registration_closed`, `email_unverified`,
+`account_disabled`; `Referrer-Policy: no-referrer` keeps the code out of the
+next page's `Referer`. An account created through a provider not trusted
+for its address stays unverified: while verification is required the
+callback lands on `email_unverified`, sets the registration binding cookie
+and mails the verification link, which, clicked in that browser, keeps the
+identity. A sign-in through a trusted provider onto an unverified account
+runs the ownership claim first (its password, passkeys, OAuth identities,
+sessions and keys go). Discovery documents and key sets are cached for an
+hour per instance; an unreachable or broken provider answers
+`503 provider_unavailable` and never affects readiness.
+
+Passkey options for an email return its credential ids, or one or two
+decoy ids derived from `secret_key` for an unknown address or a user
+without passkeys, in the same shape; without an email, a discoverable
+ceremony with `mediation: "conditional"`. Ceremonies are stored server-side,
+consumed before verification, bound to their user and session, and live
+`passkeys.ceremony_ttl`; the cleanup job deletes expired flows and
+ceremonies. A counter that went backwards on a credential with a nonzero
+counter refuses the sign-in (`invalid_credentials`) and audits
+`passkey.counter_regression`. Removing an identity or a passkey that is the
+last way in (a password with password sign-in on, a passkey, an identity of
+a configured provider, or a verified address with magic links on) answers
+`409 last_credential`.
+
+Error codes PR 3 registers: `invalid_ceremony` (401), `last_credential`,
+`identity_already_linked`, `passkey_exists` (409), `passkey_limit`,
+`passkey_rejected`, `passkeys_config` (422), `provider_unavailable` (503).
+
+`deny.toml` (`cargo deny check`) allows MPL-2.0 for `webauthn-rs` and
+records scoped ignores for RUSTSEC-2023-0071 (`rsa` 0.9) and
+RUSTSEC-2026-0387 (`crypto-bigint` 0.5), both pulled by `openidconnect`
+4.0.1 and unreachable from identity, which only verifies signatures with
+public keys.
 
 ## Notifications block
 

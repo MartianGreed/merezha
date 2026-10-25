@@ -1,7 +1,6 @@
-//! `[modules.identity]` (section 8) for PR 1 and PR 2, validated with every
-//! problem reported at once. Tables of PR 3 (`oauth`, `passkeys`,
-//! `links.sign_in_redirect`, `links.oauth_error`) stay `unknown_key` until
-//! it gives them behaviour.
+//! `[modules.identity]` (section 8), validated with every problem reported
+//! at once: PR 1 and PR 2's tables, and PR 3's `oauth`, `passkeys`,
+//! `links.sign_in_redirect` and `links.oauth_error`.
 use crate::{
     catalog::{Catalog, Wildcards},
     gcra::{self, Rate},
@@ -225,6 +224,91 @@ pub struct Links {
     pub password_reset: String,
     pub email_change: String,
     pub invitation: String,
+    /// Where an OAuth callback lands without `return_to`.
+    pub sign_in_redirect: String,
+    /// Where an OAuth callback that failed lands, with `#error=<code>`.
+    pub oauth_error: String,
+}
+
+/// The protocol of an OAuth provider (section 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderKind {
+    /// OIDC with discovery at `https://accounts.google.com`.
+    Google,
+    /// OAuth 2.0 plus the `/user` and `/user/emails` API calls.
+    Github,
+    /// Any OIDC provider with discovery from `issuer`.
+    Oidc,
+}
+impl ProviderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderKind::Google => "google",
+            ProviderKind::Github => "github",
+            ProviderKind::Oidc => "oidc",
+        }
+    }
+}
+
+/// `[modules.identity.oauth.providers.<name>]`.
+#[derive(Clone)]
+pub struct ProviderSettings {
+    pub name: String,
+    pub kind: ProviderKind,
+    /// The OIDC issuer (Google's, or the configured one); `None` for
+    /// GitHub.
+    pub issuer: Option<String>,
+    pub client_id: String,
+    pub client_secret: Secret,
+    pub display_name: String,
+    pub scopes: Vec<String>,
+    /// The provider's verified email claims count (section 6).
+    pub trust_email: bool,
+    pub allow_sign_up: bool,
+    /// Google `hd` values accepted; empty accepts any.
+    pub allowed_hosted_domains: Vec<String>,
+}
+impl std::fmt::Debug for ProviderSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSettings")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("trust_email", &self.trust_email)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `[modules.identity.oauth]`.
+#[derive(Clone, Debug)]
+pub struct OAuthSettings {
+    pub flow_ttl: Duration,
+    /// Owner answer ID1: off.
+    pub link_by_verified_email: bool,
+    pub http_timeout: Duration,
+    pub providers: BTreeMap<String, ProviderSettings>,
+}
+impl Default for OAuthSettings {
+    fn default() -> Self {
+        Self {
+            flow_ttl: minutes(10),
+            link_by_verified_email: false,
+            http_timeout: Duration::from_secs(10),
+            providers: BTreeMap::new(),
+        }
+    }
+}
+
+/// `[modules.identity.passkeys]`; its presence enables passkeys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PasskeySettings {
+    pub rp_id: String,
+    pub rp_name: String,
+    /// Allowed WebAuthn origins, the first one primary.
+    pub origins: Vec<String>,
+    pub ceremony_ttl: Duration,
+    /// Usernameless (conditional UI) authentication.
+    pub discoverable: bool,
+    pub max_per_user: u32,
 }
 
 /// The validated section.
@@ -261,6 +345,8 @@ pub struct Settings {
     /// `service_accounts.max_per_scope`.
     pub service_accounts_max: u32,
     pub api_keys: ApiKeySettings,
+    pub oauth: OAuthSettings,
+    pub passkeys: Option<PasskeySettings>,
 }
 impl std::fmt::Debug for Settings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -289,6 +375,14 @@ impl Settings {
             "__Host-merezha_verify"
         }
     }
+    /// The OAuth flow binding cookie's name (section 6).
+    pub fn oauth_cookie_name(&self) -> &'static str {
+        if self.dev_cookie {
+            "merezha_oauth"
+        } else {
+            "__Host-merezha_oauth"
+        }
+    }
     /// The session cookie's name.
     pub fn cookie_name(&self) -> &'static str {
         if self.dev_cookie {
@@ -306,7 +400,7 @@ const fn days(d: u64) -> Duration {
     Duration::from_secs(d * 86_400)
 }
 
-const KEYS: [&str; 22] = [
+const KEYS: [&str; 24] = [
     "app_origin",
     "api_base_url",
     "allowed_origins",
@@ -329,7 +423,13 @@ const KEYS: [&str; 22] = [
     "rbac",
     "service_accounts",
     "api_keys",
+    "oauth",
+    "passkeys",
 ];
+/// Most configured OAuth providers.
+const MAX_PROVIDERS: usize = 16;
+/// Most scopes or hosted domains of one provider.
+const MAX_SCOPES: usize = 16;
 /// Most declared application roles.
 const MAX_DECLARED_ROLES: usize = 64;
 /// Most grants in one list.
@@ -630,6 +730,8 @@ impl Settings {
                 "password_reset",
                 "email_change",
                 "invitation",
+                "sign_in_redirect",
+                "oauth_error",
             ],
         );
         let base = app_origin.clone().unwrap_or_default();
@@ -652,6 +754,8 @@ impl Settings {
             password_reset: link(&mut r, "password_reset", "/auth/reset-password"),
             email_change: link(&mut r, "email_change", "/auth/confirm-email"),
             invitation: link(&mut r, "invitation", "/auth/invitation"),
+            sign_in_redirect: link(&mut r, "sign_in_redirect", "/"),
+            oauth_error: link(&mut r, "oauth_error", "/auth/error"),
         };
         // Password.
         let password = r
@@ -831,7 +935,8 @@ impl Settings {
         let magic_links = r
             .table("magic_links", &["sign_up"])
             .map(|table| r.boolean(Some(table), "magic_links", "sign_up", true));
-        if password.is_none() && magic_links.is_none() {
+        let oauth = oauth(&mut r, private);
+        if password.is_none() && magic_links.is_none() && oauth.providers.is_empty() {
             r.issue("password", "no_sign_in_method");
         }
         // Rate limits.
@@ -930,6 +1035,12 @@ impl Settings {
             }
         };
         let dev_cookie = app_origin.as_deref().is_some_and(loopback_origin) && private;
+        let passkeys = passkeys(
+            &mut r,
+            app_origin.as_deref(),
+            &allowed_origins,
+            facts.and_then(|f| f.app_name.as_deref()),
+        );
         if !r.issues.is_empty() {
             return Err(r.issues);
         }
@@ -968,8 +1079,406 @@ impl Settings {
             rbac,
             service_accounts_max,
             api_keys,
+            oauth,
+            passkeys,
         })
     }
+}
+
+/// A host name of `origin` (`scheme://host[:port]`), without the port.
+pub fn origin_host(origin: &str) -> Option<&str> {
+    let rest = origin.split_once("://")?.1;
+    if let Some(v6) = rest.strip_prefix('[') {
+        return v6.split_once(']').map(|(host, _)| host);
+    }
+    rest.split(':').next()
+}
+
+/// An OIDC issuer: `https://host[:port][/path]` without query, fragment or
+/// userinfo, or `http://` on a loopback host when the listener is private
+/// loopback (a development identity provider).
+pub fn parse_issuer(text: &str, private: bool) -> Result<String, &'static str> {
+    let url = oauth2::url::Url::parse(text).map_err(|_| "invalid_url")?;
+    if url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.host_str().is_none()
+    {
+        return Err("invalid_url");
+    }
+    let loopback = matches!(url.host(), Some(oauth2::url::Host::Domain("localhost")))
+        || matches!(url.host(), Some(oauth2::url::Host::Ipv4(ip)) if ip.is_loopback())
+        || matches!(url.host(), Some(oauth2::url::Host::Ipv6(ip)) if ip.is_loopback());
+    match url.scheme() {
+        "https" => Ok(text.to_owned()),
+        "http" if loopback && private => Ok(text.to_owned()),
+        "http" => Err("insecure_origin"),
+        _ => Err("invalid_url"),
+    }
+}
+
+/// An RFC 6749 scope token.
+fn scope_token(text: &str) -> bool {
+    (1..=64).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b == 0x21 || (0x23..=0x5b).contains(&b) || (0x5d..=0x7e).contains(&b))
+}
+
+/// `[modules.identity.oauth]` and its providers (section 6, 8).
+fn oauth(r: &mut Reader<'_>, private: bool) -> OAuthSettings {
+    let d = OAuthSettings::default();
+    let Some(t) = r.table(
+        "oauth",
+        &[
+            "flow_ttl",
+            "link_by_verified_email",
+            "http_timeout",
+            "providers",
+        ],
+    ) else {
+        return d;
+    };
+    let mut settings = OAuthSettings {
+        flow_ttl: r.duration(
+            Some(t),
+            "oauth",
+            "flow_ttl",
+            d.flow_ttl,
+            (minutes(1), minutes(60)),
+        ),
+        link_by_verified_email: r.boolean(Some(t), "oauth", "link_by_verified_email", false),
+        http_timeout: r.duration(
+            Some(t),
+            "oauth",
+            "http_timeout",
+            d.http_timeout,
+            (Duration::from_secs(1), Duration::from_secs(30)),
+        ),
+        providers: BTreeMap::new(),
+    };
+    let providers = match t.get("providers") {
+        None => return settings,
+        Some(toml::Value::Table(providers)) => providers,
+        Some(_) => {
+            r.issue("oauth.providers", "expected_table");
+            return settings;
+        }
+    };
+    if providers.len() > MAX_PROVIDERS {
+        r.issue("oauth.providers", "out_of_range");
+    }
+    for (name, value) in providers {
+        let path = format!("oauth.providers.{name}");
+        if !crate::oauth::valid_provider_name(name) {
+            r.issue(&path, "invalid_provider_name");
+            continue;
+        }
+        let Some(table) = value.as_table() else {
+            r.issue(&path, "expected_table");
+            continue;
+        };
+        let known = [
+            "kind",
+            "issuer",
+            "client_id",
+            "client_secret",
+            "display_name",
+            "scopes",
+            "trust_email",
+            "allow_sign_up",
+            "allowed_hosted_domains",
+        ];
+        for key in table.keys() {
+            if !known.contains(&key.as_str()) {
+                r.issue(&format!("{path}.{key}"), "unknown_key");
+            }
+        }
+        let t = Some(table);
+        let kind = match (name.as_str(), r.string(t, &path, "kind").as_deref()) {
+            ("google", None | Some("google")) => ProviderKind::Google,
+            ("github", None | Some("github")) => ProviderKind::Github,
+            ("google" | "github", Some(_)) => {
+                r.issue(&format!("{path}.kind"), "invalid_choice");
+                continue;
+            }
+            (_, Some("oidc")) => ProviderKind::Oidc,
+            (_, None) => {
+                r.issue(&format!("{path}.kind"), "missing_required");
+                continue;
+            }
+            (_, Some(_)) => {
+                r.issue(&format!("{path}.kind"), "invalid_choice");
+                continue;
+            }
+        };
+        let issuer = match kind {
+            ProviderKind::Google => {
+                if table.contains_key("issuer") {
+                    r.issue(&format!("{path}.issuer"), "unknown_key");
+                }
+                Some(crate::oauth::GOOGLE_ISSUER.to_owned())
+            }
+            ProviderKind::Github => {
+                if table.contains_key("issuer") {
+                    r.issue(&format!("{path}.issuer"), "unknown_key");
+                }
+                None
+            }
+            ProviderKind::Oidc => match r.string(t, &path, "issuer") {
+                None => {
+                    if !table.contains_key("issuer") {
+                        r.issue(&format!("{path}.issuer"), "missing_required");
+                    }
+                    None
+                }
+                Some(text) => match parse_issuer(&text, private) {
+                    Ok(issuer) => Some(issuer),
+                    Err(code) => {
+                        r.issue(&format!("{path}.issuer"), code);
+                        None
+                    }
+                },
+            },
+        };
+        let client_id = match r.string(t, &path, "client_id") {
+            Some(id) if (1..=256).contains(&id.len()) && !id.chars().any(char::is_control) => {
+                Some(id)
+            }
+            Some(_) => {
+                r.issue(&format!("{path}.client_id"), "out_of_range");
+                None
+            }
+            None => {
+                if !table.contains_key("client_id") {
+                    r.issue(&format!("{path}.client_id"), "missing_required");
+                }
+                None
+            }
+        };
+        let client_secret =
+            match r
+                .section
+                .secret_at(&["oauth", "providers", name, "client_secret"])
+            {
+                Ok(Some(secret)) if !secret.expose().is_empty() => Some(secret),
+                Ok(Some(_)) => {
+                    r.issue(&format!("{path}.client_secret"), "secret_too_short");
+                    None
+                }
+                Ok(None) => {
+                    r.issue(&format!("{path}.client_secret"), "missing_required");
+                    None
+                }
+                Err(issue) => {
+                    r.issues.push(issue);
+                    None
+                }
+            };
+        let default_name = match kind {
+            ProviderKind::Google => "Google".to_owned(),
+            ProviderKind::Github => "GitHub".to_owned(),
+            ProviderKind::Oidc => name.clone(),
+        };
+        let display_name = match r.string(t, &path, "display_name") {
+            Some(text)
+                if (1..=64).contains(&text.chars().count())
+                    && !text.chars().any(char::is_control) =>
+            {
+                text
+            }
+            Some(_) => {
+                r.issue(&format!("{path}.display_name"), "out_of_range");
+                default_name
+            }
+            None => default_name,
+        };
+        let scopes = match table.get("scopes") {
+            None => match kind {
+                ProviderKind::Github => vec!["read:user".to_owned(), "user:email".to_owned()],
+                _ => vec![
+                    "openid".to_owned(),
+                    "email".to_owned(),
+                    "profile".to_owned(),
+                ],
+            },
+            Some(toml::Value::Array(items)) => {
+                if items.is_empty() || items.len() > MAX_SCOPES {
+                    r.issue(&format!("{path}.scopes"), "out_of_range");
+                }
+                let scopes: Vec<String> = items
+                    .iter()
+                    .filter_map(|item| match item.as_str() {
+                        Some(scope) if scope_token(scope) => Some(scope.to_owned()),
+                        _ => {
+                            r.issue(&format!("{path}.scopes"), "invalid_scope");
+                            None
+                        }
+                    })
+                    .collect();
+                if kind != ProviderKind::Github && !scopes.iter().any(|s| s == "openid") {
+                    r.issue(&format!("{path}.scopes"), "missing_openid_scope");
+                }
+                scopes
+            }
+            Some(_) => {
+                r.issue(&format!("{path}.scopes"), "expected_string_list");
+                Vec::new()
+            }
+        };
+        let trust_email = r.boolean(t, &path, "trust_email", kind != ProviderKind::Oidc);
+        let allow_sign_up = r.boolean(t, &path, "allow_sign_up", true);
+        let allowed_hosted_domains = match (kind, table.get("allowed_hosted_domains")) {
+            (_, None) => Vec::new(),
+            (ProviderKind::Google, Some(toml::Value::Array(items))) => {
+                if items.len() > MAX_SCOPES {
+                    r.issue(&format!("{path}.allowed_hosted_domains"), "out_of_range");
+                }
+                items
+                    .iter()
+                    .filter_map(|item| match item.as_str() {
+                        Some(domain)
+                            if !domain.is_empty()
+                                && domain.len() <= 253
+                                && domain == domain.to_ascii_lowercase()
+                                && domain.bytes().all(|b| {
+                                    b.is_ascii_alphanumeric() || b == b'-' || b == b'.'
+                                }) =>
+                        {
+                            Some(domain.to_owned())
+                        }
+                        _ => {
+                            r.issue(&format!("{path}.allowed_hosted_domains"), "invalid_domain");
+                            None
+                        }
+                    })
+                    .collect()
+            }
+            (ProviderKind::Google, Some(_)) => {
+                r.issue(
+                    &format!("{path}.allowed_hosted_domains"),
+                    "expected_string_list",
+                );
+                Vec::new()
+            }
+            (_, Some(_)) => {
+                r.issue(&format!("{path}.allowed_hosted_domains"), "unknown_key");
+                Vec::new()
+            }
+        };
+        let (Some(client_id), Some(client_secret)) = (client_id, client_secret) else {
+            continue;
+        };
+        if kind != ProviderKind::Github && issuer.is_none() {
+            continue;
+        }
+        settings.providers.insert(
+            name.clone(),
+            ProviderSettings {
+                name: name.clone(),
+                kind,
+                issuer,
+                client_id,
+                client_secret,
+                display_name,
+                scopes,
+                trust_email,
+                allow_sign_up,
+                allowed_hosted_domains,
+            },
+        );
+    }
+    settings
+}
+
+/// `[modules.identity.passkeys]` (section 6, 8): the RP id is `app_origin`'s
+/// host or a registrable suffix of it, and every origin an allowed one.
+fn passkeys(
+    r: &mut Reader<'_>,
+    app_origin: Option<&str>,
+    allowed_origins: &[String],
+    app_name: Option<&str>,
+) -> Option<PasskeySettings> {
+    let t = r.table(
+        "passkeys",
+        &[
+            "rp_id",
+            "rp_name",
+            "origins",
+            "ceremony_ttl",
+            "discoverable",
+            "max_per_user",
+        ],
+    )?;
+    if !cfg!(feature = "passkeys") {
+        r.issue("passkeys", "passkeys_unavailable");
+    }
+    let t = Some(t);
+    let host = app_origin
+        .and_then(origin_host)
+        .unwrap_or_default()
+        .to_owned();
+    let rp_id = match r.string(t, "passkeys", "rp_id") {
+        None => host.clone(),
+        Some(rp_id) => {
+            let suffix =
+                host == rp_id || (rp_id.contains('.') && host.ends_with(&format!(".{rp_id}")));
+            if !suffix || rp_id != rp_id.to_ascii_lowercase() {
+                r.issue("passkeys.rp_id", "rp_id_mismatch");
+            }
+            rp_id
+        }
+    };
+    let rp_name = match r.string(t, "passkeys", "rp_name") {
+        Some(name)
+            if (1..=64).contains(&name.chars().count()) && !name.chars().any(char::is_control) =>
+        {
+            name
+        }
+        Some(_) => {
+            r.issue("passkeys.rp_name", "out_of_range");
+            String::new()
+        }
+        None => app_name.map_or_else(|| host.clone(), str::to_owned),
+    };
+    let mut origins = Vec::new();
+    match t.and_then(|t| t.get("origins")) {
+        None => origins.extend(app_origin.map(str::to_owned)),
+        Some(toml::Value::Array(items)) => {
+            if items.is_empty() || items.len() > MAX_ORIGINS {
+                r.issue("passkeys.origins", "out_of_range");
+            }
+            for item in items {
+                match item.as_str().and_then(parse_origin) {
+                    Some(origin) if allowed_origins.contains(&origin) => origins.push(origin),
+                    Some(_) => r.issue("passkeys.origins", "origin_not_allowed"),
+                    None => r.issue("passkeys.origins", "invalid_origin"),
+                }
+            }
+        }
+        Some(_) => r.issue("passkeys.origins", "expected_string_list"),
+    }
+    for origin in &origins {
+        let host = origin_host(origin).unwrap_or_default();
+        if host != rp_id && !host.ends_with(&format!(".{rp_id}")) {
+            r.issue("passkeys.origins", "rp_id_mismatch");
+        }
+    }
+    Some(PasskeySettings {
+        rp_id,
+        rp_name,
+        origins,
+        ceremony_ttl: r.duration(
+            t,
+            "passkeys",
+            "ceremony_ttl",
+            minutes(5),
+            (Duration::from_secs(30), minutes(30)),
+        ),
+        discoverable: r.boolean(t, "passkeys", "discoverable", true),
+        max_per_user: r.integer(t, "passkeys", "max_per_user", 20, (1, 100)) as u32,
+    })
 }
 
 /// A string list of grants at `path`, each checked against `catalog`.

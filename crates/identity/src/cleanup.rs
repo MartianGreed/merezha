@@ -39,6 +39,8 @@ enum Step {
     Audit,
     Invitations,
     Keys,
+    OAuthFlows,
+    Ceremonies,
 }
 
 /// What one pass deleted.
@@ -51,6 +53,9 @@ pub struct CleanupReport {
     pub invitations: u64,
     /// API keys revoked or expired more than 30 days ago.
     pub api_keys: u64,
+    /// Expired OAuth flows and WebAuthn ceremonies.
+    pub oauth_flows: u64,
+    pub ceremonies: u64,
     pub unverified_accounts: u64,
     /// Live sessions after the pass, the `sessions.active` gauge.
     pub active_sessions: u64,
@@ -76,6 +81,8 @@ impl Core {
             api_keys: self
                 .batched(Step::Keys, minus(now, KEY_RETENTION), batch)
                 .await?,
+            oauth_flows: self.batched(Step::OAuthFlows, now, batch).await?,
+            ceremonies: self.batched(Step::Ceremonies, now, batch).await?,
             ..CleanupReport::default()
         };
         if self.settings.require_verified_email {
@@ -133,6 +140,16 @@ impl Core {
                 Step::Keys => {
                     self.db()
                         .execute(&client, &crate::sql::CLEANUP_KEYS, &params)
+                        .await
+                }
+                Step::OAuthFlows => {
+                    self.db()
+                        .execute(&client, &crate::sql::CLEANUP_OAUTH_FLOWS, &params)
+                        .await
+                }
+                Step::Ceremonies => {
+                    self.db()
+                        .execute(&client, &crate::sql::CLEANUP_CEREMONIES, &params)
                         .await
                 }
             }

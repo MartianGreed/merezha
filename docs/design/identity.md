@@ -937,7 +937,8 @@ Behavior notes:
 The OAuth callback is a browser navigation, so it answers with redirects, not
 JSON. Error codes in the fragment: `oauth_denied`, `oauth_failed`,
 `invalid_state`, `account_exists`, `identity_already_linked`,
-`registration_closed`, `email_unverified`, `account_disabled`.
+`registration_closed`, `email_unverified`, `account_disabled`, and
+`provider_unavailable` (PR 3 as built, section 10).
 
 `POST /passkeys/authentications/options` without `email` starts a
 discoverable (usernameless, conditional UI) ceremony. With `email`, it
@@ -2180,6 +2181,73 @@ Test plan:
   redirect response (not followed); ceremony expired between options and
   verify; user deleted mid-flow (flow cascade-deleted, callback
   `invalid_state`).
+
+PR 3 as built (2026-10-25):
+
+- Migration 3 is the SQL above plus bounds (`oauth_identities.email_normalized`
+  at most 254 bytes, `pkce_verifier` 43 to 128 bytes, `nonce` and
+  `return_to` bounded, at most 8 `transports`), checks that a link flow and
+  a registration or reauthentication ceremony carry their session, and the
+  indexes `oauth_flows_user_idx`, `oauth_flows_session_idx`,
+  `webauthn_ceremonies_user_idx` and `webauthn_ceremonies_session_idx` the
+  cascades and the claim read.
+- Providers live in `crate::oauth`; `oauth::adapter` is the only module
+  that touches `openidconnect`, `oauth2` and `chrono` (R14). Google's
+  issuer and GitHub's endpoints can be replaced in code only
+  (`IdentityModule::override_provider_endpoints`, for GitHub Enterprise
+  Server and the tests' mock providers), never by request input or
+  configuration. An OIDC `issuer` may be `http://` on a loopback host only
+  on a private loopback listener (a development identity provider).
+  GitHub sends no `iss`; one it sends is ignored, since GitHub has no
+  issuer to compare.
+- The callback's fragment codes add `provider_unavailable` for a provider
+  unreachable at the code exchange. The start route answers
+  `503 provider_unavailable` for any discovery failure (unreachable,
+  redirect, error status, document over 1 MiB, mismatched `issuer`).
+- Discovery fetches the key set with the document; an unknown `kid`
+  refetches it at most once a minute per provider and instance, so a
+  stream of tokens with foreign keys cannot make identity hammer the
+  provider. `azp`, which `openidconnect` leaves to the client, is checked
+  here: present means this client, several audiences require it.
+- Linking: rule 1 and rule 2 mark an unverified account verified, without
+  the claim, when a trusted provider asserts its exact address (the
+  identity was linked by someone holding a session on the account, which
+  the pre-hijacking rule already required). Rule 1 on an unverified
+  account answers `email_unverified` while verification is required.
+  Rule 4 with an untrusted address and verification required creates the
+  account unverified with the identity, sets the registration binding
+  cookie and mails `identity.verify_email` in the same transaction, and
+  lands on `email_unverified`; the link clicked in that browser verifies
+  without a claim, so the identity stays. A sign-in through a trusted
+  provider onto an unverified account (rule 3) runs the claim, which now
+  also deletes passkeys, OAuth identities, pending OAuth link flows and
+  WebAuthn ceremonies, in every flow that claims (verification without the
+  binding, magic link, reset, invitation, OAuth).
+- "Another credential remains" counts what can sign in under the running
+  configuration: a password with password sign-in on, a passkey with
+  passkeys on, an identity of a configured provider, or a verified address
+  with magic links on (section 1).
+- Ceremony ids are random UUIDv4 rendered `cer_<hex>`, not time ordered.
+  `passkey.ip` is charged on the three options routes; a failed passkey
+  reauthentication charges `reauth.session` like a wrong password.
+  Reauthentication options for a user without passkeys answer
+  `404 not_found`. Email-first answers drop `transports` and `extensions`
+  so real and decoy answers have one shape; decoy ids come from a
+  `passkey-decoy` key derived from `secret_key`. A lost compare-and-swap
+  on a passkey's `revision` merges into a fresh read (counters only grow)
+  and retries once; every passkey writer holds the user lock.
+- Passkeys alone do not satisfy `no_sign_in_method` (ID7: they are
+  registered from a signed-in session). New error codes:
+  `invalid_ceremony`, `last_credential`, `identity_already_linked`,
+  `passkey_exists`, `passkey_limit`, `passkey_rejected`, `passkeys_config`,
+  `provider_unavailable`.
+- Crates as listed in section 9, plus `chrono` 0.4.45 and `reqwest` as
+  direct dependencies of the adapter, and `openssl` as a dev-dependency for
+  the mock provider's test-only signing keys, generated at test start.
+  `deny.toml` adds a scoped ignore of RUSTSEC-2026-0387 (`crypto-bigint`
+  0.5 through `elliptic-curve` 0.13 in `openidconnect`), unreachable for
+  the same reason as RUSTSEC-2023-0071: identity only verifies signatures
+  with public keys.
 
 ## 11. Decisions
 

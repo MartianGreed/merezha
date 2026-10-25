@@ -55,6 +55,8 @@ pub fn router(core: Arc<Core>) -> Router {
         .route("/me/email-changes/confirm", post(confirm_email_change))
         .route("/me/security-events", get(security_events))
         .merge(crate::admin_http::routes())
+        .merge(crate::oauth::routes::routes())
+        .merge(crate::passkey_routes())
         .fallback(|| async { failure(ApiError::code("not_found")) })
         .method_not_allowed_fallback(|| async { failure(ApiError::code("method_not_allowed")) })
         .layer(axum::middleware::map_response(no_store))
@@ -107,7 +109,7 @@ impl Ctx {
         }
     }
     /// The signed-in caller, or `401 unauthenticated`.
-    fn session(&self) -> Result<Caller, ApiError> {
+    pub(crate) fn session(&self) -> Result<Caller, ApiError> {
         self.caller.ok_or_else(|| ApiError::code("unauthenticated"))
     }
     /// The Origin check of anonymous unsafe requests (login CSRF);
@@ -221,6 +223,10 @@ impl Fields {
 /// Split the request, require JSON within the size limit and parse it as
 /// an object.
 pub(crate) async fn json(request: Request) -> Result<(Ctx, Fields), ApiError> {
+    json_within(request, MAX_BODY_BYTES).await
+}
+/// [`json`] with a body of at most `limit` bytes.
+pub(crate) async fn json_within(request: Request, limit: usize) -> Result<(Ctx, Fields), ApiError> {
     let (parts, body) = request.into_parts();
     let ctx = Ctx::new(parts);
     let json_type = ctx
@@ -239,10 +245,10 @@ pub(crate) async fn json(request: Request) -> Result<(Ctx, Fields), ApiError> {
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok());
-    if declared.is_some_and(|n| n > MAX_BODY_BYTES) {
+    if declared.is_some_and(|n| n > limit) {
         return Err(ApiError::code("body_limit"));
     }
-    let bytes = axum::body::to_bytes(body, MAX_BODY_BYTES)
+    let bytes = axum::body::to_bytes(body, limit)
         .await
         .map_err(|_| ApiError::code("body_limit"))?;
     let map = match serde_json::from_slice::<Value>(&bytes) {
@@ -291,6 +297,14 @@ pub(crate) fn respond(core: &Core, result: Result<Reply, ApiError>) -> Response 
     };
     if let Some(binding) = binding {
         response.headers_mut().append(header::SET_COOKIE, binding);
+    }
+    let oauth = match &reply.oauth_binding {
+        None => None,
+        Some(Binding::Set(value)) => core.oauth_binding_cookie(Some(value.expose_secret())),
+        Some(Binding::Clear) => core.oauth_binding_cookie(None),
+    };
+    if let Some(oauth) = oauth {
+        response.headers_mut().append(header::SET_COOKIE, oauth);
     }
     response
 }

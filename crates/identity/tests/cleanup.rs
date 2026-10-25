@@ -80,6 +80,7 @@ async fn unverified_accounts_survive_without_required_verification_or_once_signe
         clock: world.clock.clone(),
         mail: world.mail.clone(),
         section: base(),
+        endpoints: Default::default(),
     };
     let lenient = node;
     let signed = b

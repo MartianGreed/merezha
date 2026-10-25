@@ -12,8 +12,11 @@
 //! keys in the `Authenticator`, version-cached grant snapshots, the RBAC
 //! [`RbacAuthorizer`](rbac::RbacAuthorizer), the
 //! [`IdentityDirectory`](directory::IdentityDirectory) and the
-//! `platform_admin` grant of the CLI. OAuth, OIDC and passkeys arrive with
-//! PR 3.
+//! `platform_admin` grant of the CLI.
+//!
+//! PR 3: OAuth 2.0 and OIDC sign-in, sign-up and linking (Google, GitHub,
+//! generic OIDC; [`oauth`], [`link`]) and, behind the `passkeys` cargo
+//! feature, WebAuthn passkeys (`passkeys`).
 pub mod access;
 pub mod admin_http;
 pub mod apikey;
@@ -37,6 +40,9 @@ pub mod machines;
 pub mod metrics;
 pub mod module;
 pub mod normalize;
+pub mod oauth;
+#[cfg(feature = "passkeys")]
+pub mod passkeys;
 pub mod password;
 pub mod rbac;
 pub mod secrets;
@@ -49,3 +55,15 @@ pub use config::{HostFacts, Settings};
 pub use core::{NAME, event, topic};
 pub use module::{ERRORS, IdentityHandle, IdentityModule, MIGRATIONS};
 pub use session::SessionAuthenticator;
+
+/// The passkey routes, when the feature is compiled in.
+pub(crate) fn passkey_routes() -> axum::Router<std::sync::Arc<core::Core>> {
+    #[cfg(feature = "passkeys")]
+    {
+        passkeys::routes::routes()
+    }
+    #[cfg(not(feature = "passkeys"))]
+    {
+        axum::Router::new()
+    }
+}
