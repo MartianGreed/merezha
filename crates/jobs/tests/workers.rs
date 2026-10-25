@@ -1005,9 +1005,11 @@ async fn heartbeats_extend_leases_and_timeouts_are_transient() {
 }
 
 /// The dispatcher wakes on `merezha_jobs` notifications, so with a one
-/// minute poll a newly enqueued job still runs long before the next poll
-/// (well under a second on an idle machine; the wait is bounded by
-/// `PATIENCE`, half the poll interval).
+/// minute poll a newly enqueued job still runs long before the next poll.
+/// The job is enqueued only once the dispatcher is parked with every other
+/// wake consumed (the start poll, the freed slot of a first job, the new
+/// `LISTEN` session's wake): only the notification can have run it within
+/// `PATIENCE`, half the poll interval.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notifications_wake_the_dispatcher() {
     let Some(test) = TestDatabase::create() else {
@@ -1015,8 +1017,6 @@ async fn notifications_wake_the_dispatcher() {
     };
     let db = database(&test).await;
     let config = jobs_config(&test, "[jobs]\npoll_interval_ms = 60000");
-    // Inserted without a notification before the start: only the start
-    // poll can take it, so once it ran that poll is over.
     let first = insert_job(&db, "tasks.remind", "tasks:before-start", "{}", false).await;
     let jobs = workers_with(
         PgJobs::with_mode(&config, RelayMode::Listen),
@@ -1025,15 +1025,12 @@ async fn notifications_wake_the_dispatcher() {
         vec![("tasks.remind", func(|_, _| ok()))],
     )
     .await;
-    wait_for(
-        &db,
-        "SELECT count(*) FROM pg_stat_activity
-          WHERE datname = current_database() AND query LIKE 'LISTEN merezha_jobs%'",
-        2,
-        PATIENCE,
-    )
-    .await;
     wait_state(&db, first, "succeeded", PATIENCE).await;
+    let deadline = Instant::now() + PATIENCE;
+    while !jobs.dispatchers_settled() {
+        assert!(Instant::now() < deadline, "the dispatcher never settled");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let enqueued = handle(&jobs, "tasks")
         .enqueue(merezha_platform::ports::NewJob {
             queue: id("default"),
@@ -1073,7 +1070,13 @@ async fn backlog_counts_for_readiness_only_with_max_lag() {
         vec![],
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Ready after a whole reaper pass, the one that would have measured
+    // the backlog had `max_lag_ms` been set.
+    let deadline = Instant::now() + PATIENCE;
+    while relaxed.reaper_passes() < 1 {
+        assert!(Instant::now() < deadline, "the reaper never ran");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert!(relaxed.ready().await.is_ok());
     relaxed.shutdown(soon()).await;
     // The strict instance starts with nothing due, so it becomes ready:

@@ -349,6 +349,28 @@ impl PgJobs {
             .get()
             .is_some_and(|worker| worker.stopping())
     }
+    /// Completed reaper passes, each with its backlog measurement when
+    /// `jobs.readiness.max_lag_ms` is set (feature `test-hooks`); 0 before
+    /// the workers start.
+    #[cfg(feature = "test-hooks")]
+    pub fn reaper_passes(&self) -> u64 {
+        self.inner
+            .worker
+            .get()
+            .map_or(0, |worker| worker.reaper_passes())
+    }
+    /// Whether every queue's dispatcher is parked and has consumed every
+    /// wake from a freed slot or a new `LISTEN` session, the first session
+    /// included when the instance listens (feature `test-hooks`): from then
+    /// on only a `merezha_jobs` notification, the poll interval or the stop
+    /// wakes it.
+    #[cfg(feature = "test-hooks")]
+    pub fn dispatchers_settled(&self) -> bool {
+        self.inner
+            .worker
+            .get()
+            .is_some_and(|worker| worker.dispatchers_settled())
+    }
     /// Shorter reissue bounds for tests (feature `test-hooks`): the hook
     /// deadline, the age after which the reaper reverts a claim, and how
     /// long `POST dead/replay` waits before answering `202`. Call before

@@ -242,6 +242,47 @@ struct Lane {
     plan: QueuePlan,
     slots: Arc<Semaphore>,
     wake: Notify,
+    #[cfg(feature = "test-hooks")]
+    wakes: WakeLog,
+}
+
+/// What woke a dispatcher, for tests (feature `test-hooks`). Every event
+/// takes the next number of `seq`. A lease pass begun by a `wake` after the
+/// last wake from a freed slot or a new `LISTEN` session consumed that
+/// wake; parked after it, with no job left to free its slot, the dispatcher
+/// next wakes only for a notification, the poll interval or the stop.
+#[cfg(feature = "test-hooks")]
+#[derive(Default)]
+struct WakeLog {
+    seq: std::sync::atomic::AtomicU64,
+    /// The last wake from a freed slot or a new `LISTEN` session.
+    other: std::sync::atomic::AtomicU64,
+    /// The last pass begun by a `wake`.
+    woken: std::sync::atomic::AtomicU64,
+    parked: AtomicBool,
+    /// A `LISTEN` session opened and woke the dispatcher.
+    listened: AtomicBool,
+    /// Jobs whose freed-slot wake is still to come.
+    running: std::sync::atomic::AtomicUsize,
+}
+#[cfg(feature = "test-hooks")]
+impl WakeLog {
+    fn next(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::SeqCst) + 1
+    }
+    fn settled(&self) -> bool {
+        self.running.load(Ordering::SeqCst) == 0
+            && self.parked.load(Ordering::SeqCst)
+            && self.woken.load(Ordering::SeqCst) > self.other.load(Ordering::SeqCst)
+    }
+}
+impl Lane {
+    /// A wake that is not a `merezha_jobs` notification.
+    fn wake_other(&self) {
+        #[cfg(feature = "test-hooks")]
+        self.wakes.other.store(self.wakes.next(), Ordering::SeqCst);
+        self.wake.notify_one();
+    }
 }
 
 /// The dispatchers, heartbeat, reaper and drain of one instance.
@@ -263,6 +304,10 @@ pub(crate) struct Worker {
     failing: Mutex<HashSet<&'static str>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     dispatchers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Completed reaper passes, lag measurement included (feature
+    /// `test-hooks`).
+    #[cfg(feature = "test-hooks")]
+    reaper_passes: std::sync::atomic::AtomicU64,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -291,6 +336,8 @@ impl Worker {
                     slots: Arc::new(Semaphore::new(plan.concurrency as usize)),
                     plan,
                     wake: Notify::new(),
+                    #[cfg(feature = "test-hooks")]
+                    wakes: WakeLog::default(),
                 })
             })
             .collect();
@@ -313,6 +360,8 @@ impl Worker {
             failing: Mutex::new(HashSet::new()),
             tasks: Mutex::new(Vec::new()),
             dispatchers: Mutex::new(Vec::new()),
+            #[cfg(feature = "test-hooks")]
+            reaper_passes: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -342,6 +391,24 @@ impl Worker {
     #[cfg(feature = "test-hooks")]
     pub(crate) fn stopping(&self) -> bool {
         *self.stop.borrow()
+    }
+
+    /// Completed reaper passes, each with its lag measurement when
+    /// `jobs.readiness.max_lag_ms` is set.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn reaper_passes(&self) -> u64 {
+        self.reaper_passes.load(Ordering::SeqCst)
+    }
+
+    /// Whether every dispatcher is parked with no wake pending but a
+    /// notification's, the poll interval's or the stop's (see `WakeLog`),
+    /// after its `LISTEN` session's wake when the instance listens.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn dispatchers_settled(&self) -> bool {
+        self.lanes.iter().all(|lane| {
+            lane.wakes.settled()
+                && (!self.config.listen || lane.wakes.listened.load(Ordering::SeqCst))
+        })
     }
 
     /// `false` while `jobs.readiness.max_lag_ms` is set and exceeded.
@@ -1031,11 +1098,15 @@ async fn dispatch(worker: Arc<Worker>, lane: Arc<Lane>) {
                             };
                             let worker = worker.clone();
                             let lane = lane.clone();
+                            #[cfg(feature = "test-hooks")]
+                            lane.wakes.running.fetch_add(1, Ordering::SeqCst);
                             spawn(async move {
                                 let wake = lane.clone();
                                 worker.run(lane, job, cancelled).await;
                                 drop(permit);
-                                wake.wake.notify_one();
+                                wake.wake_other();
+                                #[cfg(feature = "test-hooks")]
+                                wake.wakes.running.fetch_sub(1, Ordering::SeqCst);
                             });
                         }
                     }
@@ -1046,11 +1117,18 @@ async fn dispatch(worker: Arc<Worker>, lane: Arc<Lane>) {
         if full {
             continue;
         }
+        #[cfg(feature = "test-hooks")]
+        lane.wakes.parked.store(true, Ordering::SeqCst);
         tokio::select! {
             _ = stop.changed() => {}
-            () = lane.wake.notified() => {}
+            () = lane.wake.notified() => {
+                #[cfg(feature = "test-hooks")]
+                lane.wakes.woken.store(lane.wakes.next(), Ordering::SeqCst);
+            }
             () = tokio::time::sleep(worker.config.poll_interval) => {}
         }
+        #[cfg(feature = "test-hooks")]
+        lane.wakes.parked.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1091,6 +1169,8 @@ async fn reaper(worker: Arc<Worker>) {
                 Err(failure) => worker.failed("lag", &failure),
             }
         }
+        #[cfg(feature = "test-hooks")]
+        worker.reaper_passes.fetch_add(1, Ordering::SeqCst);
         tokio::select! {
             _ = stop.changed() => return,
             () = tokio::time::sleep(worker.config.reaper_interval) => {}
@@ -1161,7 +1241,9 @@ async fn listen(worker: Arc<Worker>) {
         // Wake every queue once: notifications sent before the session
         // opened were missed.
         for lane in lanes.values() {
-            lane.wake.notify_one();
+            lane.wake_other();
+            #[cfg(feature = "test-hooks")]
+            lane.wakes.listened.store(true, Ordering::SeqCst);
         }
         loop {
             tokio::select! {
