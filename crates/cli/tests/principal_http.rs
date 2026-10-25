@@ -241,3 +241,53 @@ async fn an_oversize_principal_fails_only_the_version_2_call() {
     assert_eq!(status, 200);
     assert!(recorder.0.lock().unwrap().is_empty(), "no guest decided");
 }
+
+/// AP-C2: the guest receives the role keys held at the route's scope: the
+/// tenant roles on a tenant-scoped route, whose stream is the principal's
+/// tenant's, and the application roles on an application route.
+#[tokio::test]
+async fn the_guest_sees_the_roles_at_the_routes_scope() {
+    let recorder = Recorder::default();
+    let config = Config::parse(
+        "version=2\n[[commands]]\ntag=\"Add\"\nservice=\"domain\"\naggregate=\"Counter\"\naccess=\"authenticated\"\n\
+         [[commands]]\ntag=\"TenantAdd\"\nservice=\"domain\"\naggregate=\"Counter\"\naccess=\"authenticated\"\nscope=\"tenant\"\n",
+    )
+    .unwrap();
+    let policy = Arc::new(LoopbackAllowAll::new("127.0.0.1:1".parse().unwrap()).unwrap());
+    let app = Application::in_memory(config, Arc::new(recorder.clone()), policy.clone()).unwrap();
+    let principal = principal();
+    let app =
+        merezha_cli::application_http::router(app, Some(policy)).layer(axum::middleware::from_fn(
+            move |mut request: axum::extract::Request, next: axum::middleware::Next| {
+                request
+                    .extensions_mut()
+                    .insert(Authenticated(Some(principal.clone())));
+                next.run(request)
+            },
+        ));
+    let (status, tenant) = post(
+        &app,
+        "/v1/application/commands",
+        json!({"tag":"TenantAdd","stream":"one","payload":1}),
+    )
+    .await;
+    assert_eq!(
+        (status, tenant["stream"].clone()),
+        (200, json!("org_1:Counter/one"))
+    );
+    let (status, _) = post(
+        &app,
+        "/v1/application/commands",
+        json!({"tag":"Add","stream":"one","payload":1}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let roles: Vec<Value> = recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|metadata| metadata["principal"]["roles"].clone())
+        .collect();
+    assert_eq!(roles, [json!(["member"]), json!(["user"])]);
+}

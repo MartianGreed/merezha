@@ -2118,18 +2118,20 @@ PR 2 as built (2026-10-25):
 - The catalog is identity's and the host's permissions plus the blocks' lists
   the binary hands the module (`IdentityModule::add_block_permissions`).
   `application.toml` `[[permissions]]` and route `resource` kinds are AP-C2's
-  syntax and still refused by the application layer, so they join through
-  `add_application_permissions` and `add_resource_kinds` with AP-C2; until
-  then the resource kinds are the blocks' (`content_type`). Wildcards inside
+  syntax; since AP-C2 they join through `add_application_permissions` and
+  `add_resource_kinds` (`merezha_cli::identity_module`), beside the blocks'
+  kinds (`content_type`). Wildcards inside
   a block namespace are accepted only in `builtin_grants` (operator
   configuration), so a release adding a block permission never widens a
   custom role, a declared role or a key. `admin` holds every catalog
   permission except `identity.organization.delete`,
   `identity.organization.transfer` and the application-only identity ones.
-- The RBAC `Authorizer` refuses application commands and queries
-  (`unauthorized`) until AP-C2 checks their route permissions with the
-  principal; every other host check (application and jobs admin,
-  `/v1/admin/status`, content) uses it.
+- The RBAC `Authorizer` decides application routes since AP-C2, which
+  checks each route's permission with the principal at its scope through
+  `Authorizer::check` before any guest call; its payload hook `authorize`
+  still refuses and is no longer called for application messages. Every
+  other host check (application and jobs admin, `/v1/admin/status`,
+  content) uses it too.
 - Identity's own tenant routes evaluate the caller in the path's
   organization: a member's session gets that organization's snapshot
   without selecting it first; a caller with no standing there (no
@@ -2164,9 +2166,9 @@ PR 2 as built (2026-10-25):
   more than 30 days ago. `platform-admin grant` needs a verified, active
   account. TE's catalog gains `identity.declared_role_in_use` and
   `identity.unknown_permissions`.
-- Not done: the startup warning when `builtin_grants.user` grants a
-  permission a route checks at `scope = "tenant"` needs AP-C2's route
-  declarations.
+- The startup warning when `builtin_grants.user` grants a permission a
+  route checks at `scope = "tenant"` landed with AP-C2's route declarations
+  (`identity.user_grant_tenant_route`).
 
 ### PR 3: OAuth, OIDC and passkeys (stage 2)
 

@@ -129,7 +129,7 @@ async fn every_admin_route_checks_its_permission_at_application_scope() {
         .await
         .unwrap();
     let config = Config::parse(
-        r#"version=1
+        r#"version=2
 [storage]
 backend="postgres"
 application="admin-test"
@@ -137,10 +137,12 @@ application="admin-test"
 tag="Add"
 service="domain"
 aggregate="Counter"
+access="public"
 [[queries]]
 tag="Total"
 service="domain"
 projection="total"
+access="public"
 [[projections]]
 name="total"
 service="domain"
@@ -191,8 +193,8 @@ initial=0
             )
         }
     };
-    // Route, the permission it needs (none for messages) and its status
-    // once allowed. The order runs the rebuild before it is abandoned.
+    // Route, the permission it needs (none for the public messages) and its
+    // status once allowed. The order runs the rebuild before it is abandoned.
     let routes: [(&str, &str, Option<&str>, u16); 9] = [
         ("POST", "/commands", None, 200),
         ("POST", "/queries", None, 200),

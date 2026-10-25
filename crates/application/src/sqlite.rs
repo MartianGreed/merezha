@@ -1572,6 +1572,7 @@ initial=0
             tenant: None,
             actor: Some(id("alice")),
             key: id("k"),
+            authenticated: false,
         }
     }
     fn fingerprint() -> String {
@@ -2382,6 +2383,19 @@ initial=0
             encode(&anonymous).unwrap(),
             r#"{"tag":"Add","actor":null,"key":"k"}"#
         );
+        // A principal's key scope is marked, so an anonymous caller naming
+        // the same actor never shares it (AP-C2).
+        let principal = Key {
+            authenticated: true,
+            ..key()
+        };
+        let text = encode(&principal).unwrap();
+        assert_eq!(
+            text,
+            r#"{"tag":"Add","actor":"alice","key":"k","authenticated":true}"#
+        );
+        assert_eq!(decode::<Key>(&text, 1024).unwrap(), principal);
+        assert_ne!(decode::<Key>(&text, 1024).unwrap(), key());
     }
     #[test]
     fn a_version_1_store_reopens_under_the_same_configuration_at_version_2() {

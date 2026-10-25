@@ -129,8 +129,8 @@ fn call(
 
 /// With the identity block, application commands carry a real session's
 /// principal into `command_as`: a body principal is never trusted, another
-/// actor is `actor_mismatch`, and the RBAC policy still refuses the route
-/// (`unauthorized`) until AP-C2 checks route permissions.
+/// actor is `actor_mismatch`, and a route open to any principal
+/// (`access = "authenticated"`, AP-C2) answers.
 #[test]
 fn identity_sessions_reach_the_trusted_entry_points() {
     let Some(test) = TestDatabase::create() else {
@@ -146,7 +146,13 @@ fn identity_sessions_reach_the_trusted_entry_points() {
          [[services]]\nid=\"protocol\"\npath=\"protocol.wasm\"\n",
     )
     .unwrap();
-    application(dir.path(), "");
+    // With identity every route declares its access (AP §C.4).
+    fs::write(
+        dir.path().join("application.toml"),
+        "version=2\n[[commands]]\ntag=\"Add\"\nservice=\"protocol\"\naggregate=\"Counter\"\n\
+         access=\"authenticated\"\n",
+    )
+    .unwrap();
     let config = dir.path().join("merezha.toml");
     fs::write(
         &config,
@@ -249,8 +255,7 @@ fn identity_sessions_reach_the_trusted_entry_points() {
             &session,
             &command(serde_json::json!({})),
         )),
-        (403, Some("unauthorized".into())),
-        "refused until AP-C2 checks route permissions"
+        (200, None),
     );
     host.stop();
 }

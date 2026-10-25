@@ -9,14 +9,16 @@
 //! (success, failure, a cancelled step, a guest panic) closes the session,
 //! which releases the lock and rolls back an open transaction. No pooled
 //! session ever takes a session lock.
-use super::{PostgresStore, decode, encode, invalid, read_error, signed, sql, unsigned};
+use super::{
+    PostgresStore, decode, encode, invalid, read_error, signed, sql, stored_state, unsigned,
+};
 use crate::{
     Application,
     application::{ProjectionState, check_value},
     config::{MAX_STATE_BYTES, Projection},
     instrument::{ProjectionRun, RunFailure},
 };
-use merezha_domain::{Failure, Operation, Reply, StoredEvent, compatible_json};
+use merezha_domain::{Failure, Identity, Operation, Reply, StoredEvent};
 use merezha_postgres::DetachedClient;
 use merezha_telemetry::{names::dispatch::Trigger, propagation::StoredContext};
 use std::{
@@ -343,12 +345,19 @@ pub(crate) enum Outcome {
     Swapped(ProjectionState),
 }
 
-/// The served row as a run reads it.
+/// The served row as a run reads it. A partitioned row's pair has a
+/// `null` state; its states are the partitions of `generation`.
 struct Row {
     pair: ProjectionState,
     row_revision: i64,
     warm_position: u64,
+    generation: i32,
+    partitioned: bool,
 }
+/// The states one partitioned batch produced: `(tenant, encoded state)`.
+type Partitions = Vec<(String, String)>;
+/// Up to this many partitions go in one sweep statement.
+const SWEEP_CHUNK: u64 = 1000;
 
 /// One run's locked session.
 struct Session<'a> {
@@ -499,8 +508,12 @@ impl Session<'_> {
         })?;
         let row = row.ok_or_else(invalid)?;
         let text: Option<&str> = row.get(0);
-        let state: serde_json::Value = decode(text.ok_or_else(invalid)?, MAX_STATE_BYTES)?;
-        compatible_json(&state).map_err(|_| invalid())?;
+        let partitioned: bool = row.get(5);
+        let state = match (text, partitioned) {
+            (None, true) => serde_json::Value::Null,
+            (Some(text), false) => stored_state(text)?,
+            _ => return Err(invalid()),
+        };
         Ok(Row {
             pair: ProjectionState {
                 state,
@@ -508,6 +521,8 @@ impl Session<'_> {
             },
             row_revision: row.get(2),
             warm_position: unsigned(row.get(3))?,
+            generation: row.get(4),
+            partitioned,
         })
     }
     fn head(&self) -> Result<u64, Failure> {
@@ -521,8 +536,8 @@ impl Session<'_> {
         unsigned(row.get(0))
     }
     /// At most `limit` events after `after`, contiguous, with their stored
-    /// trace contexts for span links.
-    fn feed(&self, after: u64, limit: u64) -> Result<Feed, Failure> {
+    /// trace contexts for span links and their streams' tenants.
+    fn feed(&self, after: u64, limit: u64) -> Result<(Feed, Vec<Option<String>>), Failure> {
         let from = signed(after)?;
         let count = signed(limit)?;
         let rows = self.store.step(self.bounds, async {
@@ -541,9 +556,11 @@ impl Session<'_> {
         {
             return Err(Failure::transient("event_feed_gap"));
         }
-        Ok((events, PostgresStore::traces(&rows)))
+        let tenants = rows.iter().map(|row| row.get(10)).collect();
+        Ok(((events, PostgresStore::traces(&rows)), tenants))
     }
-    /// One guest `project` call within the run's bounds.
+    /// One guest `project` call within the run's bounds; `partition` names
+    /// the tenant of a partitioned projection's state.
     fn project(
         &self,
         app: &Application,
@@ -551,6 +568,7 @@ impl Session<'_> {
         state: serde_json::Value,
         events: Vec<StoredEvent>,
         live: bool,
+        partition: Option<Identity>,
     ) -> Result<serde_json::Value, RunFailure> {
         let limits = &app.config().limits;
         let deadline = self
@@ -567,8 +585,7 @@ impl Session<'_> {
                     state,
                     events,
                     live,
-                    // Partitioned projections are AP-C2's.
-                    partition: None,
+                    partition,
                 },
                 deadline,
             )
@@ -608,6 +625,143 @@ impl Session<'_> {
             }),
         )
     }
+}
+impl Session<'_> {
+    /// One partitioned batch (§A.7): the events grouped by their stream's
+    /// tenant, each group projected once from its partition at
+    /// `generation` (the configured initial state when it has none), with
+    /// `partition` set. Events without a tenant only advance the
+    /// checkpoint. At most one guest call per event.
+    fn project_partitions(
+        &self,
+        app: &Application,
+        projection: &Projection,
+        generation: i32,
+        events: Vec<StoredEvent>,
+        tenants: Vec<Option<String>>,
+        live: bool,
+    ) -> Result<Partitions, RunFailure> {
+        let mut groups: BTreeMap<String, Vec<StoredEvent>> = BTreeMap::new();
+        for (event, tenant) in events.into_iter().zip(tenants) {
+            if let Some(tenant) = tenant {
+                groups.entry(tenant).or_default().push(event);
+            }
+        }
+        if groups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names: Vec<String> = groups.keys().cloned().collect();
+        let rows = self.store.step(self.bounds, async {
+            self.store
+                .db
+                .query(
+                    &self.client,
+                    &sql::LOAD_PARTITIONS,
+                    &[&self.name, &self.revision, &generation, &names],
+                )
+                .await
+                .map_err(|e| read_error(&e))
+        })?;
+        let mut loaded = BTreeMap::new();
+        for row in &rows {
+            loaded.insert(row.get::<_, String>(0), stored_state(row.get(1))?);
+        }
+        let mut partitions = Vec::with_capacity(groups.len());
+        for (tenant, events) in groups {
+            let state = loaded
+                .remove(&tenant)
+                .unwrap_or_else(|| projection.initial.clone());
+            let partition = Identity::new(tenant.as_str()).map_err(|_| invalid())?;
+            let state = self.project(app, projection, state, events, live, Some(partition))?;
+            partitions.push((tenant, encode(&state)?));
+        }
+        Ok(partitions)
+    }
+    /// The partitioned live commit, CAS first (§A.7): the checkpoint with
+    /// row-revision CAS at `generation`, then the batch's partitions. A
+    /// lost CAS rolls back before any partition is written, and the row
+    /// lock it takes orders the batch against a rebuild swap.
+    fn commit_partitions(
+        &mut self,
+        row_revision: i64,
+        generation: i32,
+        checkpoint: u64,
+        partitions: Partitions,
+    ) -> Result<i64, Failure> {
+        let checkpoint = signed(checkpoint)?;
+        let (name, revision) = (self.name.clone(), self.revision);
+        let sleep = self.store.shared.options.hooks().pause;
+        let hard = self.bounds.hard;
+        let (store, bounds) = (self.store, self.bounds);
+        let db = store.db.clone();
+        let (tenants, states): (Vec<String>, Vec<String>) = partitions.into_iter().unzip();
+        store.step(
+            bounds,
+            self.client.transaction(hard, move |tx| {
+                Box::pin(async move {
+                    let row = db
+                        .query_opt(
+                            tx,
+                            &sql::COMMIT_PARTITIONED,
+                            &[&name, &revision, &checkpoint, &row_revision, &generation],
+                        )
+                        .await
+                        .map_err(|e| read_error(&e))?
+                        .ok_or_else(|| Failure::conflict("projection_conflict"))?;
+                    write_partitions(&db, tx, &name, revision, generation, &tenants, &states)
+                        .await?;
+                    pause_in(&db, tx, sleep, &name).await?;
+                    Ok(row.get(0))
+                })
+            }),
+        )
+    }
+    /// Delete partitions in chunks of 1000 until a chunk comes back short,
+    /// within the run's bounds: of generations before `generation` (after
+    /// a swap), or with `stale` of every generation but `generation`
+    /// (before a rebuild's first batch).
+    fn sweep(&self, stale: bool, generation: i32) -> Result<(), Failure> {
+        let db = &self.store.db;
+        loop {
+            let deleted = self.store.step(self.bounds, async {
+                let params: [&(dyn merezha_postgres::tokio_postgres::types::ToSql + Sync); 3] =
+                    [&self.name, &self.revision, &generation];
+                if stale {
+                    db.execute(&self.client, &sql::SWEEP_STALE_PARTITIONS, &params)
+                        .await
+                } else {
+                    db.execute(&self.client, &sql::SWEEP_OLD_PARTITIONS, &params)
+                        .await
+                }
+                .map_err(|e| read_error(&e))
+            })?;
+            if deleted < SWEEP_CHUNK {
+                return Ok(());
+            }
+        }
+    }
+}
+/// Upsert one batch's partitions at `generation` inside its transaction.
+async fn write_partitions(
+    db: &merezha_postgres::Database,
+    tx: &merezha_postgres::Tx<'_>,
+    name: &String,
+    revision: i32,
+    generation: i32,
+    tenants: &Vec<String>,
+    states: &Vec<String>,
+) -> Result<(), Failure> {
+    if tenants.is_empty() {
+        return Ok(());
+    }
+    db.execute(
+        tx,
+        &sql::WRITE_PARTITIONS,
+        &[name, &revision, &generation, tenants, states],
+    )
+    .await
+    .map_err(|e| read_error(&e))?;
+    Ok(())
 }
 /// The test hook's pause inside a commit transaction: the transaction
 /// stays open, idle or in a `pg_sleep`, so only the run's own bounds can
@@ -767,7 +921,7 @@ fn advance(
         if !live {
             limit = limit.min(row.warm_position - checkpoint);
         }
-        let feed = session.feed(checkpoint, limit)?;
+        let (feed, tenants) = session.feed(checkpoint, limit)?;
         record_batch(run, &feed);
         let span = run.span().clone();
         let _entered = span.enter();
@@ -776,13 +930,39 @@ fn advance(
             events.len(),
             events.last().map_or(checkpoint, |e| e.position),
         );
-        let state = session.project(app, projection, row.pair.state.clone(), events, live)?;
-        let pair = ProjectionState {
-            state,
-            checkpoint: last,
+        let committed = if row.partitioned {
+            let partitions = session.project_partitions(
+                app,
+                projection,
+                row.generation,
+                events,
+                tenants,
+                live,
+            )?;
+            session
+                .commit_partitions(row.row_revision, row.generation, last, partitions)
+                .map(|revision| {
+                    (
+                        revision,
+                        ProjectionState {
+                            state: serde_json::Value::Null,
+                            checkpoint: last,
+                        },
+                    )
+                })
+        } else {
+            let state =
+                session.project(app, projection, row.pair.state.clone(), events, live, None)?;
+            let pair = ProjectionState {
+                state,
+                checkpoint: last,
+            };
+            session
+                .commit(row.row_revision, &pair)
+                .map(|revision| (revision, pair))
         };
-        match session.commit(row.row_revision, &pair) {
-            Ok(row_revision) => {
+        match committed {
+            Ok((row_revision, pair)) => {
                 row.row_revision = row_revision;
                 row.pair = pair;
                 store.shared.publish();
@@ -808,13 +988,15 @@ fn note_warm(lane: &Lane, projection: &Projection, row: &Row) {
     }
 }
 
-/// The rebuild candidate row.
+/// The rebuild candidate row. A partitioned candidate's state is `null`;
+/// its states are the partitions of `generation`, the target.
 struct Candidate {
     state: serde_json::Value,
     checkpoint: u64,
     target: u64,
     row_revision: i64,
     running: bool,
+    generation: i32,
 }
 impl Session<'_> {
     fn candidate(&self) -> Result<Option<Candidate>, Failure> {
@@ -827,26 +1009,34 @@ impl Session<'_> {
         })?;
         let Some(row) = row else { return Ok(None) };
         let text: Option<&str> = row.get(0);
-        let state: serde_json::Value = decode(text.ok_or_else(invalid)?, MAX_STATE_BYTES)?;
-        compatible_json(&state).map_err(|_| invalid())?;
+        let state = match text {
+            Some(text) => stored_state(text)?,
+            None => serde_json::Value::Null,
+        };
         Ok(Some(Candidate {
             state,
             checkpoint: unsigned(row.get(1))?,
             target: unsigned(row.get(2))?,
             row_revision: row.get(3),
             running: row.get::<_, &str>(4) == "running",
+            generation: row.get(5),
         }))
     }
-    /// Persist the candidate with CAS on the rebuild row; `None` when the
-    /// rebuild was abandoned or changed elsewhere.
+    /// Persist the candidate with CAS on the rebuild row, then, for a
+    /// partitioned candidate (`state` `None`), the batch's partitions at the
+    /// target `generation`; `None` when the rebuild was abandoned or
+    /// changed elsewhere, and then nothing is written.
     fn commit_candidate(
         &mut self,
         row_revision: i64,
-        state: &serde_json::Value,
+        state: Option<&serde_json::Value>,
         checkpoint: u64,
+        generation: i32,
+        partitions: Partitions,
     ) -> Result<Option<i64>, Failure> {
-        let text = encode(state)?;
+        let text = state.map(encode).transpose()?;
         let checkpoint = signed(checkpoint)?;
+        let (tenants, states): (Vec<String>, Vec<String>) = partitions.into_iter().unzip();
         let (name, revision) = (self.name.clone(), self.revision);
         let sleep = self.store.shared.options.hooks().pause;
         let hard = self.bounds.hard;
@@ -864,8 +1054,12 @@ impl Session<'_> {
                         )
                         .await
                         .map_err(|e| read_error(&e))?;
+                    // CAS first: a lost candidate writes no partition.
+                    let Some(row) = row else { return Ok(None) };
+                    write_partitions(&db, tx, &name, revision, generation, &tenants, &states)
+                        .await?;
                     pause_in(&db, tx, sleep, &name).await?;
-                    Ok(row.map(|row| row.get(0)))
+                    Ok(Some(row.get(0)))
                 })
             }),
         )
@@ -886,14 +1080,15 @@ impl Session<'_> {
     }
     /// The swap transaction (§A.7 step 3): lock the served row, take the
     /// finished candidate this run built and publish it as the next
-    /// generation. `None` when the rebuild was abandoned meanwhile.
-    fn swap(&mut self, row_revision: i64) -> Result<Option<ProjectionState>, Failure> {
+    /// generation, with its generation. `None` when the rebuild was
+    /// abandoned meanwhile.
+    fn swap(&mut self, row_revision: i64) -> Result<Option<(ProjectionState, i32)>, Failure> {
         let (name, revision) = (self.name.clone(), self.revision);
         let sleep = self.store.shared.options.hooks().pause;
         let hard = self.bounds.hard;
         let (store, bounds) = (self.store, self.bounds);
         let db = store.db.clone();
-        let swapped: Option<(String, i64)> = store.step(
+        let swapped: Option<(Option<String>, i64, i32)> = store.step(
             bounds,
             self.client.transaction(hard, move |tx| {
                 Box::pin(async move {
@@ -908,8 +1103,8 @@ impl Session<'_> {
                     else {
                         return Ok(None);
                     };
+                    // NULL for a partitioned candidate, whose row keeps none.
                     let state: Option<String> = taken.get(0);
-                    let state = state.ok_or_else(invalid)?;
                     let checkpoint: i64 = taken.get(1);
                     let generation: i32 = taken.get(2);
                     db.query_one(
@@ -920,17 +1115,24 @@ impl Session<'_> {
                     .await
                     .map_err(|e| read_error(&e))?;
                     pause_in(&db, tx, sleep, &name).await?;
-                    Ok(Some((state, checkpoint)))
+                    Ok(Some((state, checkpoint, generation)))
                 })
             }),
         )?;
-        let Some((state, checkpoint)) = swapped else {
+        let Some((state, checkpoint, generation)) = swapped else {
             return Ok(None);
         };
-        Ok(Some(ProjectionState {
-            state: decode(&state, MAX_STATE_BYTES)?,
-            checkpoint: unsigned(checkpoint)?,
-        }))
+        let state = match state {
+            Some(state) => decode(&state, MAX_STATE_BYTES)?,
+            None => serde_json::Value::Null,
+        };
+        Ok(Some((
+            ProjectionState {
+                state,
+                checkpoint: unsigned(checkpoint)?,
+            },
+            generation,
+        )))
     }
 }
 
@@ -964,6 +1166,8 @@ fn rebuild_batches(
 ) -> Result<Outcome, RunFailure> {
     let store = session.store;
     let batch = app.config().limits.batch_size as u64;
+    let partitioned = projection.partitioned();
+    let mut fresh = partitioned;
     loop {
         let Some(candidate) = session.candidate()? else {
             return Ok(Outcome::Idle);
@@ -971,10 +1175,18 @@ fn rebuild_batches(
         if !candidate.running {
             return Ok(Outcome::Idle);
         }
+        // Before a partitioned rebuild's first batch, nothing at its target
+        // generation is legitimate yet: clear what an abandoned rebuild or
+        // an interrupted sweep left, so absent partitions mean the initial
+        // state.
+        if std::mem::take(&mut fresh) && candidate.checkpoint == 0 {
+            let served = session.row()?.generation;
+            session.sweep(true, served)?;
+        }
         if candidate.checkpoint >= candidate.target {
             #[cfg(test)]
             super::tests::crash_cut("rebuild_before_swap");
-            let Some(pair) = session.swap(candidate.row_revision)? else {
+            let Some((pair, generation)) = session.swap(candidate.row_revision)? else {
                 return Ok(Outcome::Idle);
             };
             #[cfg(test)]
@@ -982,6 +1194,11 @@ fn rebuild_batches(
             run.published(0, Some(pair.checkpoint));
             store.shared.publish();
             store.shared.lane(projection)?.live.notify_one();
+            // Older generations are no longer read. A failed sweep leaves
+            // rows the next rebuild's first sweep removes.
+            if partitioned {
+                let _ = session.sweep(false, generation);
+            }
             return Ok(Outcome::Swapped(pair));
         }
         if Instant::now() >= bounds.soft {
@@ -994,7 +1211,7 @@ fn rebuild_batches(
             });
         }
         let limit = batch.min(candidate.target - candidate.checkpoint);
-        let feed = session.feed(candidate.checkpoint, limit)?;
+        let (feed, tenants) = session.feed(candidate.checkpoint, limit)?;
         record_batch(run, &feed);
         let span = run.span().clone();
         let _entered = span.enter();
@@ -1003,15 +1220,37 @@ fn rebuild_batches(
             events.len(),
             events.last().map_or(candidate.checkpoint, |e| e.position),
         );
-        let state = match session.project(app, projection, candidate.state, events, false) {
-            Ok(state) => state,
+        let projected = if partitioned {
+            session
+                .project_partitions(
+                    app,
+                    projection,
+                    candidate.generation,
+                    events,
+                    tenants,
+                    false,
+                )
+                .map(|partitions| (None, partitions))
+        } else {
+            session
+                .project(app, projection, candidate.state, events, false, None)
+                .map(|state| (Some(state), Vec::new()))
+        };
+        let (state, partitions) = match projected {
+            Ok(projected) => projected,
             Err(failure) => {
                 session.fail_candidate(candidate.row_revision, &failure.failure)?;
                 return Err(failure);
             }
         };
         if session
-            .commit_candidate(candidate.row_revision, &state, last)?
+            .commit_candidate(
+                candidate.row_revision,
+                state.as_ref(),
+                last,
+                candidate.generation,
+                partitions,
+            )?
             .is_none()
         {
             return Ok(Outcome::Idle);
@@ -1058,7 +1297,8 @@ impl PostgresStore {
         let mut published = self.shared.published.subscribe();
         let mut next_try = Instant::now();
         loop {
-            let (pair, _, _) = at_deadline(self.served(projection, deadline), deadline, timed_out)?;
+            let (pair, _, _) =
+                at_deadline(self.served(projection, None, deadline), deadline, timed_out)?;
             if pair.checkpoint >= target {
                 return Ok(pair);
             }
@@ -1095,7 +1335,7 @@ impl PostgresStore {
                 deadline,
                 timed_out,
             )? {
-                None => return Ok(self.served(projection, deadline)?.0),
+                None => return Ok(self.served(projection, None, deadline)?.0),
                 Some(false) => return Err(Failure::conflict("rebuild_failed")),
                 Some(true) => {}
             }

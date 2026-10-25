@@ -1,6 +1,7 @@
 //! Bounded application orchestration with memory, owned SQLite or (feature
 //! `postgres`) shared PostgreSQL storage. The host follows the versioned
 //! guest contract in `merezha-domain`.
+pub mod access;
 mod application;
 pub mod config;
 mod durable;
@@ -11,6 +12,7 @@ mod protocol;
 mod sqlite;
 pub mod status;
 pub mod store;
+pub use access::{Anonymous, Caller, Scope};
 pub use application::{Application, ProjectionState, QueryResult};
 pub use instrument::SCOPE;
 

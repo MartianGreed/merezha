@@ -1305,6 +1305,13 @@ pub const EVENTS: &[Event] = &[
         &[local("role"), local("count")],
     ),
     ev("identity.unknown_permissions", WARN, &[local("count")]),
+    // `builtin_grants.user` grants a permission a route checks at tenant
+    // scope (identity §5, AP-C2).
+    ev(
+        "identity.user_grant_tenant_route",
+        WARN,
+        &[local("permission"), local("route")],
+    ),
     ev("identity.audit_dropped", WARN, &[local("action")]),
     ev("identity.audit_write_failed", ERROR, &[CODE]),
     // The one catalog event that carries a secret: stderr only, loopback

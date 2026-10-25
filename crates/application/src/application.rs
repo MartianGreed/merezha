@@ -1,5 +1,6 @@
 use crate::{
     Authorizer, Guest, GuestSession,
+    access::{self, Anonymous, Caller},
     config::Config,
     durable::{CommitCommand, DurableStore, ProjectionRef},
     instrument::{Dispatch, Instruments, Sample, SampledProjection, Settled},
@@ -7,8 +8,7 @@ use crate::{
     store::{EventStore, MemoryEventStore},
 };
 use merezha_domain::{
-    Command, Failure, Identity, MessageKind, Operation, Principal, Query, Receipt, Reply,
-    compatible_json,
+    Command, Failure, Identity, MessageKind, Operation, Query, Receipt, Reply, compatible_json,
 };
 use merezha_telemetry::names::dispatch::Trigger;
 use serde::{Deserialize, Serialize};
@@ -31,9 +31,10 @@ pub struct QueryResult {
     pub value: Value,
     pub checkpoint: u64,
 }
-/// An idempotency key: `(tag, tenant, actor, key)`. Its JSON encoding is
-/// the SQLite receipt key; without a tenant it is byte-identical to the
-/// encoding before tenants existed.
+/// An idempotency key: `(tag, tenant, actor, key)`, scoped by whether a
+/// principal is present. Its JSON encoding is the SQLite receipt key;
+/// without a tenant and a principal it is byte-identical to the encoding
+/// before either existed.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Key {
@@ -41,8 +42,15 @@ pub(crate) struct Key {
     /// The principal's tenant on tenant-scoped routes (AP-C2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tenant: Option<Identity>,
+    /// The principal's subject when `authenticated`, else the actor an
+    /// anonymous caller named.
     pub(crate) actor: Option<Identity>,
     pub(crate) key: Identity,
+    /// Whether a host-established principal sent it. An anonymous caller
+    /// naming a principal's subject as its `actor` therefore never shares
+    /// that principal's receipts (AP-C2, closing the seam AP-C1 recorded).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) authenticated: bool,
 }
 pub(crate) struct Record {
     pub(crate) payload: String,
@@ -471,19 +479,29 @@ impl Application {
     pub fn command(&self, command: Command) -> Result<Receipt, Failure> {
         self.admit()?.command(command)
     }
-    /// A command for a host-established principal; see
+    /// A command for a host-established caller; see
     /// [`Admission::command_as`].
-    pub fn command_as(&self, principal: Principal, command: Command) -> Result<Receipt, Failure> {
-        self.admit()?.command_as(principal, command)
+    pub fn command_as(&self, caller: impl Caller, command: Command) -> Result<Receipt, Failure> {
+        self.admit()?.command_as(caller, command)
     }
     /// An anonymous query; see [`Admission::query`].
     pub fn query(&self, query: Query) -> Result<QueryResult, Failure> {
         self.admit()?.query(query)
     }
-    /// A query for a host-established principal; see
+    /// A query for a host-established caller; see
     /// [`Admission::query_as`].
-    pub fn query_as(&self, principal: Principal, query: Query) -> Result<QueryResult, Failure> {
-        self.admit()?.query_as(principal, query)
+    pub fn query_as(&self, caller: impl Caller, query: Query) -> Result<QueryResult, Failure> {
+        self.admit()?.query_as(caller, query)
+    }
+    /// Whether `projection` is configured with `partition = "tenant"`;
+    /// `None` when it is not configured.
+    pub fn partitioned(&self, projection: &str) -> Option<bool> {
+        self.0
+            .config
+            .projections
+            .iter()
+            .find(|p| p.name.as_str() == projection)
+            .map(crate::config::Projection::partitioned)
     }
     pub fn catch_up(&self, name: &str) -> Result<ProjectionState, Failure> {
         self.admit()?.project(name, false)
@@ -580,33 +598,34 @@ impl Admission {
             .map_err(|_| Failure::transient("internal"))?;
         Ok(records.get(key).map(|record| replay(record, fingerprint)))
     }
-    /// Dispatch an anonymous command inside its `command {tag}` span,
-    /// recording its outcome, duration and appended events (TE §1.2,
-    /// §1.3). Its metadata must carry no principal: one supplied by the
-    /// caller fails `principal_not_trusted`.
+    /// Dispatch an anonymous command ([`Anonymous`]) inside its `command
+    /// {tag}` span, recording its outcome, duration and appended events (TE
+    /// §1.2, §1.3). Its metadata must carry no principal: one supplied by
+    /// the caller fails `principal_not_trusted`.
     pub fn command(self, command: Command) -> Result<Receipt, Failure> {
-        self.dispatch_command(None, command)
+        self.dispatch_command(&Anonymous, command)
     }
-    /// [`Admission::command`] for `principal`, which the host established
-    /// (the edge's authenticator, or a system principal). The guest's
-    /// metadata carries it (version 2 guests only), `actor` becomes its
+    /// [`Admission::command`] for `caller`, which the host established (the
+    /// edge's principal and policy, a system principal, or a local
+    /// allow-all). Before any guest call the route's `permission` or
+    /// `access` is enforced at its scope ([`Caller::check`]); a
+    /// tenant-scoped route writes the stream
+    /// `{tenant}:{aggregate}/{stream}` of the caller's own tenant, so a
+    /// request can only name the local stream id. The guest's metadata
+    /// carries the principal (version 2 guests only), `actor` becomes its
     /// subject (another caller-supplied actor fails `actor_mismatch`) and
-    /// stored events keep it without its roles. A principal already in
-    /// the command's metadata fails `principal_not_trusted`.
-    pub fn command_as(self, principal: Principal, command: Command) -> Result<Receipt, Failure> {
-        self.dispatch_command(Some(principal), command)
+    /// stored events keep it without its roles. A principal already in the
+    /// command's metadata fails `principal_not_trusted`.
+    pub fn command_as(self, caller: impl Caller, command: Command) -> Result<Receipt, Failure> {
+        self.dispatch_command(&caller, command)
     }
-    fn dispatch_command(
-        self,
-        principal: Option<Principal>,
-        command: Command,
-    ) -> Result<Receipt, Failure> {
+    fn dispatch_command(self, caller: &dyn Caller, command: Command) -> Result<Receipt, Failure> {
         let inner = self.inner.clone();
         let trace = inner
             .instruments
             .command(command.tag.as_str(), &command.metadata);
         let span = trace.span().clone();
-        let result = span.in_scope(|| self.decide(principal, command, &trace));
+        let result = span.in_scope(|| self.decide(caller, command, &trace));
         trace.finish(match &result {
             Ok((receipt, true)) => Ok(Settled::Replayed {
                 position: receipt.position,
@@ -622,11 +641,10 @@ impl Admission {
     /// The command flow; `true` with a stored receipt replayed.
     fn decide(
         self,
-        principal: Option<Principal>,
+        caller: &dyn Caller,
         mut command: Command,
         trace: &Dispatch<'_>,
     ) -> Result<(Receipt, bool), Failure> {
-        protocol::establish(&mut command.metadata, principal)?;
         let route = self
             .inner
             .config
@@ -634,11 +652,25 @@ impl Admission {
             .iter()
             .find(|r| r.tag == command.tag)
             .ok_or_else(|| Failure::permanent("handler_not_found"))?;
-        let stream = Identity::new(format!(
-            "{}/{}",
-            route.aggregate.as_str(),
-            command.stream.as_str()
-        ))?;
+        // The route's permission at its scope, before any guest call or
+        // receipt replay (AP §C.4).
+        let admitted = access::admit(
+            caller,
+            route.rule(),
+            route.route_scope(),
+            route.resource.as_ref().map(|kind| (kind, &command.stream)),
+        )?;
+        protocol::establish(&mut command.metadata, caller.principal(&admitted.scope))?;
+        // The tenant comes from the principal, never from the request.
+        let stream = Identity::new(match &admitted.tenant {
+            Some(tenant) => format!(
+                "{}:{}/{}",
+                tenant.as_str(),
+                route.aggregate.as_str(),
+                command.stream.as_str()
+            ),
+            None => format!("{}/{}", route.aggregate.as_str(), command.stream.as_str()),
+        })?;
         trace.stream(stream.as_str(), command.expected_version);
         let session = self.inner.guest.session()?;
         let payload = self.validate(
@@ -660,9 +692,10 @@ impl Admission {
         if let Some(key) = command.idempotency_key {
             let key = Key {
                 tag: command.tag.clone(),
-                tenant: None,
+                tenant: admitted.tenant.clone(),
                 actor: command.metadata.actor.clone(),
                 key,
+                authenticated: command.metadata.principal.is_some(),
             };
             // Bind stream and explicit expected version too, so a key cannot
             // silently replay the result of another target or precondition.
@@ -753,7 +786,7 @@ impl Admission {
             Storage::Durable(store) => store.commit(
                 CommitCommand {
                     stream: &stream,
-                    tenant: None,
+                    tenant: admitted.tenant.as_ref(),
                     expected,
                     events,
                     metadata: &metadata,
@@ -770,25 +803,23 @@ impl Admission {
         }
         Ok((receipt, replayed))
     }
-    /// Dispatch an anonymous query inside its `query {tag}` span (TE §1.2,
-    /// §1.3). A principal in its metadata fails `principal_not_trusted`.
+    /// Dispatch an anonymous query ([`Anonymous`]) inside its `query
+    /// {tag}` span (TE §1.2, §1.3). A principal in its metadata fails
+    /// `principal_not_trusted`.
     pub fn query(self, query: Query) -> Result<QueryResult, Failure> {
-        self.dispatch_query(None, query)
+        self.dispatch_query(&Anonymous, query)
     }
-    /// [`Admission::query`] for a host-established `principal`, with the
-    /// rules of [`Admission::command_as`].
-    pub fn query_as(self, principal: Principal, query: Query) -> Result<QueryResult, Failure> {
-        self.dispatch_query(Some(principal), query)
+    /// [`Admission::query`] for a host-established `caller`, with the rules
+    /// of [`Admission::command_as`]. A tenant-scoped query reads the
+    /// caller's tenant partition only.
+    pub fn query_as(self, caller: impl Caller, query: Query) -> Result<QueryResult, Failure> {
+        self.dispatch_query(&caller, query)
     }
-    fn dispatch_query(
-        self,
-        principal: Option<Principal>,
-        query: Query,
-    ) -> Result<QueryResult, Failure> {
+    fn dispatch_query(self, caller: &dyn Caller, query: Query) -> Result<QueryResult, Failure> {
         let inner = self.inner.clone();
         let trace = inner.instruments.query(query.tag.as_str(), &query.metadata);
         let span = trace.span().clone();
-        let result = span.in_scope(|| self.answer(principal, query, &trace));
+        let result = span.in_scope(|| self.answer(caller, query, &trace));
         trace.finish(match &result {
             Ok(answer) => Ok(Settled::Answered {
                 checkpoint: answer.checkpoint,
@@ -799,11 +830,10 @@ impl Admission {
     }
     fn answer(
         self,
-        principal: Option<Principal>,
+        caller: &dyn Caller,
         mut query: Query,
         trace: &Dispatch<'_>,
     ) -> Result<QueryResult, Failure> {
-        protocol::establish(&mut query.metadata, principal)?;
         let route = self
             .inner
             .config
@@ -811,6 +841,8 @@ impl Admission {
             .iter()
             .find(|r| r.tag == query.tag)
             .ok_or_else(|| Failure::permanent("handler_not_found"))?;
+        let admitted = access::admit(caller, route.rule(), route.route_scope(), None)?;
+        protocol::establish(&mut query.metadata, caller.principal(&admitted.scope))?;
         let session = self.inner.guest.session()?;
         let payload = self.validate(
             session.as_ref(),
@@ -831,7 +863,11 @@ impl Admission {
             #[cfg(feature = "postgres")]
             Storage::Durable(_) if self.inner.postgres.is_some() => {
                 let projection = self.configured(route.projection.as_str())?;
-                self.served(projection, query.min_position)?
+                self.served(projection, admitted.tenant.as_ref(), query.min_position)?
+            }
+            // Partitions exist on PostgreSQL only (`partitions_require_postgres`).
+            _ if admitted.tenant.is_some() => {
+                return Err(Failure::permanent("storage_configuration"));
             }
             Storage::Durable(store) => {
                 let projection = self.configured(route.projection.as_str())?;
@@ -884,7 +920,8 @@ impl Admission {
     /// PostgreSQL a catch-up runs to the head snapshot under the run lock,
     /// or waits for the runner holding it; a rebuild is requested (or
     /// resumed) and run to its swap the same way, and its progress
-    /// persists past `timeout`.
+    /// persists past `timeout`. A partitioned projection (PostgreSQL) has
+    /// no single state: its pair's `state` is `null`.
     pub fn project(self, name: &str, rebuild: bool) -> Result<ProjectionState, Failure> {
         #[cfg(feature = "postgres")]
         if let Some(store) = &self.inner.postgres {
@@ -898,10 +935,28 @@ impl Admission {
         }
         self.project_inline(name, rebuild)
     }
+    /// [`Admission::project`] as the HTTP answer: `{state, checkpoint}`, or
+    /// `{checkpoint, head}` for a partitioned projection, which has no
+    /// single state (AP §A.7).
+    pub fn project_document(self, name: &str, rebuild: bool) -> Result<Value, Failure> {
+        let partitioned = self.configured(name)?.partitioned();
+        let (inner, deadline) = (self.inner.clone(), self.deadline);
+        let pair = self.project(name, rebuild)?;
+        if !partitioned {
+            return serde_json::to_value(pair)
+                .map_err(|_| Failure::permanent("serialization_failed"));
+        }
+        let head = inner.store.head(deadline)?;
+        Ok(serde_json::json!({"checkpoint": pair.checkpoint, "head": head}))
+    }
     /// The run on the caller's thread, with row-revision CAS on durable
     /// stores and no run lock.
     fn project_inline(self, name: &str, rebuild: bool) -> Result<ProjectionState, Failure> {
         let projection = self.configured(name)?;
+        // Partitioned runs are the PostgreSQL runner's.
+        if projection.partitioned() {
+            return Err(Failure::permanent("storage_configuration"));
+        }
         let trigger = if rebuild {
             Trigger::Rebuild
         } else {
@@ -1023,6 +1078,7 @@ impl Admission {
     fn served(
         &self,
         projection: &crate::config::Projection,
+        tenant: Option<&Identity>,
         min_position: Option<u64>,
     ) -> Result<ProjectionState, Failure> {
         let store = self
@@ -1032,7 +1088,7 @@ impl Admission {
             .ok_or_else(|| Failure::permanent("storage_configuration"))?;
         let mut published = store.shared().published.subscribe();
         loop {
-            let read = store.served(projection, self.deadline);
+            let read = store.served(projection, tenant, self.deadline);
             let (pair, _, warm) = match min_position {
                 Some(_) => crate::postgres::at_deadline(read, self.deadline, || {
                     Failure::transient("projection_behind")

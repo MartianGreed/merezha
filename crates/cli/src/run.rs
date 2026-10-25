@@ -308,13 +308,23 @@ async fn serve(
         .await;
     let host = match started {
         Ok(host) => host,
-        Err(code) if code == "startup_interrupted" => {
+        Err(stop) if stop.code == "startup_interrupted" => {
             merezha_telemetry::event!(INFO, "listener.draining");
             early.close(CLOSE_WITHIN).await;
             return ExitCode::SUCCESS;
         }
-        Err(code) => {
-            merezha_telemetry::event!(ERROR, "startup.failed", code = code.as_str());
+        Err(stop) => {
+            match &stop.issues {
+                Some(issues) => merezha_telemetry::event!(
+                    ERROR,
+                    "startup.failed",
+                    code = stop.code.as_str(),
+                    issues = issues.as_str()
+                ),
+                None => {
+                    merezha_telemetry::event!(ERROR, "startup.failed", code = stop.code.as_str())
+                }
+            }
             early.close(CLOSE_WITHIN).await;
             return ExitCode::from(2);
         }
@@ -322,6 +332,91 @@ async fn serve(
     match early.serve(host, stop()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(1),
+    }
+}
+
+/// Why startup stopped: the `startup.failed` code and, for the
+/// application's access declarations, every issue as a JSON list of
+/// `{key, code}`.
+struct Stop {
+    code: String,
+    issues: Option<String>,
+}
+impl From<String> for Stop {
+    fn from(code: String) -> Self {
+        Self { code, issues: None }
+    }
+}
+
+/// Validate the application document, listing every access, tenancy and
+/// permission problem at once (AP §C.4): what the document shows on its
+/// own, `unknown_permission` against this binary's catalog and, with the
+/// identity block, `route_access_undeclared`. The first issue is the code;
+/// any other validation failure stops startup as before.
+fn check_access(
+    application: &merezha_application::config::Config,
+    identity: bool,
+) -> Result<(), Stop> {
+    let own = application.route_issues();
+    match application.validate() {
+        Err(failure) if own.first().is_none_or(|issue| issue.code != failure.code) => {
+            return Err(failure.code.into());
+        }
+        _ => {}
+    }
+    let catalog = crate::permission_catalog(application);
+    let issues = application.host_issues(&|permission| catalog.contains(permission), identity);
+    let Some(first) = issues.first() else {
+        return Ok(());
+    };
+    Err(Stop {
+        code: first.code.to_owned(),
+        issues: serde_json::to_string(&issues).ok(),
+    })
+}
+
+/// Identity §5: `builtin_grants.user` are application grants every user
+/// holds in every organization, so a permission a route checks at `scope =
+/// "tenant"` belongs in `member`. Warn once per such route
+/// (`identity.user_grant_tenant_route`).
+fn warn_user_grants_on_tenant_routes(
+    config: &merezha_platform::ProjectConfig,
+    application: &merezha_application::config::Config,
+) {
+    use merezha_application::config::{RouteScope, Rule};
+    let Some(user) = config
+        .modules
+        .get(merezha_identity::NAME)
+        .and_then(|section| section.table.get("rbac"))
+        .and_then(|rbac| rbac.get("builtin_grants"))
+        .and_then(|grants| grants.get("user"))
+        .and_then(|user| user.as_array())
+    else {
+        return;
+    };
+    let granted = crate::permission_catalog(application)
+        .expand(user.iter().filter_map(|grant| grant.as_str()));
+    let routes = application
+        .commands
+        .iter()
+        .map(|r| ("commands", &r.tag, r.rule(), r.route_scope()))
+        .chain(
+            application
+                .queries
+                .iter()
+                .map(|r| ("queries", &r.tag, r.rule(), r.route_scope())),
+        );
+    for (kind, tag, rule, scope) in routes {
+        if let (Rule::Permission(permission), RouteScope::Tenant) = (rule, scope)
+            && granted.contains(permission)
+        {
+            merezha_telemetry::event!(
+                WARN,
+                "identity.user_grant_tenant_route",
+                permission = permission.as_str(),
+                route = format!("{kind}.{}", tag.as_str()).as_str()
+            );
+        }
     }
 }
 
@@ -333,7 +428,7 @@ async fn start(
     mut options: HostOptions,
     jobs: merezha_jobs::PgJobs,
     rbac: Option<Arc<dyn Authorizer>>,
-) -> Result<Host, String> {
+) -> Result<Host, Stop> {
     let manifest = config.runtime.manifest.clone();
     let meters = options.meters.clone();
     let runtime_meters = meters.clone();
@@ -343,7 +438,7 @@ async fn start(
     .await;
     let runtime = match loaded {
         Ok(Ok(runtime)) => runtime,
-        _ => return Err("invalid_manifest".to_owned()),
+        _ => return Err("invalid_manifest".to_owned().into()),
     };
     // Database-backed gauges (the projection lag) refresh at this interval,
     // and only while metrics are exported.
@@ -361,8 +456,8 @@ async fn start(
     let private = host::private_listener(&config);
     // With the identity block every permission check is its RBAC
     // `Authorizer` (identity section 5), on every listener, loopback
-    // included. Application commands and queries stay refused until AP-C2
-    // checks their route permissions with the principal.
+    // included; application routes are checked through it at their scope
+    // (AP §C.4).
     let authorizer: Arc<dyn Authorizer> = match (rbac, LoopbackAllowAll::new(config.http.listen)) {
         (Some(rbac), _) if options.authenticator.is_some() => rbac,
         (_, Ok(allow)) if private && options.authenticator.is_none() => Arc::new(allow),
@@ -373,14 +468,23 @@ async fn start(
     let application = match config.application.clone() {
         Some(section) => {
             let path = section.path.clone();
-            let read = spawn_blocking_in_span(move || crate::read_application_config(&path)).await;
+            let read =
+                spawn_blocking_in_span(move || crate::read_application_document(&path)).await;
             let application = match read {
                 Ok(Ok(application)) => application,
-                Ok(Err(failure)) => return Err(failure.code),
-                Err(_) => return Err("invalid_application_config".to_owned()),
+                Ok(Err(failure)) => return Err(failure.code.into()),
+                Err(_) => return Err("invalid_application_config".to_owned().into()),
             };
+            check_access(&application, options.authenticator.is_some())?;
+            if options.authenticator.is_some() {
+                warn_user_grants_on_tenant_routes(&config, &application);
+            }
             let guest = runtime.clone();
-            let policy: Arc<dyn merezha_application::Authorizer> = authorizer.clone();
+            // Route permissions are enforced through the edge's caller and
+            // this policy before any guest call (AP §C.4), so the payload
+            // hook adds nothing on the platform host.
+            let policy: Arc<dyn merezha_application::Authorizer> =
+                Arc::new(merezha_application::AllowAll);
             if let StorageConfig::Postgres { .. } = application.storage {
                 // Opened by the host as a module once its migrations ran.
                 let module = ApplicationModule::new(
@@ -426,15 +530,15 @@ async fn start(
                         if meters.enabled() {
                             application
                                 .spawn_lag_sampler(sample_interval)
-                                .map_err(|failure| failure.code)?;
+                                .map_err(|failure| Stop::from(failure.code))?;
                         }
                         options.status.push(Arc::new(ApplicationSection(Arc::new(
                             OnceLock::from(application.clone()),
                         ))));
                         Some(application)
                     }
-                    Ok(Err(failure)) => return Err(failure.code),
-                    Err(_) => return Err("invalid_application_config".to_owned()),
+                    Ok(Err(failure)) => return Err(failure.code.into()),
+                    Err(_) => return Err("invalid_application_config".to_owned().into()),
                 }
             }
         }
@@ -481,8 +585,8 @@ async fn start(
         Ok(host) => Ok(host),
         // The application module's own reason, not `module_start_failed`.
         Err(error) => match application_failure.as_ref().and_then(|f| f.get()) {
-            Some(failure) if error.module == Some(MODULE) => Err(failure.code.clone()),
-            _ => Err(error.failure.code),
+            Some(failure) if error.module == Some(MODULE) => Err(failure.code.clone().into()),
+            _ => Err(error.failure.code.into()),
         },
     }
 }
