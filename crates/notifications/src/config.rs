@@ -257,6 +257,10 @@ impl KeyMaterial {
     pub fn expose(&self) -> &[u8] {
         &self.0
     }
+    #[cfg(test)]
+    pub(crate) fn for_tests(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
 }
 impl std::fmt::Debug for KeyMaterial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

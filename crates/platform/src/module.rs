@@ -4,7 +4,7 @@ use crate::{
     config::{ConfigIssue, ModuleSection},
     context::AppContext,
     errors::ErrorCode,
-    ports::{BlobStore, Jobs, Outbox},
+    ports::{BlobStore, Jobs, NotifierFactory, Outbox},
 };
 use axum::Router;
 use merezha_domain::Failure;
@@ -109,6 +109,17 @@ pub trait Module: Send + Sync + 'static {
     /// `[modules.content.media]` configures.
     fn blob_store(&self) -> Result<Option<Arc<dyn BlobStore>>, Failure> {
         Ok(None)
+    }
+    /// The notifier factory this module provides to every context (R2),
+    /// in place of the capture fallback; `None` (the default) provides
+    /// none. The host asks every module once, after [`Module::configure`]
+    /// and before any module starts, and installs the one factory through
+    /// `AppContext::builder().notifications(..)`. Two modules providing one
+    /// stop startup with `notifier_conflict`. The factory exists before its
+    /// module starts, so it must answer (`unavailable`) until then. The
+    /// notifications block provides it.
+    fn notifier(&self) -> Option<Arc<dyn NotifierFactory>> {
+        None
     }
     /// Routes of this module that bound their request body themselves, in
     /// place of `http.body_limit` (the upload route, say). The edge still

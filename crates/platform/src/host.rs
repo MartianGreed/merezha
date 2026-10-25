@@ -272,6 +272,28 @@ fn blob_store(modules: &[Arc<dyn Module>]) -> Result<Option<Arc<dyn BlobStore>>,
     Ok(found)
 }
 
+/// The one notifier factory a module provides ([`Module::notifier`]), or
+/// `None` for the capture fallback; two fail `notifier_conflict`.
+fn notifier_factory(
+    modules: &[Arc<dyn Module>],
+) -> Result<Option<Arc<dyn crate::ports::NotifierFactory>>, StartupError> {
+    let mut found = None;
+    for module in modules {
+        match (module.notifier(), &found) {
+            (Some(_), Some(_)) => {
+                return Err(StartupError {
+                    failure: Failure::permanent("notifier_conflict"),
+                    migration: None,
+                    module: Some(module.name()),
+                });
+            }
+            (Some(factory), None) => found = Some(factory),
+            (None, _) => {}
+        }
+    }
+    Ok(found)
+}
+
 /// Whether `config` describes a private listener: not public, a loopback
 /// address and no trusted proxy (requests through a proxy come from
 /// elsewhere even on loopback). Without identity, only a private listener
@@ -469,6 +491,9 @@ impl Host {
         }
         if let Some(blobs) = blob_store(&modules)? {
             builder = builder.blobs(blobs);
+        }
+        if let Some(notifications) = notifier_factory(&modules)? {
+            builder = builder.notifications(notifications);
         }
         let ctx = builder.build().map_err(|failure| StartupError {
             failure,

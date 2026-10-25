@@ -88,7 +88,10 @@ cargo run --locked -p merezha-cli -- run --config merezha.toml
 ```
 
 `[modules.notifications]` turns on the notifications block: templates with
-previews and capture drivers today, delivery in later slices.
+previews, the `Notifier` other blocks request through, the in-app inbox,
+preferences and unsubscribe, and email and SMS through the capture drivers
+(listed at `GET /v1/notifications/dev/captures` on loopback); Brevo, push,
+the SSE stream and webhooks arrive in later slices.
 `merezha notifications check --config merezha.toml` validates its settings
 and templates without starting the host.
 

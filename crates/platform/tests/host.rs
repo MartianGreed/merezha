@@ -1299,3 +1299,95 @@ mod timing {
         ready_within(&router, StatusCode::OK, Duration::from_secs(6)).await;
     }
 }
+
+/// Provides a notifier factory, as the notifications block does.
+struct Provider {
+    name: &'static str,
+    factory: Arc<merezha_platform::ports::CaptureNotifications>,
+}
+/// Delivers, unlike the capture fallback.
+struct Delivering(Arc<merezha_platform::ports::CaptureNotifications>);
+impl merezha_platform::ports::NotifierFactory for Delivering {
+    fn bind(
+        &self,
+        source: &merezha_platform::Source,
+    ) -> Arc<dyn merezha_platform::ports::Notifier> {
+        self.0.bind(source)
+    }
+}
+impl Module for Provider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn notifier(&self) -> Option<Arc<dyn merezha_platform::ports::NotifierFactory>> {
+        Some(Arc::new(Delivering(self.factory.clone())))
+    }
+}
+/// Records whether its context delivers notifications.
+struct Requester(Arc<AtomicBool>);
+impl Module for Requester {
+    fn name(&self) -> &'static str {
+        "requester"
+    }
+    fn start(&self, ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
+        self.0.store(ctx.notifications_deliver(), Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn a_module_provides_the_notifier_of_every_context_and_only_one_may() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let factory = Arc::new(merezha_platform::ports::CaptureNotifications::default());
+    let delivers = Arc::new(AtomicBool::new(false));
+    // The requester starts before the provider and still gets its factory.
+    Host::start(
+        config(&test, true, ""),
+        vec![
+            Box::new(Requester(delivers.clone())),
+            Box::new(Provider {
+                name: "notifications",
+                factory: factory.clone(),
+            }),
+        ],
+        parts(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        delivers.load(Ordering::SeqCst),
+        "the provided factory is installed"
+    );
+    // Without a provider the capture fallback stays, which does not deliver.
+    let fallback = Arc::new(AtomicBool::new(true));
+    Host::start(
+        config(&test, true, ""),
+        vec![Box::new(Requester(fallback.clone()))],
+        parts(),
+    )
+    .await
+    .unwrap();
+    assert!(!fallback.load(Ordering::SeqCst));
+    let error = Host::start(
+        config(&test, true, ""),
+        vec![
+            Box::new(Provider {
+                name: "notifications",
+                factory: factory.clone(),
+            }),
+            Box::new(Provider {
+                name: "other",
+                factory,
+            }),
+        ],
+        parts(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        (error.failure.code.as_str(), error.module),
+        ("notifier_conflict", Some("other"))
+    );
+}

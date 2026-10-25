@@ -97,6 +97,12 @@ pub trait Directory: Send + Sync {
         user: &'a UserId,
         tenant: &'a TenantId,
     ) -> BoxFuture<'a, Result<bool, Failure>>;
+    /// `false` only for [`EmptyDirectory`]: nothing can resolve, so
+    /// notifications record user, tenant and application recipients as
+    /// skipped with `no_directory` rather than `unknown_user` (NT §3.2).
+    fn resolves(&self) -> bool {
+        true
+    }
 }
 
 /// Fallback without identity: resolves nothing. Users are absent, pages are
@@ -134,5 +140,8 @@ impl Directory for EmptyDirectory {
         _: &'a TenantId,
     ) -> BoxFuture<'a, Result<bool, Failure>> {
         Box::pin(async { Ok(false) })
+    }
+    fn resolves(&self) -> bool {
+        false
     }
 }

@@ -243,6 +243,7 @@ mod tests {
     #[tokio::test]
     async fn the_empty_directory_resolves_nothing() {
         let directory = EmptyDirectory;
+        assert!(!directory.resolves());
         assert!(directory.users(&[id("usr_1")]).await.unwrap().is_empty());
         let too_many = vec![id("usr_1"); MAX_USERS_PER_CALL + 1];
         assert_eq!(

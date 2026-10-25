@@ -3,7 +3,9 @@
 //! loads the project like `merezha run`, kernel sections included, and
 //! prints one JSON report on stdout: `{"status":"ok",...}` and exit 0, or
 //! `{"status":"invalid","issues":[{"key","code","origin"}]}` and exit 2.
-//! Issues name settings and template files, never values.
+//! An ok report lists `warnings` (`[{key, code}]`), such as
+//! `security_mail_disabled` with `email.driver = "disabled"`. Issues and
+//! warnings name settings and template files, never values.
 use merezha_notifications::{HostFacts, Notifications};
 use merezha_platform::{ConfigInput, Module, host};
 use serde_json::{Value, json};
@@ -21,6 +23,11 @@ pub fn check(input: &ConfigInput) -> (Value, ExitCode) {
         Ok(_) => match handle.checked() {
             Some(checked) => {
                 let settings = &checked.settings;
+                let warnings: Vec<Value> = checked
+                    .warnings()
+                    .into_iter()
+                    .map(|(key, code)| json!({"key": key, "code": code}))
+                    .collect();
                 let report = json!({
                     "status": "ok",
                     "topics": settings.topics.len(),
@@ -30,6 +37,7 @@ pub fn check(input: &ConfigInput) -> (Value, ExitCode) {
                     "sms": settings.sms.driver.as_str(),
                     "push": settings.push.is_some(),
                     "webhooks": settings.webhooks.is_some(),
+                    "warnings": warnings,
                 });
                 (report, ExitCode::SUCCESS)
             }

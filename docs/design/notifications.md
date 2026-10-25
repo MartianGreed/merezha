@@ -137,7 +137,11 @@ terminal, with one exception: a provider event can move `unknown` to
 
 Each slice adds its tables in its own migration (section 11). The schema has
 no foreign keys into other modules' schemas: `user_id` and `tenant_id` are
-opaque identity ids.
+opaque identity ids. Identity renders them as prefixed text (`usr_<hex>`,
+R7), so migration 2 (N2) stores every `user_id` and `tenant_id` column as
+`text` (at most 128 bytes) and adds the recipient's display name to
+`deliveries` (`name`, nulled with the data); the listing below keeps
+migration 1 as it was applied.
 
 ```sql
 CREATE SCHEMA IF NOT EXISTS merezha_notify;
@@ -256,13 +260,13 @@ CREATE UNIQUE INDEX captures_idempotency_idx
 
 -- Migration 2 (slice N2): inbox
 CREATE TABLE inbox_counters (                   -- one row per user with an inbox item
-  user_id uuid PRIMARY KEY,
+  user_id text PRIMARY KEY,
   last_seq bigint NOT NULL,                     -- highest seq or change_seq handed out
   purged_through bigint NOT NULL DEFAULT 0      -- highest change_seq ever deleted
 );
 CREATE TABLE inbox_items (
   id uuid PRIMARY KEY,                          -- = delivery id
-  user_id uuid NOT NULL, tenant_id uuid, notification_id uuid NOT NULL, topic text NOT NULL,
+  user_id text NOT NULL, tenant_id text, notification_id uuid NOT NULL, topic text NOT NULL,
   title text NOT NULL CHECK (length(title) <= 200),
   body text NOT NULL CHECK (length(body) <= 2000),
   link text CHECK (length(link) <= 2048),
@@ -1487,7 +1491,7 @@ Versions were checked with `cargo info` on 2026-10-23, with
 | `minijinja` | 3.0.3 | 1.70 | `default-features = false, features = ["builtins", "macros", "multi_template", "fuel", "urlencode"]`. `add_template_owned`, `set_auto_escape_callback`, `set_undefined_behavior` and `set_fuel` (fuel feature) are present in 3.0.3. |
 | `hmac` | 0.13.0 | 1.85 | Webhook signatures, unsubscribe tokens, SMS path MAC (R14) |
 | `sha2` | 0.11.1 | 1.88 | SHA-256; the workspace version once K bumps from 0.10 (R14), and the same major as web-push-native |
-| `hkdf` | 0.13.0 | 1.85 | Key derivation from `secret_key` |
+| `hkdf` | not used | | Key derivation from `secret_key` is HKDF-SHA256 with one output block over `hmac` (N2), as identity derives its keys; no extra crate |
 | `aes-gcm` | 0.10.3 | 1.56 | Webhook secret encryption. Pinned to 0.10 to share the tree with web-push-native; 0.11.1 exists. |
 | `subtle` | 2.6.1 | n/a | Constant-time comparison of bearer tokens and MACs |
 | `base64` | 0.23.1 | 1.71 | `whsec_`, base64url keys |
