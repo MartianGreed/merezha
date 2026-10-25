@@ -159,9 +159,10 @@ pub trait Module: Send + Sync + 'static {
 }
 
 /// One route that bounds its own body ([`Module::body_limits`]): `method`
-/// and `path` (relative to `/v1/<name>`, matched exactly against the
-/// request path, without parameters) and the most bytes the edge lets the
-/// route read.
+/// and `path` (relative to `/v1/<name>`, matched segment by segment
+/// against the request path: a `{name}` segment matches any one non-empty
+/// segment, every other segment exactly) and the most bytes the edge lets
+/// the route read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteBodyLimit {
     pub method: axum::http::Method,

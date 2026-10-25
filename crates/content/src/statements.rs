@@ -820,12 +820,6 @@ pub(crate) const REF_ENTRIES: Statement = Statement::new(
                   WHERE id = ANY($1::text[]::uuid[]) AND (scope = $2 OR scope = 'app') \
                   ORDER BY id FOR KEY SHARE",
 );
-pub(crate) const REF_LIVE_ENTRIES: Statement = Statement::new(
-    "content.refs.live_entries",
-    "SELECT merezha_content.entries",
-    "SELECT id::text FROM merezha_content.entries \
-                      WHERE id = ANY($1::text[]::uuid[]) AND deleted_at IS NULL",
-);
 pub(crate) const REF_ASSETS: Statement = Statement::new(
     "content.refs.assets",
     "SELECT merezha_content.assets",
@@ -942,7 +936,6 @@ pub const STATEMENTS: &[Statement] = &[
     REBUILD_ENTRIES,
     REBUILD_ADVANCE,
     REF_ENTRIES,
-    REF_LIVE_ENTRIES,
     REF_ASSETS,
     MANAGE_EXPLAIN,
     TIGHTENED_PUBLISHED,

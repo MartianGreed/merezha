@@ -1,9 +1,12 @@
 //! Reference resolution for draft saves (section 2, `reference` and
 //! `asset` rules): the target must exist, not be in the trash, have an
 //! allowed type and live in the saving entry's scope or the application
-//! scope. Lookups filter on those scopes; only a target found nowhere
-//! visible is looked up again, as an existence bit, to tell
-//! `reference_scope` from `reference_not_found`.
+//! scope. Lookups filter on those scopes and nothing else: a target in a
+//! scope the entry cannot reference (another organization's, or any
+//! organization's from the application scope) is `reference_not_found`,
+//! exactly like an id that exists nowhere, so a save never tells whether
+//! another tenant has an entry with that id (C9). `reference_scope` is
+//! no longer reported.
 //!
 //! The targets found are locked `FOR KEY SHARE` until the saving
 //! transaction ends (in id order), so a delete, purge, publish or
@@ -16,14 +19,14 @@ use merezha_domain::Failure;
 use merezha_platform::{Database, FieldError, Tx};
 use merezha_postgres::classify;
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// What the database says about a save's references.
 #[derive(Debug, Default)]
 pub(crate) struct Resolution {
-    /// `reference_not_found`, `reference_type`, `reference_scope`,
-    /// `asset_not_found` and `asset_type` details.
+    /// `reference_not_found`, `reference_type`, `asset_not_found` and
+    /// `asset_type` details.
     pub problems: Vec<FieldError>,
     /// Entry references written without `type`, with the target's type.
     pub types: Vec<(String, Uuid, String)>,
@@ -69,7 +72,6 @@ pub(crate) async fn resolve(
     asset_ids.sort();
     asset_ids.dedup();
     let mut entries: HashMap<Uuid, Found> = HashMap::new();
-    let mut elsewhere: HashSet<Uuid> = HashSet::new();
     if !entry_ids.is_empty() {
         let rows = db
             .query(&*tx, &statements::REF_ENTRIES, &[&entry_ids, &scope])
@@ -86,23 +88,6 @@ pub(crate) async fn resolve(
                     },
                 );
             }
-        }
-        let missing: Vec<String> = entry_ids
-            .iter()
-            .filter(|id| Uuid::try_parse(id).is_ok_and(|id| !entries.contains_key(&id)))
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            // Only whether a live entry of another scope has the id; none of
-            // its columns leave the statement.
-            let rows = db
-                .query(&*tx, &statements::REF_LIVE_ENTRIES, &[&missing])
-                .await
-                .map_err(|e| classify(&e))?;
-            elsewhere.extend(
-                rows.iter()
-                    .filter_map(|row| Uuid::try_parse(row.get::<_, &str>(0)).ok()),
-            );
         }
     }
     let mut assets: HashMap<Uuid, String> = HashMap::new();
@@ -145,9 +130,8 @@ pub(crate) async fn resolve(
                     }
                     out.rows.push((path.to_owned(), "entry", *id));
                 }
-                None if elsewhere.contains(id) => {
-                    out.problems.push(detail(path, "reference_scope"))
-                }
+                // Absent, or in a scope this entry cannot reference: the
+                // same answer, so no other scope's ids are revealed.
                 None => out.problems.push(detail(path, "reference_not_found")),
             },
             ReferenceTarget::Asset { id, accept } => match assets.get(id) {

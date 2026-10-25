@@ -57,6 +57,40 @@ fn configure_issues(dir: &Path) -> Result<ContentHandle, Vec<(String, String)>> 
 }
 
 #[test]
+fn organization_types_load_only_beside_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let model = "version = 1\nlocales = [{ code = \"en\", default = true }]\n\
+                 [types.help]\nscope = \"organization\"\naccess = \"public\"\n\
+                 fields = [{ name = \"title\", type = \"string\" }]\n";
+    project(
+        dir.path(),
+        false,
+        "[modules.content]\n",
+        &[("content.toml", model)],
+    );
+    // Without identity there are no organizations to scope them to.
+    assert_eq!(
+        configure_issues(dir.path()).unwrap_err(),
+        vec![(
+            "modules.content.model:types.help.scope".to_owned(),
+            "content_model_invalid".to_owned()
+        )]
+    );
+    let module = ContentModule::new().with_organizations(true);
+    let handle = module.handle();
+    configure(
+        &input(dir.path(), "postgres://localhost/x"),
+        vec![Box::new(module)],
+    )
+    .expect("organization types load");
+    let state = handle.state().unwrap();
+    assert_eq!(
+        state.model().content_type("help").unwrap().scope,
+        merezha_content::Scope::Organization
+    );
+}
+
+#[test]
 fn the_model_path_follows_the_runtime_manifest_rules() {
     let dir = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();

@@ -1,10 +1,15 @@
 //! The asset routes (section 5), nested by the host under `/v1/content`:
-//! management under `/manage/assets` (checked at `Application` scope, the
-//! scope of C7's assets) and delivery at `/assets/{id}/{filename}`.
+//! management under `/manage/assets` and delivery at
+//! `/assets/{id}/{filename}` and `/o/{organization}/assets/{id}/{filename}`.
+//! The path chooses the management scope, as it does for delivery
+//! (section 8, C9): `/manage/assets` is the application's, checked at
+//! `Application`, and `/o/{organization}/manage/assets` that
+//! organization's, checked at `Tenant(org)` for a principal whose active
+//! organization it is. An id of another scope is `asset_not_found`.
 //! Management answers `private, no-store`.
 use super::{
     ASSETS_DELETE, ASSETS_READ, ASSETS_WRITE, AssetDelete, AssetFilter, AssetView, Assets, Serve,
-    app_target, focal_point, not_found,
+    asset_target, focal_point, not_found,
     serve::{Disposition, PRIVATE_ASSET_CACHE},
     sniff,
     upload::Upload,
@@ -13,7 +18,7 @@ use crate::{
     http::{actor, error_response, json, page_json, principal},
     json::body_object,
     query::{self, decode_cursor, encode_cursor, pairs},
-    store::Rejection,
+    store::{Rejection, Target},
 };
 use axum::{
     Router,
@@ -33,6 +38,8 @@ use uuid::Uuid;
 
 /// The upload route, relative to `/v1/content`.
 pub(crate) const UPLOAD_PATH: &str = "/manage/assets";
+/// An organization's upload route, relative to `/v1/content`.
+pub(crate) const ORG_UPLOAD_PATH: &str = "/o/{organization}/manage/assets";
 /// Longest `title`, in Unicode scalar values.
 pub const MAX_TITLE_CHARS: usize = 500;
 
@@ -49,17 +56,32 @@ pub(crate) fn router(assets: Assets, policy: Arc<dyn Authorizer>) -> Router {
         .route("/manage/assets/{id}", get(read).patch(patch).delete(delete))
         .route("/manage/assets/{id}/file", get(file))
         .route("/manage/assets/{id}/undelete", post(undelete))
+        .route(ORG_UPLOAD_PATH, get(list).post(upload))
+        .route(
+            "/o/{organization}/manage/assets/{id}",
+            get(read).patch(patch).delete(delete),
+        )
+        .route("/o/{organization}/manage/assets/{id}/file", get(file))
+        .route(
+            "/o/{organization}/manage/assets/{id}/undelete",
+            post(undelete),
+        )
         .route("/assets/{id}/{filename}", get(deliver))
+        .route("/o/{organization}/assets/{id}/{filename}", get(deliver))
         .with_state(Routes { assets, policy })
 }
 
-/// The upload route bounds its own body at `media.max_upload_bytes`.
+/// The upload routes bound their own body at `media.max_upload_bytes`.
 pub(crate) fn body_limits(max_upload_bytes: u64) -> Vec<RouteBodyLimit> {
-    vec![RouteBodyLimit {
-        method: Method::POST,
-        path: UPLOAD_PATH,
-        limit: usize::try_from(max_upload_bytes).unwrap_or(usize::MAX),
-    }]
+    let limit = usize::try_from(max_upload_bytes).unwrap_or(usize::MAX);
+    [UPLOAD_PATH, ORG_UPLOAD_PATH]
+        .into_iter()
+        .map(|path| RouteBodyLimit {
+            method: Method::POST,
+            path,
+            limit,
+        })
+        .collect()
 }
 
 /// The error shape, with `Retry-After` on every transient refusal.
@@ -78,17 +100,45 @@ fn respond(reply: Result<Response, Rejection>) -> Response {
 }
 
 impl Routes {
-    /// `permission` at `Application` scope for the request's principal.
-    fn authorize(&self, parts: &Parts, permission: &str) -> Result<(), Rejection> {
+    /// `permission` for the request's principal in the scope the path
+    /// names: the application's at `Application` (a tenant-pinned key is
+    /// refused there), or `/o/{organization}`'s at `Tenant(org)`, and then
+    /// only for a principal whose active organization it is, so an
+    /// application grant never reaches another organization's assets
+    /// through a path. The active organization never moves an upload.
+    /// Returns that scope's target.
+    fn authorize(
+        &self,
+        parts: &Parts,
+        params: &HashMap<String, String>,
+        permission: &str,
+    ) -> Result<Target, Rejection> {
         let principal = principal(parts);
+        let permission = Identity::new(permission)?;
+        let refused = |principal: Option<&merezha_platform::ports::Principal>| {
+            Rejection::new(Failure::permanent(if principal.is_some() {
+                "unauthorized"
+            } else {
+                "unauthenticated"
+            }))
+        };
+        let org = match params.get("organization") {
+            None => None,
+            Some(org) => {
+                Some(Identity::new(org.clone()).map_err(|_| refused(principal.as_deref()))?)
+            }
+        };
+        let scope = match &org {
+            Some(org) => ResourceScope::Tenant(org.clone()),
+            None => ResourceScope::Application,
+        };
         self.policy
-            .check(
-                principal.as_deref(),
-                &Identity::new(permission)?,
-                &ResourceScope::Application,
-            )
-            .map(|_| ())
-            .map_err(|denied| Rejection::new(denied.failure()))
+            .check(principal.as_deref(), &permission, &scope)
+            .map_err(|denied| Rejection::new(denied.failure()))?;
+        if org.is_some() && principal.as_ref().and_then(|p| p.tenant.as_ref()) != org.as_ref() {
+            return Err(refused(principal.as_deref()));
+        }
+        Ok(asset_target(org))
     }
 }
 
@@ -135,21 +185,24 @@ fn valid_title(title: &str) -> bool {
     title.chars().count() <= MAX_TITLE_CHARS && !title.chars().any(char::is_control)
 }
 
-fn asset_response(status: StatusCode, asset: &AssetView, usage: Option<(i64, i64)>) -> Response {
+fn asset_response(status: StatusCode, asset: &AssetView, usage: Option<super::Usage>) -> Response {
     let mut response = json(status, asset.json(usage));
     if status == StatusCode::CREATED
-        && let Ok(location) =
-            HeaderValue::from_str(&format!("/v1/content/manage/assets/{}", asset.id))
+        && let Ok(location) = HeaderValue::from_str(&asset.manage_url())
     {
         response.headers_mut().insert(header::LOCATION, location);
     }
     response
 }
 
-async fn upload(State(routes): State<Routes>, request: Request) -> Response {
+async fn upload(
+    State(routes): State<Routes>,
+    Path(params): Path<HashMap<String, String>>,
+    request: Request,
+) -> Response {
     let run = async {
         let (parts, body) = request.into_parts();
-        routes.authorize(&parts, ASSETS_WRITE)?;
+        let target = routes.authorize(&parts, &params, ASSETS_WRITE)?;
         let settings = routes.assets.settings();
         // Admission: a slot of `media.max_concurrent_uploads`, held until
         // the upload ends.
@@ -192,6 +245,7 @@ async fn upload(State(routes): State<Routes>, request: Request) -> Response {
         let asset = routes
             .assets
             .upload(
+                &target,
                 Upload {
                     content_type,
                     filename,
@@ -206,10 +260,14 @@ async fn upload(State(routes): State<Routes>, request: Request) -> Response {
     respond(run.await)
 }
 
-async fn list(State(routes): State<Routes>, request: Request) -> Response {
+async fn list(
+    State(routes): State<Routes>,
+    Path(params): Path<HashMap<String, String>>,
+    request: Request,
+) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
-        routes.authorize(&parts, ASSETS_READ)?;
+        let scope = routes.authorize(&parts, &params, ASSETS_READ)?.scope;
         let query = parameters(
             parts.uri.query(),
             &["content_type", "filename_prefix", "limit", "cursor"],
@@ -246,7 +304,6 @@ async fn list(State(routes): State<Routes>, request: Request) -> Response {
                 .filter(|n| (1..=limits.max_page_size).contains(n))
                 .ok_or_else(|| invalid_query("/limit", "invalid_value"))?,
         };
-        let scope = app_target().scope;
         let fp = crate::http::fingerprint(&[
             "assets",
             &scope,
@@ -279,22 +336,30 @@ async fn list(State(routes): State<Routes>, request: Request) -> Response {
     respond(run.await)
 }
 
-async fn read(State(routes): State<Routes>, Path(id): Path<String>, request: Request) -> Response {
+async fn read(
+    State(routes): State<Routes>,
+    Path(params): Path<HashMap<String, String>>,
+    request: Request,
+) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
-        routes.authorize(&parts, ASSETS_READ)?;
+        let target = routes.authorize(&parts, &params, ASSETS_READ)?;
         parameters(parts.uri.query(), &[])?;
-        let id = asset_id(&id)?;
-        let (asset, usage) = routes.assets.get(&app_target().scope, &id).await?;
+        let id = asset_id(params.get("id").map(String::as_str).unwrap_or(""))?;
+        let (asset, usage) = routes.assets.get(&target.scope, &id).await?;
         Ok(asset_response(StatusCode::OK, &asset, Some(usage)))
     };
     respond(run.await)
 }
 
-async fn patch(State(routes): State<Routes>, Path(id): Path<String>, request: Request) -> Response {
+async fn patch(
+    State(routes): State<Routes>,
+    Path(params): Path<HashMap<String, String>>,
+    request: Request,
+) -> Response {
     let run = async {
         let (parts, body) = request.into_parts();
-        routes.authorize(&parts, ASSETS_WRITE)?;
+        let target = routes.authorize(&parts, &params, ASSETS_WRITE)?;
         parameters(parts.uri.query(), &[])?;
         let merge = parts
             .headers
@@ -308,7 +373,7 @@ async fn patch(State(routes): State<Routes>, Path(id): Path<String>, request: Re
         if !merge {
             return Err(Failure::permanent("unsupported_media_type").into());
         }
-        let id = asset_id(&id)?;
+        let id = asset_id(params.get("id").map(String::as_str).unwrap_or(""))?;
         let bytes = axum::body::to_bytes(
             body,
             routes.assets.state().settings().limits.max_request_bytes,
@@ -316,7 +381,6 @@ async fn patch(State(routes): State<Routes>, Path(id): Path<String>, request: Re
         .await
         .map_err(|_| Rejection::new(Failure::permanent("body_limit")))?;
         let patch = body_object(&bytes, &["title", "focal_point"])?;
-        let scope = app_target().scope;
         let mut problems = Vec::new();
         let title = match patch.get("title") {
             None => None,
@@ -343,7 +407,7 @@ async fn patch(State(routes): State<Routes>, Path(id): Path<String>, request: Re
         }
         let asset = routes
             .assets
-            .patch(&scope, &id, title, focal, &actor(&parts))
+            .patch(&target, &id, title, focal, &actor(&parts))
             .await?;
         Ok(asset_response(StatusCode::OK, &asset, None))
     };
@@ -360,21 +424,21 @@ fn flag(query: &HashMap<String, String>, name: &str) -> Result<bool, Rejection> 
 
 async fn delete(
     State(routes): State<Routes>,
-    Path(id): Path<String>,
+    Path(params): Path<HashMap<String, String>>,
     request: Request,
 ) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
-        routes.authorize(&parts, ASSETS_DELETE)?;
+        let target = routes.authorize(&parts, &params, ASSETS_DELETE)?;
         let query = parameters(parts.uri.query(), &["force", "purge"])?;
         let options = AssetDelete {
             force: flag(&query, "force")?,
             purge: flag(&query, "purge")?,
         };
-        let id = asset_id(&id)?;
+        let id = asset_id(params.get("id").map(String::as_str).unwrap_or(""))?;
         routes
             .assets
-            .delete(&app_target().scope, &id, options, &actor(&parts))
+            .delete(&target, &id, options, &actor(&parts))
             .await?;
         let mut response = Response::new(axum::body::Body::empty());
         *response.status_mut() = StatusCode::NO_CONTENT;
@@ -389,15 +453,15 @@ async fn delete(
 
 async fn undelete(
     State(routes): State<Routes>,
-    Path(id): Path<String>,
+    Path(params): Path<HashMap<String, String>>,
     request: Request,
 ) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
-        routes.authorize(&parts, ASSETS_DELETE)?;
+        let target = routes.authorize(&parts, &params, ASSETS_DELETE)?;
         parameters(parts.uri.query(), &[])?;
-        let id = asset_id(&id)?;
-        let asset = routes.assets.undelete(&app_target().scope, &id).await?;
+        let id = asset_id(params.get("id").map(String::as_str).unwrap_or(""))?;
+        let asset = routes.assets.undelete(&target.scope, &id).await?;
         Ok(asset_response(StatusCode::OK, &asset, None))
     };
     respond(run.await)
@@ -405,13 +469,17 @@ async fn undelete(
 
 /// `GET /manage/assets/{id}/file`: any state but purged, always proxied as
 /// an attachment.
-async fn file(State(routes): State<Routes>, Path(id): Path<String>, request: Request) -> Response {
+async fn file(
+    State(routes): State<Routes>,
+    Path(params): Path<HashMap<String, String>>,
+    request: Request,
+) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
-        routes.authorize(&parts, ASSETS_READ)?;
+        let target = routes.authorize(&parts, &params, ASSETS_READ)?;
         parameters(parts.uri.query(), &[])?;
-        let id = asset_id(&id)?;
-        let (asset, _) = routes.assets.get(&app_target().scope, &id).await?;
+        let id = asset_id(params.get("id").map(String::as_str).unwrap_or(""))?;
+        let (asset, _) = routes.assets.get(&target.scope, &id).await?;
         routes
             .assets
             .proxy(
@@ -426,22 +494,29 @@ async fn file(State(routes): State<Routes>, Path(id): Path<String>, request: Req
     respond(run.await)
 }
 
-/// `GET /assets/{id}/{filename}`: delivery, under the asset's referencing
-/// types' access.
+/// `GET /assets/{id}/{filename}` and
+/// `/o/{organization}/assets/{id}/{filename}`: delivery, under the
+/// asset's referencing types' access on that path.
 async fn deliver(
     State(routes): State<Routes>,
-    Path((id, filename)): Path<(String, String)>,
+    Path(params): Path<HashMap<String, String>>,
     request: Request,
 ) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
         parameters(parts.uri.query(), &[])?;
-        let id = asset_id(&id)?;
+        let id = asset_id(params.get("id").map(String::as_str).unwrap_or(""))?;
+        let filename = params.get("filename").cloned().unwrap_or_default();
+        // An invalid organization is absent like any unknown id.
+        let org = match params.get("organization") {
+            None => None,
+            Some(org) => Some(Identity::new(org.clone()).map_err(|_| not_found())?),
+        };
         let principal = principal(&parts);
         let (asset, public) = routes
             .assets
             .deliverable(
-                &app_target().scope,
+                org.as_ref(),
                 &id,
                 &filename,
                 principal.as_deref(),

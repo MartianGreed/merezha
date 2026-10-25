@@ -9,8 +9,8 @@
 //! transaction flips the locked row to `stored` only from `stored`,
 //! `orphaned`, or `pending` after its own put. A row that moved meanwhile
 //! sends the upload back to the claim with the same spool file.
-use super::{ASSET_UPLOADED, AssetView, Assets, app_target, blob_key, hex, sniff, sql, sql_error};
-use crate::store::{Actor, Rejection, new_id, transaction};
+use super::{ASSET_UPLOADED, AssetView, Assets, blob_key, hex, sniff, sql, sql_error};
+use crate::store::{Actor, Rejection, Target, new_id, transaction};
 use axum::body::Body;
 use futures_util::StreamExt;
 use merezha_domain::Failure;
@@ -89,6 +89,7 @@ impl Assets {
     /// length and type and the filename.
     pub(crate) async fn upload(
         &self,
+        target: &Target,
         upload: Upload,
         body: Body,
         actor: &Actor,
@@ -100,7 +101,8 @@ impl Assets {
         let dimensions = sniff::dimensions(&spooled.path, &upload.content_type)
             .await
             .map_err(|()| rejected_type())?;
-        let scope = app_target().scope;
+        // Blobs are per scope: an organization's bytes get its own key tag.
+        let scope = target.scope.clone();
         let key = blob_key(&scope, &spooled.sha256)?;
         let disposition = if self.settings().inline(&upload.content_type) {
             "inline"
@@ -123,7 +125,7 @@ impl Assets {
                 return Err(rejection);
             }
             match self
-                .finish(&scope, &spooled, &upload, dimensions, put, actor)
+                .finish(target, &spooled, &upload, dimensions, put, actor)
                 .await
             {
                 Ok(Some(asset)) => return Ok(asset),
@@ -302,7 +304,7 @@ impl Assets {
     /// blob row moved since the claim (cleanup took it).
     async fn finish(
         &self,
-        scope: &str,
+        target: &Target,
         spooled: &Spooled,
         upload: &Upload,
         dimensions: Option<(i32, i32)>,
@@ -313,8 +315,9 @@ impl Assets {
         let work = self.store.work();
         let id = new_id(&work.ctx)?.hyphenated().to_string();
         let size = i64::try_from(spooled.size).map_err(|_| too_large())?;
+        let target = target.clone();
         let (scope, sha256, upload, actor) = (
-            scope.to_owned(),
+            target.scope.clone(),
             spooled.sha256.clone(),
             upload.clone(),
             actor.clone(),
@@ -349,7 +352,7 @@ impl Assets {
                 .await
                 .map_err(|e| sql_error(&e))?;
                 let record = work.event(
-                    &app_target(),
+                    &target,
                     ASSET_UPLOADED,
                     json!({"scope": scope, "id": id, "content_type": upload.content_type,
                            "size": size, "sha256": sha256, "actor": actor.json()}),

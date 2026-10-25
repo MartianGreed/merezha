@@ -16,7 +16,8 @@ macro_rules! asset_columns {
          to_char(a.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), \
          to_char(a.deleted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), \
          b.storage_key, \
-         to_char(a.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
+         to_char(a.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'), \
+         a.scope"
     };
 }
 
@@ -212,13 +213,16 @@ pub(crate) const ASSET_LIST: Statement = Statement::new(
           LIMIT $7"
     ),
 );
-/// Draft and published refs to an asset recorded in its scope.
+/// Refs to an asset: draft and published ones recorded in its scope `$2`,
+/// and those of every other scope, counted without naming them.
 pub(crate) const ASSET_USAGE: Statement = Statement::new(
     "content.assets.usage",
     "SELECT merezha_content.refs",
-    "SELECT count(*) FILTER (WHERE stage = 'draft'), count(*) FILTER (WHERE stage = 'published') \
+    "SELECT count(*) FILTER (WHERE scope = $2 AND stage = 'draft'), \
+            count(*) FILTER (WHERE scope = $2 AND stage = 'published'), \
+            count(*) FILTER (WHERE scope <> $2) \
        FROM merezha_content.refs \
-      WHERE target_kind = 'asset' AND target_id = $1::text::uuid AND scope = $2",
+      WHERE target_kind = 'asset' AND target_id = $1::text::uuid",
 );
 /// Whether anything in any scope references an asset (`asset_in_use`),
 /// without returning the referrers.

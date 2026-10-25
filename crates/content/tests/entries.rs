@@ -718,7 +718,9 @@ async fn references_resolve_against_the_database_and_referrers_list_them() {
         (nowhere, "reference_not_found"),
         (page.as_str(), "reference_type"),
         (trashed.as_str(), "reference_not_found"),
-        (other_scope.as_str(), "reference_scope"),
+        // Another scope's entry answers like an absent one (C9): a save
+        // never tells that another tenant has the id.
+        (other_scope.as_str(), "reference_not_found"),
     ] {
         let reply = fx
             .post("/v1/content/manage/entries/article")
