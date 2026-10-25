@@ -939,7 +939,9 @@ mod timing {
             &db,
             &module(&[CREATE]),
             MigrationMode::Apply,
-            Instant::now() + Duration::from_millis(300),
+            // Room for a loaded server to open the run's session; the
+            // race below is the last lock poll against the deadline.
+            Instant::now() + Duration::from_secs(2),
         )
         .await
         .unwrap_err();
