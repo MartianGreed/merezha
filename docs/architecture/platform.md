@@ -800,6 +800,7 @@ Guest calls, dispatch and projections are instrumented (TE-T3; TE §1.2,
 | `ready()` | readiness contribution, answered within 1 s |
 | `blob_store()` | the `BlobStore` it provides to every context, opened from its settings; `Ok(None)` (default) provides none. Asked once after `configure`, before any module starts; a failure stops startup naming the module, a second provider stops it with `blob_store_conflict`. Content provides the store `[modules.content.media]` configures |
 | `notifier()` | the `NotifierFactory` it provides to every context in place of the capture fallback; `None` (default) provides none. Asked once after `configure`, before any module starts, so a module that starts earlier already binds it; a second provider stops startup with `notifier_conflict`. The factory answers `unavailable` until its module started. The notifications block provides it |
+| `credential_free_routes()` | `CredentialFreeRoute { method, path }` for routes that take no credential (a signed link, a provider callback): for an exact match the edge never runs the authenticator (no session lookup, Origin or CSRF check, no refusal of a stale cookie) and inserts `Authenticated(None)`, so such a route cannot see a principal and must never act on one; default none. Notifications declares `GET` and `POST /unsubscribe` |
 | `body_limits()` | `RouteBodyLimit { method, path, limit }` for routes that bound their own body (the upload route): the edge reads such a body up to `limit` instead of `http.body_limit` and leaves a declared length to the route; default none |
 | `shutdown(deadline)` | stop and drain background work after the listener drained |
 
@@ -881,7 +882,7 @@ pass what they learned in (`NotificationRequest::members`).
 | `Authorizer` | extends the application `Authorizer` with `check(Option<&Principal>, permission, scope) -> Result<Allowed, AccessDenied>`; synchronous and I/O-free. Without a principal it denies `Unauthenticated` (401), otherwise `unauthorized` (403). Identity's `RbacAuthorizer` evaluates the principal's snapshot | `LoopbackAllowAll` on a private listener (constructible only for loopback addresses), `DenyAll` otherwise (401 anonymous, 403 with a principal) |
 | `Outbox` | `append(tx, source, &[OutboxRecord], OnDuplicate) -> Appended` (AP §B.3); records carry a `DedupeKey` (at most 160 bytes, R4a; `DedupeKey::api(subject, key)` namespaces HTTP keys), an `OutboxTarget` (`Event { topic }` or `Job { queue, kind }`), a JSON payload of at most 64 KiB, `contains_secret`, `run_at`, `priority` and a `MessageContext`; at most 256 records per call. `OutboxRecord::event(source, topic, NewEvent)` (or `SourceOutbox::event`) builds an event record whose payload is the `IntegrationEvent` envelope (R11). `JobFailure` carries the code, classification and `retry_after` job handlers report | `UnavailableOutbox`: fails `outbox_unavailable`, so the caller's transaction rolls back. `merezha_jobs::PgOutbox` is the PostgreSQL implementation |
 | `Jobs` | through `JobsHandle`: `enqueue(NewJob) -> Enqueued` in its own transaction, idempotent on the queue and `{source}:{key}`; `cancel(id)`; `register(kind, queue, Arc<dyn JobHandler>, KindOptions)` and `subscribe(topic, kind)` before the jobs runtime starts; `queue_status() -> QueueStatus` (per queue `ready`, `delayed`, `leased`, `dead`, `oldest_ready_age_s` and slots, plus the outbox backlog and up to 100 quarantined records), the read behind `GET /v1/jobs/admin/queues` and `outbox` and TE's status and gauges (R10). `JobHandler`, `JobContext`, `KindOptions` and `Reissue` are AP §B.3's; `NewJob` hides its payload from `Debug` | `UnavailableJobs`: every call fails `jobs_unavailable` |
-| `Notifier` | `validate(&request)` (pure), `request(tx, NotificationRequest)` and `emit_webhook(tx, WebhookEvent)` (NT §3.1); a webhook's `source_event_id` is an `EventId` of up to 225 bytes, room for `{source}:{dedupe_key}`. Requests carry topic, 1 to 100 recipients (`User`, `Tenant`, `Application { roles }`, `Address`), channels, template, `data`, `secret_data`, locale, dedupe key, tenant, `members`, `not_before`, `expires_at`, collapse key and correlation. For sources `application` and `api` with a tenant every user recipient must be in `members` (`recipient_not_in_tenant`). `Debug` never shows data, secret data or addresses. `NotifierFactory::bind(source)` hands out bound notifiers | `CaptureNotifications`: validates structurally, logs a redacted `notification.captured` warning, keeps the last 64 redacted records (never `data`, `secret_data` or addresses) and delivers nothing. With `[modules.notifications]` the block's `BlockNotifiers` replaces it (`Module::notifier`) |
+| `Notifier` | `validate(&request)` (pure), `request(tx, NotificationRequest)` and `emit_webhook(tx, WebhookEvent)` (NT §3.1); a webhook's `source_event_id` is an `EventId` of up to 225 bytes, room for `{source}:{dedupe_key}`. Requests carry topic, 1 to 100 recipients (`User`, `Tenant`, `Application { roles }`, `Address`), channels, template, `data`, `secret_data`, locale, dedupe key, tenant, `members`, `not_before`, `expires_at`, collapse key and correlation. With a tenant every user recipient must be in `members` (`recipient_not_in_tenant`) for every source but `identity` (`MEMBERSHIP_EXEMPT_SOURCES`; the rule fails closed). `Debug` never shows data, secret data or addresses. `NotifierFactory::bind(source)` hands out bound notifiers | `CaptureNotifications`: validates structurally, logs a redacted `notification.captured` warning, keeps the last 64 redacted records (never `data`, `secret_data` or addresses) and delivers nothing. With `[modules.notifications]` the block's `BlockNotifiers` replaces it (`Module::notifier`) |
 | `Directory` | `users(ids)` (at most 100) to verified `Contact`s, `tenant_members(tenant, roles?, PageRequest)` and `application_members(roles?, PageRequest)` (pages of at most 500, keyset by user id), `is_member(user, tenant)` (R7). Installed through `HostOptions::directory`; identity's implements it. `resolves()` is `true` except for the fallback, so notifications can tell "no such user" from "no directory" | `EmptyDirectory`: resolves nothing; nobody is a member; `resolves()` is `false` |
 | `BlobStore` | `put(key, BlobBody, attrs) -> BlobStat` streaming, `get(key, range?) -> BlobRead` streaming, `head`, idempotent `delete`, `signed_get_url(key, ttl) -> Option<String>` (CT §6); `BlobKey` is 1 to 1024 bytes of `[A-Za-z0-9._-]` segments; `BlobError` maps to classified failures | `UnavailableBlobStore`: fails permanent `blob_store_unavailable`. `merezha_blob::ObjectBlobStore` is the local and S3 implementation |
 
@@ -1197,8 +1198,9 @@ fallback stays. `validate` checks the topic, template, channels (a subset
 of the topic's), 1 to `limits.max_recipients` recipients, reserved data keys
 and `limits.max_data_bytes` (data plus secret data), then dry-renders every
 requested channel in the default locale with strict undefined. `request`
-adds the membership rule (sources `application` and `api` with a tenant:
-every user recipient in `members`, else `recipient_not_in_tenant`) and
+adds the membership rule (with a tenant, every user recipient in
+`members`, else `recipient_not_in_tenant`, for every source but `identity`)
+and
 appends one job record (`notify.expand`, outbox source `notifications`, key
 `request:{notification_id}`, flagged `contains_secret` when the request has
 `secret_data`, `run_at = not_before`) in the caller's transaction. It makes
@@ -1209,6 +1211,8 @@ whose only connection the caller holds. The notification id is
 appends a `notify.webhook_event` record for a declared event type
 (`[modules.notifications.webhooks]` present, else `webhooks_disabled`); its
 fan-out handler arrives with NT-N7, so these jobs wait unleased until then.
+Metrics label only declared topics; any other `notify.topic` is
+`unknown`.
 
 The `notify.expand` job resolves recipients through the `Directory` before
 it opens its transaction: `users` in batches of 100, tenant and application
@@ -1279,8 +1283,8 @@ check their permission at `Application` scope.
 
 | Method and path | Access | Answer |
 | --- | --- | --- |
-| `POST send` | `notifications.send` | body: `topic`, `recipients` (`{user: "usr_.." \| {id}}`, `{tenant: {id, roles?}}`, `{application: {roles}}`, `{address: {email, name?, locale?}}`, `{address: {phone, locale?}}`), `channels?`, `template?`, `data?`, `secret_data?`, `locale?`, `dedupe_key` (stored as `api:{subject}:{key}`, at most 160 bytes in all, R4a), `tenant?`, `not_before?`, `expires_at?`, `collapse_key?`. With a tenant, user recipients are checked with `Directory::is_member` before the transaction. 202 `{notification_id, duplicate}`; 422 `invalid_dedupe_key`, `unknown_topic`, `unknown_template`, `channel_not_allowed`, `too_many_recipients`, `invalid_recipient`, `recipient_not_in_tenant`, `reserved_data_key`, `data_too_large`, `render_failed`; 503 `unavailable` (Directory) |
-| `GET status/{notification_id}` | `notifications.status.read` | `{id, topic, status, status_reason, created_at, settled_at, deliveries: [{id, channel, status, status_reason, attempt_count, target, accepted_at, settled_at}]}`, targets masked (`a***@example.com`, `+33•••••••78`, `push`, `inbox`), at most 1,000 deliveries; 404 |
+| `POST send` | `notifications.send` | body: `topic`, `recipients` (`{user: "usr_.." \| {id}}`, `{tenant: {id, roles?}}`, `{application: {roles}}`, `{address: {email, name?, locale?}}`, `{address: {phone, locale?}}`), `channels?`, `template?`, `data?`, `secret_data?`, `locale?`, `dedupe_key` (stored as `api:{subject}:{key}`, at most 160 bytes in all, R4a), `tenant?`, `not_before?` (at most 30 days ahead, else 422 `validation_failed` at `/not_before`), `expires_at?` (after `not_before`, else at `/expires_at`), `collapse_key?`. With a tenant, user recipients are checked with `Directory::is_member` before the transaction. 202 `{notification_id, duplicate}`; 422 `invalid_dedupe_key`, `unknown_topic`, `unknown_template`, `channel_not_allowed`, `too_many_recipients`, `invalid_recipient`, `recipient_not_in_tenant`, `reserved_data_key`, `data_too_large`, `render_failed`; 503 `unavailable` (Directory) |
+| `GET status/{notification_id}` | `notifications.status.read` for the caller's own sends (source `api`, key `api:{subject}:…`); `notifications.admin` for every notification; 404 otherwise | `{id, topic, status, status_reason, created_at, settled_at, deliveries: [{id, channel, status, status_reason, attempt_count, target, accepted_at, settled_at}]}`, targets masked (`a***@example.com`, `+33•••••••78`, `push`, `inbox`), at most 1,000 deliveries; 404 |
 | `POST deliveries/{id}/redeliver` | `notifications.admin` | 202 `{generation}`: a new generation and job; 409 `not_redeliverable` (not `failed`, `unknown` or `expired`, or an inbox or push delivery), 409 `secret_purged` (the request had secret data), 410 `data_purged`; 404 |
 | `GET inbox?cursor=&limit=&state=unread\|all&topic=&tenant=` | self | `{items: [InboxItem], next_cursor}`, newest first, 1 to 100 (default 30), archived items hidden; 400 `invalid_cursor` |
 | `GET inbox/unread-count?tenant=` | self | `{unread}` |
@@ -1294,15 +1298,19 @@ check their permission at `Application` scope.
 | `POST suppressions`, `DELETE suppressions/{id}` | same | `{channel: email\|sms, address, topic?, reason: "manual"}`: 201 with the suppression (an existing one for the same key is returned); 204; 404 |
 
 `InboxItem` is `{id, topic, title, body, link, payload, tenant_id, seq,
-change_seq, created_at, read_at, archived_at}`. Inbox lists and counts
-cover the items without a tenant plus those of the `tenant` asked, or of
-the principal's active tenant. Unsubscribe tokens are
+change_seq, created_at, read_at, archived_at}`. Every inbox route sees the
+items without a tenant plus those of the principal's active tenant; a
+principal without an active tenant sees only the tenantless ones. A
+`tenant` parameter naming another tenant than the active one answers 403
+`unauthorized`, and another tenant's item answers 404. Unsubscribe tokens are
 `v1.<b64url(claims)>.<b64url(HMAC-SHA256(k_unsub, "v1." + b64url(claims)))>`
 with `k_unsub = HKDF-SHA256(secret_key, "merezha-notify/unsubscribe/v1")`;
-tokens signed with `secret_key_previous` still verify and never expire. The
-POST route takes no session; a browser that also holds a session cookie
-for the API origin goes through identity's CSRF check like any cookie
-request.
+tokens signed with `secret_key_previous` still verify and never expire.
+A token must name exactly one of a user and an address, the `email`
+channel and a configured, user-configurable topic. Both unsubscribe routes
+are credential-free (`Module::credential_free_routes`): a browser holding a
+session cookie without its CSRF header, or a stale cookie, unsubscribes
+like a mail client.
 
 ### Templates
 

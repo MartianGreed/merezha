@@ -10,7 +10,10 @@ use opentelemetry::{
     KeyValue,
     metrics::{Counter, Histogram, Meter},
 };
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
+
+/// The `notify.topic` value of a topic the configuration does not declare.
+pub const UNKNOWN_TOPIC: &str = "unknown";
 
 struct Instruments {
     requests: Counter<u64>,
@@ -20,6 +23,18 @@ struct Instruments {
     latency: Histogram<f64>,
     render_failures: Counter<u64>,
     data_purged: Counter<u64>,
+    /// Declared topics; any other is labelled [`UNKNOWN_TOPIC`].
+    topics: BTreeSet<String>,
+}
+
+impl Instruments {
+    fn topic(&self, topic: &str) -> String {
+        if self.topics.contains(topic) {
+            topic.to_owned()
+        } else {
+            UNKNOWN_TOPIC.to_owned()
+        }
+    }
 }
 
 /// Cheap to clone; [`Metrics::disabled`] records nothing.
@@ -36,7 +51,9 @@ impl Metrics {
     pub fn disabled() -> Self {
         Self(None)
     }
-    pub fn new(meter: &Meter) -> Self {
+    /// The instruments on `meter`; only `topics` become `notify.topic`
+    /// values, so a caller's undeclared topic cannot grow the label set.
+    pub fn new(meter: &Meter, topics: impl IntoIterator<Item = String>) -> Self {
         Self(Some(Arc::new(Instruments {
             requests: instruments::counter(meter, &metric::NOTIFICATION_REQUESTS),
             deliveries: instruments::counter(meter, &metric::NOTIFICATION_DELIVERIES),
@@ -45,6 +62,7 @@ impl Metrics {
             latency: instruments::histogram(meter, &metric::NOTIFICATION_LATENCY),
             render_failures: instruments::counter(meter, &metric::NOTIFICATION_RENDER_FAILURES),
             data_purged: instruments::counter(meter, &metric::NOTIFICATION_DATA_PURGED),
+            topics: topics.into_iter().collect(),
         })))
     }
     /// `outcome`: `accepted`, `duplicate` or `invalid`.
@@ -54,7 +72,7 @@ impl Metrics {
                 1,
                 &[
                     KeyValue::new("notify.source", source.to_owned()),
-                    KeyValue::new("notify.topic", topic.to_owned()),
+                    KeyValue::new("notify.topic", i.topic(topic)),
                     KeyValue::new("notify.outcome", outcome),
                 ],
             );
@@ -67,7 +85,7 @@ impl Metrics {
                 1,
                 &[
                     KeyValue::new("notify.channel", channel.as_str()),
-                    KeyValue::new("notify.topic", topic.to_owned()),
+                    KeyValue::new("notify.topic", i.topic(topic)),
                     KeyValue::new("notify.status", status),
                     KeyValue::new("notify.reason", reason.to_owned()),
                 ],
@@ -107,7 +125,7 @@ impl Metrics {
                 1,
                 &[
                     KeyValue::new("notify.channel", channel.as_str()),
-                    KeyValue::new("notify.topic", topic.to_owned()),
+                    KeyValue::new("notify.topic", i.topic(topic)),
                 ],
             );
         }

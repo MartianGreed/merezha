@@ -148,7 +148,8 @@ mod tests {
         ];
         request.tenant = Some(id("org_1"));
         request.members = vec![id("usr_1")];
-        for source in ["application", "api"] {
+        // Fails closed: every source but identity is checked.
+        for source in ["application", "api", "notifications", "content"] {
             assert_eq!(
                 check_members(&Source::new(source).unwrap(), &request),
                 Err(NotifyError::RecipientNotInTenant)

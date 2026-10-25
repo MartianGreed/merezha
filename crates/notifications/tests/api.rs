@@ -14,6 +14,7 @@ fn people() -> Arc<People> {
     people.user("usr_ada", "ada@example.com", Some("Ada"), None);
     people.user("usr_bob", "bob@example.com", Some("Bob"), None);
     people.join("org_1", "usr_ada", &["member"]);
+    people.join("org_2", "usr_ada", &["member"]);
     people
 }
 
@@ -247,6 +248,21 @@ async fn status_masks_targets_and_redeliver_sends_a_new_generation() {
         )
         .await;
     assert_eq!(status.as_u16(), 403);
+    // `status.read` covers the caller's own sends only; admin reads all.
+    instance.tokens.add(
+        "reader",
+        principal(
+            "key_reader",
+            PrincipalKind::ApiKey,
+            &["notifications.status.read"],
+            None,
+        ),
+    );
+    let path = format!("/v1/notifications/status/{id}");
+    let (status, _) = instance.call("GET", &path, Some("reader"), None).await;
+    assert_eq!(status.as_u16(), 404, "another caller's notification");
+    let (status, _) = instance.call("GET", &path, Some("admin"), None).await;
+    assert_eq!(status.as_u16(), 200, "notifications.admin reads every one");
     let (status, report) = instance
         .call(
             "GET",
@@ -502,12 +518,23 @@ async fn the_inbox_lists_and_changes_only_the_callers_items_in_counter_order() {
     instance.stop().await;
 }
 
+/// Tenant isolation (NT §5.4): a principal sees the items of its active
+/// tenant and the tenantless ones; without an active tenant only the
+/// tenantless ones; another tenant is refused or not found.
 #[tokio::test]
-async fn inbox_items_are_scoped_to_the_active_tenant_and_expire_with_purged_through() {
+async fn inbox_items_are_isolated_by_the_active_tenant_and_expire_with_purged_through() {
     let Some((world, instance)) = started(SECTION).await else {
         return;
     };
-    for (key, tenant) in [("t-org", Some("org_1")), ("t-none", None)] {
+    instance
+        .tokens
+        .add("ada_org2", user("usr_ada", &[], Some("org_2")));
+    let mut ids = std::collections::BTreeMap::new();
+    for (key, tenant) in [
+        ("t-org1", Some("org_1")),
+        ("t-org2", Some("org_2")),
+        ("t-none", None),
+    ] {
         let mut body = json!({
             "topic": "identity.password_changed",
             "recipients": [{"user": "usr_ada"}],
@@ -523,31 +550,121 @@ async fn inbox_items_are_scoped_to_the_active_tenant_and_expire_with_purged_thro
         assert_eq!(status.as_u16(), 202, "{reply}");
     }
     instance.settle().await;
-    let (_, scoped) = instance
+    for row in world
+        .text(
+            "SELECT coalesce(tenant_id, 'none') || '=' || id::text FROM merezha_notify.inbox_items",
+        )
+        .await
+    {
+        let (tenant, id) = row.split_once('=').unwrap();
+        ids.insert(tenant.to_owned(), id.to_owned());
+    }
+    let tenants_of = |page: &Value| -> Vec<String> {
+        let mut found: Vec<String> = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["tenant_id"].as_str().unwrap_or("none").to_owned())
+            .collect();
+        found.sort();
+        found
+    };
+    let instance = &instance;
+    let list = |token: &'static str, query: &'static str| async move {
+        instance
+            .call(
+                "GET",
+                &format!("/v1/notifications/inbox{query}"),
+                Some(token),
+                None,
+            )
+            .await
+    };
+    let (_, page) = list("ada", "").await;
+    assert_eq!(
+        tenants_of(&page),
+        ["none"],
+        "no active tenant: tenantless only"
+    );
+    let (_, page) = list("ada_org", "").await;
+    assert_eq!(tenants_of(&page), ["none", "org_1"]);
+    let (_, page) = list("ada_org", "?tenant=org_1").await;
+    assert_eq!(tenants_of(&page), ["none", "org_1"]);
+    for (token, query) in [
+        ("ada_org", "?tenant=org_2"),
+        ("ada", "?tenant=org_1"),
+        ("ada_org", "/unread-count?tenant=org_2"),
+    ] {
+        let (status, reply) = list(token, query).await;
+        assert_eq!(
+            (status.as_u16(), reply["error"]["code"].clone()),
+            (403, json!("unauthorized")),
+            "{token} {query}"
+        );
+    }
+    let (_, unread) = list("ada", "/unread-count").await;
+    assert_eq!(unread, json!({"unread": 1}));
+    let (_, unread) = list("ada_org", "/unread-count").await;
+    assert_eq!(unread, json!({"unread": 2}));
+    // Another tenant's item is not found on every change.
+    for action in ["read", "unread", "archive"] {
+        let (status, _) = instance
+            .call(
+                "POST",
+                &format!("/v1/notifications/inbox/{}/{action}", ids["org_2"]),
+                Some("ada_org"),
+                None,
+            )
+            .await;
+        assert_eq!(status.as_u16(), 404, "{action}");
+    }
+    let (status, _) = instance
         .call(
-            "GET",
-            "/v1/notifications/inbox?tenant=org_2",
+            "POST",
+            &format!("/v1/notifications/inbox/{}/read", ids["org_1"]),
             Some("ada"),
             None,
         )
         .await;
     assert_eq!(
-        scoped["items"].as_array().unwrap().len(),
-        1,
-        "only the tenantless item"
+        status.as_u16(),
+        404,
+        "a tenant item without its tenant active"
     );
-    let (_, active) = instance
-        .call("GET", "/v1/notifications/inbox", Some("ada_org"), None)
+    let (status, _) = instance
+        .call(
+            "POST",
+            "/v1/notifications/inbox/read-all",
+            Some("ada_org"),
+            Some(json!({"tenant": "org_2"})),
+        )
         .await;
-    assert_eq!(active["items"].as_array().unwrap().len(), 2);
+    assert_eq!(status.as_u16(), 403);
+    let (_, all) = instance
+        .call(
+            "POST",
+            "/v1/notifications/inbox/read-all",
+            Some("ada_org"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(all, json!({"updated": 2}));
+    let (_, unread) = list("ada_org2", "?state=unread").await;
+    assert_eq!(tenants_of(&unread), ["org_2"], "org_2's item is untouched");
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.inbox_items WHERE read_at IS NULL")
+            .await,
+        1
+    );
     // Expiry deletes in user order and raises purged_through.
     let expiring = world
-        .scalar("SELECT change_seq FROM merezha_notify.inbox_items WHERE tenant_id IS NULL")
+        .scalar("SELECT change_seq FROM merezha_notify.inbox_items WHERE tenant_id = 'org_2'")
         .await;
     world
         .execute(
             "UPDATE merezha_notify.inbox_items SET expires_at = now() - interval '1 second' \
-             WHERE tenant_id IS NULL",
+             WHERE tenant_id = 'org_2'",
         )
         .await;
     let core = instance.core();
@@ -555,15 +672,16 @@ async fn inbox_items_are_scoped_to_the_active_tenant_and_expire_with_purged_thro
         .await
         .unwrap();
     assert_eq!(deleted, 1);
+    let last = world
+        .scalar("SELECT last_seq FROM merezha_notify.inbox_counters")
+        .await;
     assert_eq!(
         world
-            .text(
-                "SELECT purged_through::text || '/' || last_seq::text \
-                 FROM merezha_notify.inbox_counters"
-            )
+            .scalar("SELECT purged_through FROM merezha_notify.inbox_counters")
             .await,
-        [format!("{expiring}/2")]
+        expiring
     );
+    assert_eq!(last, 5, "three items, then two read");
     instance.stop().await;
 }
 
@@ -601,6 +719,28 @@ async fn unsubscribe_tokens_write_preferences_or_suppressions_and_forgeries_fail
             iat: 1,
         },
     );
+    // Tokens name a configured topic users can turn off.
+    for topic in ["identity.password_changed", "tasks.nope"] {
+        let token = token_for(
+            &instance,
+            &Unsubscribe {
+                u: Some("usr_ada".into()),
+                a: None,
+                t: topic.into(),
+                c: "email".into(),
+                iat: 1,
+            },
+        );
+        let (status, _) = instance
+            .call(
+                "POST",
+                "/v1/notifications/unsubscribe",
+                None,
+                Some(json!({"token": token})),
+            )
+            .await;
+        assert_eq!(status.as_u16(), 400, "{topic}");
+    }
     let (signed, mac) = user_token.rsplit_once('.').unwrap();
     let forged = format!("{signed}.{}", mac.chars().rev().collect::<String>());
     let (status, reply) = instance
@@ -872,6 +1012,47 @@ async fn suppressions_are_managed_with_the_permission() {
             .scalar("SELECT count(*) FROM merezha_notify.suppressions")
             .await,
         0
+    );
+    instance.stop().await;
+}
+
+#[tokio::test]
+async fn send_bounds_not_before_and_expires_at() {
+    let Some((world, instance)) = started(SECTION).await else {
+        return;
+    };
+    let now = jiff::Timestamp::now();
+    let at = |days: i64| (now + jiff::SignedDuration::from_hours(days * 24)).to_string();
+    for (not_before, expires_at, path, code) in [
+        (at(31), None, "/not_before", "too_far"),
+        (at(2), Some(at(2)), "/expires_at", "not_after_not_before"),
+        (at(2), Some(at(1)), "/expires_at", "not_after_not_before"),
+    ] {
+        let mut body = send_body(json!([{"user": "usr_ada"}]), "b1");
+        body["not_before"] = json!(not_before);
+        if let Some(expires_at) = expires_at {
+            body["expires_at"] = json!(expires_at);
+        }
+        let (status, reply) = instance
+            .call("POST", "/v1/notifications/send", Some("sender"), Some(body))
+            .await;
+        assert_eq!(status.as_u16(), 422, "{reply}");
+        assert_eq!(reply["error"]["code"], "validation_failed");
+        assert_eq!(reply["error"]["details"][0]["path"], path);
+        assert_eq!(reply["error"]["details"][0]["code"], code);
+    }
+    let mut body = send_body(json!([{"user": "usr_ada"}]), "b2");
+    body["not_before"] = json!(at(29));
+    body["expires_at"] = json!(at(30));
+    let (status, _) = instance
+        .call("POST", "/v1/notifications/send", Some("sender"), Some(body))
+        .await;
+    assert_eq!(status.as_u16(), 202);
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_jobs.outbox WHERE run_at > now()")
+            .await,
+        1
     );
     instance.stop().await;
 }

@@ -129,6 +129,16 @@ pub trait Module: Send + Sync + 'static {
     fn body_limits(&self) -> Vec<RouteBodyLimit> {
         Vec::new()
     }
+    /// Routes of this module that take no credential, such as a signed
+    /// unsubscribe link or a provider callback that proves itself another
+    /// way: `method` and `path` relative to `/v1/<name>`, matched exactly.
+    /// The edge never runs the authenticator on them (no session lookup,
+    /// Origin or CSRF check, and no refusal of a stale cookie) and hands
+    /// them `Authenticated(None)`. Such a route must never act on a
+    /// principal. Read once, after [`Module::configure`].
+    fn credential_free_routes(&self) -> Vec<CredentialFreeRoute> {
+        Vec::new()
+    }
     /// Routes, nested under `/v1/<name>`. Called once after `start`. Errors
     /// should use [`crate::edge::error_response`].
     fn routes(&self, ctx: &AppContext) -> Router {
@@ -157,6 +167,13 @@ pub struct RouteBodyLimit {
     pub method: axum::http::Method,
     pub path: &'static str,
     pub limit: usize,
+}
+
+/// One route that takes no credential ([`Module::credential_free_routes`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialFreeRoute {
+    pub method: axum::http::Method,
+    pub path: &'static str,
 }
 
 /// The ports a [`JobsRuntime`] installs in every [`AppContext`].

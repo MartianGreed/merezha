@@ -70,11 +70,17 @@ pub(crate) fn pairs(query: Option<&str>) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// The items in scope: the query's tenant, else the principal's active
-/// tenant; items without a tenant are always in scope. A principal with
-/// neither sees every item of the user.
-fn scope(asked: Option<String>, active: Option<String>) -> Option<String> {
-    asked.or(active)
+/// The tenant in scope (NT §5.4): the principal's active tenant. Items
+/// without a tenant are always in scope; a principal without an active
+/// tenant sees only those. A `tenant` parameter naming another tenant than
+/// the active one is refused (403 `unauthorized`).
+fn scope(asked: Option<String>, active: Option<String>) -> Result<Option<String>, ErrorReply> {
+    match asked {
+        Some(asked) if Some(&asked) != active.as_ref() => {
+            Err(ErrorReply::new(Failure::permanent("unauthorized")))
+        }
+        _ => Ok(active),
+    }
 }
 
 pub(crate) async fn list(
@@ -112,7 +118,10 @@ pub(crate) async fn list(
             _ => return reply("invalid_input"),
         }
     }
-    let scope = scope(tenant, active);
+    let scope = match scope(tenant, active) {
+        Ok(scope) => scope,
+        Err(reply) => return reply.into_response(),
+    };
     let Ok(core) = ctx.core() else {
         return reply("unavailable");
     };
@@ -163,7 +172,10 @@ pub(crate) async fn unread_count(
             _ => return reply("invalid_input"),
         }
     }
-    let scope = scope(tenant, active);
+    let scope = match scope(tenant, active) {
+        Ok(scope) => scope,
+        Err(reply) => return reply.into_response(),
+    };
     let Ok(core) = ctx.core() else {
         return reply("unavailable");
     };
@@ -231,7 +243,8 @@ async fn change(
     Path(id): Path<String>,
     change: Change,
 ) -> Response {
-    let (user, _) = match ctx.user(principal.as_deref()) {
+    // A single item outside the active tenant is not found.
+    let (user, active) = match ctx.user(principal.as_deref()) {
         Ok(found) => found,
         Err(reply) => return reply.into_response(),
     };
@@ -245,6 +258,7 @@ async fn change(
     let db = core.database.clone();
     let now = core.now();
     let owner = user.clone();
+    let tenant = active.clone();
     let changed = db
         .clone()
         .transaction(deadline, move |tx| {
@@ -261,7 +275,7 @@ async fn change(
                     .query_opt(
                         tx,
                         &sql::INBOX_CHANGE,
-                        &[&id, &owner, &change.as_str(), &now, &seq],
+                        &[&id, &owner, &change.as_str(), &now, &seq, &tenant],
                     )
                     .await
                     .map_err(|e| classify(&e))?;
@@ -287,7 +301,7 @@ async fn change(
             };
             match core
                 .database
-                .query_opt(&client, &sql::INBOX_GET, &[&id, &user])
+                .query_opt(&client, &sql::INBOX_GET, &[&id, &user, &active])
                 .await
             {
                 Ok(Some(row)) => Json(item(&row)).into_response(),
@@ -333,7 +347,10 @@ pub(crate) async fn read_all(
     {
         return reply("invalid_input");
     }
-    let scope = scope(request.tenant, active);
+    let scope = match scope(request.tenant, active) {
+        Ok(scope) => scope,
+        Err(reply) => return reply.into_response(),
+    };
     let Ok(core) = ctx.core() else {
         return reply("unavailable");
     };

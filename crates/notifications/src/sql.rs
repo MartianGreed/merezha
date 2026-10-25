@@ -130,7 +130,8 @@ pub const DELIVERY_SENDING: Statement = s(
      updated_at = $3 WHERE id = $1",
 );
 /// Move delivery `$1` of generation `$2` to `$3` / `$4`; terminal and
-/// settled statuses set `settled_at`.
+/// settled statuses set `settled_at`. With `$7`, only while attempt `$7` is
+/// the one sending: a worker whose lease was taken over records nothing.
 pub const DELIVERY_SET: Statement = s(
     "notify.delivery.set",
     "UPDATE merezha_notify.deliveries",
@@ -138,14 +139,15 @@ pub const DELIVERY_SET: Statement = s(
      updated_at = $5::timestamptz, run_at = COALESCE($6::timestamptz, run_at), \
      settled_at = CASE WHEN $3::text IN ('queued', 'sending', 'retrying') THEN NULL \
        ELSE $5::timestamptz END \
-     WHERE id = $1 AND generation = $2",
+     WHERE id = $1 AND generation = $2 \
+     AND ($7::int IS NULL OR (status = 'sending' AND attempt_count = $7::int))",
 );
 pub const DELIVERY_ACCEPT: Statement = s(
     "notify.delivery.accept",
     "UPDATE merezha_notify.deliveries",
     "UPDATE merezha_notify.deliveries SET status = 'accepted', status_reason = NULL, \
      provider = $3, provider_message_id = $4, accepted_at = $5, settled_at = $5, updated_at = $5 \
-     WHERE id = $1 AND generation = $2",
+     WHERE id = $1 AND generation = $2 AND status = 'sending' AND attempt_count = $6",
 );
 pub const PREFERENCES_FOR_USER: Statement = s(
     "notify.preference.for_user",
@@ -170,7 +172,7 @@ pub const TIMEZONE_FOR_USER: Statement = s(
 pub const STATUS_NOTIFICATION: Statement = s(
     "notify.status.notification",
     "SELECT merezha_notify.notifications",
-    "SELECT topic, status, status_reason, expanded_at, settled_at \
+    "SELECT topic, status, status_reason, expanded_at, settled_at, source, dedupe_key \
      FROM merezha_notify.notifications WHERE id = $1",
 );
 pub const STATUS_DELIVERIES: Statement = s(
@@ -187,7 +189,7 @@ pub const REDELIVER_LOCK: Statement = s(
      n.id \
      FROM merezha_notify.deliveries d \
      JOIN merezha_notify.notifications n ON n.id = d.notification_id \
-     WHERE d.id = $1 FOR UPDATE OF d",
+     WHERE d.id = $1 FOR UPDATE OF d, n",
 );
 pub const REDELIVER_SET: Statement = s(
     "notify.redeliver.set",
@@ -276,7 +278,7 @@ pub const INBOX_LIST: Statement = s(
         " FROM merezha_notify.inbox_items \
          WHERE user_id = $1 AND archived_at IS NULL AND (NOT $2::bool OR read_at IS NULL) \
          AND ($3::text IS NULL OR topic = $3) \
-         AND ($4::text IS NULL OR tenant_id IS NULL OR tenant_id = $4) \
+         AND (tenant_id IS NULL OR tenant_id = $4::text) \
          AND ($5::bigint IS NULL OR seq < $5) ORDER BY seq DESC LIMIT $6"
     ),
 );
@@ -285,7 +287,7 @@ pub const INBOX_UNREAD: Statement = s(
     "SELECT merezha_notify.inbox_items",
     "SELECT count(*) FROM merezha_notify.inbox_items \
      WHERE user_id = $1 AND read_at IS NULL AND archived_at IS NULL \
-     AND ($2::text IS NULL OR tenant_id IS NULL OR tenant_id = $2)",
+     AND (tenant_id IS NULL OR tenant_id = $2::text)",
 );
 pub const INBOX_GET: Statement = s(
     "notify.inbox.get",
@@ -293,7 +295,8 @@ pub const INBOX_GET: Statement = s(
     concat!(
         "SELECT ",
         item_columns!(),
-        " FROM merezha_notify.inbox_items WHERE id = $1 AND user_id = $2"
+        " FROM merezha_notify.inbox_items WHERE id = $1 AND user_id = $2 \
+         AND (tenant_id IS NULL OR tenant_id = $3::text)"
     ),
 );
 /// Hand out `$2` numbers of user `$1`, locking the row until commit.
@@ -309,7 +312,8 @@ pub const COUNTER_LOCK: Statement = s(
     "SELECT last_seq FROM merezha_notify.inbox_counters WHERE user_id = $1 FOR UPDATE",
 );
 /// Set one item's state: `$3` names it (`read`, `unread`, `archive`), `$4`
-/// is the time, `$5` the new `change_seq`. Only a real change matches.
+/// is the time, `$5` the new `change_seq`, `$6` the tenant in scope (NULL:
+/// tenantless items only). Only a real change matches.
 pub const INBOX_CHANGE: Statement = s(
     "notify.inbox.change",
     "UPDATE merezha_notify.inbox_items",
@@ -319,7 +323,8 @@ pub const INBOX_CHANGE: Statement = s(
            ELSE read_at END, \
          archived_at = CASE $3::text WHEN 'archive' THEN $4::timestamptz ELSE archived_at END, \
          change_seq = $5 \
-         WHERE id = $1 AND user_id = $2 AND CASE $3::text \
+         WHERE id = $1 AND user_id = $2 AND (tenant_id IS NULL OR tenant_id = $6::text) \
+         AND CASE $3::text \
            WHEN 'read' THEN read_at IS NULL \
            WHEN 'unread' THEN read_at IS NOT NULL \
            ELSE archived_at IS NULL END \
@@ -336,7 +341,7 @@ pub const INBOX_READ_ALL: Statement = s(
      FROM (SELECT id, row_number() OVER (ORDER BY seq) AS rn FROM merezha_notify.inbox_items \
        WHERE user_id = $1 AND read_at IS NULL AND archived_at IS NULL \
        AND ($4::bigint IS NULL OR seq <= $4) \
-       AND ($5::text IS NULL OR tenant_id IS NULL OR tenant_id = $5) \
+       AND (tenant_id IS NULL OR tenant_id = $5::text) \
        ORDER BY seq LIMIT $6) t \
      WHERE i.id = t.id",
 );
@@ -351,11 +356,14 @@ pub const INBOX_NOTIFY_ONE: Statement = s(
 pub const SETTLE: Statement = s(
     "notify.maintenance.settle",
     "UPDATE merezha_notify.notifications",
-    "UPDATE merezha_notify.notifications SET settled_at = $1 WHERE id IN \
+    "UPDATE merezha_notify.notifications n SET settled_at = $1 WHERE n.id IN \
      (SELECT m.id FROM merezha_notify.notifications m WHERE m.settled_at IS NULL \
       AND NOT EXISTS (SELECT 1 FROM merezha_notify.deliveries d WHERE d.notification_id = m.id \
         AND d.status IN ('queued', 'sending', 'retrying')) \
-      ORDER BY m.expanded_at LIMIT $2)",
+      ORDER BY m.expanded_at LIMIT $2) \
+     AND n.settled_at IS NULL \
+     AND NOT EXISTS (SELECT 1 FROM merezha_notify.deliveries d WHERE d.notification_id = n.id \
+       AND d.status IN ('queued', 'sending', 'retrying'))",
 );
 pub const PURGE_DATA: Statement = s(
     "notify.maintenance.purge_data",
@@ -363,6 +371,7 @@ pub const PURGE_DATA: Statement = s(
     "UPDATE merezha_notify.notifications SET data = NULL, data_purged_at = $1 WHERE id IN \
      (SELECT id FROM merezha_notify.notifications WHERE data IS NOT NULL \
       AND settled_at IS NOT NULL AND settled_at < $2 ORDER BY settled_at LIMIT $3) \
+     AND data IS NOT NULL AND settled_at IS NOT NULL AND settled_at < $2 \
      RETURNING id",
 );
 pub const PURGE_NAMES: Statement = s(

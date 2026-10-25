@@ -532,9 +532,10 @@ is_member(user, tenant) -> bool
 - `Tenant { id, roles }` pages through `tenant_members`, and `Application {
   roles }` through `application_members`, up to `limits.max_targets + 1` to
   detect overflow (`rejected` / `too_many_targets`).
-- When a request from source `application` (reactions) or `api` names a
-  `tenant`, every `User` recipient must be in `request.members`, or `request`
-  fails with `recipient_not_in_tenant` (R4). The caller fills `members` from
+- When a request names a `tenant`, every `User` recipient must be in
+  `request.members`, or `request` fails with `recipient_not_in_tenant` (R4).
+  The rule fails closed: every source but `identity` is checked (N2 review;
+  R4 names `application` and `api`). The caller fills `members` from
   `Directory::is_member` before it opens its transaction (AP before the
   reactor checkpoint transaction, AP §C.5; the send route before its own); a
   Directory failure is then the caller's transient error. `request` makes no
@@ -940,7 +941,9 @@ sent within one transaction.
     move the resume point.
   - A `: hb` comment every `sse.heartbeat` (15 s).
 - **Scope.** Items whose `tenant_id` is NULL or equals the principal's tenant. A
-  session with no tenant sees all of the user's items.
+  session with no active tenant sees only the items without a tenant (N2
+  review). The REST routes apply the same scope; a `tenant` parameter other
+  than the active tenant is refused (403), another tenant's item is 404.
 
 **Loop.** As in ADR-0022, each stream subscribes to its user's wake signal (a
 `tokio::sync::Notify`) before its first query. On a wake, or every
@@ -1128,6 +1131,11 @@ coverage defined in 5.2.
   exempt from CSRF. A user token writes `(user, topic, email, false)`; an
   address token writes a topic-scoped `unsubscribed` suppression. Every
   well-formed token gets 200 `{}`.
+- Both unsubscribe routes are credential-free: the edge never runs the
+  authenticator on them (`Module::credential_free_routes`), so a session
+  cookie without CSRF header, or a stale one, does not stop an unsubscribe.
+  A token must name a configured, user-configurable topic. The Brevo
+  callbacks (N3, N4) use the same hook.
 - **`GET …?token=`** changes nothing, because mail scanners prefetch links.
   It redirects (303) to `links.unsubscribe_page` when that is set, and
   otherwise serves a minimal page with one POST button.
@@ -1179,7 +1187,7 @@ Cookie-authenticated state changes need the Origin check and the CSRF token.
 | Method and path | Auth | Request | Response | Errors |
 | --- | --- | --- | --- | --- |
 | `POST send` | `notifications.send` | `NotificationRequest` JSON without `members` (`recipients` as `{user}`, `{tenant: {id, roles?}}`, `{application: {roles}}`, `{address: {email, name?}}`, `{address: {phone}}`), `dedupe_key` required, stored as `api:{subject}:{key}` | 202 `{ notification_id, duplicate }` | 422 `invalid_dedupe_key` (over 200 bytes once namespaced), `unknown_topic`, `unknown_template`, `channel_not_allowed`, `invalid_recipient`, `recipient_not_in_tenant`, `data_too_large`, `reserved_data_key`, `render_failed`; 503 `unavailable` (Directory) |
-| `GET status/{notification_id}` | `notifications.status.read` | none | 200 `{ id, topic, status, status_reason, created_at, settled_at, deliveries: [{ id, channel, status, status_reason, attempt_count, target: "a***@example.com" \| "+33•••••78" \| "push" \| "inbox", accepted_at, settled_at }] }` | 404 `not_found` |
+| `GET status/{notification_id}` | `notifications.status.read` for the caller's own `api:{subject}:` sends, `notifications.admin` for all | none | 200 `{ id, topic, status, status_reason, created_at, settled_at, deliveries: [{ id, channel, status, status_reason, attempt_count, target: "a***@example.com" \| "+33•••••78" \| "push" \| "inbox", accepted_at, settled_at }] }` | 404 `not_found` |
 | `POST deliveries/{id}/redeliver` | `notifications.admin` | none | 202 `{ generation }` | 404; 409 `not_redeliverable` (not `failed` / `unknown` / `expired`), `secret_purged` (R4a); 410 `data_purged` |
 | `GET inbox?cursor=&limit=&state=unread\|all&topic=&tenant=` | self | limit 1 to 100 (default 30) | 200 `{ items: [InboxItem], next_cursor }` | 400 `invalid_cursor` |
 | `GET inbox/unread-count` | self | none | 200 `{ unread }` | none |

@@ -928,3 +928,43 @@ async fn expired_requests_and_the_inbox_render_follow_the_request() {
     );
     instance.stop().await;
 }
+
+/// Metrics carry declared topics only: a caller's undeclared topic is
+/// labelled `unknown`, so the label set stays bounded (R9).
+#[tokio::test]
+async fn metrics_label_undeclared_topics_unknown() {
+    let harness = merezha_telemetry::testing::Harness::new();
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let mut options = Options::new(SECTION, Arc::new(EmptyDirectory));
+    options.workers = false;
+    options.meters = Some(harness.telemetry().meters());
+    let instance = Instance::start(&world, options).await;
+    let refused = commit(
+        &instance,
+        "identity",
+        request("tasks.never_declared_7f", vec![to_user("usr_ada")], "m:1"),
+    )
+    .await;
+    assert_eq!(refused, Err(NotifyError::UnknownTopic));
+    commit(
+        &instance,
+        "identity",
+        password_changed(vec![to_user("usr_ada")], "identity.password_changed:m2"),
+    )
+    .await
+    .unwrap();
+    let points = harness.metric("merezha.notification.requests");
+    assert_eq!(
+        points.value(&[("notify.topic", "unknown"), ("notify.outcome", "invalid")]),
+        Some(1.0)
+    );
+    assert_eq!(
+        points.value(&[
+            ("notify.topic", "identity.password_changed"),
+            ("notify.outcome", "accepted")
+        ]),
+        Some(1.0)
+    );
+}

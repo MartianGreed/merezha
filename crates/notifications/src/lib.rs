@@ -168,6 +168,16 @@ pub struct Notifications {
     checked: Arc<OnceLock<Arc<Checked>>>,
     core: notifier::Slot,
     faults: faults::Faults,
+    email_driver: DriverOverride,
+}
+/// An email driver a test installs in place of the configured one
+/// (feature `testkit`).
+#[derive(Clone, Default)]
+struct DriverOverride(Option<Arc<dyn drivers::EmailDriver>>);
+impl std::fmt::Debug for DriverOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Some(..)" } else { "None" })
+    }
 }
 impl Notifications {
     /// The block with the host facts its cross-section checks need; see
@@ -182,6 +192,13 @@ impl Notifications {
     #[cfg(feature = "testkit")]
     pub fn with_faults(mut self, faults: faults::Faults) -> Self {
         self.faults = faults;
+        self
+    }
+    /// The block with `driver` in place of the configured email driver
+    /// (feature `testkit`), to script provider outcomes.
+    #[cfg(feature = "testkit")]
+    pub fn with_email_driver(mut self, driver: Arc<dyn drivers::EmailDriver>) -> Self {
+        self.email_driver = DriverOverride(Some(driver));
         self
     }
     /// The validated configuration, once [`Module::configure`] succeeded.
@@ -245,6 +262,19 @@ impl Module for Notifications {
     fn events(&self) -> ModuleEvents {
         ModuleEvents::default()
     }
+    /// The unsubscribe routes take no session: a mail client or a browser
+    /// holding a (possibly stale) session cookie must get through, and the
+    /// signed token is the only credential (NT §6). The Brevo callbacks of
+    /// NT-N3 and NT-N4 join this list.
+    fn credential_free_routes(&self) -> Vec<merezha_platform::CredentialFreeRoute> {
+        [axum::http::Method::GET, axum::http::Method::POST]
+            .into_iter()
+            .map(|method| merezha_platform::CredentialFreeRoute {
+                method,
+                path: "/unsubscribe",
+            })
+            .collect()
+    }
     fn notifier(&self) -> Option<Arc<dyn NotifierFactory>> {
         self.checked()
             .map(|_| Arc::new(self.notifiers()) as Arc<dyn NotifierFactory>)
@@ -257,9 +287,11 @@ impl Module for Notifications {
             let settings = checked.settings.clone();
             let capture =
                 || drivers::CaptureDriver::new(ctx.database().clone(), settings.retention.captures);
-            let email: Option<Arc<dyn drivers::EmailDriver>> = (settings.email.driver
-                == config::Driver::Capture)
-                .then(|| Arc::new(capture()) as _);
+            let email: Option<Arc<dyn drivers::EmailDriver>> =
+                self.email_driver.0.clone().or_else(|| {
+                    (settings.email.driver == config::Driver::Capture)
+                        .then(|| Arc::new(capture()) as _)
+                });
             let sms: Option<Arc<dyn drivers::SmsDriver>> =
                 (settings.sms.driver == config::Driver::Capture).then(|| Arc::new(capture()) as _);
             let core = notifier::Core {
@@ -271,7 +303,10 @@ impl Module for Notifications {
                 directory: ctx.directory().clone(),
                 clock: clock(&ctx),
                 random: random(&ctx),
-                metrics: metrics::Metrics::new(&ctx.telemetry().meter(METER_SCOPE)),
+                metrics: metrics::Metrics::new(
+                    &ctx.telemetry().meter(METER_SCOPE),
+                    settings.topics.keys().cloned(),
+                ),
                 faults: self.faults.clone(),
                 email,
                 sms,
@@ -283,7 +318,11 @@ impl Module for Notifications {
                 Arc::new(handler::Expand(self.core.clone())),
                 KindOptions::default(),
             )?;
-            for channel in delivering(&settings) {
+            let mut channels = delivering(&settings);
+            if self.email_driver.0.is_some() && !channels.contains(&Channel::Email) {
+                channels.push(Channel::Email);
+            }
+            for channel in channels {
                 if let Some((queue, kind)) = expand::delivery_queue(channel) {
                     jobs.register(
                         kind,

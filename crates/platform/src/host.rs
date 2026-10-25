@@ -617,6 +617,15 @@ impl Host {
                 })
             })
             .collect();
+        let credential_free = modules
+            .iter()
+            .flat_map(|module| {
+                module
+                    .credential_free_routes()
+                    .into_iter()
+                    .map(|route| (route.method, format!("/v1/{}{}", module.name(), route.path)))
+            })
+            .collect();
         let router = edge::apply(
             router.merge(parts.routes),
             edge_settings(
@@ -625,7 +634,8 @@ impl Host {
                 ctx.authenticator().cloned(),
                 &options.meters,
             )
-            .route_body_limits(body_limits),
+            .route_body_limits(body_limits)
+            .credential_free_routes(credential_free),
         );
         // The first evaluation runs before the host is handed out, so a
         // started host reports its real readiness at once.

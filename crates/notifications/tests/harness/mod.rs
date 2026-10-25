@@ -339,6 +339,12 @@ pub struct Options {
     pub faults: Faults,
     /// The pool the block runs on; the world's by default.
     pub database: Option<Database>,
+    /// `false`: the relay runs only on [`Instance::relay_now`].
+    pub relay: bool,
+    /// An email driver in place of the configured one.
+    pub email_driver: Option<Arc<dyn merezha_notifications::drivers::EmailDriver>>,
+    /// The host's meters; no-op by default.
+    pub meters: Option<merezha_telemetry::Meters>,
 }
 impl Options {
     pub fn new(section: &str, directory: Arc<dyn Directory>) -> Self {
@@ -349,6 +355,9 @@ impl Options {
             heartbeat: true,
             faults: Faults::default(),
             database: None,
+            relay: true,
+            email_driver: None,
+            meters: None,
         }
     }
 }
@@ -380,6 +389,9 @@ impl Instance {
         let config = ProjectConfig::load(&input).unwrap();
         let mut module = Notifications::new(merezha_notifications::HostFacts::load(&input))
             .with_faults(options.faults.clone());
+        if let Some(driver) = options.email_driver.clone() {
+            module = module.with_email_driver(driver);
+        }
         module
             .configure(&config.modules["notifications"])
             .unwrap_or_else(|issues| panic!("{issues:?}"));
@@ -387,7 +399,7 @@ impl Instance {
         let db = options.database.clone().unwrap_or_else(|| world.db.clone());
         let mut jobs = PgJobs::with_mode(
             &config.jobs,
-            if options.workers {
+            if options.workers && options.relay {
                 RelayMode::Listen
             } else {
                 RelayMode::Off
@@ -398,7 +410,11 @@ impl Instance {
         }
         let ports = jobs.ports(&db);
         let tokens = Arc::new(Tokens::default());
-        let ctx = AppContext::builder("tasks", db.clone(), Arc::new(Grantsheet))
+        let mut builder = AppContext::builder("tasks", db.clone(), Arc::new(Grantsheet));
+        if let Some(meters) = options.meters.clone() {
+            builder = builder.telemetry(meters);
+        }
+        let ctx = builder
             .outbox(ports.outbox)
             .jobs(ports.jobs)
             .directory(options.directory.clone())
@@ -421,7 +437,14 @@ impl Instance {
         let router = edge::apply(
             Router::new().nest("/v1/notifications", module.routes(&ctx)),
             edge::EdgeSettings::new(&config.http, Arc::new(errors))
-                .authenticator(Some(tokens.clone() as Arc<dyn Authenticator>)),
+                .authenticator(Some(tokens.clone() as Arc<dyn Authenticator>))
+                .credential_free_routes(
+                    module
+                        .credential_free_routes()
+                        .into_iter()
+                        .map(|r| (r.method, format!("/v1/notifications{}", r.path)))
+                        .collect(),
+                ),
         );
         Self {
             router,
@@ -494,6 +517,23 @@ impl Instance {
                 return;
             }
             assert!(Instant::now() < deadline, "notifications never settled");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    /// Relay what is pending now (with `Options::relay = false`).
+    pub async fn relay_now(&self) {
+        self.jobs.relay_now().await.unwrap();
+    }
+    /// Wait until `sql` (one integer) answers `want`.
+    pub async fn until(&self, sql: &str, want: i64) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let client = self.db.acquire(soon()).await.unwrap();
+            let got: i64 = client.query_one(sql, &[]).await.unwrap().get(0);
+            if got == want {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{sql} stayed {got}, not {want}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }

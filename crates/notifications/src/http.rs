@@ -44,6 +44,8 @@ pub const STATUS_PERMISSION: &str = "notifications.status.read";
 pub const ADMIN_PERMISSION: &str = "notifications.admin";
 pub const SUPPRESSIONS_PERMISSION: &str = "notifications.suppressions.manage";
 
+/// Furthest `not_before` a send may ask for, in days.
+const MAX_NOT_BEFORE_DAYS: i64 = 30;
 /// Most entries in one `PUT preferences`.
 const MAX_PREFERENCES: usize = 200;
 /// Most deliveries `status` lists.
@@ -397,6 +399,24 @@ async fn send(
             }
         }
     }
+    // NT §3.1 bounds: at most 30 days ahead, and expiring after it starts.
+    let now = core.now();
+    let latest = now
+        .checked_add(jiff::SignedDuration::from_hours(MAX_NOT_BEFORE_DAYS * 24))
+        .unwrap_or(now);
+    if request.not_before.is_some_and(|at| at > latest) {
+        return field("validation_failed", "/not_before".into(), "too_far").into_response();
+    }
+    if let (Some(start), Some(end)) = (request.not_before, request.expires_at)
+        && end <= start
+    {
+        return field(
+            "validation_failed",
+            "/expires_at".into(),
+            "not_after_not_before",
+        )
+        .into_response();
+    }
     if let Err(error) = ctx.api.validate(&request) {
         return failed(error.into());
     }
@@ -432,9 +452,16 @@ async fn status(
     principal: Option<Extension<Authenticated>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(reply) = ctx.allow(principal.as_deref(), STATUS_PERMISSION) {
-        return reply.into_response();
-    }
+    // `notifications.admin` reads every notification; `status.read` only
+    // the caller's own sends, under its `api:{subject}:` namespace (R4a).
+    let own = match ctx.allow(principal.as_deref(), ADMIN_PERMISSION) {
+        Ok(_) => None,
+        Err(_) => match ctx.allow(principal.as_deref(), STATUS_PERMISSION) {
+            Ok(Some(principal)) => Some(format!("api:{}:", principal.subject.as_str())),
+            Ok(None) => return reply("unauthenticated"),
+            Err(reply) => return reply.into_response(),
+        },
+    };
     let Ok(id) = Uuid::try_parse(&id) else {
         return reply("not_found");
     };
@@ -453,6 +480,13 @@ async fn status(
         else {
             return Ok(None);
         };
+        let (source, key): (String, String) = (row.get(5), row.get(6));
+        if own
+            .as_ref()
+            .is_some_and(|prefix| source != "api" || !key.starts_with(prefix.as_str()))
+        {
+            return Ok(None);
+        }
         let deliveries = db
             .query(
                 &client,
@@ -851,13 +885,26 @@ async fn unsubscribe(
         Ok(core) => core,
         Err(reply) => return reply.into_response(),
     };
-    let Some(claims) = token.and_then(|t| core.keys.verify_unsubscribe(&t)) else {
+    let Some(claims) = token.and_then(|t| {
+        core.keys
+            .verify_unsubscribe(&t, |name| configurable(&ctx, name))
+    }) else {
         return reply("token_invalid");
     };
     match apply_unsubscribe(&core, &claims).await {
         Ok(()) => Json(json!({})).into_response(),
         Err(error) => failed(error),
     }
+}
+
+/// Whether unsubscribe tokens may name `topic`: a configured topic users
+/// can turn off.
+fn configurable(ctx: &Ctx, topic: &str) -> bool {
+    ctx.checked
+        .settings
+        .topics
+        .get(topic)
+        .is_some_and(|t| t.user_configurable)
 }
 
 /// A user token writes `(user, topic, email, false)`; an address token a
@@ -918,7 +965,11 @@ async fn unsubscribe_page(State(ctx): State<Ctx>, RawQuery(query): RawQuery) -> 
         Ok(core) => core,
         Err(reply) => return reply.into_response(),
     };
-    let Some(token) = token.filter(|t| core.keys.verify_unsubscribe(t).is_some()) else {
+    let Some(token) = token.filter(|t| {
+        core.keys
+            .verify_unsubscribe(t, |name| configurable(&ctx, name))
+            .is_some()
+    }) else {
         return reply("token_invalid");
     };
     let encoded: String = url::form_urlencoded::byte_serialize(token.as_bytes()).collect();

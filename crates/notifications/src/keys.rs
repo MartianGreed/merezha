@@ -93,8 +93,15 @@ impl Keys {
         format!("{signed}.{}", URL_SAFE_NO_PAD.encode(mac))
     }
     /// The claims of a well-formed token whose MAC verifies under either
-    /// key; `None` otherwise (forged, truncated, another version).
-    pub fn verify_unsubscribe(&self, token: &str) -> Option<Unsubscribe> {
+    /// key, names exactly one of a user and an address, the `email`
+    /// channel and a topic `topic_ok` accepts (configured and
+    /// user-configurable); `None` otherwise (forged, truncated, another
+    /// version, another topic).
+    pub fn verify_unsubscribe(
+        &self,
+        token: &str,
+        topic_ok: impl Fn(&str) -> bool,
+    ) -> Option<Unsubscribe> {
         if token.len() > MAX_TOKEN_BYTES {
             return None;
         }
@@ -110,8 +117,11 @@ impl Keys {
         let claims: Unsubscribe =
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
         let one_target = claims.u.is_some() != claims.a.is_some();
-        (one_target && claims.c == "email" && crate::topics::valid_dotted_name(&claims.t))
-            .then_some(claims)
+        (one_target
+            && claims.c == "email"
+            && crate::topics::valid_dotted_name(&claims.t)
+            && topic_ok(&claims.t))
+        .then_some(claims)
     }
 }
 
@@ -121,6 +131,39 @@ mod tests {
 
     fn material(byte: u8) -> KeyMaterial {
         crate::config::KeyMaterial::for_tests(vec![byte; 32])
+    }
+
+    fn any(_: &str) -> bool {
+        true
+    }
+
+    #[test]
+    fn a_token_names_one_target_and_an_accepted_topic() {
+        let keys = Keys::new(&material(1), None);
+        let claims = |u: Option<&str>, a: Option<&str>| Unsubscribe {
+            u: u.map(str::to_owned),
+            a: a.map(str::to_owned),
+            t: "tasks.digest".into(),
+            c: "email".into(),
+            iat: 1,
+        };
+        for refused in [
+            claims(Some("usr_1"), Some("a@b.example")),
+            claims(None, None),
+        ] {
+            let token = keys.unsubscribe_token(&refused);
+            assert_eq!(keys.verify_unsubscribe(&token, any), None, "{refused:?}");
+        }
+        let token = keys.unsubscribe_token(&claims(None, Some("a@b.example")));
+        assert!(keys.verify_unsubscribe(&token, any).is_some());
+        assert_eq!(
+            keys.verify_unsubscribe(&token, |t| t == "tasks.other"),
+            None
+        );
+        let mut sms = claims(Some("usr_1"), None);
+        sms.c = "sms".into();
+        let token = keys.unsubscribe_token(&sms);
+        assert_eq!(keys.verify_unsubscribe(&token, any), None);
     }
 
     #[test]
@@ -134,19 +177,22 @@ mod tests {
         };
         let old = Keys::new(&material(1), None);
         let token = old.unsubscribe_token(&claims);
-        assert_eq!(old.verify_unsubscribe(&token), Some(claims.clone()));
+        assert_eq!(old.verify_unsubscribe(&token, any), Some(claims.clone()));
         let rotated = Keys::new(&material(2), Some(&material(1)));
-        assert_eq!(rotated.verify_unsubscribe(&token), Some(claims.clone()));
         assert_eq!(
-            Keys::new(&material(3), None).verify_unsubscribe(&token),
+            rotated.verify_unsubscribe(&token, any),
+            Some(claims.clone())
+        );
+        assert_eq!(
+            Keys::new(&material(3), None).verify_unsubscribe(&token, any),
             None
         );
         let (signed, mac) = token.rsplit_once('.').unwrap();
         let mut forged = mac.as_bytes().to_vec();
         forged[0] = if forged[0] == b'A' { b'B' } else { b'A' };
         let forged = format!("{signed}.{}", String::from_utf8(forged).unwrap());
-        assert_eq!(old.verify_unsubscribe(&forged), None);
-        assert_eq!(old.verify_unsubscribe("v2.e30.AAAA"), None);
-        assert_eq!(old.verify_unsubscribe(""), None);
+        assert_eq!(old.verify_unsubscribe(&forged, any), None);
+        assert_eq!(old.verify_unsubscribe("v2.e30.AAAA", any), None);
+        assert_eq!(old.verify_unsubscribe("", any), None);
     }
 }

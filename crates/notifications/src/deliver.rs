@@ -346,6 +346,7 @@ async fn prepare(
                             &why,
                             &now,
                             &None::<jiff::Timestamp>,
+                            &None::<i32>,
                         ],
                     )
                     .await
@@ -392,6 +393,7 @@ async fn prepare(
                                     &"ambiguous",
                                     &now,
                                     &None::<jiff::Timestamp>,
+                                    &None::<i32>,
                                 ],
                             )
                             .await
@@ -519,33 +521,39 @@ async fn finish(
         .clone()
         .transaction(deadline, move |tx| {
             Box::pin(async move {
-                db.execute(
-                    tx,
-                    &sql::ATTEMPT_FINISH,
-                    &[&id, &attempt, &"permanent", &now, &why, &None::<i32>],
-                )
-                .await
-                .map_err(|e| classify(&e))?;
-                db.execute(
-                    tx,
-                    &sql::DELIVERY_SET,
-                    &[
-                        &id,
-                        &generation,
-                        &status,
-                        &why,
-                        &now,
-                        &None::<jiff::Timestamp>,
-                    ],
-                )
-                .await
-                .map_err(|e| classify(&e))?;
-                Ok(())
+                let changed = db
+                    .execute(
+                        tx,
+                        &sql::DELIVERY_SET,
+                        &[
+                            &id,
+                            &generation,
+                            &status,
+                            &why,
+                            &now,
+                            &None::<jiff::Timestamp>,
+                            &Some(attempt),
+                        ],
+                    )
+                    .await
+                    .map_err(|e| classify(&e))?;
+                if changed > 0 {
+                    db.execute(
+                        tx,
+                        &sql::ATTEMPT_FINISH,
+                        &[&id, &attempt, &"permanent", &now, &why, &None::<i32>],
+                    )
+                    .await
+                    .map_err(|e| classify(&e))?;
+                }
+                Ok(changed)
             })
         })
         .await;
     match written {
-        Ok(()) => {
+        // Another run took the delivery over.
+        Ok(0) => Outcome::Done,
+        Ok(_) => {
             tracing::Span::current().record("notify.outcome", "permanent");
             log_settled(core, channel, id, &locked.topic, status, why, Some(attempt));
             Outcome::Permanent(why.to_owned())
@@ -657,37 +665,57 @@ async fn record(
         .clone()
         .transaction(deadline, move |tx| {
             Box::pin(async move {
-                db.execute(
-                    tx,
-                    &sql::ATTEMPT_FINISH,
-                    &[&id, &attempt, &attempt_outcome, &now, &code, &after_ms],
-                )
-                .await
-                .map_err(|e| classify(&e))?;
-                if status == "accepted" {
+                let changed = if status == "accepted" {
                     db.execute(
                         tx,
                         &sql::DELIVERY_ACCEPT,
-                        &[&id, &generation, &provider_name, &message_id, &now],
+                        &[
+                            &id,
+                            &generation,
+                            &provider_name,
+                            &message_id,
+                            &now,
+                            &attempt,
+                        ],
                     )
                     .await
-                    .map_err(|e| classify(&e))?;
+                    .map_err(|e| classify(&e))?
                 } else {
                     let why: Option<&str> = (!reason_text.is_empty()).then_some(&reason_text);
                     db.execute(
                         tx,
                         &sql::DELIVERY_SET,
-                        &[&id, &generation, &status, &why, &now, &run_at],
+                        &[
+                            &id,
+                            &generation,
+                            &status,
+                            &why,
+                            &now,
+                            &run_at,
+                            &Some(attempt),
+                        ],
+                    )
+                    .await
+                    .map_err(|e| classify(&e))?
+                };
+                if changed > 0 {
+                    db.execute(
+                        tx,
+                        &sql::ATTEMPT_FINISH,
+                        &[&id, &attempt, &attempt_outcome, &now, &code, &after_ms],
                     )
                     .await
                     .map_err(|e| classify(&e))?;
                 }
-                Ok(())
+                Ok(changed)
             })
         })
         .await;
-    if let Err(failure) = written {
-        return Outcome::retry(&failure.code);
+    match written {
+        Err(failure) => return Outcome::retry(&failure.code),
+        // Another run took the delivery over: it records the outcome.
+        Ok(0) => return Outcome::Done,
+        Ok(_) => {}
     }
     tracing::Span::current().record("notify.outcome", attempt_outcome);
     core.metrics
