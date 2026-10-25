@@ -1086,7 +1086,14 @@ fn explicit_catch_up_waits_on_the_running_runner_within_its_deadline() {
     let kept = pg.checkpoint("count");
     assert!(kept > 20, "progress persists: {kept}");
     // With max_concurrent = 1, two explicit catch-ups on two projections
-    // hold one lock session at a time; the second waits for a slot.
+    // hold one lock session at a time; the second waits for a slot. The
+    // session the cut catch-up gave up closes asynchronously: wait until no
+    // earlier lock is held, so the count below is only `both`'s.
+    until(
+        Duration::from_secs(30),
+        "earlier run locks released",
+        || pg.lock_holders().is_empty(),
+    );
     let both = pg.open(c, &probe, options).unwrap();
     let sampling = AtomicBool::new(true);
     std::thread::scope(|scope| {
