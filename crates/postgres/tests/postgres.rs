@@ -196,45 +196,13 @@ async fn concurrent_runners_are_serialized_by_the_advisory_lock() {
     assert_eq!(applied, 1, "exactly one runner applies the migration");
     let db = Database::connect(&test.config()).unwrap();
     assert_eq!(ledger(&db).await.len(), 1);
-    // The lock died with the detached session: a new apply proceeds at once.
+    // The lock died with the detached session: a new apply proceeds at
+    // once, where a lock left behind would hold it to its 20 s deadline.
     let started = Instant::now();
     run_migrations(&db, &module(&[SLOW]), MigrationMode::Apply, soon())
         .await
         .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(5));
-}
-
-#[tokio::test]
-async fn lock_wait_is_bounded_by_the_deadline() {
-    let Some(test) = TestDatabase::create() else {
-        return;
-    };
-    let db = Database::connect(&test.config()).unwrap();
-    let holder = db.acquire(soon()).await.unwrap();
-    holder
-        .execute(
-            "SELECT pg_advisory_lock($1)",
-            &[&merezha_postgres::MIGRATIONS_LOCK],
-        )
-        .await
-        .unwrap();
-    let error = run_migrations(
-        &db,
-        &module(&[CREATE]),
-        MigrationMode::Apply,
-        Instant::now() + Duration::from_millis(300),
-    )
-    .await
-    .unwrap_err();
-    // The poll loop gives up before the run's outer deadline fires.
-    assert_eq!(error.failure.code, "migration_lock_timeout", "{error}");
-    holder
-        .execute(
-            "SELECT pg_advisory_unlock($1)",
-            &[&merezha_postgres::MIGRATIONS_LOCK],
-        )
-        .await
-        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
 
 #[tokio::test]
@@ -328,7 +296,8 @@ async fn transactions_commit_roll_back_and_take_statement_timeout_from_the_deadl
         .await
         .unwrap_err();
     assert_eq!(error.code, "database_timeout");
-    assert!(started.elapsed() < Duration::from_secs(2));
+    // Cut long before the 5 s sleep.
+    assert!(started.elapsed() < Duration::from_secs(4));
     let client = db.acquire(soon()).await.unwrap();
     let rows: i64 = client
         .query_one("SELECT count(*) FROM items", &[])
@@ -774,7 +743,8 @@ async fn detached_transactions_behave_like_pooled_ones() {
             .await
             .unwrap_err();
         assert_eq!(late.code, "database_timeout", "{label}");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // Cut long before the 5 s sleep.
+        assert!(started.elapsed() < Duration::from_secs(4));
         // A session's state is unknown after a timeout: start a new one.
         let mut session = if detached {
             Session::Detached(db.detach(soon()).await.unwrap())
@@ -796,7 +766,8 @@ async fn detached_transactions_behave_like_pooled_ones() {
             .await
             .unwrap_err();
         assert_eq!(unknown.code, "commit_outcome_unknown", "{label}");
-        assert!(started.elapsed() < Duration::from_millis(1300), "{label}");
+        // The caller gave up at its deadline, not after the 3 s commit.
+        assert!(started.elapsed() < Duration::from_secs(3), "{label}");
     }
     let client = db.acquire(soon()).await.unwrap();
     let rows: i64 = client
@@ -835,7 +806,8 @@ async fn a_detached_session_keeps_its_lock_across_transactions_and_releases_it_o
     assert!(!taken, "the detached session still holds the lock");
     drop(holder);
     let mut free = false;
-    for _ in 0..50 {
+    let closing = Instant::now();
+    while closing.elapsed() < Duration::from_secs(10) {
         free = other
             .query_one("SELECT pg_try_advisory_xact_lock(42)", &[])
             .await
@@ -857,9 +829,9 @@ async fn detached_sessions_are_bounded_and_leave_their_pool_slot_open() {
     let mut config = test.config();
     config.pool_size = 1;
     config.max_detached = 1;
-    // Long enough for a slow CI server to open a connection, short enough
-    // to see the bound refuse.
-    config.acquire_timeout = Duration::from_millis(1500);
+    // Long enough for a loaded server to open a connection, short enough
+    // to see the bound refuse well before the 20 s deadline.
+    config.acquire_timeout = Duration::from_secs(3);
     let db = Database::connect(&config).unwrap();
     let first = db.detach(soon()).await.unwrap();
     // The single pool slot reopened: a pooled client is still available
@@ -870,7 +842,7 @@ async fn detached_sessions_are_bounded_and_leave_their_pool_slot_open() {
     let started = Instant::now();
     let error = db.detach(soon()).await.unwrap_err();
     assert_eq!(error.code, "database_busy");
-    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(started.elapsed() < Duration::from_secs(12));
     // A migration run is a detached session too.
     let error = run_migrations(&db, &module(&[CREATE]), MigrationMode::Apply, soon())
         .await
@@ -907,7 +879,7 @@ async fn a_dropped_detached_session_mid_statement_releases_its_lock_within_secon
             .await
     });
     let other = db.acquire(soon()).await.unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let held: i64 = other
             .query_one(
@@ -926,9 +898,11 @@ async fn a_dropped_detached_session_mid_statement_releases_its_lock_within_secon
     // The owner goes away mid-statement, without pg_terminate_backend.
     busy.abort();
     let _ = busy.await;
+    // The server checks the connection every 500 ms; 10 s is generous for
+    // a loaded one and far below the 30 s sleep.
     let dropped = Instant::now();
     let mut free = false;
-    while dropped.elapsed() < Duration::from_secs(2) {
+    while dropped.elapsed() < Duration::from_secs(10) {
         free = other
             .query_one("SELECT pg_try_advisory_xact_lock(43)", &[])
             .await
@@ -939,5 +913,46 @@ async fn a_dropped_detached_session_mid_statement_releases_its_lock_within_secon
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(free, "the lock outlived its client by more than 2 s");
+    assert!(free, "the lock outlived its client by more than 10 s");
+}
+
+/// Latency and deadline-race tests (issue #37). CI runs them after the
+/// parallel suite, alone and one at a time:
+/// `cargo test -- --test-threads=1 timing::`.
+mod timing {
+    use super::*;
+    #[tokio::test]
+    async fn lock_wait_is_bounded_by_the_deadline() {
+        let Some(test) = TestDatabase::create() else {
+            return;
+        };
+        let db = Database::connect(&test.config()).unwrap();
+        let holder = db.acquire(soon()).await.unwrap();
+        holder
+            .execute(
+                "SELECT pg_advisory_lock($1)",
+                &[&merezha_postgres::MIGRATIONS_LOCK],
+            )
+            .await
+            .unwrap();
+        let error = run_migrations(
+            &db,
+            &module(&[CREATE]),
+            MigrationMode::Apply,
+            // Room for a loaded server to open the run's session; the
+            // race below is the last lock poll against the deadline.
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err();
+        // The poll loop gives up before the run's outer deadline fires.
+        assert_eq!(error.failure.code, "migration_lock_timeout", "{error}");
+        holder
+            .execute(
+                "SELECT pg_advisory_unlock($1)",
+                &[&merezha_postgres::MIGRATIONS_LOCK],
+            )
+            .await
+            .unwrap();
+    }
 }

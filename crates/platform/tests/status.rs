@@ -122,12 +122,15 @@ impl JobsRuntime for FakeRuntime {
 struct ApplicationSection {
     hold: tokio::sync::Semaphore,
     held: AtomicUsize,
+    /// Reads that reached the hold.
+    waiting: AtomicUsize,
 }
 impl Default for ApplicationSection {
     fn default() -> Self {
         Self {
             hold: tokio::sync::Semaphore::new(0),
             held: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
         }
     }
 }
@@ -138,6 +141,7 @@ impl StatusSection for ApplicationSection {
     fn read(&self) -> BoxFuture<'_, Result<Value, Failure>> {
         Box::pin(async move {
             if self.held.load(Ordering::SeqCst) > 0 {
+                self.waiting.fetch_add(1, Ordering::SeqCst);
                 let _ = self.hold.acquire().await;
             }
             Ok(json!({"application": "ledger", "head": 7, "projections": []}))
@@ -361,7 +365,12 @@ async fn without_identity_status_is_served_to_loopback_on_a_private_listener_onl
         let router = router.clone();
         async move { get(&router, status_request("127.0.0.1:5000", None)).await.0 }
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The first request is inside its read before the second arrives.
+    let spawned = std::time::Instant::now();
+    while application.waiting.load(Ordering::SeqCst) == 0 {
+        assert!(spawned.elapsed() < Duration::from_secs(30), "never held");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let response = router
         .clone()
         .oneshot(status_request("127.0.0.1:5000", None))

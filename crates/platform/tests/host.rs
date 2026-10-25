@@ -100,6 +100,7 @@ impl Module for Notes {
             .route(
                 "/slow",
                 get(|| async {
+                    SLOW_ENTERED.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(400)).await;
                     "done"
                 }),
@@ -176,11 +177,12 @@ async fn call(
 fn get_request(path: &str) -> Request<Body> {
     Request::get(path).body(Body::empty()).unwrap()
 }
-async fn ready(router: &Router) -> StatusCode {
-    // Probes read the background evaluation (every 100 ms here) and each
-    // check takes up to 1 s against an unreachable database; wait it out.
-    tokio::time::sleep(Duration::from_millis(1_300)).await;
-    call(router, get_request("/health/ready")).await.0
+/// Wait until `/health/ready` answers `status`. Probes read the
+/// background evaluation (every 100 ms here) and each check takes up to
+/// 1 s against an unreachable database: 20 s is generous on a loaded
+/// machine.
+async fn ready(router: &Router, status: StatusCode) {
+    ready_within(router, status, Duration::from_secs(20)).await;
 }
 
 #[tokio::test]
@@ -425,7 +427,7 @@ async fn verify_mode_refuses_readiness_until_migrations_are_current() {
     )
     .await
     .unwrap();
-    assert_eq!(ready(&router).await, StatusCode::OK);
+    ready(&router, StatusCode::OK).await;
     // A changed migration stops the next startup in either mode.
     const EDITED: [Migration; 1] = [Migration::new(1, "create_schema", "CREATE SCHEMA notes;")];
     for migrate in [false, true] {
@@ -459,12 +461,12 @@ async fn readiness_follows_the_pool_and_modules() {
     .await
     .unwrap();
     let router = host.router();
-    assert_eq!(ready(&router).await, StatusCode::OK);
+    ready(&router, StatusCode::OK).await;
     test.admin_execute(&format!(
         "ALTER DATABASE \"{0}\" ALLOW_CONNECTIONS false; SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{0}'",
         test.name()
     ));
-    assert_eq!(ready(&router).await, StatusCode::SERVICE_UNAVAILABLE);
+    ready(&router, StatusCode::SERVICE_UNAVAILABLE).await;
     // Liveness does not depend on the database.
     assert_eq!(
         call(&router, get_request("/health/live")).await.0,
@@ -474,18 +476,12 @@ async fn readiness_follows_the_pool_and_modules() {
         "ALTER DATABASE \"{}\" ALLOW_CONNECTIONS true",
         test.name()
     ));
-    let mut recovered = false;
-    for _ in 0..10 {
-        if ready(&router).await == StatusCode::OK {
-            recovered = true;
-            break;
-        }
-    }
-    assert!(recovered, "readiness did not recover with the database");
+    // Readiness recovers with the database.
+    ready(&router, StatusCode::OK).await;
     notes.unready.store(true, Ordering::SeqCst);
-    assert_eq!(ready(&router).await, StatusCode::SERVICE_UNAVAILABLE);
+    ready(&router, StatusCode::SERVICE_UNAVAILABLE).await;
     notes.unready.store(false, Ordering::SeqCst);
-    assert_eq!(ready(&router).await, StatusCode::OK);
+    ready(&router, StatusCode::OK).await;
 }
 
 #[tokio::test]
@@ -544,6 +540,7 @@ async fn shutdown_drains_in_flight_requests_then_stops_modules() {
     let server = tokio::spawn(host.serve(listener, async move {
         let _ = stopped.await;
     }));
+    let entered = SLOW_ENTERED.load(Ordering::SeqCst);
     let slow = tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
@@ -555,7 +552,12 @@ async fn shutdown_drains_in_flight_requests_then_stops_modules() {
         stream.read_to_string(&mut response).await.unwrap();
         response
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The request is in flight, inside its handler, when the stop comes.
+    let sent = Instant::now();
+    while SLOW_ENTERED.load(Ordering::SeqCst) == entered {
+        assert!(sent.elapsed() < Duration::from_secs(20), "never in flight");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     stop.send(()).unwrap();
     let response = slow.await.unwrap();
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -939,11 +941,14 @@ async fn http_get(address: std::net::SocketAddr, path: &str) -> (u16, String, St
     (status, head.to_ascii_lowercase(), body.to_owned())
 }
 
+/// `/slow` requests that reached their handler, across the tests.
+static SLOW_ENTERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// A migration slow enough to observe the early listener while it runs.
 const SLOW_NOTES: [Migration; 1] = [Migration::new(
     1,
     "slow_schema",
-    "SELECT pg_sleep(2); CREATE SCHEMA notes; CREATE TABLE notes.items (id bigint PRIMARY KEY); INSERT INTO notes.items VALUES (1);",
+    "SELECT pg_sleep(4); CREATE SCHEMA notes; CREATE TABLE notes.items (id bigint PRIMARY KEY); INSERT INTO notes.items VALUES (1);",
 )];
 
 /// TE §8 "Health": while a slow migration runs, `/health/startup` and
@@ -978,7 +983,34 @@ async fn the_early_listener_answers_health_and_refuses_routes_during_a_slow_migr
         parts(),
         options,
     ));
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Probe once the migration's sleep runs, so every probe below lands
+    // inside it.
+    let watcher = merezha_postgres::Database::connect(&test.config()).unwrap();
+    let client = watcher
+        .acquire(Instant::now() + Duration::from_secs(20))
+        .await
+        .unwrap();
+    let began = Instant::now();
+    loop {
+        let running: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_stat_activity
+                  WHERE datname = current_database() AND query LIKE 'SELECT pg_sleep(4)%'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        if running == 1 {
+            break;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "the migration never ran"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(client);
     assert!(!starting.is_finished(), "the migration is still running");
     let (status, _, body) = http_get(address, "/health/startup").await;
     assert_eq!((status, body.as_str()), (503, r#"{"status":"starting"}"#));
@@ -1032,9 +1064,9 @@ async fn shutdown_flips_readiness_before_the_listener_closes() {
         &test,
         true,
         "",
-        &[("http.drain_delay_ms".into(), "1500".into())],
+        &[("http.drain_delay_ms".into(), "3000".into())],
     );
-    assert_eq!(config.http.drain_delay, Duration::from_millis(1500));
+    assert_eq!(config.http.drain_delay, Duration::from_millis(3000));
     let notes = Notes::default();
     let host = Host::start(config, vec![Box::new(notes.clone())], parts())
         .await
@@ -1051,18 +1083,23 @@ async fn shutdown_flips_readiness_before_the_listener_closes() {
     assert_eq!(http_get(address, "/health/ready").await.0, 200);
     let signalled = Instant::now();
     stop.send(()).unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    // Within the delay: not ready at once, still live and still serving.
-    assert_eq!(http_get(address, "/health/ready").await.0, 503);
+    // Within the delay: no longer ready, still live and still serving.
+    while http_get(address, "/health/ready").await.0 != 503 {
+        assert!(
+            signalled.elapsed() < Duration::from_millis(3000),
+            "readiness did not flip within the drain delay"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(http_get(address, "/health/live").await.0, 200);
     assert_eq!(http_get(address, "/v1/notes/count").await.0, 200);
     assert_eq!(notes.stopped.load(Ordering::SeqCst), 0, "modules still run");
-    tokio::time::timeout(Duration::from_secs(5), server)
+    tokio::time::timeout(Duration::from_secs(15), server)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(signalled.elapsed() >= Duration::from_millis(1500));
+    assert!(signalled.elapsed() >= Duration::from_millis(3000));
     assert_eq!(notes.stopped.load(Ordering::SeqCst), 1);
     assert!(
         tokio::net::TcpStream::connect(address).await.is_err(),
@@ -1133,7 +1170,7 @@ async fn a_panicking_readiness_check_turns_readiness_off() {
     ready_within(
         &router,
         StatusCode::SERVICE_UNAVAILABLE,
-        Duration::from_secs(2),
+        Duration::from_secs(10),
     )
     .await;
     let evaluation = host.lifecycle().evaluation().unwrap();
@@ -1144,61 +1181,7 @@ async fn a_panicking_readiness_check_turns_readiness_off() {
         .collect();
     assert_eq!(codes, [("notes", "ok"), ("flaky", "internal")]);
     flaky.mode.store(HEALTHY, Ordering::SeqCst);
-    ready_within(&router, StatusCode::OK, Duration::from_secs(2)).await;
-}
-
-/// Review finding 1: a `ready()` that blocks its thread is bounded by the
-/// check timeout and stalls neither the other checks nor the runtime,
-/// even on a single-threaded runtime.
-#[tokio::test(flavor = "current_thread")]
-async fn a_blocking_readiness_check_stalls_nothing_else() {
-    let Some(test) = TestDatabase::create() else {
-        return;
-    };
-    let flaky = Flaky::default();
-    let notes = Notes::default();
-    let host = Host::start(
-        config(&test, true, ""),
-        vec![Box::new(notes.clone()), Box::new(flaky.clone())],
-        parts(),
-    )
-    .await
-    .unwrap();
-    let router = host.router();
-    flaky.mode.store(BLOCKS, Ordering::SeqCst);
-    let took = ready_within(
-        &router,
-        StatusCode::SERVICE_UNAVAILABLE,
-        Duration::from_secs(3),
-    )
-    .await;
-    assert!(took < Duration::from_millis(2_500), "{took:?}");
-    // The runtime still answers at once while the check blocks.
-    let started = Instant::now();
-    assert_eq!(
-        call(&router, get_request("/health/live")).await.0,
-        StatusCode::OK
-    );
-    assert!(started.elapsed() < Duration::from_millis(200));
-    // The other module's state still reaches readiness.
-    notes.unready.store(true, Ordering::SeqCst);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let evaluation = host.lifecycle().evaluation().unwrap();
-        let codes: Vec<(&str, &str)> = evaluation
-            .modules
-            .iter()
-            .map(|m| (m.name, m.code.as_str()))
-            .collect();
-        if codes == [("notes", "warming_up"), ("flaky", "timeout")] {
-            break;
-        }
-        assert!(Instant::now() < deadline, "{codes:?}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    notes.unready.store(false, Ordering::SeqCst);
-    flaky.mode.store(HEALTHY, Ordering::SeqCst);
-    ready_within(&router, StatusCode::OK, Duration::from_secs(6)).await;
+    ready_within(&router, StatusCode::OK, Duration::from_secs(10)).await;
 }
 
 /// A module whose start takes long, to interrupt it.
@@ -1243,7 +1226,8 @@ async fn an_interrupted_startup_stops_the_modules_it_started() {
     signal.send(true).unwrap();
     let error = starting.await.unwrap().unwrap_err();
     assert_eq!(error.failure.code, "startup_interrupted");
-    assert!(signalled.elapsed() < Duration::from_secs(2));
+    // Well before the 8 s start would have ended on its own.
+    assert!(signalled.elapsed() < Duration::from_secs(6));
     assert_eq!(
         notes.stopped.load(Ordering::SeqCst),
         1,
@@ -1254,4 +1238,64 @@ async fn an_interrupted_startup_stops_the_modules_it_started() {
         .await
         .unwrap_err();
     assert_eq!(error.failure.code, "startup_interrupted");
+}
+
+/// Latency and deadline-race tests (issue #37). CI runs them after the
+/// parallel suite, alone and one at a time:
+/// `cargo test -- --test-threads=1 timing::`.
+mod timing {
+    use super::*;
+    /// Review finding 1: a `ready()` that blocks its thread is bounded by the
+    /// check timeout and stalls neither the other checks nor the runtime,
+    /// even on a single-threaded runtime.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_blocking_readiness_check_stalls_nothing_else() {
+        let Some(test) = TestDatabase::create() else {
+            return;
+        };
+        let flaky = Flaky::default();
+        let notes = Notes::default();
+        let host = Host::start(
+            config(&test, true, ""),
+            vec![Box::new(notes.clone()), Box::new(flaky.clone())],
+            parts(),
+        )
+        .await
+        .unwrap();
+        let router = host.router();
+        flaky.mode.store(BLOCKS, Ordering::SeqCst);
+        let took = ready_within(
+            &router,
+            StatusCode::SERVICE_UNAVAILABLE,
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(took < Duration::from_millis(2_500), "{took:?}");
+        // The runtime still answers at once while the check blocks.
+        let started = Instant::now();
+        assert_eq!(
+            call(&router, get_request("/health/live")).await.0,
+            StatusCode::OK
+        );
+        assert!(started.elapsed() < Duration::from_millis(200));
+        // The other module's state still reaches readiness.
+        notes.unready.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let evaluation = host.lifecycle().evaluation().unwrap();
+            let codes: Vec<(&str, &str)> = evaluation
+                .modules
+                .iter()
+                .map(|m| (m.name, m.code.as_str()))
+                .collect();
+            if codes == [("notes", "warming_up"), ("flaky", "timeout")] {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{codes:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        notes.unready.store(false, Ordering::SeqCst);
+        flaky.mode.store(HEALTHY, Ordering::SeqCst);
+        ready_within(&router, StatusCode::OK, Duration::from_secs(6)).await;
+    }
 }

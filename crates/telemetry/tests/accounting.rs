@@ -80,7 +80,8 @@ fn settle_until(
     account: &SignalAccount,
     done: impl Fn(&merezha_telemetry::status::SignalCounts) -> bool,
 ) {
-    for _ in 0..500 {
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_secs(20) {
         if done(&account.counts()) {
             return;
         }

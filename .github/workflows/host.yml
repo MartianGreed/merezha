@@ -33,7 +33,12 @@ jobs:
       - run: cargo +1.98.0 fmt --all --check
       - run: cargo +1.98.0 check --locked --workspace
       - run: cargo +1.98.0 clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo +1.98.0 test --locked --workspace
+      # Tests in a `timing` module measure latency or race a deadline
+      # against the server (issue #37): the parallel run skips them, the
+      # next step runs them alone, one at a time. Both gate.
+      - run: 'cargo +1.98.0 test --locked --workspace -- --skip timing::'
+      - name: Timing tests, one at a time
+        run: 'cargo +1.98.0 test --locked --workspace -- --test-threads=1 timing::'
       # AP §E: the append throughput is recorded in the log, never gated.
       - name: Append throughput (recorded, not gated)
         continue-on-error: true
@@ -52,7 +57,9 @@ jobs:
       - run: cargo +1.98.0 fmt --all --check
       - run: cargo +1.98.0 check --locked --workspace
       - run: cargo +1.98.0 clippy --locked --workspace --all-targets -- -D warnings
-      - run: cargo +1.98.0 test --locked --workspace
+      - run: 'cargo +1.98.0 test --locked --workspace -- --skip timing::'
+      - name: Timing tests, one at a time
+        run: 'cargo +1.98.0 test --locked --workspace -- --test-threads=1 timing::'
       - run: cargo +1.98.0 test --locked --workspace --doc
       - run: cargo +1.98.0 doc --locked --workspace --no-deps
       - run: cargo +1.98.0 build --locked --workspace

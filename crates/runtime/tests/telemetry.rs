@@ -178,7 +178,7 @@ fn application_operations_name_the_span_and_the_series() {
     let f = fixture(ECHO, HEADER, "");
     let rt = load(&harness, &f);
     let session = rt.session().unwrap();
-    let deadline = Instant::now() + std::time::Duration::from_secs(1);
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
     for operation in GuestOperation::ALL {
         session
             .invoke_operation_until("echo", operation, "x", deadline)

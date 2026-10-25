@@ -212,36 +212,6 @@ async fn a_stopped_server_is_unavailable_within_the_timeout() {
 }
 
 #[tokio::test]
-async fn a_server_that_never_answers_times_out_and_is_bounded() {
-    let mock = support::MockS3::start().await;
-    let mut config = mock.config();
-    config.timeout = Duration::from_secs(1);
-    let store = ObjectBlobStore::open(&DriverConfig::S3(config)).unwrap();
-    mock.hang.store(true, Ordering::SeqCst);
-    let started = Instant::now();
-    assert_eq!(store.head(&key()).await.unwrap_err(), UNAVAILABLE);
-    let elapsed = started.elapsed();
-    assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
-    assert!(
-        elapsed < RETRY_TIMEOUT + Duration::from_secs(1 + 2),
-        "timeout + retry window + backoff: {elapsed:?}"
-    );
-    assert_eq!(
-        mock.request_count(),
-        1 + MAX_RETRIES,
-        "timeouts are retried"
-    );
-
-    // Readiness answers within its own deadline.
-    let started = Instant::now();
-    assert_eq!(
-        store.ready(Duration::from_millis(300)).await.unwrap_err(),
-        UNAVAILABLE
-    );
-    assert!(started.elapsed() < Duration::from_millis(800));
-}
-
-#[tokio::test]
 async fn invalid_input_never_reaches_the_backend() {
     let mock = support::MockS3::start().await;
     let mut config = mock.config();
@@ -539,4 +509,40 @@ async fn a_stalled_read_fails_within_the_timeout_and_its_retries() {
         "{:?}",
         started.elapsed()
     );
+}
+
+/// Latency and deadline-race tests (issue #37). CI runs them after the
+/// parallel suite, alone and one at a time:
+/// `cargo test -- --test-threads=1 timing::`.
+mod timing {
+    use super::*;
+    #[tokio::test]
+    async fn a_server_that_never_answers_times_out_and_is_bounded() {
+        let mock = support::MockS3::start().await;
+        let mut config = mock.config();
+        config.timeout = Duration::from_secs(1);
+        let store = ObjectBlobStore::open(&DriverConfig::S3(config)).unwrap();
+        mock.hang.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        assert_eq!(store.head(&key()).await.unwrap_err(), UNAVAILABLE);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+        assert!(
+            elapsed < RETRY_TIMEOUT + Duration::from_secs(1 + 2),
+            "timeout + retry window + backoff: {elapsed:?}"
+        );
+        assert_eq!(
+            mock.request_count(),
+            1 + MAX_RETRIES,
+            "timeouts are retried"
+        );
+
+        // Readiness answers within its own deadline.
+        let started = Instant::now();
+        assert_eq!(
+            store.ready(Duration::from_millis(300)).await.unwrap_err(),
+            UNAVAILABLE
+        );
+        assert!(started.elapsed() < Duration::from_millis(800));
+    }
 }

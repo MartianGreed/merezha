@@ -567,33 +567,6 @@ fn component_compile_failure_rejects_the_entire_initial_and_reloaded_catalog() {
 }
 
 #[test]
-fn a_guest_that_runs_after_partial_admission_wait_keeps_the_original_deadline() {
-    let f = Fixture::new(
-        &component("(loop $forever br $forever) unreachable", "", ""),
-        &HEADER
-            .replace("fuel = 10000000", "fuel = 1000000000")
-            .replace("timeout_ms = 1000", "timeout_ms = 600"),
-        "[[pipelines]]\nid=\"looping\"\nsteps=[\"echo\",\"echo\"]\n",
-    );
-    let rt = f.runtime();
-    let admitted = Instant::now();
-    let invocation = rt.prepare_pipeline("looping").unwrap();
-    std::thread::sleep(Duration::from_millis(400));
-    assert!(
-        Instant::now() < invocation.deadline(),
-        "guest must begin before the admission deadline"
-    );
-    assert_eq!(invocation.run("").unwrap_err(), Error::Timeout);
-    // The guest has about 200 ms left, with 250 ms scheduling tolerance. A
-    // reset to a fresh 600 ms store budget would take about 1000 ms in total.
-    assert!(
-        admitted.elapsed() < Duration::from_millis(850),
-        "guest execution reset the admission deadline: {:?}",
-        admitted.elapsed()
-    );
-}
-
-#[test]
 fn manifest_accepts_count_boundaries_and_rejects_the_next_entry() {
     let services = |count| {
         let mut text = HEADER.to_owned();
@@ -657,4 +630,41 @@ fn padded_component(size: usize) -> Vec<u8> {
     bytes.push(0);
     bytes.resize(bytes.len() + size, 0);
     bytes
+}
+
+/// Latency and deadline-race tests (issue #37). CI runs them after the
+/// parallel suite, alone and one at a time:
+/// `cargo test -- --test-threads=1 timing::`.
+mod timing {
+    use super::*;
+    #[test]
+    fn a_guest_that_runs_after_partial_admission_wait_keeps_the_original_deadline() {
+        let f = Fixture::new(
+            &component("(loop $forever br $forever) unreachable", "", ""),
+            &HEADER.replace("fuel = 10000000", "fuel = 1000000000"),
+            "[[pipelines]]\nid=\"looping\"\nsteps=[\"echo\",\"echo\"]\n",
+        );
+        let rt = f.runtime();
+        let invocation = rt.prepare_pipeline("looping").unwrap();
+        let deadline = invocation.deadline();
+        // The guest keeps 300 ms: short enough for the fuel cap of a fast
+        // machine, long enough to tell from a reset.
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(
+            Instant::now() < deadline,
+            "guest must begin before the admission deadline"
+        );
+        let began = Instant::now();
+        assert_eq!(invocation.run("").unwrap_err(), Error::Timeout);
+        // A reset to a fresh 1 s store budget would end at `began + 1 s`,
+        // at least 700 ms past the admission deadline; the guest must stop
+        // closer to the deadline than to that.
+        let reset = began + Duration::from_millis(1000);
+        let bound = deadline + (reset - deadline) / 2;
+        assert!(
+            Instant::now() < bound,
+            "guest execution reset the admission deadline: ended {:?} past it",
+            Instant::now().saturating_duration_since(deadline)
+        );
+    }
 }

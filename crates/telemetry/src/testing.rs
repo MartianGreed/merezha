@@ -18,12 +18,12 @@ use crate::{
     status::SignalCounts,
 };
 use opentelemetry_sdk::{
-    logs::{InMemoryLogExporter, in_memory_exporter::LogDataWithResource},
+    logs::{InMemoryLogExporter, SdkLoggerProvider, in_memory_exporter::LogDataWithResource},
     metrics::{
-        InMemoryMetricExporter,
+        InMemoryMetricExporter, SdkMeterProvider,
         data::{AggregatedMetrics, MetricData},
     },
-    trace::{InMemorySpanExporter, SpanData},
+    trace::{InMemorySpanExporter, SdkTracerProvider, SpanData},
 };
 use std::{
     collections::BTreeMap,
@@ -192,14 +192,26 @@ pub fn span_attribute(span: &SpanData, key: &str) -> Option<String> {
         .map(|kv| kv.value.to_string())
 }
 
+type Providers = (
+    Option<SdkTracerProvider>,
+    Option<SdkMeterProvider>,
+    Option<SdkLoggerProvider>,
+);
+
 /// Signals, stderr and events of one test, in memory.
 pub struct Harness {
     telemetry: Option<Telemetry>,
     memory: MemorySinks,
     stderr: SharedBuffer,
     recorder: CatalogRecorder,
-    dispatch: Dispatch,
-    _guard: tracing::dispatcher::DefaultGuard,
+    /// Clones of the providers, released only after the subscriber; see
+    /// the `Drop` impl.
+    providers: Option<Providers>,
+    /// Set by the subscriber's [`Destroyed`] layer.
+    destroyed: Arc<std::sync::atomic::AtomicBool>,
+    /// `Some` until dropped.
+    dispatch: Option<Dispatch>,
+    guard: Option<tracing::dispatcher::DefaultGuard>,
 }
 impl Default for Harness {
     fn default() -> Self {
@@ -237,28 +249,36 @@ impl Harness {
         };
         let stderr = SharedBuffer::default();
         let recorder = CatalogRecorder::default();
+        let destroyed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (telemetry, dispatch) = Telemetry::assemble(
             &config,
             &service,
             Sinks::Memory(memory.clone()),
             stderr_layer(&config, &service, stderr.clone()),
             None,
-            vec![recorder.clone().boxed()],
+            vec![
+                recorder.clone().boxed(),
+                Destroyed(destroyed.clone()).boxed(),
+            ],
         )
         .expect("in-memory telemetry builds");
         let guard = tracing::dispatcher::set_default(&dispatch);
+        let (traces, metrics, logs) = telemetry.providers();
+        let providers = (traces.cloned(), metrics.cloned(), logs.cloned());
         Self {
+            providers: Some(providers),
+            destroyed,
             telemetry: Some(telemetry),
             memory,
             stderr,
             recorder,
-            dispatch,
-            _guard: guard,
+            dispatch: Some(dispatch),
+            guard: Some(guard),
         }
     }
     /// The harness dispatcher, for other threads and futures.
     pub fn dispatch(&self) -> &Dispatch {
-        &self.dispatch
+        self.dispatch.as_ref().expect("harness not dropped")
     }
     pub fn telemetry(&self) -> &Telemetry {
         self.telemetry.as_ref().expect("harness not shut down")
@@ -370,6 +390,51 @@ impl Harness {
             .shutdown()
     }
 }
+/// The dispatcher goes first and the providers only once its subscriber
+/// is destroyed.
+///
+/// Registering a dispatcher (any `Harness::new` on another thread) walks
+/// every live dispatcher under `tracing-core`'s registry write lock,
+/// holding a strong reference to each. When this harness drops its own
+/// references meanwhile, that walk destroys the subscriber. Had the
+/// subscriber held the last reference to an OpenTelemetry provider, the
+/// provider's `Drop` would emit its internal logs there, register their
+/// callsites, ask for the registry's read lock on the thread holding its
+/// write lock and hang every test of the process (issue #37). The harness
+/// keeps the providers until the subscriber's last layer, [`Destroyed`],
+/// reports that every layer before it is gone, so whoever destroys the
+/// subscriber only releases references. A subscriber still referenced
+/// elsewhere (a clone moved into a worker) is waited for on a thread of
+/// its own rather than on the test's.
+impl Drop for Harness {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        drop(self.dispatch.take());
+        let held = (self.telemetry.take(), self.providers.take());
+        let destroyed = self.destroyed.clone();
+        if destroyed.load(std::sync::atomic::Ordering::Acquire) {
+            drop(held);
+            return;
+        }
+        std::thread::spawn(move || {
+            while !destroyed.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            drop(held);
+        });
+    }
+}
+
+/// The harness subscriber's last layer: set once it is dropped, after
+/// every layer before it, the OpenTelemetry bridges included.
+struct Destroyed(Arc<std::sync::atomic::AtomicBool>);
+impl<S: Subscriber> Layer<S> for Destroyed {}
+impl Drop for Destroyed {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 fn collect_any<T: Copy>(data: &MetricData<T>, out: &mut Vec<Point>, f: impl Fn(T) -> f64) {
     match data {
         MetricData::Gauge(g) => out.extend(g.data_points().map(|p| Point {

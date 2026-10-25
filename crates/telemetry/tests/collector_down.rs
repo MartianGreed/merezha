@@ -444,35 +444,41 @@ async fn baseline(pace: Duration) -> Run {
     workload(dispatch, pace).await
 }
 
-#[test]
-fn a_down_collector_never_blocks_and_never_grows_memory() {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let pace = calibrate().await;
-        eprintln!("pace {pace:?}");
-        let (hole, _hole) = blackhole();
-        for protocol in [Protocol::HttpProtobuf, Protocol::Grpc] {
-            let recover = protocol == Protocol::HttpProtobuf;
-            for (port, recover) in [(hole, false), (closed_port(), recover)] {
-                // Timing tails are noisy on shared runners: a scenario
-                // passes when one of three baseline-and-run pairs keeps
-                // them. A pipeline that blocked on the collector fails all
-                // three; the accounting, memory and shutdown checks hold
-                // on every attempt.
-                let mut failures = Vec::new();
-                for _ in 0..ATTEMPTS {
-                    let base = baseline(pace).await;
-                    match scenario(protocol, port, &base, recover, pace).await {
-                        Ok(()) => break,
-                        Err(failure) => failures.push(failure),
+/// Latency and deadline-race tests (issue #37). CI runs them after the
+/// parallel suite, alone and one at a time:
+/// `cargo test -- --test-threads=1 timing::`.
+mod timing {
+    use super::*;
+    #[test]
+    fn a_down_collector_never_blocks_and_never_grows_memory() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let pace = calibrate().await;
+            eprintln!("pace {pace:?}");
+            let (hole, _hole) = blackhole();
+            for protocol in [Protocol::HttpProtobuf, Protocol::Grpc] {
+                let recover = protocol == Protocol::HttpProtobuf;
+                for (port, recover) in [(hole, false), (closed_port(), recover)] {
+                    // Timing tails are noisy on shared runners: a scenario
+                    // passes when one of three baseline-and-run pairs keeps
+                    // them. A pipeline that blocked on the collector fails all
+                    // three; the accounting, memory and shutdown checks hold
+                    // on every attempt.
+                    let mut failures = Vec::new();
+                    for _ in 0..ATTEMPTS {
+                        let base = baseline(pace).await;
+                        match scenario(protocol, port, &base, recover, pace).await {
+                            Ok(()) => break,
+                            Err(failure) => failures.push(failure),
+                        }
                     }
+                    assert!(failures.len() < ATTEMPTS, "{failures:#?}");
                 }
-                assert!(failures.len() < ATTEMPTS, "{failures:#?}");
             }
-        }
-    });
+        });
+    }
 }

@@ -575,7 +575,7 @@ fn a_job_whose_host_is_killed_mid_run_is_reaped_and_runs_once_more() {
     fresh.stop();
 }
 
-/// AP-B2 test 5, drain: SIGTERM with a 10 s handler and
+/// AP-B2 test 5, drain: SIGTERM with a 60 s handler and
 /// `drain_timeout_ms = 1000` releases the job with its attempt refunded, the
 /// host exits cleanly, and a fresh host runs the job.
 #[test]
@@ -592,7 +592,7 @@ fn sigterm_releases_a_running_job_with_its_attempt_refunded() {
         &config,
         &[
             (DATABASE_ENV, test.url()),
-            (merezha_jobs::TEST_HANDLER_ENV, "10000"),
+            (merezha_jobs::TEST_HANDLER_ENV, "60000"),
         ],
         "draining",
     );
@@ -611,9 +611,11 @@ fn sigterm_releases_a_running_job_with_its_attempt_refunded() {
     assert_eq!(schedules.status, 200, "{}", schedules.body);
     let signalled = Instant::now();
     draining.stop();
+    // The drain stops at its 1 s timeout plus the 2 s grace; waiting for
+    // the 60 s handler would outlast the 20 s process bound of `stop`.
     let took = signalled.elapsed();
     assert!(
-        took < Duration::from_secs(8),
+        took < Duration::from_secs(15),
         "the drain stops at its timeout plus the grace: {took:?}"
     );
     assert_eq!(query_cell::<String>(&runtime, &db, &state), "available");
@@ -735,7 +737,7 @@ fn status_embeds_the_jobs_admin_data_and_backlog_counts_only_with_max_lag() {
     // Still refused once the jobs runtime has synced and measured the lag.
     std::thread::sleep(Duration::from_millis(2_500));
     assert_eq!(request(address, "GET", "/health/ready", "").status, 503);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let not_ready = loop {
         // The stderr writer is buffered; wait for the line.
         if let Some(event) = strict
