@@ -480,3 +480,63 @@ async fn the_size_cap_applies_to_streams_of_unknown_length() {
     );
     assert_eq!(merezha_blob::MAX_BLOB_BYTES, 5 * 1024 * 1024 * 1024);
 }
+
+/// Read a whole object through `get`, as proxy serving does.
+async fn read_all(store: &ObjectBlobStore) -> Result<Vec<u8>, String> {
+    use futures_util::StreamExt;
+    let mut read = store
+        .get(&key(), None)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let mut out = Vec::new();
+    while let Some(chunk) = read.body.next().await {
+        out.extend_from_slice(&chunk.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+#[tokio::test]
+async fn a_read_that_keeps_moving_may_outlast_the_timeout() {
+    let mock = support::MockS3::start().await;
+    let mut config = mock.config();
+    config.timeout = Duration::from_secs(1);
+    let store = ObjectBlobStore::open(&DriverConfig::S3(config)).unwrap();
+    let data: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    store
+        .put(&key(), BlobBody::Bytes(Bytes::from(data.clone())), &attrs())
+        .await
+        .unwrap();
+    // Twenty chunks, 300 ms apart: 6 s in all, each wait well under 1 s.
+    mock.pace(1000, Duration::from_millis(300));
+    let started = Instant::now();
+    assert_eq!(read_all(&store).await.unwrap(), data);
+    assert!(started.elapsed() > Duration::from_secs(5));
+    // One GET: never cut and resumed.
+    let gets = mock
+        .seen()
+        .iter()
+        .filter(|r| r.method == axum::http::Method::GET)
+        .count();
+    assert_eq!(gets, 1);
+}
+
+#[tokio::test]
+async fn a_stalled_read_fails_within_the_timeout_and_its_retries() {
+    let mock = support::MockS3::start().await;
+    let mut config = mock.config();
+    config.timeout = Duration::from_secs(1);
+    let store = ObjectBlobStore::open(&DriverConfig::S3(config)).unwrap();
+    store
+        .put(&key(), bytes(b"stalled body"), &attrs())
+        .await
+        .unwrap();
+    // Every wait for bytes is longer than the timeout.
+    mock.pace(4, Duration::from_secs(3));
+    let started = Instant::now();
+    assert!(read_all(&store).await.is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(1) + RETRY_TIMEOUT + Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}

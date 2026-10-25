@@ -14,6 +14,9 @@ http.workspace = true
 object_store.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 axum.workspace = true
 jiff.workspace = true

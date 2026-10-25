@@ -232,6 +232,136 @@ fn limits_revision_retention_and_trash_are_validated_with_every_problem_at_once(
     );
 }
 
+/// A model with an asset field.
+const MEDIA_MODEL: &str = r#"
+version = 1
+locales = [{ code = "en", default = true }]
+[types.page]
+access = "public"
+fields = [{ name = "title", type = "string" }, { name = "image", type = "asset", accept = ["image/*"] }]
+"#;
+
+#[test]
+fn media_settings_are_validated_with_every_problem_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = [("content.toml", MEDIA_MODEL)];
+    // Without `[modules.content.media]` asset fields are refused.
+    project(dir.path(), false, "[modules.content]\n", &files);
+    let issues = configure_issues(dir.path()).unwrap_err();
+    assert!(
+        issues
+            .iter()
+            .all(|(_, code)| code == "content_model_invalid"),
+        "{issues:?}"
+    );
+    // Every media problem at once, with its dotted key.
+    project(
+        dir.path(),
+        false,
+        "[modules.content.media]\ndriver = \"local\"\nlocal = { root = \"relative\" }\n\
+         serve = \"redirect\"\nsigned_url_ttl = \"2h\"\nmax_upload_bytes = 10\n\
+         max_concurrent_uploads = 65\nallowed_types = [\"image/png\", \"text/html\", \"Image/PNG\"]\n\
+         inline_types = [\"image/svg+xml\"]\nspool_dir = \"spool\"\n\
+         asset_cache_control = \"public\\nmax-age=1\"\norphan_grace = \"1m\"\n\
+         cleanup_cron = \"never\"\nwatermark = true\n",
+        &files,
+    );
+    let mut issues = configure_issues(dir.path()).unwrap_err();
+    issues.sort();
+    let key = |k: &str| format!("modules.content.media.{k}");
+    let mut expected = vec![
+        (key("allowed_types"), "invalid_media_type".to_owned()),
+        (key("allowed_types"), "media_type_unsupported".to_owned()),
+        (
+            key("asset_cache_control"),
+            "invalid_header_value".to_owned(),
+        ),
+        (key("cleanup_cron"), "invalid_cron".to_owned()),
+        (key("inline_types"), "inline_type_refused".to_owned()),
+        (key("local.root"), "invalid_path".to_owned()),
+        (key("max_concurrent_uploads"), "out_of_range".to_owned()),
+        (key("max_upload_bytes"), "out_of_range".to_owned()),
+        (key("orphan_grace"), "out_of_range".to_owned()),
+        (key("serve"), "media_config_invalid".to_owned()),
+        (key("signed_url_ttl"), "out_of_range".to_owned()),
+        (key("spool_dir"), "invalid_path".to_owned()),
+        (key("watermark"), "unknown_key".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(issues, expected);
+    // S3: required keys, nested secrets and the driver's own validation.
+    project(
+        dir.path(),
+        false,
+        "[modules.content.media]\ndriver = \"s3\"\nlocal = { root = \"/srv/media\" }\n\
+         [modules.content.media.s3]\nbucket = \"Bad_Bucket\"\nendpoint = \"http://127.0.0.1:9000\"\n\
+         access_key_id = \"literal-key\"\nsecret_access_key = { env = \"UNSET_S3_SECRET\" }\n\
+         timeout = \"10m\"\nacl = \"public\"\n",
+        &files,
+    );
+    let mut issues = configure_issues(dir.path()).unwrap_err();
+    issues.sort();
+    let mut expected = vec![
+        (key("local"), "unused_driver_settings".to_owned()),
+        (key("s3.access_key_id"), "secret_literal".to_owned()),
+        (key("s3.acl"), "unknown_key".to_owned()),
+        (key("s3.bucket"), "invalid_name".to_owned()),
+        (key("s3.endpoint"), "plaintext_endpoint_refused".to_owned()),
+        (key("s3.region"), "missing_required".to_owned()),
+        (key("s3.secret_access_key"), "secret_unavailable".to_owned()),
+        (key("s3.timeout"), "out_of_range".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(issues, expected);
+    // A valid S3 section, credentials from files; its Debug redacts them.
+    let secret = dir.path().join("secret");
+    std::fs::write(&secret, "s3-secret-value\n").unwrap();
+    project(
+        dir.path(),
+        false,
+        &format!(
+            "[modules.content.media]\ndriver = \"s3\"\nserve = \"redirect\"\n\
+             [modules.content.media.s3]\nbucket = \"media\"\nregion = \"eu-west-1\"\n\
+             access_key_id = {{ file = {secret:?} }}\nsecret_access_key = {{ file = {secret:?} }}\n"
+        ),
+        &files,
+    );
+    let handle = configure_issues(dir.path()).unwrap();
+    let state = handle.state().unwrap();
+    let media = state.media().unwrap();
+    assert_eq!(
+        media.settings().serve,
+        merezha_content::media::Serve::Redirect
+    );
+    let merezha_blob::DriverConfig::S3(s3) = &media.settings().driver else {
+        panic!("not s3");
+    };
+    assert_eq!(s3.secret_access_key.expose(), "s3-secret-value");
+    assert!(!format!("{:?}", media.settings()).contains("s3-secret-value"));
+    // Defaults, with a local root.
+    project(
+        dir.path(),
+        false,
+        "[modules.content.media]\nlocal = { root = \"/srv/media\" }\n",
+        &files,
+    );
+    let handle = configure_issues(dir.path()).unwrap();
+    let state = handle.state().unwrap();
+    let settings = state.media().unwrap().settings();
+    assert_eq!(settings.serve, merezha_content::media::Serve::Proxy);
+    assert_eq!(settings.max_upload_bytes, 52_428_800);
+    assert_eq!(settings.max_concurrent_uploads, 4);
+    assert_eq!(settings.signed_url_ttl, Duration::from_secs(300));
+    assert_eq!(settings.orphan_grace, Duration::from_secs(86_400));
+    assert_eq!(settings.cleanup_cron, "47 3 * * *");
+    assert_eq!(settings.asset_cache_control, "public, max-age=3600");
+    assert_eq!(settings.allowed_types.len(), 13);
+    assert!(settings.inline("image/png"));
+    assert!(!settings.inline("text/plain"));
+    assert!(!settings.inline("image/svg+xml"));
+    assert!(settings.spool_dir.ends_with("merezha-content"));
+}
+
 #[test]
 fn population_limits_and_delivery_cache_headers_are_validated_with_every_problem_at_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -343,7 +473,30 @@ fn content_errors_register_with_the_kernel_codes() {
             "{code}"
         );
     }
-    assert_eq!(ContentModule::new().errors(), ERRORS);
+    // The module registers its codes, the asset codes and the blob
+    // driver's, all beside the kernel's.
+    let errors = ContentModule::new().errors().to_vec();
+    assert!(errors.starts_with(ERRORS));
+    let mut registry = ErrorRegistry::kernel();
+    registry.register("content", &errors).unwrap();
+    for (code, status) in [
+        ("asset_not_found", 404),
+        ("asset_in_use", 409),
+        ("asset_too_large", 413),
+        ("media_type_rejected", 415),
+        ("range_not_satisfiable", 416),
+        ("blob_unavailable", 503),
+        ("blob_backend_rejected", 502),
+        ("blob_root_insecure", 422),
+        ("media_config_invalid", 422),
+        ("overloaded", 503),
+    ] {
+        assert_eq!(
+            registry.status_of(code).map(|s| s.as_u16()),
+            Some(status),
+            "{code}"
+        );
+    }
     // Activation's 300 s plus a 10 s margin, beyond the host's 10 s default.
     assert_eq!(
         ContentModule::new().start_timeout(),

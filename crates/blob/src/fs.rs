@@ -7,24 +7,60 @@ use std::path::{Path, PathBuf};
 /// Create `path` with mode 0700 if missing (parents included) and return
 /// its canonical form. Fails permanent `blob_root_unusable` when `path` is
 /// relative, cannot be created or is not a directory, and
-/// `blob_root_insecure` when the directory grants group or others any
-/// permission (mode `& 0o077`). The 0700 directory is the access boundary;
-/// files and subdirectories below it follow the process umask.
+/// `blob_root_insecure` when it is a symbolic link (read with `lstat`, so a
+/// link planted in a shared directory such as `/tmp` is never followed),
+/// is owned by another user than the process's effective one, or grants
+/// group or others any permission (mode `& 0o077`). The 0700 directory is
+/// the access boundary; files and subdirectories below it follow the
+/// process umask.
 pub fn ensure_private_dir(path: &Path) -> Result<PathBuf, Failure> {
     if !path.is_absolute() {
         return Err(Failure::permanent(ROOT_UNUSABLE));
     }
-    if !path.exists() {
+    if std::fs::symlink_metadata(path).is_err() {
         create_private(path).map_err(|_| Failure::permanent(ROOT_UNUSABLE))?;
     }
-    let metadata = std::fs::metadata(path).map_err(|_| Failure::permanent(ROOT_UNUSABLE))?;
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| Failure::permanent(ROOT_UNUSABLE))?;
+    if metadata.file_type().is_symlink() {
+        return Err(Failure::permanent(ROOT_INSECURE));
+    }
     if !metadata.is_dir() {
         return Err(Failure::permanent(ROOT_UNUSABLE));
     }
-    if open_to_others(&metadata) {
+    if insecure(&metadata) {
         return Err(Failure::permanent(ROOT_INSECURE));
     }
     std::fs::canonicalize(path).map_err(|_| Failure::permanent(ROOT_UNUSABLE))
+}
+
+/// Whether a directory is not this process's own: open to group or
+/// others, or owned by another user.
+pub(crate) fn insecure(metadata: &std::fs::Metadata) -> bool {
+    open_to_others(metadata) || !owned_by(metadata, effective_uid())
+}
+
+/// The process's effective user id.
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, cannot fail and touches no
+    // memory of ours (POSIX.1-2008).
+    unsafe { libc::geteuid() }
+}
+#[cfg(not(unix))]
+fn effective_uid() -> u32 {
+    0
+}
+
+/// Whether `metadata` belongs to user `uid`.
+#[cfg(unix)]
+fn owned_by(metadata: &std::fs::Metadata, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.uid() == uid
+}
+#[cfg(not(unix))]
+fn owned_by(_: &std::fs::Metadata, _: u32) -> bool {
+    true
 }
 
 #[cfg(unix)]
@@ -93,6 +129,35 @@ mod tests {
                 assert_eq!(result.unwrap_err().code, "blob_root_insecure", "{bits:o}");
             }
         }
+    }
+
+    #[test]
+    fn symlinks_and_directories_of_other_users_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(ensure_private_dir(&real).is_ok());
+        // A link to a private directory is refused, never followed.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            ensure_private_dir(&link).unwrap_err().code,
+            "blob_root_insecure"
+        );
+        // A dangling link is not created through either.
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        assert_eq!(
+            ensure_private_dir(&dangling).unwrap_err().code,
+            "blob_root_insecure"
+        );
+        assert!(!dir.path().join("nowhere").exists());
+        // Ownership: ours passes, any other uid is refused.
+        let metadata = std::fs::symlink_metadata(&real).unwrap();
+        assert!(owned_by(&metadata, effective_uid()));
+        assert!(!owned_by(&metadata, effective_uid().wrapping_add(1)));
+        assert!(!insecure(&metadata));
     }
 
     #[test]

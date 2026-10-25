@@ -465,3 +465,71 @@ async fn only_the_edges_own_refusals_count_as_rejected() {
     );
     assert_eq!(rejected.points().len(), 1);
 }
+
+/// Count a body's bytes as a route bounding its own body does: `limit`
+/// when the edge stopped it.
+async fn count_body(body: Body) -> String {
+    use http_body_util::BodyExt;
+    let mut body = body;
+    let mut total = 0usize;
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => total += frame.data_ref().map_or(0, |d| d.len()),
+            Err(error) if edge::is_body_limit(&error) => return "limit".into(),
+            Err(_) => return "error".into(),
+        }
+    }
+    total.to_string()
+}
+
+#[tokio::test]
+async fn a_route_with_its_own_body_limit_reads_past_the_edge_limit_and_stops_at_its_own() {
+    let config = project("");
+    let router = Router::new()
+        .route("/v1/media/upload", post(count_body))
+        .route("/v1/notes", post(|body: String| async move { body }));
+    let router = edge::apply(
+        router,
+        EdgeSettings::new(&config.http, Arc::new(ErrorRegistry::kernel())).route_body_limits(vec![
+            (axum::http::Method::POST, "/v1/media/upload".into(), 3 << 20),
+        ]),
+    );
+    let text = |response: axum::response::Response| async move {
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    };
+    // Over `http.body_limit` (1 MiB): declared and read, the route gets it.
+    let mut upload = request("POST", "/v1/media/upload", PUBLIC_PEER, None);
+    upload
+        .headers_mut()
+        .insert("content-length", (2u32 << 20).to_string().parse().unwrap());
+    *upload.body_mut() = Body::from(vec![b'x'; 2 << 20]);
+    let response = send(&router, upload).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(text(response).await, (2u32 << 20).to_string());
+    // A declared length past the route's own limit is the route's to
+    // answer; the bytes past it never reach the route.
+    let mut over = request("POST", "/v1/media/upload", PUBLIC_PEER, None);
+    over.headers_mut()
+        .insert("content-length", (4u32 << 20).to_string().parse().unwrap());
+    *over.body_mut() = Body::from(vec![b'x'; 4 << 20]);
+    let response = send(&router, over).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(text(response).await, "limit");
+    // Other routes, and other methods on the same path, keep the edge's.
+    let mut other = request("POST", "/v1/notes", PUBLIC_PEER, None);
+    *other.body_mut() = Body::from(vec![b'x'; 2 << 20]);
+    assert_eq!(
+        send(&router, other).await.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let mut get = request("GET", "/v1/media/upload", PUBLIC_PEER, None);
+    get.headers_mut()
+        .insert("content-length", (2u32 << 20).to_string().parse().unwrap());
+    assert_eq!(
+        send(&router, get).await.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+}

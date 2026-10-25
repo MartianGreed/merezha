@@ -59,7 +59,9 @@ pub struct S3Config {
     pub allow_http: bool,
     pub access_key_id: Secret,
     pub secret_access_key: Secret,
-    /// Per request, 1 s to 300 s.
+    /// 1 s to 300 s. Bounds each request; an object read (`get`) is bounded
+    /// per wait for its next bytes instead, so a proxied download of a
+    /// large file may take longer while it keeps moving.
     pub timeout: Duration,
     /// Prepended to every key. Empty, or key segments; a missing trailing
     /// `/` is added, so `tenant-a` stores `tenant-a/<key>`.

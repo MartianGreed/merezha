@@ -72,6 +72,17 @@ pub struct MockS3 {
     faults: Mutex<VecDeque<u16>>,
     /// Accept requests and never answer.
     pub hang: AtomicBool,
+    /// Stream object bodies in chunks of this many bytes with this pause
+    /// before each, for read timeouts.
+    pace: Mutex<Option<(usize, Duration)>>,
+    /// Pause before answering an object `DELETE`.
+    delete_delay: Mutex<Duration>,
+    /// Pause before answering any `PUT` (faults included).
+    put_delay: Mutex<Duration>,
+    /// Statuses answered to the next `PUT`s only, before normal handling.
+    put_faults: Mutex<VecDeque<u16>>,
+    /// Statuses answered to the next object `DELETE`s only.
+    delete_faults: Mutex<VecDeque<u16>>,
     pub requests: AtomicUsize,
     seen: Mutex<Vec<Seen>>,
 }
@@ -85,6 +96,11 @@ impl MockS3 {
             store: Mutex::default(),
             faults: Mutex::default(),
             hang: AtomicBool::new(false),
+            pace: Mutex::new(None),
+            delete_delay: Mutex::new(Duration::ZERO),
+            put_delay: Mutex::new(Duration::ZERO),
+            put_faults: Mutex::default(),
+            delete_faults: Mutex::default(),
             requests: AtomicUsize::new(0),
             seen: Mutex::default(),
         });
@@ -116,6 +132,26 @@ impl MockS3 {
             .iter()
             .filter(|r| r.method == method && r.query.is_empty())
             .count()
+    }
+    /// Serve object bodies `chunk` bytes at a time, `pause` before each.
+    pub fn pace(&self, chunk: usize, pause: Duration) {
+        *self.pace.lock().unwrap() = Some((chunk.max(1), pause));
+    }
+    /// Answer object deletes only after `delay`.
+    pub fn delay_deletes(&self, delay: Duration) {
+        *self.delete_delay.lock().unwrap() = delay;
+    }
+    /// Answer every `PUT` (a fault too) only after `delay`.
+    pub fn delay_puts(&self, delay: Duration) {
+        *self.put_delay.lock().unwrap() = delay;
+    }
+    /// Answer the next `PUT`s with `statuses`, other requests untouched.
+    pub fn fail_puts(&self, statuses: &[u16]) {
+        self.put_faults.lock().unwrap().extend(statuses);
+    }
+    /// Answer the next `DELETE`s with `statuses`, other requests untouched.
+    pub fn fail_deletes(&self, statuses: &[u16]) {
+        self.delete_faults.lock().unwrap().extend(statuses);
     }
     pub fn fail_next(&self, statuses: &[u16]) {
         self.faults.lock().unwrap().extend(statuses);
@@ -159,10 +195,20 @@ async fn handle(State(mock): State<Arc<MockS3>>, request: Request) -> Response {
         path: path.clone(),
         query: raw_query.clone(),
     });
+    let put_delay = *mock.put_delay.lock().unwrap();
+    if parts.method == Method::PUT && !put_delay.is_zero() {
+        tokio::time::sleep(put_delay).await;
+    }
     if mock.hang.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }
-    let fault = mock.faults.lock().unwrap().pop_front();
+    let mut fault = mock.faults.lock().unwrap().pop_front();
+    if fault.is_none() && parts.method == Method::PUT {
+        fault = mock.put_faults.lock().unwrap().pop_front();
+    }
+    if fault.is_none() && parts.method == Method::DELETE {
+        fault = mock.delete_faults.lock().unwrap().pop_front();
+    }
     if let Some(status) = fault {
         let status = StatusCode::from_u16(status).unwrap();
         let mut response = s3_error(
@@ -319,9 +365,14 @@ async fn handle(State(mock): State<Arc<MockS3>>, request: Request) -> Response {
             let Some(object) = mock.object(&key) else {
                 return s3_error(StatusCode::NOT_FOUND, "NoSuchKey");
             };
-            read_object(&parts.method, &parts.headers, &object).await
+            let pace = *mock.pace.lock().unwrap();
+            read_object(&parts.method, &parts.headers, &object, pace).await
         }
         (Method::DELETE, None, _) => {
+            let delay = *mock.delete_delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             if let Some(object) = mock.store.lock().unwrap().objects.remove(&key) {
                 let _ = std::fs::remove_file(object.path);
             }
@@ -444,7 +495,12 @@ async fn write_body(
     Ok((size, format!("\"{}\"", &digest[..32])))
 }
 
-async fn read_object(method: &Method, headers: &HeaderMap, object: &Object) -> Response {
+async fn read_object(
+    method: &Method,
+    headers: &HeaderMap,
+    object: &Object,
+    pace: Option<(usize, Duration)>,
+) -> Response {
     let mut range = 0..object.size;
     let mut partial = false;
     if let Some(value) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
@@ -492,7 +548,17 @@ async fn read_object(method: &Method, headers: &HeaderMap, object: &Object) -> R
     }
     let bytes = std::fs::read(&object.path).unwrap();
     let slice = bytes[range.start as usize..range.end as usize].to_vec();
-    response.body(Body::from(slice)).unwrap()
+    match pace {
+        None => response.body(Body::from(slice)).unwrap(),
+        Some((chunk, pause)) => {
+            let chunks: Vec<Vec<u8>> = slice.chunks(chunk).map(<[u8]>::to_vec).collect();
+            let stream = futures_util::stream::iter(chunks).then(move |chunk| async move {
+                tokio::time::sleep(pause).await;
+                Ok::<_, std::io::Error>(bytes::Bytes::from(chunk))
+            });
+            response.body(Body::from_stream(stream)).unwrap()
+        }
+    }
 }
 
 // --- SigV4, independently of object_store ---------------------------------

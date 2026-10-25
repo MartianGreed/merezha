@@ -4,7 +4,7 @@ use crate::{
     config::{ConfigIssue, ModuleSection},
     context::AppContext,
     errors::ErrorCode,
-    ports::{Jobs, Outbox},
+    ports::{BlobStore, Jobs, Outbox},
 };
 use axum::Router;
 use merezha_domain::Failure;
@@ -99,6 +99,25 @@ pub trait Module: Send + Sync + 'static {
     fn start_timeout(&self) -> Option<std::time::Duration> {
         None
     }
+    /// The blob store this module provides to every context (R13), opened
+    /// from its own settings; `Ok(None)` (the default) provides none. The
+    /// host asks every module once, after [`Module::configure`] and before
+    /// any module starts, and installs the one store through
+    /// `AppContext::builder().blobs(..)`. A failure stops startup naming
+    /// the module; two modules providing one stop it with
+    /// `blob_store_conflict`. The content block provides the store
+    /// `[modules.content.media]` configures.
+    fn blob_store(&self) -> Result<Option<Arc<dyn BlobStore>>, Failure> {
+        Ok(None)
+    }
+    /// Routes of this module that bound their request body themselves, in
+    /// place of `http.body_limit` (the upload route, say). The edge still
+    /// stops each such body past its [`RouteBodyLimit::limit`], but leaves
+    /// a declared length to the route, so the route answers its own code.
+    /// Read once, after [`Module::configure`].
+    fn body_limits(&self) -> Vec<RouteBodyLimit> {
+        Vec::new()
+    }
     /// Routes, nested under `/v1/<name>`. Called once after `start`. Errors
     /// should use [`crate::edge::error_response`].
     fn routes(&self, ctx: &AppContext) -> Router {
@@ -116,6 +135,17 @@ pub trait Module: Send + Sync + 'static {
         let _ = deadline;
         Box::pin(async {})
     }
+}
+
+/// One route that bounds its own body ([`Module::body_limits`]): `method`
+/// and `path` (relative to `/v1/<name>`, matched exactly against the
+/// request path, without parameters) and the most bytes the edge lets the
+/// route read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteBodyLimit {
+    pub method: axum::http::Method,
+    pub path: &'static str,
+    pub limit: usize,
 }
 
 /// The ports a [`JobsRuntime`] installs in every [`AppContext`].

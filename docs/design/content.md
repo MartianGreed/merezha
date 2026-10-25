@@ -1423,6 +1423,99 @@ Management `GET /assets/{id}/file` always proxies with `attachment`.
   restores the previous state. The guarded state change makes an upload and
   cleanup racing on the same blob end with exactly one winner.
 
+### As built (C7)
+
+- The store is `merezha-blob`'s `ObjectBlobStore`, opened from
+  `[modules.content.media]` and provided to every context through
+  `Module::blob_store`; `merezha_blob::ERRORS` registers with content's
+  codes and readiness adds `ObjectBlobStore::ready`. The S3 credentials
+  are nested secrets read with `ModuleSection::secret_at` (`{ env }` or
+  `{ file }` references), so the keys keep their `media.s3.*` names.
+  `MEREZHA_*` overrides reach top-level module keys only; one naming a
+  nested key fails `nested_override_unsupported`.
+- The upload route bounds its own body: `Module::body_limits` lets the
+  edge read it up to `media.max_upload_bytes` in place of
+  `http.body_limit` and leaves a declared length to the route
+  (`asset_too_large`). A wait of 30 s for the next bytes, or a body not
+  done within the one-hour lease, fails `upload_incomplete` (400); a spool
+  write failure is `spool_unavailable` (503). `title` is at most 500
+  characters without control characters.
+- `infer`'s text guesses (HTML, XML, shell scripts) are not signatures:
+  text is judged as UTF-8, so an HTML file declared `text/plain` is stored
+  as plain text and served as an attachment. Plain text is therefore not
+  in the default `inline_types` (a deviation from section 9's default:
+  the acceptance criterion requires the attachment); listing it serves
+  such files inline as plain text, still with `nosniff` and the sandbox
+  CSP. `allowed_types` must be types the sniffer can confirm
+  (`media_type_unsupported` otherwise), so `text/html` cannot be allowed.
+- A raster header that does not parse is malformed like an oversized
+  side (`media_type_rejected`).
+- The claim leases a `pending` row for an hour (`UPLOAD_LEASE`); the put
+  must end two minutes before it does. The `orphaned` to `stored` flip
+  happens in the transaction that inserts the asset (not in the claim),
+  guarded with the row locked: from `stored` or `orphaned`, or from
+  `pending` after this upload's own put. A row that cleanup took between
+  the claim and that transaction sends the upload back to the claim (three
+  claims at most, then `blob_unavailable`). An upload that inserted its
+  row and then fails moves it to `deleting` while its lease is still its
+  own, deletes the object and the row, so a refused upload leaves nothing;
+  a crash leaves the `pending` row for cleanup. When that object delete
+  fails the row goes back to `pending` with its lease over, so the next
+  upload of the bytes joins it and puts again.
+- The claim's insert has no conflict target (`ON CONFLICT DO NOTHING`):
+  the primary key and `storage_key` conflict together, and two identical
+  uploads at once must both get the row, never a unique violation (review
+  finding 1).
+- Every step after a deletion claim is fenced on its lease, the token: the
+  claim sets `deleting` with a ten-minute lease (`DELETE_LEASE`); right
+  before each object delete the worker re-takes the row only while the
+  lease is still its token, renewing it; the object delete is bounded by
+  half the lease; the row delete and a restore match the renewed token. A
+  worker whose lease expired and was taken over, or whose row went and
+  came back with the same bytes, touches nothing (`Swept::Lost`), so a
+  stale run can never delete a re-uploaded object (review finding 2). A
+  batch stops taking new blobs once half a lease has passed. The same
+  fence applies to an upload's give-up. An upload that meets a `deleting`
+  row whose lease is over takes it over as its own claim and puts again.
+- A purge marks the blob `orphaned` after locking it, in a new statement
+  that sees assets committed while it waited, so it never orphans a blob
+  an upload just reused. "Uses" counts trashed assets too, which an
+  undelete may bring back.
+- Cleanup also takes `deleting` rows whose delete lease expired: a crash
+  between the claim and the object delete. The asset trash purge (assets trashed longer
+  than `trash.retention`) runs at the start of `content.blob_cleanup`, not
+  in `content.trash_purge`, so the purge that frees a blob and the
+  cleanup that deletes it share one job and schedule.
+- Delivery decides with the entries' own rule (C5's `delivery::access`,
+  on the application path) for each type whose published variants
+  reference the asset, and answers `asset_not_found` for every asset the
+  caller may not read (anonymous callers included), never 401 or 403, so
+  an id reveals nothing. Through a `public` type it uses `asset_cache_control`, else
+  `private, no-cache`; responses vary on `Authorization` and `Cookie`. The
+  ETag is the SHA-256 and a matching `If-None-Match` is 304. An `If-Range`
+  other than that ETag, several ranges or a malformed one get the full
+  body. Plain text and CSV are served with `; charset=utf-8`. Every asset
+  response (200, 206, 304, 416) carries `nosniff` and the sandbox CSP.
+- Redirect mode hands the bytes to the bucket, which serves them without
+  `nosniff` or the CSP: give the bucket (or its CDN) its own domain, never
+  the API's or the site's origin.
+- The local root and `spool_dir` are refused (`blob_root_insecure`) when
+  they are a symbolic link (read with `lstat`, never followed), owned by
+  another user than the process's effective one, or open to group or
+  others, so a directory planted in a shared `/tmp` is never used.
+- On S3, `media.s3.timeout` bounds each request, and object reads per
+  wait for bytes (a reqwest read timeout, no whole-response bound) so a
+  proxied download of a large file outlasts it while it moves; a stall
+  longer than the timeout still fails after the bounded retries.
+- Management reads (`GET /assets/{id}`, `.../file`) see trashed assets;
+  `PATCH` and a soft delete act on live ones only (`asset_not_found`).
+  Undelete bumps the generation and appends no event (section 7 has none
+  for it).
+- Every statement is a TE-T4 `Statement` (`merezha_content::media::STATEMENTS`);
+  the media sources hand no SQL to the driver (a `scan_sources` test).
+- C9 seams: the routes check at `Application` scope and use the `app`
+  scope; `blob_key` already derives the `org-<hash>` tag.
+
 ## 7. Events
 
 Every event is an outbox record appended inside the transaction of the change
@@ -1528,7 +1621,7 @@ multi-application platform keeps that rule, so the layout survives it.
 | `media.max_upload_bytes` | int | 52428800 | 1024 to 5368709120. |
 | `media.max_concurrent_uploads` | int | 4 | 1 to 64. |
 | `media.allowed_types` | string list | png, jpeg, gif, webp, avif, svg+xml, pdf, mp4, webm, mpeg audio, ogg audio, plain text, csv | Bare MIME types. |
-| `media.inline_types` | string list | png, jpeg, gif, webp, avif, plain text | Must be a subset of `allowed_types`. HTML, SVG, XML and PDF are refused. |
+| `media.inline_types` | string list | png, jpeg, gif, webp, avif | Must be a subset of `allowed_types`. HTML, SVG, XML and PDF are refused. Plain text left the default in C7 (below). |
 | `media.spool_dir` | absolute path | `<OS temp dir>/merezha-content` | Same filesystem rules as `local.root`. |
 | `media.asset_cache_control` | string | `"public, max-age=3600"` | |
 | `media.orphan_grace` | duration | `"1d"` | 1 hour to 30 days. |
@@ -1598,7 +1691,7 @@ and tested on 1.98.0 in their slice.
 | `tempfile` | 3.27.0 (workspace) | | MIT OR Apache-2.0 | Upload spooling. |
 | `bytes` | 1.12.1 | 1.57 | MIT | Blob bodies. |
 | `futures-util` | 0.3.34 | 1.71 | MIT OR Apache-2.0 | `BoxFuture`, `BoxStream`. |
-| `tokio-util` | 0.7.20 | 1.85 | MIT | `ReaderStream` for file bodies (C7). C6 reads spooled files with `tokio::fs` instead. |
+| `tokio-util` | 0.7.20 | 1.85 | MIT | Not used: C6 reads spooled files with `tokio::fs`, and C7 streams blob reads (`BlobRead::body`) straight into the response. |
 | `serde`, `serde_json`, `toml`, `axum`, `tokio` | workspace pins | | | Model parsing, HTTP. |
 
 Not used: `aws-sdk-s3`, `rust-s3` (section 6), `multer` (raw upload bodies),

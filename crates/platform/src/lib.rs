@@ -22,6 +22,6 @@ pub use edge::{EDGE_SCOPE, ErrorReply, error_response};
 pub use errors::{ErrorCode, ErrorRegistry, FieldError};
 pub use host::{EarlyListener, Host, HostOptions, HostParts, StartupError, Timeouts};
 pub use merezha_postgres::{BoxFuture, Database, Migration, MigrationKind, Secret, Tx};
-pub use module::{JobsPorts, JobsRuntime, Module, ModuleEvents};
+pub use module::{JobsPorts, JobsRuntime, Module, ModuleEvents, RouteBodyLimit};
 pub use ports::{Principal, ResourceScope, Source};
 pub use status::StatusSection;

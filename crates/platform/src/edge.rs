@@ -327,6 +327,7 @@ pub struct EdgeSettings {
     trust: TrustInbound,
     metrics: HttpMetrics,
     starting: bool,
+    body_limits: Vec<(Method, String, usize)>,
 }
 impl std::fmt::Debug for EdgeSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -348,7 +349,16 @@ impl EdgeSettings {
             trust: TrustInbound::TrustedProxies,
             metrics: HttpMetrics::noop(),
             starting: false,
+            body_limits: Vec::new(),
         }
+    }
+    /// Routes that bound their own body (`Module::body_limits`), as
+    /// `(method, full path, limit)`: for an exact match the edge stops the
+    /// body past `limit` instead of `http.body_limit` and leaves a declared
+    /// `Content-Length` to the route, which answers its own code.
+    pub fn route_body_limits(mut self, limits: Vec<(Method, String, usize)>) -> Self {
+        self.body_limits = limits;
+        self
     }
     pub fn authenticator(mut self, authenticator: Option<Arc<dyn Authenticator>>) -> Self {
         self.authenticator = authenticator;
@@ -375,6 +385,7 @@ impl EdgeSettings {
 struct EdgeState {
     trusted: Arc<[Cidr]>,
     body_limit: usize,
+    route_limits: Arc<[(Method, String, usize)]>,
     authenticator: Option<Arc<dyn Authenticator>>,
     errors: Arc<ErrorRegistry>,
     trust: TrustInbound,
@@ -390,6 +401,7 @@ pub fn apply(router: Router, settings: EdgeSettings) -> Router {
     let state = EdgeState {
         trusted: http.trusted_proxies.clone().into(),
         body_limit: http.body_limit,
+        route_limits: settings.body_limits.clone().into(),
         authenticator: settings.authenticator.clone(),
         errors: settings.errors.clone(),
         trust: settings.trust,
@@ -875,7 +887,32 @@ async fn normalize_errors(
     response
 }
 
+/// Whether `error`, from reading a request body, is the edge's limit
+/// stopping it: a route listed in `Module::body_limits` answers its own
+/// code for it.
+pub fn is_body_limit(error: &axum::Error) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = current {
+        if error.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
 async fn limit_body(State(state): State<EdgeState>, request: Request, next: Next) -> Response {
+    // A route that bounds its own body: stopped past its limit, its
+    // declared length left to the route.
+    if let Some((_, _, limit)) = state
+        .route_limits
+        .iter()
+        .find(|(method, path, _)| request.method() == method && request.uri().path() == path)
+    {
+        let limit = *limit;
+        let request = request.map(|body| Body::new(http_body_util::Limited::new(body, limit)));
+        return next.run(request).await;
+    }
     let declared = request
         .headers()
         .get(header::CONTENT_LENGTH)

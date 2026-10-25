@@ -36,10 +36,13 @@
 //! # });
 //! ```
 //!
-//! Seams for CT-C7: the content block parses `[modules.content.media]`
-//! into [`LocalConfig`] / [`S3Config`] (nested secrets included), refuses
-//! `serve = "redirect"` unless [`Driver::signs_urls`], reuses
-//! [`ensure_private_dir`] for `media.spool_dir`, and records
+//! The content block (CT-C7) parses `[modules.content.media]` into
+//! [`LocalConfig`] / [`S3Config`] (nested secrets through
+//! `ModuleSection::secret_at`), refuses `serve = "redirect"` unless
+//! [`Driver::signs_urls`], reuses [`ensure_private_dir`] for
+//! `media.spool_dir`, provides the store to every context through
+//! `Module::blob_store`, registers [`ERRORS`] and calls
+//! [`ObjectBlobStore::ready`] from its readiness. TE-T6 records
 //! `merezha.content.blob.duration` around these calls with
 //! [`ObjectBlobStore::driver`].
 mod config;

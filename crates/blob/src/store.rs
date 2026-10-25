@@ -84,6 +84,10 @@ enum Backend {
     },
     S3 {
         store: AmazonS3,
+        /// The same bucket for object reads: no bound on a whole response,
+        /// the timeout bounds each wait for bytes instead, so a proxied
+        /// download may outlast it while it keeps moving.
+        reader: AmazonS3,
         prefix: String,
     },
 }
@@ -94,7 +98,9 @@ enum Backend {
 /// S3 key, at most 1024 bytes), attributes, ranges and signed URL
 /// lifetimes. S3 requests are bounded by the configured timeout and retried
 /// at most [`MAX_RETRIES`] times within [`RETRY_TIMEOUT`]: every operation
-/// is idempotent on a content-addressed key.
+/// is idempotent on a content-addressed key. Object reads are bounded per
+/// wait for bytes (the response headers, then each read of the body), not
+/// as a whole, so streaming a large object to a slow client is not cut.
 pub struct ObjectBlobStore {
     backend: Backend,
     /// Largest body a put accepts, at most [`MAX_BLOB_BYTES`].
@@ -139,9 +145,18 @@ impl ObjectBlobStore {
         let (Some(prefix), true) = (prefix, config.validate().is_empty()) else {
             return Err(Failure::permanent(CONFIG_INVALID));
         };
+        let connect = config.timeout.min(MAX_CONNECT_TIMEOUT);
         let options = ClientOptions::new()
             .with_timeout(config.timeout)
-            .with_connect_timeout(config.timeout.min(MAX_CONNECT_TIMEOUT))
+            .with_connect_timeout(connect)
+            .with_allow_http(config.allow_http);
+        // Reads stream a whole object, as long as a client takes to read
+        // it: `timeout` bounds every wait for the next bytes (the headers
+        // included) rather than the response.
+        let read_options = ClientOptions::new()
+            .with_timeout_disabled()
+            .with_read_timeout(config.timeout)
+            .with_connect_timeout(connect)
             .with_allow_http(config.allow_http);
         let retry = RetryConfig {
             // 100 ms, then jittered doubling: three retries sleep under
@@ -156,26 +171,34 @@ impl ObjectBlobStore {
         };
         // `new()`, not `from_env()`: no setting comes from AWS_* variables
         // or instance metadata.
-        let mut builder = AmazonS3Builder::new()
-            .with_bucket_name(&config.bucket)
-            .with_region(&config.region)
-            .with_access_key_id(config.access_key_id.expose())
-            .with_secret_access_key(config.secret_access_key.expose())
-            .with_virtual_hosted_style_request(!config.path_style)
-            .with_allow_http(config.allow_http)
-            // One `DELETE /key` per blob: core S3 API on every provider,
-            // where bulk `POST /?delete` is not.
-            .with_disable_bulk_delete(true)
-            .with_client_options(options)
-            .with_retry(retry);
-        if let Some(endpoint) = &config.endpoint {
-            builder = builder.with_endpoint(endpoint.trim_end_matches('/'));
-        }
-        let store = builder
-            .build()
-            .map_err(|_| Failure::permanent(CONFIG_INVALID))?;
+        let build = |options: ClientOptions| {
+            let mut builder = AmazonS3Builder::new()
+                .with_bucket_name(&config.bucket)
+                .with_region(&config.region)
+                .with_access_key_id(config.access_key_id.expose())
+                .with_secret_access_key(config.secret_access_key.expose())
+                .with_virtual_hosted_style_request(!config.path_style)
+                .with_allow_http(config.allow_http)
+                // One `DELETE /key` per blob: core S3 API on every provider,
+                // where bulk `POST /?delete` is not.
+                .with_disable_bulk_delete(true)
+                .with_client_options(options)
+                .with_retry(retry.clone());
+            if let Some(endpoint) = &config.endpoint {
+                builder = builder.with_endpoint(endpoint.trim_end_matches('/'));
+            }
+            builder
+                .build()
+                .map_err(|_| Failure::permanent(CONFIG_INVALID))
+        };
+        let store = build(options)?;
+        let reader = build(read_options)?;
         Ok(Self {
-            backend: Backend::S3 { store, prefix },
+            backend: Backend::S3 {
+                store,
+                reader,
+                prefix,
+            },
             max_bytes: MAX_BLOB_BYTES,
         })
     }
@@ -209,11 +232,11 @@ impl ObjectBlobStore {
             match &self.backend {
                 Backend::Local { root, .. } => {
                     let metadata = tokio::fs::metadata(root).await.map_err(|_| unavailable)?;
-                    if !metadata.is_dir() || crate::fs::open_to_others(&metadata) {
+                    if !metadata.is_dir() || crate::fs::insecure(&metadata) {
                         return Err(unavailable);
                     }
                 }
-                Backend::S3 { store, prefix } => {
+                Backend::S3 { store, prefix, .. } => {
                     let options = PaginatedListOptions {
                         max_keys: Some(1),
                         ..PaginatedListOptions::default()
@@ -367,7 +390,11 @@ impl ObjectBlobStore {
             range: range.clone().map(GetRange::Bounded),
             ..GetOptions::default()
         };
-        match self.store().get_opts(&path, options).await {
+        let reader: &dyn ObjectStore = match &self.backend {
+            Backend::Local { store, .. } => store,
+            Backend::S3 { reader, .. } => reader,
+        };
+        match reader.get_opts(&path, options).await {
             Ok(result) => {
                 let stat = BlobStat {
                     size: result.meta.size,
