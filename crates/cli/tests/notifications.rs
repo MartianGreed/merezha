@@ -194,3 +194,93 @@ fn run_mounts_the_block_and_applies_its_migration() {
     assert!(text.contains("\"module\":\"notifications\""), "{text}");
     assert!(!text.contains(KEY), "the secret key is never logged");
 }
+
+/// `merezha notifications brevo register-webhook` (NT-N3): one `POST
+/// /v3/webhooks` creating the transactional webhook with the callback's
+/// events and the bearer token, to `public_base_url` plus the callback
+/// path; the key and the token never reach stdout or stderr.
+#[test]
+fn brevo_register_webhook_creates_the_bearer_webhook() {
+    use merezha_notifications::testkit::FakeBrevo;
+    let key = "xkeysib-cli-0123456789abcdef";
+    let token = "cli-webhook-token-0123456789abcdef-0123";
+    // The fake serves from this runtime's workers while the binary runs.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let fake = runtime.block_on(FakeBrevo::start(key)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let config = project(
+        dir.path(),
+        &format!(
+            "[modules.notifications]\nsecret_key = {{ env = \"NOTIFY_KEY\" }}\n\
+             public_base_url = \"https://api.acme.test\"\n\
+             [modules.notifications.email]\ndriver = \"brevo\"\nfrom = \"Acme <no-reply@acme.test>\"\n\
+             [modules.notifications.brevo]\napi_key = {{ env = \"CLI_BREVO_KEY\" }}\n\
+             webhook_token = {{ env = \"CLI_BREVO_TOKEN\" }}\nbase_url = \"{}\"\n",
+            fake.base_url()
+        ),
+    );
+    let run = |api_key: &str, extra: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_merezha"))
+            .args(["notifications", "brevo", "register-webhook", "--config"])
+            .arg(&config)
+            .args(extra)
+            .env("NOTIFY_TEST_DATABASE_URL", "postgres://app@127.0.0.1:1/app")
+            .env("NOTIFY_KEY", KEY)
+            .env("CLI_BREVO_KEY", api_key)
+            .env("CLI_BREVO_TOKEN", token)
+            .output()
+            .unwrap()
+    };
+    let output = run(key, &[]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{stdout} {stderr}");
+    let report: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(report["status"], "registered");
+    assert_eq!(report["id"], 1);
+    assert_eq!(
+        report["url"],
+        "https://api.acme.test/v1/notifications/providers/brevo/email"
+    );
+    for secret in [key, token] {
+        assert!(!stdout.contains(secret) && !stderr.contains(secret));
+    }
+    let created = fake.requests_to("/v3/webhooks");
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0].headers["api-key"], key);
+    let body = &created[0].body;
+    assert_eq!(body["type"], "transactional");
+    assert_eq!(
+        body["auth"],
+        serde_json::json!({"type": "bearer", "token": token})
+    );
+    assert_eq!(
+        body["events"],
+        serde_json::json!([
+            "delivered",
+            "hardBounce",
+            "softBounce",
+            "blocked",
+            "spam",
+            "invalid",
+            "deferred",
+            "unsubscribed"
+        ])
+    );
+    // An explicit URL must be https (or loopback http).
+    let output = run(key, &["--url", "http://example.com/hook"]);
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["code"], "invalid_url");
+    // A wrong key is an account error, reported by code only.
+    let output = run("xkeysib-wrong", &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["code"], "provider_account");
+    assert_eq!(fake.requests_to("/v3/webhooks").len(), 2);
+    drop(fake);
+}
