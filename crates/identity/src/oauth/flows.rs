@@ -346,6 +346,22 @@ impl Core {
                 callback
             }
             Err(failed) => {
+                // Past the junk budget, a callback naming no live flow is
+                // answered `rate_limited`.
+                let failed = if !failed.audit
+                    && self
+                        .peek(
+                            gcra::OAUTH_CALLBACK_UNKNOWN_IP,
+                            Subject::Ip(client.ip),
+                            client,
+                        )
+                        .await
+                        .is_err()
+                {
+                    Failed::unknown("rate_limited")
+                } else {
+                    failed
+                };
                 self.failed_callback(client, provider.as_deref(), failed)
                     .await;
                 Callback {
@@ -375,8 +391,14 @@ impl Core {
             method = "oauth",
             outcome = outcome(code)
         );
-        self.charge_failure(gcra::OAUTH_CALLBACK_IP, Subject::Ip(client.ip))
-            .await;
+        // Junk (no live flow) fills its own, looser bucket, so it never
+        // locks the same IP's legitimate callbacks out.
+        let policy = if failed.audit {
+            gcra::OAUTH_CALLBACK_IP
+        } else {
+            gcra::OAUTH_CALLBACK_UNKNOWN_IP
+        };
+        self.charge_failure(policy, Subject::Ip(client.ip)).await;
         if !failed.audit {
             return;
         }
@@ -937,9 +959,16 @@ impl LinkCtx<'_> {
                 let Some(mut user) = core.user_by_id(tx, id, true).await? else {
                     return Ok(Some(Err("invalid_state")));
                 };
-                // The session that started the link must still be alive.
+                // The session that started the link must still be alive,
+                // and still recent: the provider round trip does not
+                // stretch the reauthentication window.
                 match core.hold_session(tx, session_id).await? {
-                    Some(s) if s.user_id == user.id && s.alive(core.now()) => {}
+                    Some(s) if s.user_id == user.id && s.alive(core.now()) => {
+                        let window = settings.sessions.reauthentication_window;
+                        if plus(s.authenticated_at, window) < core.now() {
+                            return Ok(Some(Err("reauthentication_required")));
+                        }
+                    }
                     _ => return Ok(Some(Err("invalid_state"))),
                 }
                 if !user.active() {

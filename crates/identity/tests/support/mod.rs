@@ -43,7 +43,7 @@ pub const OAUTH: &str = "__Host-merezha_oauth";
 pub const SECRET: &str = "an-identity-secret-key-of-at-least-32-bytes";
 pub const SECRET_NEXT: &str = "the-next-identity-secret-key-after-rotation";
 /// Every rate-limit table, so tests can raise the defaults.
-pub const POLICY_TABLES: [&str; 14] = [
+pub const POLICY_TABLES: [&str; 15] = [
     "sign_in_ip",
     "sign_in_account_ip",
     "sign_in_account",
@@ -58,6 +58,7 @@ pub const POLICY_TABLES: [&str; 14] = [
     "passkey_ip",
     "oauth_ip",
     "oauth_callback_ip",
+    "oauth_callback_unknown_ip",
 ];
 /// An identity section: `top` keys, cheap Argon2 at its floor, magic links
 /// on, every rate limit at 1000 per hour unless `limits` names it, then

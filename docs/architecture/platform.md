@@ -934,7 +934,7 @@ secret_key = { env = "MEREZHA_IDENTITY_SECRET_KEY" }   # at least 32 bytes
 | `sessions.max_per_user`, `sessions.bearer` | `50`, `true` | 1 to 1000 | The least recently seen session is evicted past the cap; `bearer` allows `"transport": "bearer"` |
 | `tokens.email_verification_ttl`, `magic_link_ttl`, `password_reset_ttl`, `email_change_ttl` | `24h`, `15m`, `30m`, `1h` | | One-time token lifetimes |
 | `magic_links.sign_up` | `true` | | Unknown addresses get a sign-up link while registration is open |
-| `rate_limits.<policy>.limit`, `.period` | identity §7 | 1 to 1000000, 1 s to 30 d | Policies `sign_in_ip`, `sign_in_account_ip`, `sign_in_account`, `registration_ip`, `email_address_ip`, `email_address`, `email_ip`, `token_ip`, `reauth_session`, `invitation_organization` (100 per day, per organization, on arrival), `api_key_invalid_ip` (60 per minute, on failure), `passkey_ip` (60 per 10 min, on arrival, the passkey options routes), `oauth_ip` (30 per 10 min, on arrival, `oauth/{provider}/start`), `oauth_callback_ip` (30 per 10 min, on failure, the callback, checked first) |
+| `rate_limits.<policy>.limit`, `.period` | identity §7 | 1 to 1000000, 1 s to 30 d | Policies `sign_in_ip`, `sign_in_account_ip`, `sign_in_account`, `registration_ip`, `email_address_ip`, `email_address`, `email_ip`, `token_ip`, `reauth_session`, `invitation_organization` (100 per day, per organization, on arrival), `api_key_invalid_ip` (60 per minute, on failure), `passkey_ip` (60 per 10 min, on arrival, the passkey options routes), `oauth_ip` (30 per 10 min, on arrival, `oauth/{provider}/start`), `oauth_callback_ip` (30 per 10 min, on failure of a callback naming a live flow, checked first), `oauth_callback_unknown_ip` (300 per 10 min, on failure of a callback naming no live flow) |
 | `links.invitation`, `tokens.invitation_ttl` | `/auth/invitation`, `7d` | 1 h to 30 d | The invitation page and lifetime |
 | `organizations.user_can_create`, `max_per_user`, `max_members` | `true`, `50`, `10000` | 1 to 10000, 1 to 1000000 | `false` gives an application without organizations (`POST /organizations` answers 403); organizations one user may create (`organization_limit`); members per organization |
 | `rbac.cache_entries`, `max_custom_roles`, `max_resource_assignments` | `10000`, `100`, `500` | 2 to 1000000, 1 to 1000, 1 to 10000 | Grant snapshots cached per instance; custom roles per organization (`role_limit`); resource grants per holder and scope kept in a snapshot (more are ignored, `identity.grants_truncated`) |
@@ -1197,14 +1197,19 @@ provider's tokens, and applies the linking rules of identity §6. A
 provider whose discovery document advertises RFC 9207 must send `iss`.
 Identities store the issuer they were linked under, and one whose issuer
 differs from the provider's current one never signs in (`oauth_failed`).
-Failed callbacks are charged to `oauth_callback_ip`, checked first
-(`#error=rate_limited`); one naming no live flow is counted, not audited.
+Failed callbacks naming a live flow are charged to `oauth_callback_ip`,
+checked first (`#error=rate_limited`); one naming no live flow is counted,
+not audited, and charged to `oauth_callback_unknown_ip`, so junk never locks
+out the same IP's legitimate callbacks. A link callback re-checks that the
+starting session is still within the reauthentication window
+(`#error=reauthentication_required`).
 The binding cookie is cleared only by its own browser's callback once no
 other flow of it is pending, so two tabs both complete. It always
 answers `303`: to `return_to` (resolved on `app_origin`) or
 `links.sign_in_redirect` with the session cookie on a sign-in, or to
 `links.oauth_error#error=<code>`, codes `invalid_state`, `oauth_denied`,
-`oauth_failed`, `provider_unavailable`, `rate_limited`, `account_exists`,
+`oauth_failed`, `provider_unavailable`, `rate_limited`,
+`reauthentication_required`, `account_exists`,
 `identity_already_linked`, `registration_closed`, `email_unverified`,
 `account_disabled`; `Referrer-Policy: no-referrer` keeps the code out of the
 next page's `Referer`. An account created through a provider not trusted

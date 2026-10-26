@@ -129,16 +129,24 @@ pub const OAUTH_IP: Policy = Policy {
     charge: Charge::Arrival,
     default: Rate::new(30, minutes(10)),
 };
-/// Failed OAuth callbacks per IP (unknown or unbound `state`, refused
-/// codes): checked before the callback does any work, charged when it
-/// fails, so a flood of forged callbacks costs nothing past its budget.
+/// Failed OAuth callbacks per IP that named a live flow (unbound, refused
+/// codes, provider errors): checked before the callback does any work,
+/// charged when it fails.
 pub const OAUTH_CALLBACK_IP: Policy = Policy {
     name: "oauth_callback.ip",
     charge: Charge::Failure,
     default: Rate::new(30, minutes(10)),
 };
+/// OAuth callbacks per IP naming no live flow (unknown, replayed or forged
+/// `state`): their own, looser bucket, so junk never locks out the same
+/// IP's legitimate callbacks; past it junk is answered `rate_limited`.
+pub const OAUTH_CALLBACK_UNKNOWN_IP: Policy = Policy {
+    name: "oauth_callback_unknown.ip",
+    charge: Charge::Failure,
+    default: Rate::new(300, minutes(10)),
+};
 /// Every policy of section 7.
-pub const POLICIES: [Policy; 14] = [
+pub const POLICIES: [Policy; 15] = [
     SIGN_IN_IP,
     SIGN_IN_ACCOUNT_IP,
     SIGN_IN_ACCOUNT,
@@ -153,6 +161,7 @@ pub const POLICIES: [Policy; 14] = [
     PASSKEY_IP,
     OAUTH_IP,
     OAUTH_CALLBACK_IP,
+    OAUTH_CALLBACK_UNKNOWN_IP,
 ];
 
 /// The configuration table name of a policy: dots become underscores.

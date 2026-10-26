@@ -1422,12 +1422,13 @@ async fn linking_needs_a_recent_session_and_sends_a_notice() {
     );
 }
 
-/// Callbacks with unknown or forged states cost the IP's
-/// `oauth_callback.ip` budget and are counted, not audited; a callback
-/// that named a live flow is audited.
+/// Callbacks with unknown or forged states are counted, not audited, and
+/// charged to their own bucket; a callback that named a live flow is
+/// audited and charged to `oauth_callback.ip`.
 #[tokio::test]
 async fn failed_callbacks_are_throttled_and_unknown_states_not_audited() {
-    let Some(env) = env_with("", "", &[("oauth_callback_ip", 3, "10m")]).await else {
+    // One failure of a live flow fills the budget; junk does not count.
+    let Some(env) = env_with("", "", &[("oauth_callback_ip", 1, "10m")]).await else {
         return;
     };
     let mut attacker = Browser::new("203.0.113.80");
@@ -1808,4 +1809,72 @@ async fn rule_one_verifies_through_a_trusted_assertion() {
     assert_eq!(user["email_verified"], true);
     assert_eq!(user["credentials"]["password"], true, "no claim");
     assert_eq!(user["credentials"]["oauth"], json!(["acme", "loose"]));
+}
+
+/// A flood of junk callbacks exhausts only its own bucket: past it junk is
+/// answered `rate_limited`, while the same IP's legitimate callback still
+/// signs in.
+#[tokio::test]
+async fn junk_callbacks_never_lock_out_legitimate_ones() {
+    let Some(env) = env_with(
+        "",
+        "",
+        &[
+            ("oauth_callback_ip", 5, "10m"),
+            ("oauth_callback_unknown_ip", 20, "10m"),
+        ],
+    )
+    .await
+    else {
+        return;
+    };
+    let mut attacker = Browser::new("203.0.113.85");
+    let mut limited = 0;
+    for n in 0..60u32 {
+        let state = B64.encode([&n.to_be_bytes()[..], &[7u8; 28]].concat());
+        let answer = env
+            .callback(&mut attacker, "acme", &format!("code=x&state={state}"))
+            .await;
+        if answer.location() == error_page("rate_limited") {
+            limited += 1;
+        } else {
+            assert_eq!(answer.location(), error_page("invalid_state"));
+        }
+    }
+    assert_eq!(limited, 40, "junk past its own budget is refused");
+    let mut legit = Browser::new("203.0.113.85");
+    let answer = env
+        .oidc(
+            &mut legit,
+            "acme",
+            "sign_in",
+            json!({"sub": "after-flood", "email": "flood@example.com", "email_verified": true}),
+        )
+        .await;
+    assert_eq!(answer.location(), SIGNED_IN);
+}
+
+/// The link callback re-checks the reauthentication window: a link started
+/// with a recent session (9 min) and completed past it (18 min) links
+/// nothing.
+#[tokio::test]
+async fn a_link_completed_past_the_reauthentication_window_is_refused() {
+    let Some(env) = env().await else { return };
+    let mut ada = signed_up(&env.world, &env.node, "ada@example.com", PASSWORD).await;
+    env.world.clock.advance(Duration::from_secs(9 * 60));
+    let auth = env.start(&mut ada, "acme", "link").await;
+    env.world.clock.advance(Duration::from_secs(9 * 60));
+    let claims = env
+        .idp
+        .claims(&auth, env.now(), json!({"sub": "slow-link"}));
+    let code = env.idp.grant(&auth, claims, Token::Signed);
+    let answer = env
+        .callback(
+            &mut ada,
+            "acme",
+            &format!("code={code}&state={}", auth.state),
+        )
+        .await;
+    assert_eq!(answer.location(), error_page("reauthentication_required"));
+    assert_eq!(env.identities().await, 0);
 }

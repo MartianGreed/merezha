@@ -1258,9 +1258,11 @@ onto accounts.
    A missing or mismatched binding fails `invalid_state` and leaves the
    browser's cookie alone. This blocks login CSRF and callback injection,
    where an attacker finishes a flow in the victim's browser with the
-   attacker's code. Failed callbacks are charged to `oauth_callback.ip`,
-   checked before any work; a callback naming no live flow is counted, not
-   audited.
+   attacker's code. Failed callbacks naming a live flow are charged to
+   `oauth_callback.ip`, checked before any work; a callback naming no live
+   flow is counted, not audited, and charged to its own looser
+   `oauth_callback_unknown.ip`, so junk never locks out the same IP's
+   legitimate callbacks.
 4. Code exchange and ID token validation use `openidconnect`: signature
    against the provider JWKS (refetched once on an unknown `kid`), allowed
    algorithms `RS256`, `ES256` and `EdDSA` only, `iss`, `aud`, `azp`,
@@ -1287,7 +1289,9 @@ trusted, signed_in_user, existing_user_by_email, config)`:
 2. Link intent, signed-in user from the flow row: attach the identity. The
    flow carries `session_id`, and that session must still be alive at the
    callback (share-locked, so a revocation is not lost). Starting a link
-   needs a recent session. One identity per provider per user. A link onto
+   needs a recent session, and the callback re-checks that it still is
+   (`reauthentication_required` otherwise; the provider round trip does not
+   stretch the window). One identity per provider per user. A link onto
    an existing account sends `identity.sign_in_method_added`.
 3. Sign-in intent, no linked identity, and a trusted verified email that
    matches an existing user:
@@ -1495,7 +1499,8 @@ IPv6 addresses are keyed by their /64.
 | `reauth.session` | session | 5 per 15 min | on failure |
 | `passkey.ip` | IP | 60 per 10 min | on arrival, options routes |
 | `oauth.ip` | IP | 30 per 10 min | on arrival, start route |
-| `oauth_callback.ip` | IP | 30 per 10 min | on failure, callback route (checked first) |
+| `oauth_callback.ip` | IP | 30 per 10 min | on failure of a callback naming a live flow (checked first) |
+| `oauth_callback_unknown.ip` | IP | 300 per 10 min | on failure of a callback naming no live flow; past it such callbacks answer `rate_limited`, never the IP's legitimate ones |
 | `invitation.organization` | organization | 100 per day | on arrival |
 | `api_key.invalid.ip` | IP | 60 per min | on failure |
 
@@ -2256,7 +2261,9 @@ PR 3 as built (2026-10-25):
   passkey registration re-checks its session (share-locked) under the user
   lock, and a passkey removed mid sign-in refuses it
   (`invalid_credentials`); failed callbacks are throttled
-  (`oauth_callback.ip`) and unknown states not audited; the binding cookie
+  (`oauth_callback.ip`, and `oauth_callback_unknown.ip` for states naming
+  no flow) and unknown states not audited; the link callback re-checks
+  the reauthentication window; the binding cookie
   is cleared only by its own browser's callback once no flow of it is
   pending; rule 4 reuses a presented registration binding; failed
   discovery is remembered 30 s; identities store their issuer
