@@ -89,8 +89,7 @@ fn max_stream_events_is_bounded() {
 }
 
 /// Each version 2 document below sets one version 2 key, with what this
-/// build answers: `ok`, the access issue, or `unsupported_in_this_build`
-/// for reactors (AP-C3).
+/// build answers: `ok`, or the access, tenancy or reactor issue.
 fn version_2_documents() -> Vec<(&'static str, String, &'static str)> {
     let command = |extra: &str| {
         format!(
@@ -169,7 +168,8 @@ fn version_2_documents() -> Vec<(&'static str, String, &'static str)> {
             format!(
                 "{ROUTES}[[reactors]]\nname = \"task-notifier\"\nservice = \"task-notifier\"\n"
             ),
-            "unsupported_in_this_build",
+            // Reactors write through the outbox (AP §C.5).
+            "reactors_require_postgres",
         ),
         // Writing the key at all is version 2, even as an empty list.
         (
@@ -177,16 +177,12 @@ fn version_2_documents() -> Vec<(&'static str, String, &'static str)> {
             format!("permissions = []\n{ROUTES}"),
             "ok",
         ),
-        (
-            "empty reactors",
-            format!("reactors = []\n{ROUTES}"),
-            "unsupported_in_this_build",
-        ),
+        ("empty reactors", format!("reactors = []\n{ROUTES}"), "ok"),
     ]
 }
 
 #[test]
-fn version_2_access_and_tenancy_keys_are_accepted_and_reactors_refused_as_unsupported() {
+fn version_2_access_tenancy_and_reactor_keys_are_accepted() {
     for (name, body, expected) in version_2_documents() {
         let parsed = Config::parse(&format!("version = 2\n{body}"));
         match expected {
@@ -216,7 +212,7 @@ fn version_1_documents_cannot_use_version_2_keys() {
 }
 
 #[test]
-fn the_designed_version_2_examples_parse_completely_before_the_refusal() {
+fn the_designed_version_2_examples_parse_completely() {
     // AP §C.4 and §C.5, verbatim apart from the shared service names and
     // the PostgreSQL storage partitions need.
     let text = r#"version = 2
@@ -266,8 +262,16 @@ allow_addresses = false
 start = "head"
 on_error = "halt"
 "#;
-    assert_eq!(code(text), "unsupported_in_this_build");
-    // Without the reactor (AP-C3) the §C.4 example is accepted as written.
+    // The §C.5 reactor names a command tag the §C.4 routes do not declare.
+    assert_eq!(code(text), "unknown_command");
+    let archive = "[[commands]]\ntag = \"ArchiveTask\"\nservice = \"task-domain\"\naggregate = \"Task\"\npermission = \"tasks.archive\"\nscope = \"tenant\"\n[[reactors]]";
+    let complete = Config::parse(&text.replacen("[[reactors]]", archive, 1)).unwrap();
+    assert!(complete.route_issues().is_empty());
+    assert_eq!(
+        complete.reactors.as_ref().unwrap()[0].name.as_str(),
+        "task-notifier"
+    );
+    // Without the reactor the §C.4 example is accepted as written.
     let routes = Config::parse(text.split("[[reactors]]").next().unwrap()).unwrap();
     assert!(routes.route_issues().is_empty());
     assert_eq!(
@@ -372,7 +376,7 @@ fn permission_and_reactor_counts_and_description_length_are_bounded() {
         assert!(Config::parse(&at).is_ok(), "{name} at the bound");
         assert_eq!(code(&over), "invalid_config", "{name} over the bound");
     }
-    assert_eq!(code(&reactors(32)), "unsupported_in_this_build");
+    assert_eq!(code(&reactors(32)), "reactors_require_postgres");
     assert_eq!(code(&reactors(33)), "invalid_config");
 }
 

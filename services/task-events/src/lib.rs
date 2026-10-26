@@ -4,8 +4,8 @@
 //!
 //! Both components are built independently; this crate is the schema they
 //! share, in the role of an event registry. Every event is written with
-//! [`SCHEMA_VERSION`], except a `TaskCreated` that records its owner, which
-//! is [`OWNED_SCHEMA_VERSION`]. Decoding checks the tag, the version and the
+//! [`SCHEMA_VERSION`], except a `TaskCreated` or `TaskCompleted` that
+//! records its owner, which is [`OWNED_SCHEMA_VERSION`]. Decoding checks the tag, the version and the
 //! payload shape, so a component never interprets a fact it does not know.
 
 use merezha_domain::{Event, Failure, Identity};
@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 /// Schema version of every task board event without an owner.
 pub const SCHEMA_VERSION: u16 = 1;
 
-/// Schema version of a `TaskCreated` that records its owner: the
-/// principal who created the task through protocol version 2.
+/// Schema version of a `TaskCreated` or `TaskCompleted` that records its
+/// owner: the principal who created the task through protocol version 2.
 pub const OWNED_SCHEMA_VERSION: u16 = 2;
 
 /// Longest accepted task title, in Unicode scalar values.
@@ -63,6 +63,11 @@ pub struct TaskRenamed {
 #[serde(deny_unknown_fields)]
 pub struct TaskCompleted {
     pub task_id: Identity,
+    /// The task's owner (schema version 2), so a reactor can notify them
+    /// without reading state; `None` for an unowned task (schema version
+    /// 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<Identity>,
 }
 
 impl TaskEvent {
@@ -107,7 +112,8 @@ impl TaskEvent {
     /// The schema version the event is written with.
     pub fn schema_version(&self) -> u16 {
         match self {
-            Self::Created(TaskCreated { owner: Some(_), .. }) => OWNED_SCHEMA_VERSION,
+            Self::Created(TaskCreated { owner: Some(_), .. })
+            | Self::Completed(TaskCompleted { owner: Some(_), .. }) => OWNED_SCHEMA_VERSION,
             _ => SCHEMA_VERSION,
         }
     }
@@ -118,7 +124,7 @@ impl TaskEvent {
     ///
     /// `unknown_event` for a tag this schema does not define,
     /// `unsupported_schema_version` for any version but [`SCHEMA_VERSION`]
-    /// (and [`OWNED_SCHEMA_VERSION`] for `TaskCreated`), and
+    /// (and [`OWNED_SCHEMA_VERSION`] for `TaskCreated` and `TaskCompleted`), and
     /// `invalid_event` when the payload does not match the tag's shape and
     /// version or carries an invalid title.
     pub fn decode(event: &Event) -> Result<Self, Failure> {
@@ -129,7 +135,7 @@ impl TaskEvent {
             _ => return Err(Failure::permanent("unknown_event")),
         }?;
         let known = match &decoded {
-            Self::Created(_) => {
+            Self::Created(_) | Self::Completed(_) => {
                 [SCHEMA_VERSION, OWNED_SCHEMA_VERSION].contains(&event.schema_version)
             }
             _ => event.schema_version == SCHEMA_VERSION,

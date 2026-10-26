@@ -191,7 +191,7 @@ pub const PROJECTION_PARTITIONED: Statement = Statement::new(
 /// `pg_locks` with `classid = 1297760592`.
 pub const LOCK_CLASS: i32 = 1_297_760_592;
 /// A session advisory lock on a detached session; `$1` is the run key
-/// (`p:{name}:{revision}` or `b:{name}:{revision}`).
+/// (`p:{name}:{revision}`, `b:{name}:{revision}` or `r:{reactor}`).
 pub const TRY_LOCK: Statement = Statement::new(
     "app.run.try_lock",
     "SELECT pg_try_advisory_lock()",
@@ -340,6 +340,136 @@ pub const COMMIT_DELAY: Statement = Statement::new(
     "SELECT pg_sleep(<seconds>)",
 );
 
+/// A configured reactor without a row starts at the head (`$2` false) or
+/// at the beginning (`$2` true), once: a later start keeps the row, even
+/// after the reactor left the configuration. The `NOT EXISTS` read keeps a
+/// starting host from waiting on a run's open checkpoint transaction.
+pub const INSERT_REACTOR: Statement = Statement::new(
+    "app.reactors.insert",
+    "INSERT merezha_app.reactors",
+    "INSERT INTO merezha_app.reactors (name, checkpoint, start_position) \
+    SELECT $1, p.position, p.position \
+      FROM (SELECT CASE WHEN $2 THEN 0 ELSE h.position END AS position \
+              FROM merezha_app.head h WHERE h.id = 1) p \
+     WHERE NOT EXISTS (SELECT 1 FROM merezha_app.reactors r WHERE r.name = $1) \
+    ON CONFLICT (name) DO NOTHING",
+);
+/// A reactor's row, with the milliseconds until `retry_at` (0 when due or
+/// unset).
+pub const REACTOR: Statement = Statement::new(
+    "app.reactors.read",
+    "SELECT merezha_app.reactors",
+    "SELECT checkpoint, row_revision, status, halted_position, failures, \
+        greatest(0, ceil(extract(epoch FROM coalesce(retry_at, now()) - now()) * 1000))::bigint \
+    FROM merezha_app.reactors WHERE name = $1",
+);
+/// Checkpoint transaction step 1 (AP §C.5): the row, locked, so the batch
+/// orders against admin skips and pauses and other runs.
+pub const LOCK_REACTOR: Statement = Statement::new(
+    "app.reactors.lock",
+    "SELECT merezha_app.reactors",
+    "SELECT checkpoint, row_revision, status FROM merezha_app.reactors WHERE name = $1 FOR UPDATE",
+);
+/// The batch's rejected effects (`$2` positions, `$3` indexes, `$4`
+/// effect types, `$5` codes zipped), inside its checkpoint transaction.
+pub const INSERT_REJECTIONS: Statement = Statement::new(
+    "app.reactor_rejections.insert",
+    "INSERT merezha_app.reactor_rejections",
+    "INSERT INTO merezha_app.reactor_rejections (name, position, index, effect, code) \
+    SELECT $1, u.position, u.index, u.effect, u.code \
+      FROM unnest($2::bigint[], $3::smallint[], $4::text[], $5::text[]) AS u (position, index, effect, code) \
+    ON CONFLICT DO NOTHING",
+);
+/// Skipped events `$6` to `$2`: `on_error = "skip"` in the checkpoint
+/// transaction, or an operator's skip (`$5` the principal).
+pub const INSERT_SKIP: Statement = Statement::new(
+    "app.reactor_skips.insert",
+    "INSERT merezha_app.reactor_skips",
+    "INSERT INTO merezha_app.reactor_skips (name, position, reason, failure_code, principal, first_position) \
+    VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+);
+/// Checkpoint transaction, last step: advance past the batch and clear
+/// every failure mark; a halted reactor that succeeds is active again.
+pub const ADVANCE_REACTOR: Statement = Statement::new(
+    "app.reactors.advance",
+    "UPDATE merezha_app.reactors",
+    "UPDATE merezha_app.reactors \
+    SET checkpoint = $2, row_revision = row_revision + 1, status = 'active', halted_position = NULL, \
+        failures = 0, failure_code = NULL, failure_class = NULL, retry_at = NULL, updated_at = now() \
+    WHERE name = $1 RETURNING row_revision",
+);
+/// A failed batch (`$5` halts at that position when set): the checkpoint
+/// stays, `failures` grows and the next attempt waits `$4` ms. A paused
+/// reactor stays paused.
+pub const REACTOR_FAILURE: Statement = Statement::new(
+    "app.reactors.record_failure",
+    "UPDATE merezha_app.reactors",
+    "UPDATE merezha_app.reactors \
+    SET failure_code = $2, failure_class = $3, failures = failures + 1, \
+        retry_at = now() + $4::bigint * interval '1 millisecond', \
+        status = CASE WHEN status = 'paused' THEN 'paused' WHEN $5::bigint IS NULL THEN status ELSE 'halted' END, \
+        halted_position = CASE WHEN status = 'paused' THEN NULL WHEN $5::bigint IS NULL THEN halted_position ELSE $5 END, \
+        updated_at = now() \
+    WHERE name = $1 AND checkpoint = $6 RETURNING failures",
+);
+/// `POST reactors/{name}/pause` and `/resume`: resume makes the reactor
+/// active and due now; a halted reactor resumed retries at once.
+pub const SET_REACTOR_STATUS: Statement = Statement::new(
+    "app.reactors.set_status",
+    "UPDATE merezha_app.reactors",
+    "UPDATE merezha_app.reactors \
+    SET status = $2, halted_position = NULL, row_revision = row_revision + 1, \
+        retry_at = CASE WHEN $2 = 'active' THEN NULL ELSE retry_at END, updated_at = now() \
+    WHERE name = $1 RETURNING status",
+);
+/// `POST reactors/{name}/retry`: due now, whatever its backoff.
+pub const RETRY_REACTOR: Statement = Statement::new(
+    "app.reactors.retry",
+    "UPDATE merezha_app.reactors",
+    "UPDATE merezha_app.reactors SET retry_at = NULL, updated_at = now() \
+    WHERE name = $1 RETURNING status",
+);
+/// An operator's skip, inside its transaction after `LOCK_REACTOR`: the
+/// checkpoint moves to `$2`, an active or halted reactor becomes active.
+pub const SKIP_REACTOR: Statement = Statement::new(
+    "app.reactors.skip",
+    "UPDATE merezha_app.reactors",
+    "UPDATE merezha_app.reactors \
+    SET checkpoint = $2, row_revision = row_revision + 1, \
+        status = CASE WHEN status = 'paused' THEN 'paused' ELSE 'active' END, halted_position = NULL, \
+        failures = 0, failure_code = NULL, failure_class = NULL, retry_at = NULL, updated_at = now() \
+    WHERE name = $1 AND $2 <= (SELECT position FROM merezha_app.head WHERE id = 1) \
+    RETURNING checkpoint",
+);
+/// The configured reactors (`$1`), in one snapshot with the head: each
+/// row and the accepted time of its first unprocessed event; with `$2 > 0`
+/// also its rejections, counted up to `$2` (only `GET reactors` counts:
+/// the lag sampler and the status document pass 0).
+pub const REACTORS_OVERVIEW: Statement = Statement::new(
+    "app.reactors.overview",
+    "SELECT merezha_app.reactors",
+    "SELECT r.name, r.checkpoint, r.status, r.halted_position, r.failure_code, r.failures, \
+        to_char(r.retry_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), \
+        CASE WHEN $2::bigint > 0 THEN (SELECT count(*) FROM (SELECT 1 FROM merezha_app.reactor_rejections j \
+            WHERE j.name = r.name LIMIT $2::bigint) capped) END, \
+        e.accepted_unix_ms \
+    FROM unnest($1::text[]) AS c (name) \
+    JOIN merezha_app.reactors r ON r.name = c.name \
+    LEFT JOIN merezha_app.events e ON e.position = r.checkpoint + 1 \
+    ORDER BY r.name",
+);
+/// One page of a reactor's rejections after the cursor `($2, $3)`, oldest
+/// first, one row more than `$4` to tell whether another page follows.
+pub const REJECTIONS: Statement = Statement::new(
+    "app.reactor_rejections.list",
+    "SELECT merezha_app.reactor_rejections",
+    "SELECT position, index, effect, code, \
+        to_char(rejected_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') \
+    FROM merezha_app.reactor_rejections \
+    WHERE name = $1 AND (position, index) > ($2, $3::smallint) \
+    ORDER BY position, index LIMIT $4",
+);
+
 /// Every statement the store runs, the verification's included.
 pub const STATEMENTS: &[Statement] = &[
     APPEND,
@@ -377,6 +507,18 @@ pub const STATEMENTS: &[Statement] = &[
     REVISIONS,
     DELETE_REVISION,
     OVERVIEW,
+    INSERT_REACTOR,
+    REACTOR,
+    LOCK_REACTOR,
+    INSERT_REJECTIONS,
+    INSERT_SKIP,
+    ADVANCE_REACTOR,
+    REACTOR_FAILURE,
+    SET_REACTOR_STATUS,
+    RETRY_REACTOR,
+    SKIP_REACTOR,
+    REACTORS_OVERVIEW,
+    REJECTIONS,
     ADMIN_SNAPSHOT,
     COMMIT_DELAY,
     super::verify::SNAPSHOT,

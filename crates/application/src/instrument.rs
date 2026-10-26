@@ -155,6 +155,11 @@ struct Labels {
     commands: BTreeMap<String, Label>,
     queries: BTreeMap<String, Label>,
     projections: BTreeMap<String, Label>,
+    #[cfg_attr(
+        not(feature = "postgres"),
+        expect(dead_code, reason = "reactors run on PostgreSQL only")
+    )]
+    reactors: BTreeMap<String, Label>,
     unknown_command: Label,
     unknown_query: Label,
     unknown_projection: Label,
@@ -172,6 +177,10 @@ impl Labels {
             projections: build(
                 "projection",
                 config.projections.iter().map(|p| p.name.as_str()),
+            ),
+            reactors: build(
+                "react",
+                config.reactors.iter().flatten().map(|r| r.name.as_str()),
             ),
             unknown_command: Label::new("command", dispatch::UNKNOWN),
             unknown_query: Label::new("query", dispatch::UNKNOWN),
@@ -202,11 +211,17 @@ struct ProjectionLag {
 pub(crate) struct LagState {
     head: Option<u64>,
     projections: BTreeMap<String, ProjectionLag>,
+    /// Reactor lag, keyed like projections; `warm` and `rebuild_remaining`
+    /// stay unset, `halted` is the reactor's.
+    reactors: BTreeMap<String, ProjectionLag>,
+    halted: BTreeMap<String, bool>,
 }
 /// A read of the store's lag, by the sampler.
 pub(crate) struct Sample {
     pub head: u64,
     pub projections: Vec<SampledProjection>,
+    /// Reactors as projections, plus whether each is halted.
+    pub reactors: Vec<(SampledProjection, bool)>,
 }
 pub(crate) struct SampledProjection {
     pub name: String,
@@ -227,9 +242,13 @@ impl LagState {
         }
         self.head = Some(position);
         let now = now_ms();
-        for lag in self.projections.values_mut() {
+        for lag in self
+            .projections
+            .values_mut()
+            .chain(self.reactors.values_mut())
+        {
             // Events just accepted are the oldest unprocessed ones of a
-            // projection that was caught up.
+            // projection or reactor that was caught up.
             if previous.is_some() && lag.checkpoint == previous && lag.oldest_ms.is_none() {
                 lag.oldest_ms = Some(now);
             }
@@ -279,6 +298,42 @@ impl LagState {
             lag.warm = row.warm;
             lag.rebuild_remaining = row.rebuild_remaining;
         }
+        for (row, halted) in sample.reactors {
+            self.halted.insert(row.name.clone(), halted);
+            let lag = self.reactors.entry(row.name).or_default();
+            if lag.checkpoint.is_none_or(|c| c <= row.checkpoint) {
+                lag.checkpoint = Some(row.checkpoint);
+                lag.oldest_ms = if row.checkpoint < sample.head {
+                    row.oldest_ms
+                } else {
+                    None
+                };
+            }
+        }
+    }
+    /// A reactor's committed checkpoint and halted state.
+    #[cfg(feature = "postgres")]
+    fn reactor(&mut self, name: &str, checkpoint: u64, halted: bool) {
+        self.halted.insert(name.to_owned(), halted);
+        if self.head.is_none_or(|h| h < checkpoint) {
+            self.head = Some(checkpoint);
+        }
+        let head = self.head;
+        let lag = self.reactors.entry(name.to_owned()).or_default();
+        lag.checkpoint = Some(lag.checkpoint.map_or(checkpoint, |c| c.max(checkpoint)));
+        if head.is_some_and(|h| lag.checkpoint.is_some_and(|c| c >= h)) {
+            lag.oldest_ms = None;
+        }
+    }
+    /// A reactor's feed read from `position`, accepted at `accepted_ms`.
+    #[cfg(feature = "postgres")]
+    fn reactor_feed(&mut self, name: &str, position: u64, accepted_ms: u64) {
+        let lag = self.reactors.entry(name.to_owned()).or_default();
+        lag.checkpoint = Some(position.saturating_sub(1).max(lag.checkpoint.unwrap_or(0)));
+        lag.oldest_ms = Some(accepted_ms);
+        if self.head.is_none_or(|h| h < position) {
+            self.head = Some(position);
+        }
     }
     /// `(events, age in seconds)` of `lag`, when known.
     fn lag(&self, lag: &ProjectionLag) -> Option<(u64, Option<f64>)> {
@@ -309,6 +364,25 @@ struct Metrics {
     _warm: ObservableGauge<u64>,
     _rebuild: ObservableGauge<u64>,
     _locks: Option<(ObservableGauge<f64>, ObservableCounter<u64>)>,
+    #[cfg_attr(
+        not(feature = "postgres"),
+        expect(dead_code, reason = "reactors run on PostgreSQL only")
+    )]
+    reactor_batch: Histogram<f64>,
+    #[cfg_attr(
+        not(feature = "postgres"),
+        expect(dead_code, reason = "reactors run on PostgreSQL only")
+    )]
+    reactor_effects: Counter<u64>,
+    #[cfg_attr(
+        not(feature = "postgres"),
+        expect(dead_code, reason = "reactors run on PostgreSQL only")
+    )]
+    reactor_skipped: Counter<u64>,
+    _reactor_lag_events: ObservableGauge<u64>,
+    _reactor_lag_age: ObservableGauge<f64>,
+    _reactor_halted: ObservableGauge<u64>,
+    _reactor_locks: Option<(ObservableGauge<f64>, ObservableCounter<u64>)>,
 }
 
 /// The per-revision lock sources a PostgreSQL store exposes (AP-A3):
@@ -318,6 +392,14 @@ pub(crate) trait LockSource: Send + Sync {
     fn held(&self) -> Vec<(String, f64)>;
     /// `(projection, contended attempts)`, live and rebuild together.
     fn contended(&self) -> Vec<(String, u64)>;
+    /// `(reactor, seconds held)` of the `r:` locks held here.
+    fn reactors_held(&self) -> Vec<(String, f64)> {
+        Vec::new()
+    }
+    /// `(reactor, contended attempts)`.
+    fn reactors_contended(&self) -> Vec<(String, u64)> {
+        Vec::new()
+    }
 }
 
 /// Telemetry state of one application: its instruments, once a meter is
@@ -349,6 +431,7 @@ impl Instruments {
                     )
                 })
                 .collect(),
+            ..LagState::default()
         };
         Self {
             metrics: OnceLock::new(),
@@ -380,6 +463,58 @@ impl Instruments {
     }
     pub(crate) fn apply(&self, sample: Sample) {
         self.lag().apply(sample);
+    }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn observe_reactor(&self, name: &str, checkpoint: u64, halted: bool) {
+        self.lag().reactor(name, checkpoint, halted);
+    }
+    #[cfg(feature = "postgres")]
+    pub(crate) fn observe_reactor_feed(&self, name: &str, position: u64, accepted_ms: u64) {
+        self.lag().reactor_feed(name, position, accepted_ms);
+    }
+    #[cfg(feature = "postgres")]
+    /// One event of `reactor` skipped (`merezha.reactor.skipped`).
+    pub(crate) fn reactor_skipped(&self, reactor: &str, reason: merezha_telemetry::names::Reason) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.reactor_skipped.add(
+                1,
+                &[
+                    dispatch::reactor_name(self.reactor_label(reactor).name.clone()),
+                    attr::reason(reason),
+                ],
+            );
+        }
+    }
+    #[cfg(feature = "postgres")]
+    fn reactor_label(&self, name: &str) -> &Label {
+        self.labels
+            .reactors
+            .get(name)
+            .unwrap_or(&self.labels.unknown_projection)
+    }
+    #[cfg(feature = "postgres")]
+    /// The tracker of one batch of configured reactor `name`.
+    pub(crate) fn react(&self, name: &str) -> ReactorRun<'_> {
+        let label = self.reactor_label(name);
+        let span = tracing::info_span!(
+            parent: None,
+            "react",
+            otel.name = &*label.span,
+            otel.status_code = Empty,
+            merezha.reactor.name = &*label.name,
+            merezha.outcome = Empty,
+            error.type = Empty,
+            merezha.guest.error_code = Empty,
+            merezha.events.count = Empty,
+            merezha.event.position = Empty,
+        );
+        ReactorRun {
+            instruments: self,
+            label,
+            span,
+            started: Instant::now(),
+            links: Vec::new(),
+        }
     }
     /// The tracker of one command dispatch of `tag`, recorded as
     /// `_unknown` unless configured.
@@ -462,6 +597,31 @@ impl Metrics {
                 (head, rows)
             }
         };
+        let reactors = |lag: &Arc<Mutex<LagState>>| {
+            let lag = lag.clone();
+            move || {
+                let state = lag.lock().unwrap_or_else(|e| e.into_inner());
+                state
+                    .reactors
+                    .iter()
+                    .map(|(name, r)| (name.clone(), state.lag(r)))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let reactor_events = reactors(lag);
+        let reactor_age = reactors(lag);
+        let halted = {
+            let lag = lag.clone();
+            move || {
+                let state = lag.lock().unwrap_or_else(|e| e.into_inner());
+                state
+                    .halted
+                    .iter()
+                    .map(|(name, halted)| (name.clone(), *halted))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let reactor_locks = locks.clone();
         let head = read(lag);
         let events = read(lag);
         let age = read(lag);
@@ -525,6 +685,51 @@ impl Metrics {
                         move |o| {
                             for (name, attempts) in locks.contended() {
                                 o.observe(attempts, &[dispatch::projection_name(name.as_str())]);
+                            }
+                        },
+                    ),
+                )
+            }),
+            reactor_batch: instruments::histogram(meter, &metric::REACTOR_BATCH_DURATION),
+            reactor_effects: instruments::counter(meter, &metric::REACTOR_EFFECTS),
+            reactor_skipped: instruments::counter(meter, &metric::REACTOR_SKIPPED),
+            _reactor_lag_events: instruments::u64_gauge(
+                meter,
+                &metric::REACTOR_LAG_EVENTS,
+                move |o| {
+                    for (name, lag) in reactor_events() {
+                        if let Some((events, _)) = lag {
+                            o.observe(events, &[dispatch::reactor_name(name.as_str())]);
+                        }
+                    }
+                },
+            ),
+            _reactor_lag_age: instruments::f64_gauge(meter, &metric::REACTOR_LAG_AGE, move |o| {
+                for (name, lag) in reactor_age() {
+                    if let Some((_, Some(age))) = lag {
+                        o.observe(age, &[dispatch::reactor_name(name.as_str())]);
+                    }
+                }
+            }),
+            _reactor_halted: instruments::u64_gauge(meter, &metric::REACTOR_HALTED, move |o| {
+                for (name, halted) in halted() {
+                    o.observe(u64::from(halted), &[dispatch::reactor_name(name.as_str())]);
+                }
+            }),
+            _reactor_locks: reactor_locks.map(|locks| {
+                let held = locks.clone();
+                (
+                    instruments::f64_gauge(meter, &metric::REACTOR_LOCK_HELD, move |o| {
+                        for (name, seconds) in held.reactors_held() {
+                            o.observe(seconds, &[dispatch::reactor_name(name.as_str())]);
+                        }
+                    }),
+                    instruments::observable_counter(
+                        meter,
+                        &metric::REACTOR_LOCK_CONTENDED,
+                        move |o| {
+                            for (name, attempts) in locks.reactors_contended() {
+                                o.observe(attempts, &[dispatch::reactor_name(name.as_str())]);
                             }
                         },
                     ),
@@ -836,6 +1041,103 @@ impl ProjectionRun<'_> {
     }
 }
 
+#[cfg(feature = "postgres")]
+/// One reactor batch with matching events: a root `react {reactor}` span
+/// linked to at most 8 distinct source traces, and on finish
+/// `merezha.reactor.batch.duration` and `merezha.reactor.effects`.
+pub(crate) struct ReactorRun<'a> {
+    instruments: &'a Instruments,
+    label: &'a Label,
+    span: Span,
+    started: Instant,
+    links: Vec<TraceId>,
+}
+#[cfg(feature = "postgres")]
+impl ReactorRun<'_> {
+    pub(crate) fn span(&self) -> &Span {
+        &self.span
+    }
+    /// The batch's source traces become links (`source_event`).
+    pub(crate) fn batch<'e>(
+        &mut self,
+        traces: impl IntoIterator<Item = &'e Option<StoredContext>>,
+    ) {
+        for context in traces.into_iter().flatten() {
+            let context = context.span_context();
+            let trace = context.trace_id();
+            if !context.is_valid()
+                || self.links.contains(&trace)
+                || self.links.len() >= dispatch::MAX_SOURCE_LINKS
+            {
+                continue;
+            }
+            self.links.push(trace);
+            self.span
+                .add_link_with_attributes(context, vec![dispatch::source_event_link()]);
+        }
+    }
+    fn record(&self, outcome: Outcome) {
+        self.span.record("merezha.outcome", outcome.as_str());
+        if let Some(metrics) = self.instruments.metrics.get() {
+            metrics.reactor_batch.record(
+                self.started.elapsed().as_secs_f64(),
+                &[
+                    dispatch::reactor_name(self.label.name.clone()),
+                    attr::outcome(outcome),
+                ],
+            );
+        }
+    }
+    /// The batch of `events` committed through `position`, with its
+    /// accepted effect types and its rejections.
+    pub(crate) fn finish_accepted(
+        self,
+        events: usize,
+        position: u64,
+        accepted: &[&'static str],
+        rejected: &[&'static str],
+    ) {
+        self.span.record("merezha.events.count", events as u64);
+        self.span.record("merezha.event.position", position);
+        self.record(Outcome::Accepted);
+        let Some(metrics) = self.instruments.metrics.get() else {
+            return;
+        };
+        let effect = |kind: &str| match kind {
+            "notify" => dispatch::ReactorEffect::Notify,
+            "webhook" => dispatch::ReactorEffect::Webhook,
+            _ => dispatch::ReactorEffect::Command,
+        };
+        for (kinds, outcome) in [(accepted, Outcome::Accepted), (rejected, Outcome::Rejected)] {
+            for kind in kinds {
+                metrics.reactor_effects.add(
+                    1,
+                    &[
+                        dispatch::reactor_name(self.label.name.clone()),
+                        dispatch::reactor_effect(effect(kind)),
+                        attr::outcome(outcome),
+                    ],
+                );
+            }
+        }
+    }
+    /// The batch failed; `halted` when it halted the reactor. A guest's
+    /// own code is recorded as `merezha.guest.error_code` only.
+    pub(crate) fn finish_failed(self, run: &RunFailure, halted: bool) {
+        if run.from_guest {
+            self.span
+                .record("merezha.guest.error_code", run.failure.code.as_str());
+        }
+        self.span.record("error.type", run.log_code());
+        self.span.record("otel.status_code", "error");
+        self.record(if halted {
+            Outcome::Halted
+        } else {
+            Outcome::Failed
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,6 +1199,7 @@ mod tests {
                 },
             )]
             .into(),
+            ..LagState::default()
         };
         let p = |s: &LagState| s.lag(&s.projections["p"]);
         assert_eq!(p(&state), Some((0, Some(0.0))));
@@ -920,6 +1223,7 @@ mod tests {
                 warm: Some(true),
                 rebuild_remaining: None,
             }],
+            reactors: Vec::new(),
         });
         let (events, age) = p(&state).unwrap();
         assert_eq!(events, 7);
@@ -935,6 +1239,7 @@ mod tests {
                 warm: Some(true),
                 rebuild_remaining: Some(6),
             }],
+            reactors: Vec::new(),
         });
         assert_eq!(p(&state), Some((0, Some(0.0))));
         assert_eq!(state.projections["p"].rebuild_remaining, Some(6));

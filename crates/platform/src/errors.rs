@@ -46,6 +46,7 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("not_found", 404),
     ErrorCode::new("handler_not_found", 404),
     ErrorCode::new("projection_not_found", 404),
+    ErrorCode::new("reactor_not_found", 404),
     ErrorCode::new("unknown_service", 404),
     ErrorCode::new("blob_not_found", 404),
     ErrorCode::new("method_not_allowed", 405),
@@ -61,6 +62,10 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("rebuild_in_progress", 409),
     ErrorCode::new("rebuild_failed", 409),
     ErrorCode::new("revision_active", 409),
+    // A reactor skip must name exactly the stuck event (AP §D.1).
+    ErrorCode::new("invalid_skip", 409),
+    // A reactor batch that lost its row revision; the run reloads.
+    ErrorCode::new("reactor_conflict", 409),
     ErrorCode::new("storage_owned", 409),
     ErrorCode::new("outbox_duplicate", 409),
     ErrorCode::new("revision_conflict", 412),
@@ -78,6 +83,13 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("service_protocol_mismatch", 422),
     ErrorCode::new("principal_not_trusted", 422),
     ErrorCode::new("invalid_principal", 422),
+    // Reactors (AP §C.5): startup refusals, effect rejections and the
+    // `application.command` handler's permanent failures.
+    ErrorCode::new("reactor_requires_protocol_2", 422),
+    ErrorCode::new("reactor_effects_unavailable", 422),
+    ErrorCode::new("command_not_allowed", 422),
+    ErrorCode::new("invalid_delay", 422),
+    ErrorCode::new("invalid_effect", 422),
     ErrorCode::new("serialization_failed", 422),
     ErrorCode::new("constraint_violation", 422),
     ErrorCode::new("database_error", 422),
@@ -951,6 +963,12 @@ fn after() -> Failure {
             "sms",
             "push",
             "inbox",
+            // Effect types and classifications (AP §C.5).
+            "notify",
+            "webhook",
+            "command",
+            "permanent",
+            "transient",
             "kernel",
             "apply",
             "verify",

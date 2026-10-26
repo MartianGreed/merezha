@@ -29,6 +29,8 @@ tokio.workspace = true
 tracing = { workspace = true, features = ["release_max_level_debug"] }
 
 [dev-dependencies]
+# `RunHooks::reactor_fail` for the reactor rollback tests.
+merezha-application = { path = "../application", features = ["postgres", "test-support"] }
 # The process tests drive the relay through MEREZHA_JOBS_TEST_RELAY.
 merezha-jobs = { path = "../jobs", features = ["test-hooks"] }
 # `testkit::FakeBrevo` for `merezha notifications brevo register-webhook`.

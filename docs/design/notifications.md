@@ -1739,6 +1739,14 @@ calling the `Notifier`; an invalid reaction topic is recorded as rejected and
 the checkpoint still advances, while a malformed reply halts the reactor; two
 reactors on one event give two notifications. *Tests:* an example
 application end to end, from guest event to reaction to inbox item to SSE event.
+*Reaction part, as built in AP-C3:* reactions reach `Notifier::request` and
+`emit_webhook` with source `application` inside the reactor checkpoint
+transaction (AP §C.5, C3 delivery notes); an unknown topic, a user outside the
+event's tenant and an address recipient without `allow_addresses` are recorded
+as rejected while the checkpoint advances, a malformed reply halts the reactor,
+and two reactors on one event give two notifications
+(`crates/cli/tests/reactors.rs`, `crates/application/tests/reactors.rs`). The
+end-to-end example application stays with stage 3 (`merezha new`).
 
 **N9: quiet hours** (migration 6, after v1). *Scope:* the section, the
 settings fields and the rule of section 6. *Acceptance:* a push moves to the

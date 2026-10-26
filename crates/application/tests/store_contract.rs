@@ -260,7 +260,9 @@ impl GuestSession for Fake {
                     state: json!(state.as_i64().unwrap() + added),
                 })
             }
-            Operation::Describe {} => unreachable!("a version 1 fake is never described"),
+            Operation::Describe {} | Operation::React { .. } => {
+                unreachable!("a version 1 fake is never described and never reacts")
+            }
             Operation::Query { state, .. } => Ok(Reply::Queried { value: state }),
         }
     }

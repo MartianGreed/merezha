@@ -358,7 +358,19 @@ pub enum OnError {
     Halt,
     Skip,
 }
-/// A reactor declaration (version 2, AP-C3).
+/// Most `events` tags one reactor filters on.
+pub const MAX_REACTOR_EVENTS: usize = 64;
+/// Longest reactor name, so `reaction:{reactor}:{event_id}:{index}` and
+/// `rx:{reactor}:{position}:{index}` stay within their key limits.
+pub const MAX_REACTOR_NAME: usize = 48;
+/// A reactor name: 1 to [`MAX_REACTOR_NAME`] bytes of `[A-Za-z0-9._-]`.
+pub fn valid_reactor_name(name: &str) -> bool {
+    (1..=MAX_REACTOR_NAME).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+/// A reactor declaration (version 2, AP §C.5). PostgreSQL only.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reactor {
@@ -401,8 +413,8 @@ pub enum StorageConfig {
 /// The application configuration. Version 1 is the original format.
 /// Version 2 adds `limits.max_stream_events`, the access and tenancy keys
 /// (`[[permissions]]`, route `permission`, `access`, `scope` and
-/// `resource`, projection `partition`, AP §C.4) and `[[reactors]]`, which
-/// this build parses and refuses with `unsupported_in_this_build` (AP-C3).
+/// `resource`, projection `partition`, AP §C.4) and `[[reactors]]` (AP
+/// §C.5, PostgreSQL only).
 /// A version 1 document using a version 2 key fails `invalid_config`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -485,9 +497,6 @@ impl Config {
         if let Some(issue) = self.route_issues().into_iter().next() {
             return Err(Failure::permanent(issue.code));
         }
-        if self.reactors.is_some() {
-            return Err(Failure::permanent("unsupported_in_this_build"));
-        }
         // Total capacity is an operator disk concern on PostgreSQL (§A.6).
         if matches!(self.storage, StorageConfig::Postgres { .. }) {
             self.limits.reject_capacity_keys()?;
@@ -526,7 +535,15 @@ impl Config {
     ///   anonymous callers (`public`, or undeclared) or to any principal
     ///   (`authenticated`), unless it sets `cross_tenant = true`, since it
     ///   returns every tenant's data; `cross_tenant_scoped`: the opt-in on
-    ///   a tenant-scoped query.
+    ///   a tenant-scoped query;
+    /// - for `[[reactors]]` (AP §C.5), keyed `reactors.{name}`:
+    ///   `invalid_reactor_name` (1 to 48 bytes of `[A-Za-z0-9._-]`, so the
+    ///   derived keys and the `sys_reactor_{name}` subject stay bounded),
+    ///   `duplicate_reactor`, `unknown_command` for a `commands` tag no
+    ///   `[[commands]]` route declares, `invalid_permission` for a
+    ///   `permissions` entry off the grammar, `too_many_events` past 64
+    ///   `events` tags, and `reactors_require_postgres` on memory or SQLite
+    ///   storage, which have no outbox.
     ///
     /// [`Config::validate`] fails with the first; a host lists them all
     /// with [`Config::host_issues`].
@@ -605,6 +622,7 @@ impl Config {
                 issue(key, "cross_tenant_query");
             }
         }
+        self.reactor_issues(&mut issue);
         if !matches!(self.storage, StorageConfig::Postgres { .. }) {
             for projection in self.projections.iter().filter(|p| p.partitioned()) {
                 issue(
@@ -665,6 +683,19 @@ impl Config {
                     .iter()
                     .map(|r| (format!("queries.{}", r.tag.as_str()), r.rule())),
             );
+        for reactor in self.reactors.iter().flatten() {
+            for permission in &reactor.permissions {
+                if valid_permission(permission.as_str())
+                    && !declared.contains(permission.as_str())
+                    && !catalog(permission.as_str())
+                {
+                    issues.push(RouteIssue {
+                        key: format!("reactors.{}", reactor.name.as_str()),
+                        code: "unknown_permission",
+                    });
+                }
+            }
+        }
         for (key, rule) in routes {
             match rule {
                 Rule::Undeclared if identity => issues.push(RouteIssue {
@@ -685,6 +716,40 @@ impl Config {
             }
         }
         issues
+    }
+    /// The `[[reactors]]` part of [`Config::route_issues`].
+    fn reactor_issues(&self, issue: &mut impl FnMut(String, &'static str)) {
+        let commands: BTreeSet<&str> = self.commands.iter().map(|r| r.tag.as_str()).collect();
+        let mut names = BTreeSet::new();
+        let postgres = matches!(self.storage, StorageConfig::Postgres { .. });
+        for reactor in self.reactors.iter().flatten() {
+            let key = format!("reactors.{}", reactor.name.as_str());
+            if !valid_reactor_name(reactor.name.as_str()) {
+                issue(key.clone(), "invalid_reactor_name");
+            } else if !names.insert(reactor.name.as_str()) {
+                issue(key.clone(), "duplicate_reactor");
+            }
+            if reactor
+                .commands
+                .iter()
+                .any(|tag| !commands.contains(tag.as_str()))
+            {
+                issue(key.clone(), "unknown_command");
+            }
+            if reactor
+                .permissions
+                .iter()
+                .any(|p| !valid_permission(p.as_str()))
+            {
+                issue(key.clone(), "invalid_permission");
+            }
+            if reactor.events.len() > MAX_REACTOR_EVENTS {
+                issue(key.clone(), "too_many_events");
+            }
+            if !postgres {
+                issue(key, "reactors_require_postgres");
+            }
+        }
     }
     /// Whether `route` would read every tenant's data: the application has
     /// a tenant-scoped route, the query is application-scoped on an

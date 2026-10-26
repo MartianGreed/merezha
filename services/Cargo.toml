@@ -8,6 +8,7 @@ members = [
     "task-events",
     "task-domain",
     "task-view",
+    "task-notifier",
     "contract-tests",
     "componentize",
     "scenario",

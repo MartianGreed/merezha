@@ -202,8 +202,11 @@ impl Decider for TaskDecider {
                 }
                 TaskEvent::Renamed(TaskRenamed { task_id, title })
             }
-            (Task::Open { .. }, TaskCommand::CompleteTask(_)) => {
-                TaskEvent::Completed(TaskCompleted { task_id })
+            (Task::Open { owner, .. }, TaskCommand::CompleteTask(_)) => {
+                TaskEvent::Completed(TaskCompleted {
+                    task_id,
+                    owner: owner.clone(),
+                })
             }
         };
         Ok(vec![event])
@@ -290,9 +293,10 @@ pub fn dispatch(operation: Operation) -> Result<Reply, Failure> {
             Ok(Reply::Decided { events })
         }
         // `describe` never reaches a dispatcher: the SDK answers it.
-        Operation::Project { .. } | Operation::Query { .. } | Operation::Describe {} => {
-            Err(Failure::permanent("unsupported_operation"))
-        }
+        Operation::Project { .. }
+        | Operation::Query { .. }
+        | Operation::Describe {}
+        | Operation::React { .. } => Err(Failure::permanent("unsupported_operation")),
     }
 }
 

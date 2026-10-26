@@ -1,6 +1,6 @@
 //! The application admin documents (AP §D.1): the status document TE's
 //! `/v1/admin/status` embeds (R10) and, on PostgreSQL, the projection
-//! overview and the rebuild request.
+//! overview, the rebuild request and the reactor documents.
 use merezha_domain::Identity;
 use serde::Serialize;
 
@@ -11,8 +11,8 @@ pub struct ApplicationStatus {
     pub application: Option<Identity>,
     pub head: u64,
     pub projections: Vec<ProjectionStatus>,
-    /// Reactors arrive with AP-C3; always empty here.
-    pub reactors: Vec<serde_json::Value>,
+    /// Configured reactors (PostgreSQL only; empty otherwise).
+    pub reactors: Vec<ReactorStatus>,
     /// PostgreSQL only.
     pub instance: Option<InstanceStatus>,
     /// `connected`, `reconnecting`, or `off` (manual catch-up or no
@@ -78,4 +78,72 @@ pub struct RebuildRequested {
     pub name: Identity,
     pub revision: u32,
     pub target: u64,
+}
+/// One reactor in [`ApplicationStatus`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorStatus {
+    pub name: Identity,
+    /// `active`, `paused` or `halted`.
+    pub status: String,
+    pub lag_events: u64,
+}
+/// `GET /v1/application/reactors`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorsOverview {
+    pub head: u64,
+    pub reactors: Vec<ReactorEntry>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorEntry {
+    pub name: Identity,
+    pub checkpoint: u64,
+    /// `head - checkpoint`: the gap a reactor removed and re-added shows.
+    pub lag: u64,
+    /// `active`, `paused` or `halted`.
+    pub status: String,
+    pub halted_position: Option<u64>,
+    pub failure_code: Option<String>,
+    pub failures: u32,
+    /// RFC 3339, UTC; the next attempt after a failure.
+    pub retry_at: Option<String>,
+    /// How many effects were rejected so far, counted up to 10,000.
+    pub rejected: u64,
+}
+/// `GET /v1/application/reactors/{name}/rejections`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RejectionsPage {
+    pub rejections: Vec<RejectionEntry>,
+    /// The cursor of the next page, `{position}.{index}`; absent at the end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RejectionEntry {
+    pub position: u64,
+    pub index: u8,
+    /// `notify`, `webhook` or `command`.
+    pub effect: String,
+    pub code: String,
+    /// RFC 3339, UTC.
+    pub rejected_at: String,
+}
+/// The answer of `POST reactors/{name}/pause`, `/resume` and `/retry`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorState {
+    pub name: Identity,
+    pub status: String,
+}
+/// The answer of `POST reactors/{name}/skip`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReactorSkipped {
+    pub name: Identity,
+    pub checkpoint: u64,
+}
+/// What `POST reactors/{name}/skip` skips.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipTo {
+    /// Exactly the stuck event: it must be `checkpoint + 1`.
+    Position(u64),
+    /// Everything up to the head.
+    Head,
 }

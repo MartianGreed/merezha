@@ -18,6 +18,7 @@ using the application protocol of `merezha-domain`; see
 | `task-domain.wasm` | `services/task-domain` | Task board decider: validates and decides `CreateTask`, `RenameTask`, `CompleteTask` |
 | `task-view.wasm` | `services/task-view` | Task board read model and the `GetTask`, `ListTasks`, `TaskSummary` queries |
 | `task-view-faulty.wasm` | `services/task-view`, feature `faulty` | Fails every projection batch containing `TaskRenamed`; used to demonstrate a failed catch-up |
+| `task-notifier.wasm` | `services/task-notifier` | Task board reactor (protocol 2): on `TaskCompleted`, notifies the owner on `tasks.completed` and asks for `ArchiveTask` seven days later ([reactors](../architecture/application.md#reactors-version-2-postgresql)) |
 
 The services live in their own Cargo workspace, `services/`, with its own
 `Cargo.lock`. Host and service dependencies never mix, with one deliberate
@@ -262,13 +263,15 @@ aggregate `Task`; the host names it `Task/<stream>` and passes that name to
 | --- | --- | --- | --- |
 | `CreateTask` | `{"title":…}` | The task has no history | `TaskCreated` `{task_id,title,owner?}` |
 | `RenameTask` | `{"title":…}` | The task is open and the title changes | `TaskRenamed` `{task_id,title}` |
-| `CompleteTask` | `{}` | The task is open | `TaskCompleted` `{task_id}` |
+| `CompleteTask` | `{}` | The task is open | `TaskCompleted` `{task_id,owner?}` |
 
 A title is 1 to 120 Unicode scalar values without control characters.
 Validation trims surrounding whitespace and returns that canonical payload,
 so `" Write docs "` and `"Write docs"` are the same command, including for
 idempotency. Unknown fields are rejected. Every event has schema version 1,
-except a `TaskCreated` that records an owner, which has schema version 2.
+except a `TaskCreated` or `TaskCompleted` that records an owner, which has
+schema version 2. `TaskCompleted` names the task's owner, whoever completed
+it, so a reactor can tell the owner without reading state.
 
 `task-domain` speaks [application protocol](../architecture/application.md#protocol-version-2)
 version 2, declared in `runtime.toml`. When the host established a principal
@@ -326,7 +329,7 @@ host codes such as `handler_not_found`, `idempotency_mismatch` and
 | `task_already_completed` | permanent | domain | `CompleteTask` twice |
 | `not_owner` | permanent | domain | `RenameTask` or `CompleteTask` on an owned task by neither its owner nor an `admin` |
 | `corrupt_history` | permanent | domain | The history breaks the checks above |
-| `unknown_event`, `unsupported_schema_version`, `invalid_event` | permanent | both | A recorded event this schema does not define (an owned `TaskCreated` must be schema version 2, an unowned one version 1) |
+| `unknown_event`, `unsupported_schema_version`, `invalid_event` | permanent | both | A recorded event this schema does not define (an owned `TaskCreated` or `TaskCompleted` must be schema version 2, an unowned one version 1) |
 | `projection_gap` | permanent | view | A batch skips or contradicts a task's versions |
 | `invalid_state`, `unknown_projection` | permanent | view | The state or projection name is not this component's |
 | `projection_failed` | transient | faulty view | The faulty revision met `TaskRenamed` |

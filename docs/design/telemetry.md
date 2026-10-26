@@ -782,6 +782,7 @@ Block events (AP's former `jobs.*` events are `job.*`):
 | --- | --- | --- |
 | `projection.warmed` / `projection.rebuild_completed` / `projection.rebuild_failed` | info / info / warn | `projection`, `revision`, `checkpoint`, `code` |
 | `reactor.halted` (malformed reply, or permanent failure with `on_error = "halt"`) / `reactor.skipped` / `reactor.effect_rejected` | error / info / warn | `reactor`, `position`, `index`, `reason`, `code` |
+| `reactor.isolating` (a batch of several events failed transiently three times in a row; it is retried one event at a time from `position`) | warn | `reactor`, `position`, `reason` (`transient_failures`), `code` |
 | `job.leased` / `job.completed` | debug | `job_id`, `queue`, `kind`, `attempt` |
 | `job.released` (a handler gave the job back, `JobFailure::release`, CT-C3) | info | `job_id`, `queue`, `kind`, `attempt` |
 | `job.retry_scheduled` / `job.dead_lettered` / `job.lease_lost` | warn / error / warn | `job_id`, `queue`, `kind`, `attempt`, `code`, `classification` |

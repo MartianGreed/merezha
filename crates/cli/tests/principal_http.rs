@@ -36,6 +36,7 @@ impl GuestSession for Recorder {
         let mut seen = self.0.lock().unwrap();
         Ok(match operation {
             Operation::Describe {} => Reply::Described { protocol: 2 },
+            Operation::React { .. } => unreachable!("this fake is not a reactor"),
             Operation::Validate { payload, .. } => Reply::Validated { payload },
             Operation::Decide {
                 payload, metadata, ..

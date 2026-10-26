@@ -9,9 +9,14 @@
 //! `interval`. Each run executes on a blocking thread.
 use super::{
     PostgresStore,
+    reactor::{self, Due, ReactorOutcome},
     runner::{self, Bounds, CatchUp, Lane, Outcome, Until},
 };
-use crate::{Application, config::Projection, instrument::RunFailure};
+use crate::{
+    Application,
+    config::{Projection, Reactor},
+    instrument::RunFailure,
+};
 use merezha_domain::Failure;
 use std::{
     sync::{
@@ -59,7 +64,9 @@ struct Context {
 }
 
 impl Scheduler {
-    /// Start the runners of a PostgreSQL `app` on the current runtime.
+    /// Start the runners of a PostgreSQL `app` on the current runtime:
+    /// live catch-up and rebuild lanes per projection revision and one
+    /// reactor lane per configured reactor (AP §C.5).
     /// Fails `storage_configuration` for another backend or outside a
     /// runtime, and `invalid_concurrency_budget` when the guest runtime
     /// admits fewer calls than HTTP admission (`limits.max_concurrent`)
@@ -95,7 +102,17 @@ impl Scheduler {
                 rebuild_lane(context.clone(), projection.clone()).with_current_subscriber(),
             ));
         }
+        for reactor in app.config().reactors.iter().flatten() {
+            tasks.push(
+                handle.spawn(
+                    reactor_lane(context.clone(), reactor.clone()).with_current_subscriber(),
+                ),
+            );
+        }
         tasks.push(handle.spawn(interval(context.clone()).with_current_subscriber()));
+        if !store.shared().reactors.is_empty() {
+            tasks.push(handle.spawn(reactor_interval(context.clone()).with_current_subscriber()));
+        }
         if options.catch_up == CatchUp::Auto && !options.hooks().skip_listen {
             store.shared().listener.store(2, Ordering::SeqCst);
             tasks.push(handle.spawn(listen(context).with_current_subscriber()));
@@ -453,6 +470,7 @@ async fn listen(context: Arc<Context>) {
         delay = RECONNECT.0;
         // Notifications may have been lost while disconnected.
         wake_all(["live"].into_iter(), shared);
+        shared.wake_reactors();
         let mut stop = context.stop.clone();
         let code = loop {
             tokio::select! {
@@ -461,6 +479,7 @@ async fn listen(context: Arc<Context>) {
                     Some(_) => {
                         while listener.try_recv().is_some() {}
                         wake_all(["live"].into_iter(), shared);
+                        shared.wake_reactors();
                     }
                     None => break "database_unavailable",
                 },
@@ -477,6 +496,123 @@ async fn listen(context: Arc<Context>) {
         merezha_telemetry::event!(WARN, "db.listener_lost", code);
         if !sleep_until(&context, Instant::now() + delay).await {
             return;
+        }
+    }
+}
+
+/// The reactors' safety-net wake (`[application.reactors] interval_ms`).
+async fn reactor_interval(context: Arc<Context>) {
+    let shared = context.store.shared();
+    let every = shared.options.reactor_interval;
+    loop {
+        if !sleep_until(&context, Instant::now() + every).await {
+            return;
+        }
+        shared.wake_reactors();
+    }
+}
+/// Wait for `notify` until `at`; `false` on stop.
+async fn wake_or_until(context: &Context, notify: &tokio::sync::Notify, at: Instant) -> bool {
+    let mut stop = context.stop.clone();
+    tokio::select! {
+        _ = stop.wait_for(|stopped| *stopped) => false,
+        () = notify.notified() => !stopped(context),
+        () = tokio::time::sleep_until(at.into()) => !stopped(context),
+    }
+}
+/// One reactor run on a blocking thread, holding a background slot.
+async fn run_reactor(
+    context: &Arc<Context>,
+    reactor: &Reactor,
+) -> Option<Result<ReactorOutcome, RunFailure>> {
+    let shared = context.store.shared();
+    let cancel = shared.cancel.subscribe();
+    if stopped(context) {
+        return None;
+    }
+    let mut stop = context.stop.clone();
+    let slot = tokio::select! {
+        _ = stop.wait_for(|stopped| *stopped) => return None,
+        slot = context.gate.clone().acquire_owned() => slot.ok()?,
+    };
+    runner::Pause::hold(shared.options.hooks().before_run, reactor.name.as_str()).await;
+    shared.runs.fetch_add(1, Ordering::SeqCst);
+    let (app, store, reactor) = (context.app.clone(), context.store.clone(), reactor.clone());
+    let result = merezha_telemetry::spawn_blocking_in_span(move || {
+        let bounds = Bounds::background(store.shared(), cancel);
+        reactor::react(&app, &store, &reactor, &bounds)
+    })
+    .await;
+    shared.runs.fetch_sub(1, Ordering::SeqCst);
+    drop(slot);
+    Some(result.unwrap_or_else(|_| Err(Failure::transient("internal").into())))
+}
+/// One reactor (AP §C.5): runs on a local commit, a `merezha_app_events`
+/// notification, the reactor interval and its retry time. A paused
+/// reactor waits for a wake; a failed one for its `retry_at`.
+async fn reactor_lane(context: Arc<Context>, reactor: Reactor) {
+    let store = context.store.clone();
+    let Ok(lane) = store.reactor_lane(reactor.name.as_str()) else {
+        return;
+    };
+    let name = reactor.name.as_str().to_owned();
+    let (base, max) = store.shared().options.reactor_retry;
+    let mut armed = true;
+    let mut retry: Option<Instant> = None;
+    let mut failures = 0u32;
+    loop {
+        if !armed {
+            let woke = match retry {
+                Some(at) => wake_or_until(&context, &lane.wake, at).await,
+                None => wake(&context, &lane.wake, false).await,
+            };
+            if !woke {
+                return;
+            }
+        }
+        armed = false;
+        retry = None;
+        // A cheap pooled read first: no lock session when nothing is due.
+        match store.reactor_due(&name, Instant::now() + READ).await {
+            Ok(Due::Run) => {}
+            Ok(Due::Idle) | Ok(Due::Paused) => continue,
+            Ok(Due::Later(wait)) => {
+                retry = Some(Instant::now() + wait);
+                continue;
+            }
+            Err(_) => {
+                failures = failures.saturating_add(1);
+                retry = Some(Instant::now() + reactor::backoff(base, max, failures));
+                continue;
+            }
+        }
+        let Some(result) = run_reactor(&context, &reactor).await else {
+            return;
+        };
+        match result {
+            Ok(ReactorOutcome::Finished { behind }) => {
+                failures = 0;
+                armed = behind;
+            }
+            // Another host runs it and lingers up to 1 s after catching
+            // up: wait as long before trying again. Wakes meanwhile
+            // coalesce.
+            Ok(ReactorOutcome::Contended) => {
+                if !sleep_until(&context, Instant::now() + CONTENDED).await {
+                    return;
+                }
+            }
+            Ok(ReactorOutcome::Waiting(wait)) => {
+                failures = 0;
+                retry = wait.map(|wait| Instant::now() + wait);
+            }
+            Err(run) if run.failure.code == "cancelled" => armed = true,
+            Err(_) => {
+                // Storage or the lock session failed before the batch
+                // could record anything: retry with backoff.
+                failures = failures.saturating_add(1);
+                retry = Some(Instant::now() + reactor::backoff(base, max, failures));
+            }
         }
     }
 }

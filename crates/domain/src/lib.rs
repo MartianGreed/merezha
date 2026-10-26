@@ -285,11 +285,20 @@ pub enum Operation {
     /// [`handle`] answers it with [`Reply::Described`] without calling the
     /// guest's dispatcher.
     Describe {},
+    /// Version 2 only: a reactor's batch of events, in position order, the
+    /// ones whose tag the reactor's `events` filter keeps. The guest answers
+    /// [`Reply::Reacted`] with exactly one [`Reaction`] per event, in order.
+    /// Reactors never see projection state.
+    React {
+        reactor: Identity,
+        events: Vec<StoredEvent>,
+    },
 }
 impl Operation {
     /// Whether this operation can travel in a request of `version`:
-    /// version 1 carries no `describe`, no `partition` and no principal,
-    /// neither in decide or query metadata nor in any event's metadata.
+    /// version 1 carries no `describe`, no `react`, no `partition` and no
+    /// principal, neither in decide or query metadata nor in any event's
+    /// metadata.
     pub fn fits(&self, version: u16) -> bool {
         match version {
             PROTOCOL_V2 => true,
@@ -305,7 +314,7 @@ impl Operation {
                         events, partition, ..
                     } => partition.is_none() && clean(events),
                     Self::Query { metadata, .. } => metadata.principal.is_none(),
-                    Self::Describe {} => false,
+                    Self::Describe {} | Self::React { .. } => false,
                 }
             }
             _ => false,
@@ -331,6 +340,139 @@ pub enum Reply {
     Described {
         protocol: u16,
     },
+    /// The answer to [`Operation::React`]: one reaction per input event,
+    /// in order.
+    Reacted {
+        reactions: Vec<Reaction>,
+    },
+}
+
+/// Most effects one event's [`Reaction`] may carry.
+pub const MAX_EFFECTS_PER_EVENT: usize = 8;
+/// Most effects one [`Reply::Reacted`] may carry in total.
+pub const MAX_EFFECTS_PER_BATCH: usize = 64;
+/// Most recipients one [`Effect::Notify`] may name.
+pub const MAX_EFFECT_RECIPIENTS: usize = 100;
+/// The longest `delay_ms` an effect may ask for: 30 days.
+pub const MAX_EFFECT_DELAY_MS: u64 = 2_592_000_000;
+
+/// What a reactor asks the host to do about one event (AP §C.2). Guests
+/// never name the dedupe key, the tenant or the source event: the host
+/// derives them from the event.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reaction {
+    /// The [`StoredEvent::event_id`] this reaction answers.
+    pub event_id: Identity,
+    /// At most [`MAX_EFFECTS_PER_EVENT`], in order; an effect's index in
+    /// this list keys it.
+    pub effects: Vec<Effect>,
+}
+/// One effect, in the notifications block's vocabulary (R4, NT §3.3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "effect", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Effect {
+    /// A notification on a declared topic.
+    Notify {
+        topic: Identity,
+        /// 1 to [`MAX_EFFECT_RECIPIENTS`].
+        recipients: Vec<Recipient>,
+        /// A subset of the topic's channels; the topic's defaults when
+        /// absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channels: Option<Vec<Channel>>,
+        #[serde(default)]
+        data: serde_json::Map<String, Value>,
+        /// 0 to [`MAX_EFFECT_DELAY_MS`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delay_ms: Option<u64>,
+    },
+    /// An event for the registered webhook endpoints of the event's tenant,
+    /// or the application-level ones for an event without tenant. Guests
+    /// never name a URL.
+    Webhook { event_type: Identity, data: Value },
+    /// A command the host runs later as the reactor's system principal,
+    /// on the event's tenant.
+    Command {
+        tag: Identity,
+        /// The local stream id; the host composes the stream.
+        stream: Identity,
+        payload: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_version: Option<u64>,
+        /// 0 to [`MAX_EFFECT_DELAY_MS`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delay_ms: Option<u64>,
+    },
+}
+impl Effect {
+    /// `notify`, `webhook` or `command`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Notify { .. } => "notify",
+            Self::Webhook { .. } => "webhook",
+            Self::Command { .. } => "command",
+        }
+    }
+}
+/// Who a notify effect is for. `{"user":{"id"}}`, `{"tenant":{"id",
+/// "roles"?}}`, `{"application":{"roles"}}` or `{"address":{"email"}}` /
+/// `{"address":{"phone"}}`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Recipient {
+    User {
+        id: Identity,
+    },
+    /// Members of the event's tenant, optionally only those with one of
+    /// `roles`.
+    Tenant {
+        id: Identity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        roles: Option<Vec<Identity>>,
+    },
+    /// Holders of application-scope roles, at least one.
+    Application {
+        roles: Vec<Identity>,
+    },
+    /// An explicit address, only for a reactor with `allow_addresses`.
+    Address(Address),
+}
+/// An explicit address: personal data, so `Debug` never shows it.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Address {
+    Email(EmailAddress),
+    Phone(PhoneAddress),
+}
+/// `{"email": "..."}`.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmailAddress {
+    pub email: String,
+}
+/// `{"phone": "+33..."}`, E.164.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhoneAddress {
+    pub phone: String,
+}
+impl std::fmt::Debug for Address {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Email(_) => f.write_str("Email(<redacted>)"),
+            Self::Phone(_) => f.write_str("Phone(<redacted>)"),
+        }
+    }
+}
+/// A delivery channel of a notify effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Channel {
+    Email,
+    Sms,
+    Push,
+    Inbox,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

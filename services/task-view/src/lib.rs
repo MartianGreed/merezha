@@ -96,7 +96,7 @@ impl Board {
                 row.title = title;
                 row.version = version;
             }
-            TaskEvent::Completed(TaskCompleted { task_id }) => {
+            TaskEvent::Completed(TaskCompleted { task_id, .. }) => {
                 let row = self.open_row(&task_id).ok_or_else(gap)?;
                 row.status = Status::Completed;
                 row.version = version;
@@ -345,7 +345,7 @@ pub fn dispatch(operation: Operation) -> Result<Reply, Failure> {
             })
         }
         // `describe` never reaches a dispatcher: the SDK answers it.
-        Operation::Decide { .. } | Operation::Describe {} => {
+        Operation::Decide { .. } | Operation::Describe {} | Operation::React { .. } => {
             Err(Failure::permanent("unsupported_operation"))
         }
     }

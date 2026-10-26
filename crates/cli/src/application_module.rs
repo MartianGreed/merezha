@@ -9,13 +9,24 @@
 //! [`Scheduler`] starts in [`Module::start`] and stops in
 //! [`Module::shutdown`]; [`Module::ready`] holds readiness until this
 //! instance's projection revisions are warm (`warm_readiness`, R10).
+//!
+//! Reactors (AP §C.5) write through [`PlatformEffects`], the module's
+//! notifier, outbox and directory bound to the source `application`; when
+//! a reactor may request commands, the module registers the
+//! `application.command` job handler before the jobs runtime starts.
+use crate::reactions::{CommandEffects, PlatformEffects};
 use merezha_application::{
     Application, Guest,
-    config::Config,
-    postgres::{MIGRATIONS, MODULE, PostgresOptions, PostgresStore, Scheduler},
+    config::{Config, EffectKind},
+    postgres::{
+        COMMAND_KIND, COMMAND_QUEUE, MIGRATIONS, MODULE, PostgresOptions, PostgresStore, Scheduler,
+    },
 };
 use merezha_domain::Failure;
-use merezha_platform::{AppContext, BoxFuture, Migration, Module, ports::Authorizer};
+use merezha_platform::{
+    AppContext, BoxFuture, Migration, Module,
+    ports::{Authorizer, KindOptions},
+};
 use std::{
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
@@ -92,11 +103,21 @@ impl ApplicationModule {
             merezha_telemetry::event!(WARN, "db.pool_undersized", pool_size, recommended);
         }
     }
+    /// Whether a configured reactor may request command effects.
+    fn commands(&self) -> bool {
+        self.config
+            .reactors
+            .iter()
+            .flatten()
+            .any(|r| r.effects.contains(&EffectKind::Command))
+    }
     async fn open(&self, ctx: &AppContext) -> Result<Application, Failure> {
         let deadline = Instant::now() + CONNECT_BUDGET;
-        let store =
-            PostgresStore::connect(ctx.database(), &self.config, self.options.clone(), deadline)
-                .await?;
+        let mut options = self.options.clone();
+        if self.config.reactors.as_ref().is_some_and(|r| !r.is_empty()) {
+            options.effects = Some(Arc::new(PlatformEffects::new(ctx)?));
+        }
+        let store = PostgresStore::connect(ctx.database(), &self.config, options, deadline).await?;
         // Route permissions are enforced through the HTTP adapter's caller
         // and `policy` before any guest call (AP §C.4); the payload hook
         // adds nothing on the platform host.
@@ -123,6 +144,24 @@ impl Module for ApplicationModule {
     }
     fn start(&self, ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
         Box::pin(async move {
+            // Command effects run as jobs; the handler must be registered
+            // before the jobs runtime starts, after every module.
+            if self.commands() {
+                let handler =
+                    CommandEffects::new(self.application.clone(), self.policy.allows_all());
+                let registered = ctx.jobs(MODULE).and_then(|jobs| {
+                    jobs.register(
+                        COMMAND_KIND,
+                        COMMAND_QUEUE,
+                        Arc::new(handler),
+                        KindOptions::default(),
+                    )
+                });
+                if let Err(failure) = registered {
+                    let _ = self.failure.set(failure.clone());
+                    return Err(failure);
+                }
+            }
             let opened = self.open(&ctx).await;
             let started = opened.and_then(|application| {
                 let scheduler = Scheduler::start(&application)?;

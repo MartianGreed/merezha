@@ -265,6 +265,18 @@ impl Application {
             guest.as_ref(),
             std::time::Instant::now() + std::time::Duration::from_millis(config.limits.timeout_ms),
         )?;
+        // `react` is a version 2 operation (AP §C.1).
+        if let Some(reactors) = &config.reactors
+            && !reactors.is_empty()
+        {
+            let session = guest.session()?;
+            if reactors
+                .iter()
+                .any(|r| session.protocol(r.service.as_str()) != merezha_domain::PROTOCOL_V2)
+            {
+                return Err(Failure::permanent("reactor_requires_protocol_2"));
+            }
+        }
         let retain_receipts = !matches!(
             config.storage,
             crate::config::StorageConfig::Postgres { .. }
@@ -400,6 +412,30 @@ impl Application {
                             .map(|r| r.target.saturating_sub(r.checkpoint)),
                     })
                     .collect(),
+                reactors: {
+                    let reactors: Vec<_> = self.0.config.reactors.iter().flatten().collect();
+                    if reactors.is_empty() {
+                        Vec::new()
+                    } else {
+                        store
+                            .reactors_overview(&reactors, false, deadline)?
+                            .1
+                            .into_iter()
+                            .map(|(entry, oldest)| {
+                                (
+                                    SampledProjection {
+                                        name: entry.name.as_str().to_owned(),
+                                        checkpoint: entry.checkpoint,
+                                        oldest_ms: oldest.and_then(|ms| u64::try_from(ms).ok()),
+                                        warm: None,
+                                        rebuild_remaining: None,
+                                    },
+                                    entry.status == "halted",
+                                )
+                            })
+                            .collect()
+                    }
+                },
             });
         }
         let head = self.0.store.head(deadline)?;
@@ -435,7 +471,11 @@ impl Application {
                 rebuild_remaining: None,
             });
         }
-        Ok(Sample { head, projections })
+        Ok(Sample {
+            head,
+            projections,
+            reactors: Vec::new(),
+        })
     }
     #[cfg(feature = "postgres")]
     pub(crate) fn config(&self) -> &Config {
@@ -537,6 +577,31 @@ impl Application {
             #[cfg(feature = "postgres")]
             None,
         )
+    }
+    /// One run of reactor `name` on the caller's thread under its `r:`
+    /// lock, bounded by the admission deadline: batches until the head,
+    /// or until it pauses, waits for its retry time or finds the lock
+    /// held. What the scheduler's reactor lane does, for deterministic
+    /// tests.
+    #[cfg(feature = "postgres")]
+    #[doc(hidden)]
+    pub fn react_now(&self, name: &str) -> Result<crate::postgres::ReactorOutcome, Failure> {
+        let admission = self.admit()?;
+        let store = self
+            .0
+            .postgres
+            .clone()
+            .ok_or_else(|| Failure::permanent("storage_configuration"))?;
+        let reactor = self
+            .0
+            .config
+            .reactors
+            .iter()
+            .flatten()
+            .find(|r| r.name.as_str() == name)
+            .ok_or_else(|| Failure::permanent("reactor_not_found"))?;
+        let bounds = crate::postgres::request_bounds(admission.deadline());
+        crate::postgres::react(self, &store, reactor, &bounds).map_err(Failure::from)
     }
     /// A catch-up or rebuild on PostgreSQL that skips the run lock and
     /// computes on the caller's thread, publishing with row-revision CAS
@@ -1112,7 +1177,8 @@ impl Admission {
         #[cfg(feature = "postgres")]
         if let Some(store) = &self.inner.postgres {
             let projections: Vec<_> = self.inner.config.projections.iter().collect();
-            return store.status(&projections, self.deadline);
+            let reactors: Vec<_> = self.inner.config.reactors.iter().flatten().collect();
+            return store.status(&projections, &reactors, self.deadline);
         }
         let head = self.inner.store.head(self.deadline)?;
         let now = std::time::SystemTime::now()
@@ -1233,6 +1299,145 @@ impl Admission {
         let name = Identity::new(name).map_err(|_| Failure::permanent("projection_not_found"))?;
         self.pg()?.delete_revision(&name, revision, self.deadline)
     }
+    /// `GET reactors`: every configured reactor with its checkpoint, lag
+    /// (`head - checkpoint`), status, failure and rejection count, counted
+    /// up to 10,000 (`postgres::REJECTIONS_COUNTED`).
+    pub fn reactors(self) -> Result<crate::status::ReactorsOverview, Failure> {
+        let reactors: Vec<_> = self.inner.config.reactors.iter().flatten().collect();
+        let (head, rows) = self
+            .pg()?
+            .reactors_overview(&reactors, true, self.deadline)?;
+        Ok(crate::status::ReactorsOverview {
+            head,
+            reactors: rows.into_iter().map(|(entry, _)| entry).collect(),
+        })
+    }
+    /// `GET reactors/{name}/rejections`: at most `limit` (1 to 200)
+    /// rejections after the cursor `after` (`{position}.{index}`, the
+    /// `next` of the previous page), oldest first. `reactor_not_found`
+    /// for a name without a row, `invalid_input` for a bad cursor.
+    pub fn rejections(
+        self,
+        name: &str,
+        limit: usize,
+        after: Option<&str>,
+    ) -> Result<crate::status::RejectionsPage, Failure> {
+        let invalid = || Failure::permanent("invalid_input");
+        if !(1..=200).contains(&limit) {
+            return Err(invalid());
+        }
+        let after = after
+            .map(|cursor| {
+                let (position, index) = cursor.split_once('.').ok_or_else(invalid)?;
+                Ok::<_, Failure>((
+                    position.parse().map_err(|_| invalid())?,
+                    index.parse().map_err(|_| invalid())?,
+                ))
+            })
+            .transpose()?;
+        let name = reactor_name(name)?;
+        self.pg()?
+            .rejections(name.as_str(), limit, after, self.deadline)
+    }
+    /// `POST reactors/{name}/pause` (`active = false`) and `/resume`.
+    pub fn set_reactor_active(
+        self,
+        name: &str,
+        active: bool,
+    ) -> Result<crate::status::ReactorState, Failure> {
+        let name = reactor_name(name)?;
+        self.pg()?.set_reactor_status(&name, active, self.deadline)
+    }
+    /// `POST reactors/{name}/retry`: the next attempt runs now.
+    pub fn retry_reactor(self, name: &str) -> Result<crate::status::ReactorState, Failure> {
+        let name = reactor_name(name)?;
+        self.pg()?.retry_reactor(&name, self.deadline)
+    }
+    /// `POST reactors/{name}/skip`: skip exactly the stuck event or to the
+    /// head, recorded with `principal` (`merezha.reactor.skipped`).
+    pub fn skip_reactor(
+        self,
+        name: &str,
+        to: crate::status::SkipTo,
+        principal: Option<&str>,
+    ) -> Result<crate::status::ReactorSkipped, Failure> {
+        use merezha_telemetry::names::Reason;
+        let name = reactor_name(name)?;
+        let (skipped, moved) = self
+            .pg()?
+            .skip_reactor(&name, to, principal, self.deadline)?;
+        if moved {
+            let reason = match to {
+                crate::status::SkipTo::Position(_) => Reason::Admin,
+                crate::status::SkipTo::Head => Reason::SkipToHead,
+            };
+            self.inner
+                .instruments
+                .reactor_skipped(name.as_str(), reason);
+            merezha_telemetry::event!(
+                INFO,
+                "reactor.skipped",
+                reactor = name.as_str(),
+                position = skipped.checkpoint,
+                reason = reason.as_str()
+            );
+        }
+        Ok(skipped)
+    }
+}
+#[cfg(feature = "postgres")]
+impl Application {
+    /// Run a reactor's command effect (AP §C.5), what the host's
+    /// `application.command` job handler does: the command as the
+    /// reactor's system principal on the event's tenant
+    /// ([`crate::ReactorCaller`]), with idempotency key and message id
+    /// `rx:{reactor}:{position}:{index}`, `causation_id` the event and its
+    /// correlation id, so a duplicate delivery replays the receipt. The
+    /// reactor must still be configured (`reactor_not_found`) and still
+    /// allow the tag (`command_not_allowed`). Call it from a blocking
+    /// thread, like any dispatch.
+    pub fn command_effect(
+        &self,
+        job: &crate::postgres::CommandJob,
+        undeclared: bool,
+    ) -> Result<Receipt, Failure> {
+        let reactor = self
+            .0
+            .config
+            .reactors
+            .iter()
+            .flatten()
+            .find(|r| r.name == job.reactor)
+            .ok_or_else(|| Failure::permanent("reactor_not_found"))?;
+        if !reactor.commands.contains(&job.tag) {
+            return Err(Failure::permanent("command_not_allowed"));
+        }
+        let key = job.idempotency_key()?;
+        let command = Command {
+            tag: job.tag.clone(),
+            stream: job.stream.clone(),
+            payload: job.payload.clone(),
+            metadata: merezha_domain::Metadata {
+                message_id: key.clone(),
+                correlation_id: job.correlation_id.clone(),
+                causation_id: Some(job.event_id.clone()),
+                actor: None,
+                principal: None,
+            },
+            idempotency_key: Some(key),
+            expected_version: job.expected_version,
+        };
+        let caller = crate::ReactorCaller::new(reactor, job.tenant.clone(), undeclared)?;
+        self.command_as(caller, command)
+    }
+}
+/// A reactor name from a path, or `reactor_not_found`.
+#[cfg(feature = "postgres")]
+fn reactor_name(name: &str) -> Result<Identity, Failure> {
+    Identity::new(name)
+        .ok()
+        .filter(|name| crate::config::valid_reactor_name(name.as_str()))
+        .ok_or_else(|| Failure::permanent("reactor_not_found"))
 }
 /// `compatible_json` and at most `maximum` encoded bytes, else
 /// `payload_limit`.
@@ -1274,6 +1479,7 @@ fn validate_services(config: &Config, guest: &dyn Guest) -> Result<(), Failure> 
         .map(|r| &r.service)
         .chain(config.queries.iter().map(|r| &r.service))
         .chain(config.projections.iter().map(|r| &r.service))
+        .chain(config.reactors.iter().flatten().map(|r| &r.service))
         .any(|service| !services.iter().any(|s| s == service.as_str()))
     {
         return Err(Failure::permanent("unknown_service"));

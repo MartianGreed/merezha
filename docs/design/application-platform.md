@@ -1451,7 +1451,8 @@ The reply is checked in two tiers (R4):
 - **Rejected** (recorded in `reactor_rejections`, the reactor advances): a well-formed effect whose
   type is not in the reactor's `effects`, a command tag outside `commands`, an `address` recipient
   without `allow_addresses`, a `tenant` recipient other than the event's tenant, a `tenant`
-  recipient on an event without tenant (`tenant_required`), or any `NotifyError` from NT,
+  recipient on an event without tenant (`tenant_required`), an `application` recipient on a
+  tenant event (`invalid_recipient`), or any `NotifyError` from NT,
   including `recipient_not_in_tenant`.
 
 ## C.3 SDK changes
@@ -1679,8 +1680,11 @@ since two reactors can react to one event. The context is the event's correlatio
 
 **Tenant safety of effects.** On a tenant event, `user` recipients must be members (step 4 fills
 `members` from `Directory::is_member`, and NT refuses any user outside it), a `tenant` recipient
-must name that tenant, and webhooks reach only its
-endpoints. `application` recipients resolve through `Directory::application_members`. Command
+must name that tenant, webhooks reach only its endpoints, and `application` recipients are
+rejected (`invalid_recipient`): application roles span every tenant, and expansion pages
+`Directory::application_members` across the whole application, so a tenant's event could otherwise
+notify other tenants' users. On an event without tenant they resolve through
+`Directory::application_members`. Command
 effects run as `{subject: "sys_reactor_{name}", kind: system, tenant: event tenant, roles: []}`
 (R13), holding only the reactor's `permissions`, so tenant routes compose the same tenant. Events
 without tenant accept `user`, `application` and allowed `address` recipients (NT §3.3),
@@ -2193,6 +2197,99 @@ presence and subject to the key scope. *Closed in C2 by the second option (below
 10. Memory and SQLite reject reactors at startup.
 11. A test Directory that fails if called while a checkpoint transaction is open is never tripped;
     a Directory outage retries the batch without advancing.
+
+**C3 delivery notes.** As built in AP-C3:
+
+- The seam is `merezha_application::postgres::Effects` (`check`, pure;
+  `is_member`, before the transaction; `write`, inside it), with the
+  request types `EffectRequest`, `EffectBody` and `CommandJob`. The
+  platform's adapter is `merezha_cli::reactions::PlatformEffects` over the
+  application module's `Notifier`, `Outbox` and `Directory`, bound to the
+  source `application` (the module's own name), and
+  `merezha_cli::reactions::CommandEffects` is the `application.command`
+  handler. `PostgresOptions::effects` carries the port; a store whose
+  configuration has reactors fails `reactor_effects_unavailable` without
+  it. The handler is registered only when a reactor allows `command`
+  effects, so applications without them get no `application` queue.
+- Command effects run through `Application::command_effect`: the reactor
+  must still be configured (`reactor_not_found`) and still list the tag
+  (`command_not_allowed`), both permanent. The caller is
+  `merezha_application::ReactorCaller` (`sys_reactor_{name}`, kind `system`,
+  the event's tenant, no roles, the reactor's `permissions` at any scope).
+  It is application-side, since the reactor's grants are its configuration,
+  not identity's; routes declaring neither `permission` nor `access` admit
+  it only under the loopback allow-all policy, as for edge callers.
+- Rejection codes the host assigns: `effect_not_allowed`,
+  `command_not_allowed`, `address_not_allowed`, `invalid_recipient` (a
+  `tenant` recipient naming another tenant, or an `application` recipient
+  on a tenant event), `tenant_required` (a `tenant`
+  recipient on an event without tenant) and `invalid_delay` (over 30 days,
+  rejected rather than malformed); the notifications block's codes pass
+  through (`unknown_topic`, `recipient_not_in_tenant`, ...). A port's
+  permanent refusal inside the transaction rejects the effect; any other
+  failure rolls the transaction back.
+- `Address` recipients are `{"address":{"email"}}` or
+  `{"address":{"phone"}}`, without a display name; an invalid address is
+  rejected `invalid_recipient`.
+- Reactor names are 1 to 48 bytes of `[A-Za-z0-9._-]` (no `:` or `/`), and
+  startup also refuses `duplicate_reactor`, `unknown_command` (a `commands`
+  tag no route declares), `invalid_permission`, `too_many_events` (64) and,
+  against the binary's catalog, `unknown_permission` for `permissions`.
+- Isolation reads the failed range one event at a time (not a bisection);
+  the range is remembered in memory per instance, so another instance that
+  takes over isolates it again from the full batch. A run that caught up
+  lingers once for a wake and ends when it brought no new event, so the
+  interval's wakes never keep a background slot.
+- `reactor.halted` carries `reason` `malformed_reply` or `guest_failed` and
+  is logged when the reactor turns halted, not on its later retries.
+  `reactor.effect_rejected` carries the effect type as `reason`.
+- Pausing a halted reactor clears `halted_position` (the table's CHECK);
+  resume and retry make it due now. `skip` with `{"to":"head"}` records one
+  `reactor_skips` row at the new checkpoint; with nothing to skip it changes
+  nothing. The reactor admin routes act on any row, configured or not, so a
+  removed reactor can be skipped before it is re-added; `GET reactors` lists
+  configured reactors only. Codes: `404 reactor_not_found`, `409
+  invalid_skip`.
+- Test 2's kill -9 cuts are `reactor_before_commit` (inside the checkpoint
+  transaction, after its writes) and `reactor_after_commit`, run in the
+  crate's crash-cut child process; the relay side of "relayed once" is AP-B1
+  test 3. A forced rollback uses the test hook `RunHooks::reactor_fail`
+  (feature `test-support`).
+- `task-notifier` notifies the task's owner from `TaskCompleted.owner`
+  (review fixes below). `ArchiveTask` is not a `task-domain` command yet;
+  the stage 3 example application adds the route and the command.
+- Review fixes (security review of #65, PASS-WITH-FINDINGS):
+  - *Design gap, fixed:* the failure table isolates only permanent
+    failures, so one event failing transiently forever (a guest timeout or
+    overload) stalled its reactor with the status `active` and no log, and
+    `skip {position}` could not name it. After `ISOLATE_AFTER` (3)
+    consecutive transient guest failures of a batch of several events, the
+    reactor retries it one event at a time (log `reactor.isolating`, a TE
+    catalog row): the healthy prefix commits and the failing event becomes
+    `checkpoint + 1`, which an operator can `skip`. Storage, Directory and
+    notifier outages are not event-specific and keep retrying the batch.
+  - `application` recipients on a tenant event are rejected
+    `invalid_recipient` (tenant safety, above).
+  - The `application.command` handler maps `idempotency_mismatch` (a
+    conflict) to permanent: the job's own key names another command, so
+    retrying cannot succeed.
+  - `GET reactors` counts rejections up to 10,000 (`REJECTIONS_COUNTED`);
+    the lag sampler and the status document no longer count them.
+  - `reactor_skips.first_position` records the start of the skipped range
+    (a skip to the head covers `checkpoint + 1` to the head).
+  - The forced-rollback hook `RunHooks::reactor_fail` is compiled only with
+    `test-support` and fails `cancelled`, so no test-only code reaches the
+    error registry.
+  - `TaskCompleted` carries the task's `owner` (schema version 2 when set,
+    as `TaskCreated`), so `task-notifier` notifies the owner as §C.3 says,
+    also when an admin completed the task. This replaces the earlier
+    "notify the completer" deviation.
+  - Follow-ups, not changed: the capture notifier logs
+    `notification.captured` inside the checkpoint transaction, before it
+    commits; the batch's `is_member` calls run one after another.
+- Not in this slice (NT-N8's other parts): the identity topics, content
+  subscriptions, `max_per_target_per_hour`, the `webhook_disabled` alert,
+  the operations guide and the end-to-end example application.
 
 # F. Decisions
 

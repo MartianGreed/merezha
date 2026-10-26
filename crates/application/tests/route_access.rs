@@ -62,7 +62,9 @@ impl GuestSession for Counting {
                 state: json!(state.as_u64().unwrap_or(0) + events.len() as u64),
             },
             Operation::Query { state, .. } => Reply::Queried { value: state },
-            Operation::Describe {} => unreachable!("a version 1 fake is never described"),
+            Operation::Describe {} | Operation::React { .. } => {
+                unreachable!("a version 1 fake is never described and never reacts")
+            }
         })
     }
 }
