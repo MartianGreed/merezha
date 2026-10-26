@@ -243,12 +243,18 @@ text built at run time runs through `batch_text` (no rows) or `query_text`
 SQL sent through the driver directly is invisible to telemetry rather than
 reported as `adhoc` (T4: `Tx` stays the driver's transaction type so blocks
 keep compiling), so one workspace scan (`crates/postgres/tests/statement_scan.rs`)
-fails the build instead: it walks every crate's `src/` and flags each driver
-method (`query`, `query_one`, `query_opt`, `execute`, `batch_execute`,
-`query_typed`, `prepare`, `prepare_typed`, `prepare_cached`, `simple_query`,
-`copy_in`, `copy_out` and the rest of `statement::DRIVER_METHODS`, matched
-with the driver's argument count) whose second argument is not a registered
-`&STATEMENT`. Its per-crate allowlist only shrinks: each entry names a file,
+fails the build instead: it parses every crate's `src/` with `syn` and flags
+each driver method (`query`, `query_one`, `query_opt`, `execute`,
+`batch_execute`, `query_typed`, `prepare`, `prepare_typed`, `prepare_cached`,
+`simple_query`, `copy_in`, `copy_out` and the rest of `scan::DRIVER_METHODS`,
+kept equal to the locked driver's methods by a test) called with the
+driver's argument count, turbofish included, whose second argument is not a
+constant the sources declare as a `Statement` (and the same file declares
+as nothing else); path calls and method references of those methods on a
+driver type, trait or bounded generic (`Transaction::execute(tx, ..)`,
+`GenericClient::query`, `C::execute` for `C: GenericClient`); and the same
+in macro arguments and `macro_rules!` bodies, with any path or method a
+metavariable names. Its per-crate allowlist only shrinks: each entry names a file,
 its exact call count and why (the registry's own dispatch, the test
 harness's administrative connection, rusqlite in the SQLite store, a
 same-named non-SQL method, test fixtures, the unmetered `PgOutbox`).

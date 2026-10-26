@@ -8,7 +8,7 @@ use crate::{
 };
 use axum::Router;
 use merezha_domain::Failure;
-use merezha_postgres::{Database, Migration};
+use merezha_postgres::{Database, Migration, Statement};
 use std::{sync::Arc, time::Instant};
 
 /// Names of route prefixes owned by the host; modules cannot use them.
@@ -66,6 +66,14 @@ pub trait Module: Send + Sync + 'static {
     }
     /// Ordered forward-only migrations for this module's own schema.
     fn migrations(&self) -> &[Migration] {
+        &[]
+    }
+    /// Every registered statement this module runs, as the lists its crate
+    /// declares (TE §1.3 "PostgreSQL"). The binary's test checks them with
+    /// [`merezha_postgres::check_registry`] beside the kernel's and every
+    /// other module's, so no two share a name; a module with migrations must
+    /// list its statements.
+    fn statements(&self) -> &[&'static [Statement]] {
         &[]
     }
     /// Kernel sources this module writes as besides its own name. The host

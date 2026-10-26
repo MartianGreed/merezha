@@ -852,6 +852,7 @@ Guest calls, dispatch and projections are instrumented (TE-T3; TE §1.2,
 | `name()` | `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not `admin` (the host's `/v1/admin/status`), `application`, `api`, `services`, `pipelines`, `reload`, `health`, `jobs` (the jobs runtime), `outbox` or `cron` (job key prefixes the relay and the scheduler mint), or `config` (the source of configured schedules). Names the section, route prefix and migration ledger key; never changes. |
 | `configure(&ModuleSection)` | validate and keep `[modules.<name>]`; return every issue at once. Default: only an empty section. |
 | `migrations()` | ordered forward-only `Migration::new(version, name, sql)` or `Migration::non_transactional(..)` for its own schema |
+| `statements()` | the registered `Statement` lists it runs (`&[sql::STATEMENTS]`); default none. Not read at startup: `crates/cli/tests/statement_registry.rs` checks every module's lists with `check_registry` beside the kernel's, and fails for a module with migrations that lists none or a statement constant of its crate that no list holds |
 | `errors()` | `ErrorCode { code, status }` it returns, registered at startup; default none |
 | `extra_sources()` | kernel sources it writes as besides its name; only `api` for `notifications` is granted |
 | `events()` | `ModuleEvents { publishes, consumes }`, logged at start |
@@ -2051,17 +2052,37 @@ capture driver's `merezha_notifications::drivers::STATEMENTS`, identity's
 `merezha_identity::sql::STATEMENTS`, the jobs runtime's
 `merezha_jobs::STATEMENTS` (`jobs.*`), content's `merezha_content::STATEMENTS`
 (`content.*`, `merezha content diff`'s included) and its assets'
-`merezha_content::media::STATEMENTS`. `crates/cli/tests/statement_registry.rs`
-checks every list together, as the binary runs them. SQL sent through the
-driver directly is not observed at all, so one test scans the whole
-workspace (`crates/postgres/tests/statement_scan.rs`): it walks every
-crate's `src/` and reports each call of a driver method (`query`,
-`query_one`, `query_opt`, `execute`, `batch_execute`, `query_typed`,
-`simple_query`, `prepare`, `prepare_typed`, `prepare_cached`, `copy_in`,
-`copy_out` and the rest of `statement::DRIVER_METHODS`, each with the
-driver's argument count, so `Application::query(query)` is not one) whose
-second argument is not a registered `&STATEMENT`, comments and string
-contents ignored. Its allowlist names each file still allowed such calls,
+`merezha_content::media::STATEMENTS`. Each module returns its lists from
+`Module::statements()`, and `crates/cli/tests/statement_registry.rs` checks
+the lists of every module the binary hosts together, as it runs them: the
+blocks `merezha_cli::modules` registers, the jobs runtime and the
+application module, so a new block is checked once the binary registers
+it. The same test parses each crate's non-test sources and fails for a
+statement constant missing from its module's lists (the kernel's from
+`KERNEL_STATEMENTS`), so a list a module leaves out is caught too, and for
+a crate declaring statements that is no module. SQL sent through the
+driver directly is not observed at all, so one test parses every crate's
+`src/` with `syn` (`crates/postgres/tests/statement_scan.rs`, rules in its
+`scan` module) and reports each call of a driver method (`query`,
+`query_one`, `query_opt`, `query_scalar`, `execute`, `execute_typed`,
+`batch_execute`, `query_typed`, `simple_query`, `prepare`, `prepare_typed`,
+`prepare_cached`, `bind`, `copy_in`, `copy_out` and the rest of
+`scan::DRIVER_METHODS`, which a test keeps equal to the locked
+`tokio-postgres` and `deadpool-postgres` methods that take a query,
+statement or portal): a method call, turbofish included, with the driver's
+argument count (so `Application::query(query)` is not one) whose second
+argument is not `&STATEMENT`, a constant the sources declare as a
+`Statement` and the same file does not declare as another constant or
+static (a parameter constant such as `&NONE` is not one); a path call or
+method reference on a driver type or trait (`Transaction::execute(tx, ..)`,
+`GenericClient::query`, `<T as GenericClient>::query`, a `use .. as` or
+`type` alias of one in the same file, a generic parameter bounded by one);
+and the same inside macro arguments and `macro_rules!` bodies, where a path
+through a metavariable (`$t::execute(..)`, `<$t>::execute(..)`) and a
+method named by one (`$client.$m(..)`, `<$t>::$m(..)`) are reported too.
+Comments and string contents are ignored. Without types, an alias declared
+in another file or a driver value reached through an unbounded generic
+stays invisible. Its allowlist names each file still allowed such calls,
 with the exact count and the reason, and only shrinks: a new call fails,
 and so does an entry whose file has fewer calls than listed. The append
 prepares through `Database::prepare_cached(&client, &STATEMENT)`.
@@ -3457,8 +3478,8 @@ still deleting the scope's rows.
 
 ## Dependencies
 
-Checked with `cargo info` on 2026-10-23 (K) and 2026-10-24 (K2). All support
-Rust 1.98.0.
+Checked with `cargo info` on 2026-10-23 (K), 2026-10-24 (K2) and 2026-10-26
+(`syn`, `proc-macro2`). All support Rust 1.98.0.
 
 | Crate | Version | MSRV | License | Features | Used by |
 | --- | --- | --- | --- | --- | --- |
@@ -3480,6 +3501,8 @@ Rust 1.98.0.
 | `futures-core` | 0.3.34 | 1.36 | MIT OR Apache-2.0 | `std` | platform: blob streams |
 | `infer` | 0.22.0 | 1.74 | MIT | none (no `std`, so no `cfb` OLE probing) | content: upload signatures |
 | `imagesize` | 0.15.0 | unset (compiled and tested on 1.98.0) | MIT | `png`, `jpeg`, `gif`, `webp`, `heif` only | content: raster dimensions |
+| `syn` | 3.0.9 | 1.71 | MIT OR Apache-2.0 | `full`, `parsing`, `visit` only; dev only | postgres: the statement scan parses the workspace and the locked driver sources; cli: the registry test reads each crate's statement constants |
+| `proc-macro2` | 1.0.107 | 1.71 | MIT OR Apache-2.0 | `span-locations` only; dev only | postgres: line numbers of the statement scan's findings |
 | `croner` | =4.0.2 | unset (edition 2021) | MIT | `jiff` only, no default `chrono` (R14); pulls `derive_builder` 0.20.2 (MIT OR Apache-2.0) and `strum` 0.27.2 (MIT, MSRV 1.66.1) with their proc-macro crates | platform: `cron`, used by config validation and the scheduler |
 
 The aws-lc-rs provider is shared by the database TLS connector and reqwest,

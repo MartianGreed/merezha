@@ -38,4 +38,6 @@ merezha-notifications = { path = "../notifications", features = ["testkit"] }
 merezha-telemetry = { path = "../telemetry", features = ["testing"] }
 tempfile.workspace = true
 wat.workspace = true
+# tests/statement_registry.rs reads the statement constants each crate declares.
+syn = { version = "3.0.9", default-features = false, features = ["full", "parsing", "visit"] }
 tower.workspace = true
