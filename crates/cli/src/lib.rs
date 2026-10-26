@@ -112,6 +112,9 @@ pub fn identity_module(input: &merezha_platform::ConfigInput) -> merezha_identit
     }
     identity
 }
+/// The resource kinds the blocks of this binary declare; a route's
+/// `resource` cannot name one (`block_resource_kind`).
+pub const BLOCK_RESOURCE_KINDS: &[&str] = &[merezha_content::RESOURCE_KIND];
 /// The identity block with the blocks' permissions and resource kinds.
 fn blocks_catalog(facts: Option<merezha_identity::HostFacts>) -> merezha_identity::IdentityModule {
     let mut identity = merezha_identity::IdentityModule::new(facts);
@@ -121,7 +124,7 @@ fn blocks_catalog(facts: Option<merezha_identity::HostFacts>) -> merezha_identit
             identity.add_block_permissions("notifications", &merezha_notifications::PERMISSIONS)
         });
     debug_assert!(added.is_ok(), "block permissions follow the grammar");
-    identity.add_resource_kinds(&[merezha_content::RESOURCE_KIND]);
+    identity.add_resource_kinds(BLOCK_RESOURCE_KINDS);
     identity
 }
 /// The application's `[[permissions]]` and route `resource` kinds join the
@@ -199,14 +202,13 @@ pub fn open_application(
     // Route permissions must name a catalog permission (AP §C.4); `serve`
     // has no identity block, so undeclared routes stay allowed.
     let catalog = permission_catalog(&config);
-    if let Some(issue) = config
-        .host_issues(
-            &|permission| catalog.contains(permission),
-            &|_| false,
-            false,
-        )
-        .first()
-    {
+    let mut issues = config.host_issues(
+        &|permission| catalog.contains(permission),
+        &|_| false,
+        false,
+    );
+    issues.extend(config.block_kind_issues(BLOCK_RESOURCE_KINDS));
+    if let Some(issue) = issues.first() {
         return Err(merezha_domain::Failure::permanent(issue.code));
     }
     merezha_application::Application::open(config, Arc::new(runtime), authorizer)

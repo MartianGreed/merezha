@@ -563,3 +563,26 @@ initial = {{}}
     );
     assert_eq!(code(&v1), "invalid_config");
 }
+
+/// A route's `resource` cannot name a block's resource kind, as
+/// `block_prefix` keeps block permission names out of `[[permissions]]`.
+#[test]
+fn route_resources_cannot_name_a_block_kind() {
+    let config = Config::parse(
+        "version = 2\n[[commands]]\ntag = \"Edit\"\nservice = \"s\"\naggregate = \"Page\"\n\
+         access = \"authenticated\"\nscope = \"tenant\"\nresource = \"content_type\"\n\
+         [[commands]]\ntag = \"Rename\"\nservice = \"s\"\naggregate = \"Task\"\n\
+         access = \"authenticated\"\nscope = \"tenant\"\nresource = \"task\"\n",
+    )
+    .unwrap();
+    let issues: Vec<_> = config
+        .block_kind_issues(&["content_type"])
+        .into_iter()
+        .map(|i| (i.key, i.code))
+        .collect();
+    assert_eq!(
+        issues,
+        [("commands.Edit".to_owned(), "block_resource_kind")]
+    );
+    assert!(config.block_kind_issues(&[]).is_empty());
+}

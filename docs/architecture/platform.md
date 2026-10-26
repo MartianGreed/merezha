@@ -224,7 +224,11 @@ own `route_access_conflict`, `invalid_permission`, `block_prefix`,
 tenant-scoped route, an application-scoped query on an unpartitioned
 projection open to anonymous callers (`public`, undeclared) or to every
 principal (`authenticated`, or a permission in `builtin_grants.user`)
-returns every tenant's data, so it must say `cross_tenant = true`. The application's
+returns every tenant's data, so it must say `cross_tenant = true`. The rule
+cannot see permissions granted at runtime through application roles: a
+permission held by most users through application roles exposes every
+tenant; use `scope = "tenant"`. `block_resource_kind` refuses a route
+`resource` naming a block's resource kind (content's `content_type`). The application's
 `[[permissions]]` join identity's catalog
 (`IdentityModule::add_application_permissions`), so roles, keys and
 `builtin_grants` can grant them, and route `resource` kinds become kinds

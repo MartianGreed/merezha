@@ -855,6 +855,13 @@ fn startup_refuses_undeclared_unknown_and_unpartitioned_routes() {
     let config = project(dir.path(), &base(undeclared), false);
     let failed = Host::spawn(&config, &unreachable, "allowed").failed();
     assert_ne!(failed["code"], "route_access_undeclared");
+    // A route `resource` naming a block's kind (content's `content_type`).
+    let dir = tempfile::tempdir().unwrap();
+    let block_kind = "[[commands]]\ntag = \"Edit\"\nservice = \"protocol\"\naggregate = \"Page\"\n\
+                      access = \"authenticated\"\nscope = \"tenant\"\nresource = \"content_type\"\n";
+    let config = project(dir.path(), &base(block_kind), true);
+    let failed = Host::spawn(&config, &unreachable, "block-kind").failed();
+    assert_eq!(failed["code"], "block_resource_kind", "{failed}");
     // The PR #58 review's PoC: beside tenant routes, an anonymous `List`
     // on an unpartitioned projection would answer every tenant's data
     // (org B's `ssn`); so would one checking a permission every user

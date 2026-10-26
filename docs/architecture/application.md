@@ -202,7 +202,11 @@ keep one state per projection) and `cross_tenant_query`: with any
 tenant-scoped route, an application-scoped query on an unpartitioned
 projection that anonymous callers or every principal may call returns every
 tenant's data, so it must opt in with `cross_tenant = true`
-(`cross_tenant_scoped` on a tenant query). `access = "authenticated"` checks
+(`cross_tenant_scoped` on a tenant query). The rule cannot see permissions
+granted at runtime through application roles: a permission held by most users
+through application roles exposes every tenant; use `scope = "tenant"`.
+`block_resource_kind` refuses a `resource` naming a block's resource kind
+(content's `content_type`). `access = "authenticated"` checks
 no permission, so it ignores an API key's permission list. Changing `partition` needs a new projection
 `revision` (`storage_configuration` otherwise).
 

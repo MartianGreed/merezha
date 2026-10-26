@@ -701,6 +701,25 @@ impl Config {
             && !partitioned
             && !route.cross_tenant
     }
+    /// `block_resource_kind` for each command whose `resource` names a
+    /// kind a block declares (`block_kinds`, such as content's
+    /// `content_type`), as `block_prefix` refuses block permission names:
+    /// a route would otherwise check grants the block hands out for its
+    /// own resources.
+    pub fn block_kind_issues(&self, block_kinds: &[&str]) -> Vec<RouteIssue> {
+        self.commands
+            .iter()
+            .filter(|r| {
+                r.resource
+                    .as_ref()
+                    .is_some_and(|kind| block_kinds.contains(&kind.as_str()))
+            })
+            .map(|r| RouteIssue {
+                key: format!("commands.{}", r.tag.as_str()),
+                code: "block_resource_kind",
+            })
+            .collect()
+    }
     /// The resource kinds routes name in `resource`, for the identity
     /// block's role assignments.
     pub fn resource_kinds(&self) -> BTreeSet<&str> {

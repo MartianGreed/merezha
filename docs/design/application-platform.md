@@ -1573,6 +1573,11 @@ Validation, all failing startup with every error listed at once:
   principal (`authenticated`, or a permission in identity's `builtin_grants.user`) may call
   fails `cross_tenant_query`, because it **returns every tenant's data**, unless the query says
   so with `cross_tenant = true`. The opt-in on a tenant-scoped query fails `cross_tenant_scoped`.
+  The rule sees only what configuration says at startup: it cannot see permissions granted at
+  runtime through application roles, so a permission held by most users through application
+  roles exposes every tenant; use `scope = "tenant"`.
+- A command's `resource` cannot name a block's resource kind (content's `content_type`), as
+  `block_prefix` keeps block namespaces out of `[[permissions]]`: `block_resource_kind`.
 - With any tenant scope, aggregate names must not contain `:`.
 - The composed stream must fit 128 bytes: `len(tenant) ≤ 40` + 1 + `len(aggregate)` + 1 +
   `len(stream)`. A stream id that is too long fails `validation_failed` per request.

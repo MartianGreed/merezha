@@ -368,11 +368,12 @@ fn check_access(
     let catalog = crate::permission_catalog(application);
     // Every user holds `builtin_grants.user` (identity §5).
     let everyone = user_grants(config, &catalog);
-    let issues = application.host_issues(
+    let mut issues = application.host_issues(
         &|permission| catalog.contains(permission),
         &|permission| everyone.iter().any(|held| held.as_str() == permission),
         identity,
     );
+    issues.extend(application.block_kind_issues(crate::BLOCK_RESOURCE_KINDS));
     let Some(first) = issues.first() else {
         return Ok(());
     };
