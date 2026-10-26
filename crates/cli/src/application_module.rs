@@ -40,8 +40,8 @@ pub struct ApplicationModule {
     failure: Arc<OnceLock<Failure>>,
 }
 impl ApplicationModule {
-    /// `policy` authorizes application messages and projection controls,
-    /// as it does for memory and SQLite applications.
+    /// `policy` decides route permissions and projection controls, as it
+    /// does for memory and SQLite applications.
     pub fn new(
         config: Config,
         guest: Arc<dyn Guest>,
@@ -97,7 +97,11 @@ impl ApplicationModule {
         let store =
             PostgresStore::connect(ctx.database(), &self.config, self.options.clone(), deadline)
                 .await?;
-        let policy: Arc<dyn merezha_application::Authorizer> = self.policy.clone();
+        // Route permissions are enforced through the HTTP adapter's caller
+        // and `policy` before any guest call (AP §C.4); the payload hook
+        // adds nothing on the platform host.
+        let policy: Arc<dyn merezha_application::Authorizer> =
+            Arc::new(merezha_application::AllowAll);
         // Construction asks every version 2 guest `describe`: guest calls
         // run on a blocking thread.
         let (config, guest) = (self.config.clone(), self.guest.clone());

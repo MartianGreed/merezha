@@ -88,9 +88,10 @@ fn max_stream_events_is_bounded() {
     );
 }
 
-/// Each version 2 document below sets one key this build parses but does
-/// not enforce yet.
-fn unsupported_documents() -> Vec<(&'static str, String)> {
+/// Each version 2 document below sets one version 2 key, with what this
+/// build answers: `ok`, the access issue, or `unsupported_in_this_build`
+/// for reactors (AP-C3).
+fn version_2_documents() -> Vec<(&'static str, String, &'static str)> {
     let command = |extra: &str| {
         format!(
             "[[commands]]\ntag = \"CreateTask\"\nservice = \"task-domain\"\naggregate = \"Task\"\n{extra}\n[[queries]]\ntag = \"ListTasks\"\nservice = \"task-view\"\nprojection = \"tasks\"\n[[projections]]\nname = \"tasks\"\nservice = \"task-view\"\ninitial = {{}}\n"
@@ -112,52 +113,95 @@ fn unsupported_documents() -> Vec<(&'static str, String)> {
             format!(
                 "{ROUTES}[[permissions]]\nname = \"tasks.create\"\ndescription = \"Create tasks\"\n"
             ),
+            "ok",
         ),
         (
             "command permission",
             command("permission = \"tasks.create\""),
+            "ok",
         ),
-        ("command access", command("access = \"public\"")),
-        ("command scope", command("scope = \"tenant\"")),
+        ("command access", command("access = \"public\""), "ok"),
+        // Tenant routes beside the undeclared `ListTasks`, which would then
+        // read every tenant's data.
+        (
+            "command scope",
+            command("scope = \"tenant\""),
+            "cross_tenant_query",
+        ),
         (
             "command scope application",
             command("scope = \"application\""),
+            "ok",
         ),
-        ("command resource", command("resource = \"task\"")),
-        ("query permission", query("permission = \"tasks.read\"")),
-        ("query access", query("access = \"authenticated\"")),
-        ("query scope", query("scope = \"tenant\"")),
-        ("projection partition", projection("partition = \"tenant\"")),
+        (
+            "command resource",
+            command("resource = \"task\""),
+            "resource_requires_tenant",
+        ),
+        (
+            "command resource in a tenant",
+            command("resource = \"task\"\nscope = \"tenant\""),
+            "cross_tenant_query",
+        ),
+        (
+            "query permission",
+            query("permission = \"tasks.read\""),
+            "ok",
+        ),
+        ("query access", query("access = \"authenticated\""), "ok"),
+        (
+            "query scope",
+            query("scope = \"tenant\""),
+            "tenant_query_unpartitioned",
+        ),
+        (
+            "projection partition",
+            projection("partition = \"tenant\""),
+            "partitions_require_postgres",
+        ),
         (
             "projection partition none",
             projection("partition = \"none\""),
+            "ok",
         ),
         (
             "reactors",
             format!(
                 "{ROUTES}[[reactors]]\nname = \"task-notifier\"\nservice = \"task-notifier\"\n"
             ),
+            "unsupported_in_this_build",
         ),
         // Writing the key at all is version 2, even as an empty list.
-        ("empty permissions", format!("permissions = []\n{ROUTES}")),
-        ("empty reactors", format!("reactors = []\n{ROUTES}")),
+        (
+            "empty permissions",
+            format!("permissions = []\n{ROUTES}"),
+            "ok",
+        ),
+        (
+            "empty reactors",
+            format!("reactors = []\n{ROUTES}"),
+            "unsupported_in_this_build",
+        ),
     ]
 }
 
 #[test]
-fn version_2_access_tenancy_and_reactor_keys_parse_and_are_refused_as_unsupported() {
-    for (name, body) in unsupported_documents() {
-        assert_eq!(
-            code(&format!("version = 2\n{body}")),
-            "unsupported_in_this_build",
-            "{name}"
-        );
+fn version_2_access_and_tenancy_keys_are_accepted_and_reactors_refused_as_unsupported() {
+    for (name, body, expected) in version_2_documents() {
+        let parsed = Config::parse(&format!("version = 2\n{body}"));
+        match expected {
+            "ok" => assert!(parsed.is_ok(), "{name}: {parsed:?}"),
+            code => assert_eq!(parsed.unwrap_err().code, code, "{name}"),
+        }
     }
 }
 
 #[test]
 fn version_1_documents_cannot_use_version_2_keys() {
-    let mut documents = unsupported_documents();
+    let mut documents: Vec<_> = version_2_documents()
+        .into_iter()
+        .map(|(name, body, _)| (name, body))
+        .collect();
     documents.push((
         "max_stream_events",
         format!("[limits]\nmax_stream_events = 8\n{ROUTES}"),
@@ -173,8 +217,13 @@ fn version_1_documents_cannot_use_version_2_keys() {
 
 #[test]
 fn the_designed_version_2_examples_parse_completely_before_the_refusal() {
-    // AP §C.4 and §C.5, verbatim apart from the shared service names.
+    // AP §C.4 and §C.5, verbatim apart from the shared service names and
+    // the PostgreSQL storage partitions need.
     let text = r#"version = 2
+
+[storage]
+backend = "postgres"
+application = "tasks"
 
 [[permissions]]
 name = "tasks.create"
@@ -218,6 +267,13 @@ start = "head"
 on_error = "halt"
 "#;
     assert_eq!(code(text), "unsupported_in_this_build");
+    // Without the reactor (AP-C3) the §C.4 example is accepted as written.
+    let routes = Config::parse(text.split("[[reactors]]").next().unwrap()).unwrap();
+    assert!(routes.route_issues().is_empty());
+    assert_eq!(
+        routes.resource_kinds().into_iter().collect::<Vec<_>>(),
+        ["task"]
+    );
     // The syntax itself decodes into the typed fields later slices enforce.
     let config: Config = toml::from_str(text).unwrap();
     assert_eq!(config.permissions.as_ref().unwrap().len(), 2);
@@ -282,8 +338,8 @@ fn version_1_configuration_encodes_without_any_version_2_key() {
 
 /// The design leaves these bounds open (PR #20, deviation 7): at most 256
 /// permissions with descriptions of at most 256 bytes, and 32 reactors. At
-/// the bound the document passes validation and reaches the refusal; one
-/// over fails `invalid_config`.
+/// the bound the document passes validation (reactors then reach their
+/// refusal); one over fails `invalid_config`.
 #[test]
 fn permission_and_reactor_counts_and_description_length_are_bounded() {
     let permissions = |count: usize, description: usize| {
@@ -312,13 +368,221 @@ fn permission_and_reactor_counts_and_description_length_are_bounded() {
             permissions(1, 256),
             permissions(1, 257),
         ),
-        ("reactor count", reactors(32), reactors(33)),
     ] {
-        assert_eq!(
-            code(&at),
-            "unsupported_in_this_build",
-            "{name} at the bound"
-        );
+        assert!(Config::parse(&at).is_ok(), "{name} at the bound");
         assert_eq!(code(&over), "invalid_config", "{name} over the bound");
     }
+    assert_eq!(code(&reactors(32)), "unsupported_in_this_build");
+    assert_eq!(code(&reactors(33)), "invalid_config");
+}
+
+/// AP §C.4: every problem of the access declarations is listed at once,
+/// in document order, keyed by entry, with what only the host knows (the
+/// catalog, whether identity is on) added by `host_issues`.
+#[test]
+fn access_declarations_list_every_issue_at_once() {
+    let text = r#"version = 2
+[[permissions]]
+name = "tasks.create"
+[[permissions]]
+name = "Tasks"
+[[permissions]]
+name = "content.entries.read"
+[[permissions]]
+name = "tasks.create"
+[[commands]]
+tag = "Both"
+service = "s"
+aggregate = "Task"
+permission = "tasks.create"
+access = "public"
+[[commands]]
+tag = "Resource"
+service = "s"
+aggregate = "Task"
+permission = "tasks.create"
+resource = "task"
+[[commands]]
+tag = "Colon"
+service = "s"
+aggregate = "a:b"
+access = "public"
+scope = "tenant"
+[[commands]]
+tag = "Unknown"
+service = "s"
+aggregate = "Task"
+permission = "tasks.delete"
+[[commands]]
+tag = "BlockPermission"
+service = "s"
+aggregate = "Task"
+permission = "content.entries.read"
+[[commands]]
+tag = "Bare"
+service = "s"
+aggregate = "Task"
+[[queries]]
+tag = "Mine"
+service = "s"
+projection = "all"
+permission = "tasks.read"
+scope = "tenant"
+[[queries]]
+tag = "All"
+service = "s"
+projection = "split"
+access = "public"
+[[projections]]
+name = "all"
+service = "s"
+initial = 0
+[[projections]]
+name = "split"
+service = "s"
+initial = 0
+partition = "tenant"
+"#;
+    let config: Config = toml::from_str(text).unwrap();
+    let issues = |list: Vec<merezha_application::config::RouteIssue>| {
+        list.into_iter()
+            .map(|i| format!("{} {}", i.key, i.code))
+            .collect::<Vec<_>>()
+    };
+    let own = [
+        "permissions.Tasks invalid_permission",
+        "permissions.content.entries.read block_prefix",
+        "permissions.tasks.create duplicate_permission",
+        "commands.Both route_access_conflict",
+        "commands.Resource resource_requires_tenant",
+        "commands.Colon tenant_aggregate",
+        "queries.Mine tenant_query_unpartitioned",
+        "queries.All partitioned_query_unscoped",
+        "projections.split partitions_require_postgres",
+    ];
+    assert_eq!(issues(config.route_issues()), own);
+    // `validate` (and so `parse`) fails with the first.
+    assert_eq!(config.validate().unwrap_err().code, "invalid_permission");
+    // The host adds catalog and identity issues: `tasks.read` and
+    // `content.entries.read` are in this catalog, `tasks.delete` is not.
+    let catalog = |name: &str| matches!(name, "content.entries.read" | "tasks.read");
+    let mut with_identity = own.to_vec();
+    with_identity.extend([
+        "commands.Unknown unknown_permission",
+        "commands.Bare route_access_undeclared",
+    ]);
+    assert_eq!(
+        issues(config.host_issues(&catalog, &|_| false, true)),
+        with_identity
+    );
+    let mut without = own.to_vec();
+    without.push("commands.Unknown unknown_permission");
+    assert_eq!(
+        issues(config.host_issues(&catalog, &|_| false, false)),
+        without
+    );
+    // A clean document has none, and declared permissions need no catalog.
+    let clean = Config::parse(
+        "version = 2\n[[permissions]]\nname = \"tasks.create\"\n\
+         [[commands]]\ntag = \"C\"\nservice = \"s\"\naggregate = \"Task\"\npermission = \"tasks.create\"\n",
+    )
+    .unwrap();
+    assert!(clean.host_issues(&|_| false, &|_| false, true).is_empty());
+}
+
+/// The PR #58 review's PoC: with tenant routes, an anonymous `List` query on
+/// an unpartitioned projection folds every tenant's events (org B's
+/// `ssn` included) and answers them to anyone. Such open application
+/// queries fail startup (`cross_tenant_query`) unless they opt in with
+/// `cross_tenant = true`; so does one checking a permission every user
+/// holds (`builtin_grants.user`), which the host passes as `everyone`.
+#[test]
+fn open_application_queries_over_tenant_data_must_opt_in() {
+    let document = |query: &str| {
+        format!(
+            r#"version = 2
+[storage]
+backend = "postgres"
+application = "leak"
+[[permissions]]
+name = "people.read"
+[[commands]]
+tag = "AddPerson"
+service = "s"
+aggregate = "Person"
+access = "authenticated"
+scope = "tenant"
+[[queries]]
+tag = "List"
+service = "s"
+projection = "people"
+{query}
+[[projections]]
+name = "people"
+service = "s"
+initial = {{}}
+"#
+        )
+    };
+    for open in ["access = \"public\"", "access = \"authenticated\"", ""] {
+        assert_eq!(code(&document(open)), "cross_tenant_query", "{open:?}");
+        let opted = Config::parse(&document(&format!("{open}\ncross_tenant = true"))).unwrap();
+        assert!(opted.route_issues().is_empty(), "{open:?}");
+        assert!(opted.queries[0].cross_tenant);
+    }
+    // A permission every user holds is as open as `authenticated`; one
+    // only some roles hold is the operator's cross-tenant grant.
+    let granted = Config::parse(&document("permission = \"people.read\"")).unwrap();
+    assert!(granted.route_issues().is_empty());
+    let everyone = |name: &str| name == "people.read";
+    assert_eq!(
+        granted
+            .host_issues(&|_| true, &everyone, true)
+            .iter()
+            .map(|i| (i.key.as_str(), i.code))
+            .collect::<Vec<_>>(),
+        [("queries.List", "cross_tenant_query")]
+    );
+    assert!(granted.host_issues(&|_| true, &|_| false, true).is_empty());
+    let opted = Config::parse(&document(
+        "permission = \"people.read\"\ncross_tenant = true",
+    ))
+    .unwrap();
+    assert!(opted.host_issues(&|_| true, &everyone, true).is_empty());
+    // Without tenant routes there is no other tenant to leak.
+    let single = document("access = \"public\"").replace("scope = \"tenant\"\n", "");
+    assert!(Config::parse(&single).is_ok());
+    // The opt-in means nothing on a tenant query.
+    let scoped = document("access = \"public\"\nscope = \"tenant\"\ncross_tenant = true")
+        .replace("initial = {}", "initial = {}\npartition = \"tenant\"");
+    assert_eq!(code(&scoped), "cross_tenant_scoped");
+    // Version 1 cannot use it.
+    let v1 = String::from(
+        "version = 1\n[[queries]]\ntag = \"Q\"\nservice = \"s\"\nprojection = \"p\"\ncross_tenant = true\n\
+         [[projections]]\nname = \"p\"\nservice = \"s\"\ninitial = 0\n",
+    );
+    assert_eq!(code(&v1), "invalid_config");
+}
+
+/// A route's `resource` cannot name a block's resource kind, as
+/// `block_prefix` keeps block permission names out of `[[permissions]]`.
+#[test]
+fn route_resources_cannot_name_a_block_kind() {
+    let config = Config::parse(
+        "version = 2\n[[commands]]\ntag = \"Edit\"\nservice = \"s\"\naggregate = \"Page\"\n\
+         access = \"authenticated\"\nscope = \"tenant\"\nresource = \"content_type\"\n\
+         [[commands]]\ntag = \"Rename\"\nservice = \"s\"\naggregate = \"Task\"\n\
+         access = \"authenticated\"\nscope = \"tenant\"\nresource = \"task\"\n",
+    )
+    .unwrap();
+    let issues: Vec<_> = config
+        .block_kind_issues(&["content_type"])
+        .into_iter()
+        .map(|i| (i.key, i.code))
+        .collect();
+    assert_eq!(
+        issues,
+        [("commands.Edit".to_owned(), "block_resource_kind")]
+    );
+    assert!(config.block_kind_issues(&[]).is_empty());
 }

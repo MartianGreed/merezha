@@ -1568,6 +1568,16 @@ Validation, all failing startup with every error listed at once:
   (`identity.`, `content.`, `notifications.`, `jobs.`, `application.`, `system.`).
 - A tenant-scoped query must reference a `partition = "tenant"` projection. Application-scoped
   queries must not reference one. `resource` requires `scope = "tenant"`.
+- Fail closed across tenants (C2 review): once any route is tenant-scoped, an application-scoped
+  query on an unpartitioned projection that anonymous callers (`public`, undeclared) or every
+  principal (`authenticated`, or a permission in identity's `builtin_grants.user`) may call
+  fails `cross_tenant_query`, because it **returns every tenant's data**, unless the query says
+  so with `cross_tenant = true`. The opt-in on a tenant-scoped query fails `cross_tenant_scoped`.
+  The rule sees only what configuration says at startup: it cannot see permissions granted at
+  runtime through application roles, so a permission held by most users through application
+  roles exposes every tenant; use `scope = "tenant"`.
+- A command's `resource` cannot name a block's resource kind (content's `content_type`), as
+  `block_prefix` keeps block namespaces out of `[[permissions]]`: `block_resource_kind`.
 - With any tenant scope, aggregate names must not contain `:`.
 - The composed stream must fit 128 bytes: `len(tenant) ≤ 40` + 1 + `len(aggregate)` + 1 +
   `len(stream)`. A stream id that is too long fails `validation_failed` per request.
@@ -1579,7 +1589,10 @@ Enforcement order for a command:
    `permission` requires a principal, then `Authorizer::check(principal, permission, scope)` with
    `ResourceScope::Tenant(principal.tenant)` (or `Resource`) for tenant routes (no tenant fails
    `tenant_required`, 403) or `ResourceScope::Application` otherwise. `platform_admin` satisfies
-   every check (R5). A denial fails `unauthorized` (403).
+   every check (R5). A denial fails `unauthorized` (403). `authenticated` checks no permission,
+   so it ignores an API key's permission list: any principal, session or key, may call it.
+   Route `resource` kinds are checked in the caller's tenant only, so identity refuses
+   application-level assignments on them (`resource_kind_tenant_only`).
 3. The host composes `"{tenant}:{aggregate}/{stream}"` from **`principal.tenant`**. The request body
    only ever names the local stream id, so cross-tenant addressing is impossible by construction.
    The `streams` CHECK constraint backs this up.
@@ -1589,8 +1602,9 @@ Enforcement order for a command:
 All of this runs before the guest validates and before any receipt is replayed, as framework.md
 requires. Unauthorized callers cost no guest fuel.
 
-The trusted entry point is `Admission::command_as(principal, command)` and `query_as(principal,
-query)`. The existing `command`/`query` methods mean "anonymous" and reject a `metadata.principal`
+The trusted entry point is `Admission::command_as(caller, command)` and `query_as(caller,
+query)`, where the host's `Caller` carries the principal and its policy (C2 delivery notes). The
+existing `command`/`query` methods mean "anonymous" and reject a `metadata.principal`
 supplied in the body with `principal_not_trusted`. That way a caller can never inject a principal
 through JSON.
 
@@ -2094,7 +2108,64 @@ description (not gated).
 (`application.rs`, the `Key` built in `decide`). So an anonymous caller naming a principal's
 subject as `actor` shares that principal's idempotency scope and can replay its receipt. C2
 must close it: refuse a caller-supplied `actor` on anonymous routes, or add the principal's
-presence and subject to the key scope.
+presence and subject to the key scope. *Closed in C2 by the second option (below).*
+
+**C2 delivery notes.** As built in AP-C2:
+
+- Enforcement lives in `merezha-application` (`access.rs`), so every entry point checks routes
+  the same way, through the application-side trait `Caller` (principal projection at a scope,
+  active tenant, `check(permission, scope)`), because the application never depends on the
+  platform. The platform's adapter is `merezha_cli::application_http::EdgeCaller` over K's
+  `Principal` and `Authorizer`; `Scope` mirrors `ResourceScope`. `command_as`/`query_as` take
+  `impl Caller`: the edge caller, `AllowAll` (`serve`'s loopback policy: every permission, no
+  tenant), or a bare `merezha_domain::Principal` (public, authenticated and undeclared routes;
+  every permission fails `unauthorized`, since its grants are unknown). `command`/`query` are
+  `Anonymous`.
+- Order: route lookup (`handler_not_found`), the route check (`unauthenticated`,
+  `tenant_required`, `unauthorized`), then the principal (`principal_not_trusted`,
+  `actor_mismatch`) and the stream, then guest `validate`, the payload hook and idempotency. A
+  composed stream over 128 bytes, or a tenant id outside `[A-Za-z0-9_-]{1,40}` (it could not
+  prefix a stream), fails `validation_failed`.
+- A route declaring neither key keeps version 1 behaviour for embedding hosts. On the platform
+  host it is served only under the loopback allow-all policy, `403 unauthorized` under deny-all
+  (as before), and refused at startup with identity (`route_access_undeclared`). The platform
+  passes `AllowAll` as the payload `Authorizer` hook: route declarations are the policy, and
+  identity's RBAC `authorize` (which still refuses) is no longer called for application
+  messages.
+- The seam is closed by scoping, not refusal, because demos and clients send anonymous
+  `actor`s: `Key.authenticated` marks a principal's key (SQLite appends
+  `"authenticated":true` to the key JSON; PostgreSQL stores `@{subject}` in
+  `receipts.actor`, outside the identity grammar). `Key.tenant` is the stream's tenant, so
+  application routes keep `''` even for a principal with an active tenant.
+- Startup issue codes besides `route_access_undeclared`: `route_access_conflict`,
+  `invalid_permission`, `block_prefix`, `duplicate_permission`, `unknown_permission`,
+  `resource_requires_tenant`, `tenant_query_unpartitioned`, `partitioned_query_unscoped`,
+  `tenant_aggregate` and `partitions_require_postgres`. `Config::route_issues` lists what the
+  document shows, `Config::host_issues` adds the catalog and identity checks; `merezha run`
+  logs them all as `startup.failed` `issues` and stops with the first, `serve` with the first.
+  The catalog check runs with and without identity, against the binary's catalog
+  (`merezha_cli::permission_catalog`).
+- Partitioned projections need PostgreSQL: memory and SQLite fail
+  `partitions_require_postgres`, so tenant queries are PostgreSQL-only; tenant streams work on
+  every backend (SQLite's tenant-prefix backstop accepts them).
+- A partitioned batch calls the guest once per tenant in tenant order. Before its first batch
+  a rebuild deletes partitions of any generation other than the served one (what an abandoned
+  rebuild left); after the swap it deletes older generations in chunks of 1000. A sweep that
+  fails after the swap is ignored: queries never read old generations, and the next rebuild's
+  first sweep removes them. The Rust `catch_up`/`rebuild` of a partitioned projection return a
+  `null` state; HTTP answers `{checkpoint, head}` (`Admission::project_document`).
+- The application's `[[permissions]]` and route `resource` kinds join identity's catalog in
+  `merezha_cli::identity_module`, and identity §5's warning for `builtin_grants.user` on a
+  tenant route is the TE event `identity.user_grant_tenant_route`.
+- Review fixes. `cross_tenant_query` and the `cross_tenant` opt-in (§C.4); `merezha run` passes
+  the expanded `builtin_grants.user` to `Config::host_issues`. Route `resource` kinds join
+  through the new `IdentityModule::add_tenant_resource_kinds`: application-level assignments on
+  them fail `resource_kind_tenant_only` (422), since a route never checks them at application
+  scope. Each rebuild request is a new candidate (migration 0002 adds the identity column
+  `projection_rebuilds.candidate`): a run stops when the candidate it started on is replaced,
+  its candidate commits, failure marks and swap match the candidate id, and a partitioned run
+  clears stale partitions before every batch at checkpoint 0, so a rebuild abandoned and
+  requested again while its run holds the lock never builds on the old request's partitions.
 
 **C3 tests.**
 

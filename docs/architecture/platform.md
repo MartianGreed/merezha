@@ -142,7 +142,9 @@ when `http.public` is false, `http.listen` is a loopback address and
 elsewhere even on loopback. A private listener keeps the explicit allow-all
 policy and the raw runtime endpoints, as `serve` does. Any other listener gets
 the deny-all policy, and the raw runtime endpoints are not mounted. Every
-application command and query then fails `403 unauthorized`. Catch-up and
+application command and query then fails `403 unauthorized`, except routes
+declaring `access = "public"`, and `401 unauthenticated` on routes needing a
+principal ([route permissions](#application-route-permissions)). Catch-up and
 rebuild are checked through the policy as the permissions
 `application.projections.catch_up` and `application.projections.rebuild` at
 `ResourceScope::Application`, for the principal the edge authenticated: none
@@ -156,8 +158,7 @@ nothing unauthenticated by accident.
 The principal the edge authenticated reaches application guests through
 `command_as` and `query_as`, as the limited projection
 `Principal::guest(scope)` builds (subject, kind, tenant and the role keys at
-the scope; never the session, the grants or a secret), with the
-application-scope roles until route scopes exist (AP-C2). Only services
+the route's scope; never the session, the grants or a secret). Only services
 declaring `application_protocol = 2` receive it. Without a principal the
 request is anonymous, and a `metadata.principal` in a request body fails
 `422 principal_not_trusted`; an `actor` other than the principal's subject
@@ -175,11 +176,68 @@ permission at `Application` (`application.admin.read`, `jobs.admin.read`,
 `system.status.read` and the rest of identity §5's catalog), and a
 `platform_admin` session passes every check once its
 `authorization.break_glass` audit row is written; when that write fails the
-use is refused, `503 audit_unavailable`. Application commands and queries stay refused
-(`unauthorized`) until AP-C2 checks their route permissions with the
-principal before any guest call. The raw runtime endpoints, which have no
+use is refused, `503 audit_unavailable`. Application commands and queries
+answer to their route declarations through the same `Authorizer`, before any
+guest call. The raw runtime endpoints, which have no
 authentication of their own, are never mounted beside the authenticator,
 even on a private listener.
+
+#### Application route permissions
+
+Each `[[commands]]` and `[[queries]]` route of a version 2 `application.toml`
+declares `permission = "..."` or `access = "public" | "authenticated"`, with
+`scope = "application" | "tenant"` and, on tenant commands, `resource`
+([application](application.md#route-permissions-and-tenant-streams-version-2),
+AP §C.4). The HTTP adapter runs every command and query as the edge's
+principal under the host policy (`merezha_cli::application_http::EdgeCaller`)
+and the application checks the route before validating the payload, reading
+a receipt or calling any guest:
+
+| Declaration | No principal | Principal |
+| --- | --- | --- |
+| `access = "public"` | passes | passes |
+| `access = "authenticated"` | `401 unauthenticated` | passes |
+| `permission` | `401 unauthenticated` | `Authorizer::check(principal, permission, scope)`: `Application`, `Tenant(principal.tenant)`, or `Resource { tenant, kind: resource, id: stream }`; `403 unauthorized` without the grant, `platform_admin` passes (break-glass audited first) |
+| neither (version 1) | served only under the loopback allow-all policy; `403 unauthorized` otherwise | the same |
+
+`access = "authenticated"` checks no permission, so it ignores an API key's
+permission list: any principal, session or key, may call it. A tenant route
+without an active organization fails `403 tenant_required`.
+Tenant commands write `{tenant}:{aggregate}/{stream}` of the principal's
+active organization and key their receipts by it; tenant queries read its
+partition. A principal's receipts are scoped apart from anonymous callers
+naming the same `actor` (PostgreSQL stores the principal's scope as
+`@{subject}` in `merezha_app.receipts.actor`). On the platform host the
+application's payload `Authorizer` hook is `AllowAll`: route declarations are
+the policy.
+
+At startup `merezha run` checks the whole document and stops with the first
+problem, listing every one in `startup.failed` (`issues: [{key, code}]`):
+with the identity block, `route_access_undeclared` for a route declaring
+neither; `unknown_permission` for a route permission outside the
+application's `[[permissions]]` and the blocks' catalog; and the document's
+own `route_access_conflict`, `invalid_permission`, `block_prefix`,
+`duplicate_permission`, `resource_requires_tenant`,
+`tenant_query_unpartitioned`, `partitioned_query_unscoped`,
+`tenant_aggregate`, `partitions_require_postgres`, `cross_tenant_query` and
+`cross_tenant_scoped`. `cross_tenant_query` fails closed: with any
+tenant-scoped route, an application-scoped query on an unpartitioned
+projection open to anonymous callers (`public`, undeclared) or to every
+principal (`authenticated`, or a permission in `builtin_grants.user`)
+returns every tenant's data, so it must say `cross_tenant = true`. The rule
+cannot see permissions granted at runtime through application roles: a
+permission held by most users through application roles exposes every
+tenant; use `scope = "tenant"`. `block_resource_kind` refuses a route
+`resource` naming a block's resource kind (content's `content_type`). The application's
+`[[permissions]]` join identity's catalog
+(`IdentityModule::add_application_permissions`), so roles, keys and
+`builtin_grants` can grant them, and route `resource` kinds become kinds
+tenant role assignments may target (`add_tenant_resource_kinds`); routes check
+them inside the caller's organization only, so an application-level
+assignment on one fails `422 resource_kind_tenant_only`. With the identity block a
+`builtin_grants.user` grant that a route checks at `scope = "tenant"` logs
+`identity.user_grant_tenant_route` (warn, `permission`, `route`): `user`
+grants hold in every organization, so tenant permissions belong in `member`.
 
 ## Configuration reference
 
@@ -1113,7 +1171,7 @@ organization): `identity.organization_created`, `_updated`, `_deleted`,
 Error codes PR 2 registers: `permission_escalation`, `email_mismatch`,
 `builtin_role` (403), `slug_taken`, `slug_reserved`, `role_key_taken`,
 `role_in_use`, `already_member`, `invitation_stale` (409), `unknown_permission`,
-`unknown_resource_kind`, `organization_limit`, `role_limit`,
+`unknown_resource_kind`, `resource_kind_tenant_only`, `organization_limit`, `role_limit`,
 `assignment_limit`, `service_account_limit`, `api_key_limit`,
 `declared_role_in_use` (422).
 
@@ -1855,6 +1913,28 @@ rebuild `failed` (log `projection.rebuild_failed`) without touching the
 served pair, `{"resume": true}` resumes it from its persisted candidate and
 `DELETE .../rebuild` abandons it (`204`). Embedding callers of
 `Application::rebuild` get the same rebuild run to its swap within the call.
+
+A `partition = "tenant"` projection (migration 2, `partitions`, of the
+`application` ledger) keeps one state per tenant in
+`merezha_app.projection_partitions (name, revision, generation, tenant,
+state)`; its `projections` row holds the checkpoint, the CAS row revision and
+the served generation, and no state. A batch groups its events by their
+stream's tenant (`merezha_app.events.tenant`), loads the touched partitions,
+calls the guest once per tenant with `project { partition }` and commits CAS
+first (`app.projections.commit_partitioned`, then `app.partitions.write`), so
+a batch that lost its CAS writes no partition. Events of application streams
+only advance the checkpoint. A tenant query reads the row and the tenant's
+partition of the served generation in one statement (`app.partitions.read`);
+a tenant without one reads the configured initial state. A rebuild writes the
+next generation beside the served one, swaps it in with the row, then deletes
+older generations in chunks of 1000 (`app.partitions.sweep_old`); before its
+first batch it clears partitions an abandoned rebuild left
+(`app.partitions.sweep_stale`). Each rebuild request is a new candidate
+(`projection_rebuilds.candidate`): a run stops when the request it started on
+was abandoned and requested again, so it never builds on the old request's
+partitions. Changing `partition` needs a new `revision`
+(`storage_configuration`). `POST .../catch-up` on a partitioned projection
+answers `{checkpoint, head}`.
 
 | Route under `/v1/application/` | Permission | Answer |
 | --- | --- | --- |
@@ -3075,10 +3155,6 @@ itself.
   `jobs.drain_timeout_ms` plus 3 s to the module shutdown budget.
 - There is no request deadline at the edge yet; handlers bound their own
   work.
-- With identity on, application commands and queries are refused until
-  AP-C2 enforces their route permissions; the application's
-  `[[permissions]]` and route `resource` kinds join identity's catalog then
-  (`IdentityModule::add_application_permissions`, `add_resource_kinds`).
 - The events, outbox and jobs `trace_parent`/`trace_state` columns are
   filled (TE-T3, TE-T5).
 - Reactor lag, lock and batch instruments arrive with the reactors (AP-C3);

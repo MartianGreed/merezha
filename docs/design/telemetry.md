@@ -798,6 +798,7 @@ Block events (AP's former `jobs.*` events are `job.*`):
 | `job.reissue_claim_lost` (a reissue hook returned after the reaper reverted its claim; its settle wrote nothing) | warn | `job_id`, `hook` (`succeeded`, `failed`) |
 | `identity.login_failed` | debug (the metric and the audit log carry the signal) | `method`, `outcome` |
 | `identity.grants_truncated` (grants past `max_resource_assignments`) / `identity.audit_write_failed` | warn / error | `count` / `code` |
+| `identity.user_grant_tenant_route` (startup: `builtin_grants.user` grants a permission a route checks at `scope = "tenant"`, AP-C2) | warn | `permission`, `route` |
 | `identity.dev_link` | info, stderr only, never bridged to OTLP | `purpose`, `link`; emitted only with `dev_print_links = true` on loopback, the one catalog event that carries a secret |
 | `notification.requested` / `notification.duplicate` / `notification.invalid` / `notification.rejected` (expansion) | debug / debug / warn / warn | `topic`, `source`, `notification_id`, `code` |
 | `notification.accepted` / `notification.skipped` / `notification.retry_scheduled` / `notification.ambiguous` / `notification.expired` | debug / debug / warn / warn / warn | `channel`, `topic`, `delivery_id`, `attempt`, `reason`, `code` |

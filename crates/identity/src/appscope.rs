@@ -348,6 +348,9 @@ impl Core {
         }
         if let Some((kind, _)) = &input.resource {
             self.known_kind(kind.as_str())?;
+            if self.tenant_resource_kinds.contains(kind.as_str()) {
+                return Err(ApiError::code("resource_kind_tenant_only"));
+            }
         }
         let core = self.clone();
         let who = who.clone();

@@ -129,14 +129,86 @@ cargo run --locked -p merezha-cli -- serve --manifest runtime.toml --application
 ```
 
 `version = 1` is the original format and stays accepted. `version = 2` adds
-`[limits] max_stream_events` (below) and the keys of the application platform's
-later slices: `[[permissions]]`, route `permission`, `access`, `scope` and
-`resource` (commands only), projection `partition` and `[[reactors]]`
-([design](../design/application-platform.md) §C.4, §C.5). This build parses
-those keys and refuses them at startup with `unsupported_in_this_build`, because
-accepting a route permission it does not enforce would silently open the route.
+`[limits] max_stream_events` (below), route permissions and tenancy (next
+section) and `[[reactors]]` ([design](../design/application-platform.md) §C.5),
+which this build parses and refuses at startup with `unsupported_in_this_build`.
 A version 1 file using any version 2 key fails `invalid_config`, as an unknown
 key did before.
+
+### Route permissions and tenant streams (version 2)
+
+```toml
+version = 2
+[[permissions]]
+name = "tasks.create"            # joins the identity block's permission catalog
+description = "Create tasks"
+
+[[commands]]
+tag = "CreateTask"
+service = "task-domain"
+aggregate = "Task"
+permission = "tasks.create"      # or access = "public" | "authenticated"
+scope = "tenant"                 # application (default) | tenant
+resource = "task"                # optional, tenant commands: checked on the stream
+
+[[queries]]
+tag = "ListTasks"
+service = "task-view"
+projection = "tasks"
+permission = "tasks.read"
+scope = "tenant"                 # reads the caller's partition
+
+[[projections]]
+name = "tasks"
+service = "task-view"
+initial = { tasks = {} }
+partition = "tenant"             # none (default) | tenant; PostgreSQL only
+```
+
+Every route is checked before any guest call and before a stored receipt is
+replayed, so a refused caller costs no guest fuel. `access = "public"` admits
+anyone; `authenticated` needs a principal (`401 unauthenticated`); a
+`permission` is checked for the principal at the route's scope: `Application`,
+`Tenant(principal.tenant)`, or for a command with `resource` the resource
+`{tenant, kind, id}` whose id is the local stream id (`403 unauthorized`). A
+tenant route without an active tenant fails `403 tenant_required`. A tenant
+command writes the stream `{tenant}:{aggregate}/{stream}` of the principal's
+tenant: the request only names the local stream id, so a tenant can never
+write another tenant's stream (naming one nests it under its own), and its
+receipts are keyed by its tenant too. A tenant query reads the tenant's
+partition of a `partition = "tenant"` projection, whose state is kept per
+tenant (the configured initial state for a tenant without events).
+
+The checks run through a host-supplied `Caller`: `Application::command_as` and
+`query_as` take one (the platform passes the edge's principal and its policy,
+`merezha_cli::application_http::EdgeCaller`); `command` and `query` are
+anonymous (`Anonymous`: public and undeclared routes only). `serve` uses the
+explicit local `AllowAll`, which admits every permission but has no tenant.
+A route declaring neither `permission` nor `access` keeps the version 1
+behaviour under `serve` and embedding hosts; the platform host serves it only
+on a private loopback listener without identity, and refuses it at startup
+with the identity block (`route_access_undeclared`).
+
+The document is checked as a whole, every problem listed at once by `merezha
+run` (`startup.failed` with `issues: [{key, code}]`): `route_access_conflict`
+(both `permission` and `access`), `invalid_permission`, `block_prefix` (an
+application permission in a block namespace: `identity.`, `content.`,
+`notifications.`, `jobs.`, `application.`, `system.`), `duplicate_permission`,
+`unknown_permission` (a route permission outside `[[permissions]]` and the
+blocks' catalog), `resource_requires_tenant`, `tenant_query_unpartitioned`,
+`partitioned_query_unscoped`, `tenant_aggregate` (with any tenant scope, an
+aggregate containing `:`), `partitions_require_postgres` (memory and SQLite
+keep one state per projection) and `cross_tenant_query`: with any
+tenant-scoped route, an application-scoped query on an unpartitioned
+projection that anonymous callers or every principal may call returns every
+tenant's data, so it must opt in with `cross_tenant = true`
+(`cross_tenant_scoped` on a tenant query). The rule cannot see permissions
+granted at runtime through application roles: a permission held by most users
+through application roles exposes every tenant; use `scope = "tenant"`.
+`block_resource_kind` refuses a `resource` naming a block's resource kind
+(content's `content_type`). `access = "authenticated"` checks
+no permission, so it ignores an API key's permission list. Changing `partition` needs a new projection
+`revision` (`storage_configuration` otherwise).
 
 Read the ephemeral port from stderr's `listener.ready`. POST JSON to
 `/v1/application/commands` with `tag`, `stream`, `payload`, `metadata`, optional
@@ -167,8 +239,11 @@ trusted loopback use. An embedding host supplies real policy and establishes
 actor identity. Projection controls and raw invocation/reload also assume a
 trusted local administrator; do not expose this server externally.
 
-Idempotency is scoped by command tag, actor and key, bound to the validated
-payload, target stream and explicit expected-version precondition. Success
+Idempotency is scoped by command tag, the stream's tenant, actor and key, bound
+to the validated payload, target stream and explicit expected-version
+precondition. A principal's commands are scoped by its subject apart from
+anonymous ones, so an anonymous caller naming a principal's subject as its
+`actor` never replays that principal's receipt. Success
 replays the original receipt. A changed payload/target/precondition gives
 `idempotency_mismatch`; a pending identical claim gives `idempotency_in_flight`.
 Failed commands release the claim. In memory mode, completed records are retained
@@ -466,12 +541,25 @@ ways ([platform: projections in the background](platform.md#projections-in-the-b
 - A projection `revision` new to the database warms up in the background;
   its queries fail `projection_warming` and `Scheduler::ready` is false until
   it reaches the head it was created at.
+- A `partition = "tenant"` projection keeps one state per tenant and
+  generation (migration 0002, `merezha_app.projection_partitions`). Each batch
+  groups its events by their stream's tenant and calls the guest once per
+  tenant with `project { partition }` (version 2 guests see it; version 1
+  guests get the same per-tenant batches without it); events of application
+  streams only advance the checkpoint. A batch commits CAS first, so a run
+  that lost its row revision writes no partition. A rebuild writes the next
+  generation beside the served one, swaps it in with the row, then deletes
+  older generations in chunks of 1000; queries read the partition of the
+  served generation in the same statement as the row, so none sees a
+  half-built or half-deleted generation. Its explicit catch-up answers
+  `{checkpoint, head}` and `catch_up`/`rebuild` return a `null` state.
 
 `Application::status()` returns the status document on every backend:
 head, per-projection checkpoint, lag and failure, plus on PostgreSQL the
 instance's background runs and listener state.
 
 ```sh
-cargo test --locked -p merezha-application --test postgres --test store_contract --test background
-cargo test --locked -p merezha-cli --test postgres_process
+cargo test --locked -p merezha-application --test postgres --test store_contract --test background --test tenancy
+cargo test --locked -p merezha-application --test route_access
+cargo test --locked -p merezha-cli --test postgres_process --test route_permissions
 ```

@@ -54,11 +54,18 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 pub const MODULE: &str = "application";
 /// Forward-only migrations of `merezha_app`. Hosts apply them with the
 /// kernel runner under [`MODULE`]; [`PostgresStore::connect`] only verifies.
-pub const MIGRATIONS: &[Migration] = &[Migration::new(
-    1,
-    "application",
-    include_str!("migrations/0001_application.sql"),
-)];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration::new(
+        1,
+        "application",
+        include_str!("migrations/0001_application.sql"),
+    ),
+    Migration::new(
+        2,
+        "partitions",
+        include_str!("migrations/0002_partitions.sql"),
+    ),
+];
 /// Every statement the store runs, registered with `merezha-postgres`
 /// (TE §1.3): `app.*` names, the append `app.events.append`.
 pub const STATEMENTS: &[merezha_postgres::Statement] = sql::STATEMENTS;
@@ -230,6 +237,12 @@ fn decode<T: serde::de::DeserializeOwned>(text: &str, max: usize) -> Result<T, F
     }
     serde_json::from_str(text).map_err(|_| invalid())
 }
+/// A stored projection state or partition, read up to the hard ceiling.
+fn stored_state(text: &str) -> Result<serde_json::Value, Failure> {
+    let state: serde_json::Value = decode(text, MAX_STATE_BYTES)?;
+    compatible_json(&state).map_err(|_| invalid())?;
+    Ok(state)
+}
 
 impl PostgresStore {
     /// Open the store for `config` on `db`, within `deadline`: check that
@@ -273,10 +286,15 @@ impl PostgresStore {
         let mut initial = Vec::with_capacity(config.projections.len());
         for projection in &config.projections {
             compatible_json(&projection.initial)?;
+            let partitioned = projection.partitioned();
             initial.push((
                 projection.name.as_str().to_owned(),
                 i32::try_from(projection.revision).map_err(|_| configuration())?,
-                encode(&projection.initial)?,
+                // A partitioned row keeps no state of its own.
+                (!partitioned)
+                    .then(|| encode(&projection.initial))
+                    .transpose()?,
+                partitioned,
             ));
         }
         let application_text = application.as_str().to_owned();
@@ -294,18 +312,22 @@ impl PostgresStore {
                 if row.get::<_, String>(0) != application_text || row.get::<_, i16>(1) != 1 {
                     return Err(configuration());
                 }
-                for (name, revision, state) in &initial {
+                for (name, revision, state, partitioned) in &initial {
                     store_db
-                        .execute(tx, &sql::INSERT_PROJECTION, &[name, revision, state])
+                        .execute(
+                            tx,
+                            &sql::INSERT_PROJECTION,
+                            &[name, revision, state, partitioned],
+                        )
                         .await
                         .map_err(|e| read_error(&e))?;
-                    let partitioned: bool = store_db
+                    let stored: bool = store_db
                         .query_one(tx, &sql::PROJECTION_PARTITIONED, &[name, revision])
                         .await
                         .map_err(|e| read_error(&e))?
                         .get(0);
-                    // Partitioning needs a new revision; this build has none.
-                    if partitioned {
+                    // Changing `partition` needs a new revision (§A.6).
+                    if stored != *partitioned {
                         return Err(configuration());
                     }
                 }
@@ -702,11 +724,19 @@ fn commit_unknown() -> Failure {
     Failure::transient("commit_outcome_unknown")
 }
 /// `(tag, tenant, actor, key)` with `''` for an absent part.
+/// A principal's key scope stores its subject as `@{subject}` in `actor`:
+/// `@` is outside the identity grammar, so no anonymous caller's actor can
+/// name it (AP-C2).
 fn key_parts(key: &Key) -> [String; 4] {
+    let actor = key.actor.as_ref().map_or("", Identity::as_str);
     [
         key.tag.as_str().to_owned(),
         key.tenant.as_ref().map_or("", Identity::as_str).to_owned(),
-        key.actor.as_ref().map_or("", Identity::as_str).to_owned(),
+        if key.authenticated {
+            format!("@{actor}")
+        } else {
+            actor.to_owned()
+        },
         key.key.as_str().to_owned(),
     ]
 }
@@ -825,7 +855,8 @@ impl PostgresStore {
             revision: projection.revision,
         })
     }
-    /// The served pair, its row revision and its `warm_position`.
+    /// The served pair, its row revision and its `warm_position`. A
+    /// partitioned row has no single state: the pair's state is `null`.
     pub(crate) async fn served_row(
         &self,
         name: String,
@@ -841,10 +872,12 @@ impl PostgresStore {
             })
             .await?;
         let row = row.ok_or_else(invalid)?;
-        // A partitioned row has no single state; this build has none.
         let text: Option<&str> = row.get(0);
-        let state: serde_json::Value = decode(text.ok_or_else(invalid)?, MAX_STATE_BYTES)?;
-        compatible_json(&state).map_err(|_| invalid())?;
+        let state = match (text, row.get::<_, bool>(5)) {
+            (None, true) => serde_json::Value::Null,
+            (Some(text), false) => stored_state(text)?,
+            _ => return Err(invalid()),
+        };
         Ok((
             ProjectionState {
                 state,
@@ -854,13 +887,45 @@ impl PostgresStore {
             unsigned(row.get(3))?,
         ))
     }
+    /// The served pair of `projection`, or with `tenant` of its partition
+    /// (the configured initial state when the tenant has none), with the
+    /// row revision (0 for a partition) and `warm_position`.
     pub(crate) fn served(
         &self,
         projection: &crate::config::Projection,
+        tenant: Option<&Identity>,
         deadline: Instant,
     ) -> Result<(ProjectionState, i64, u64), Failure> {
         let (name, revision) = self.key_of(projection)?;
-        self.block_on(deadline, self.served_row(name, revision, deadline))
+        let Some(tenant) = tenant else {
+            return self.block_on(deadline, self.served_row(name, revision, deadline));
+        };
+        let tenant = tenant.as_str().to_owned();
+        let row = self.block_on(
+            deadline,
+            self.session(deadline, timeout, async |client| {
+                self.db
+                    .query_opt(client, &sql::PARTITION, &[&name, &revision, &tenant])
+                    .await
+                    .map_err(|e| read_error(&e))
+            }),
+        )?;
+        let row = row.ok_or_else(invalid)?;
+        if !row.get::<_, bool>(3) {
+            return Err(configuration());
+        }
+        let state = match row.get::<_, Option<&str>>(2) {
+            Some(text) => stored_state(text)?,
+            None => projection.initial.clone(),
+        };
+        Ok((
+            ProjectionState {
+                state,
+                checkpoint: unsigned(row.get(0))?,
+            },
+            0,
+            unsigned(row.get(1))?,
+        ))
     }
     pub(crate) async fn head_async(&self, deadline: Instant) -> Result<u64, Failure> {
         let position: i64 = self
@@ -891,7 +956,11 @@ impl PostgresStore {
         deadline: Instant,
     ) -> Result<u64, Failure> {
         let (name, revision) = self.key_of(projection)?;
-        let initial = encode(&projection.initial)?;
+        // A partitioned candidate keeps no state of its own: its partitions
+        // build at the target generation.
+        let initial = (!projection.partitioned())
+            .then(|| encode(&projection.initial))
+            .transpose()?;
         let by = requested_by.map(str::to_owned);
         let store_db = self.db.clone();
         let target: i64 = self.block_on(

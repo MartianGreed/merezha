@@ -72,6 +72,48 @@ initial=0
     )
     .unwrap()
 }
+/// [`config`] with a tenant-scoped command and query and a partitioned
+/// projection (AP-C2).
+fn tenant_config() -> Config {
+    Config::parse(
+        r#"version=2
+[storage]
+backend="postgres"
+application="crash-test"
+[[commands]]
+tag="Add"
+service="counter"
+aggregate="Counter"
+[[commands]]
+tag="TenantAdd"
+service="counter"
+aggregate="Counter"
+access="authenticated"
+scope="tenant"
+[[queries]]
+tag="Total"
+service="counter"
+projection="total"
+cross_tenant=true
+[[queries]]
+tag="Mine"
+service="counter"
+projection="mine"
+access="authenticated"
+scope="tenant"
+[[projections]]
+name="total"
+service="counter"
+initial=0
+[[projections]]
+name="mine"
+service="counter"
+initial=0
+partition="tenant"
+"#,
+    )
+    .unwrap()
+}
 fn command(key: Option<&str>) -> Command {
     serde_json::from_value(json!({"tag":"Add","stream":"one","payload":3,"idempotency_key":key,"metadata":{"message_id":"m1","correlation_id":"c1","actor":"alice"}})).unwrap()
 }
@@ -413,8 +455,8 @@ impl GuestSession for Flaky {
 /// the append reports as `app.events.append`, and driving every store path
 /// (commands, a replay, reads, a catch-up commit, a paused rebuild, a
 /// failing rebuild with resume and abandon, the admin reads, a recorded
-/// failure and `verify`) exercises exactly the statements `STATEMENTS`
-/// lists.
+/// failure, a tenant command, a partitioned catch-up, query and rebuild,
+/// and `verify`) exercises exactly the statements `STATEMENTS` lists.
 #[test]
 fn the_store_runs_exactly_its_registered_statements_and_reports_the_append() {
     let Some(test) = TestDatabase::create() else {
@@ -448,7 +490,7 @@ fn the_store_runs_exactly_its_registered_statements_and_reports_the_append() {
         ..PostgresOptions::default()
     };
     let guest = Flaky::default();
-    let config = config();
+    let config = tenant_config();
     let projection = config.projections[0].clone();
     let caller = tracing::info_span!(target: "merezha_test", "caller");
     let _entered = caller.enter();
@@ -510,6 +552,23 @@ fn the_store_runs_exactly_its_registered_statements_and_reports_the_append() {
         .unwrap();
     store.rebuild_status(&projection, deadline()).unwrap();
     store.abandon_rebuild(&projection, deadline()).unwrap();
+    // A tenant stream, a partitioned catch-up, tenant query and rebuild.
+    let member = merezha_domain::Principal::new(
+        Identity::new("usr_1").unwrap(),
+        merezha_domain::PrincipalKind::User,
+        Some(Identity::new("org_1").unwrap()),
+        vec![],
+    )
+    .unwrap();
+    let tenant_command: Command = serde_json::from_value(json!({"tag":"TenantAdd","stream":"one","payload":3,"metadata":{"message_id":"m2","correlation_id":"c2"}})).unwrap();
+    app.command_as(member.clone(), tenant_command).unwrap();
+    app.catch_up("mine").unwrap();
+    let mine: merezha_domain::Query = serde_json::from_value(
+        json!({"tag":"Mine","payload":{},"metadata":{"message_id":"q2","correlation_id":"c2"}}),
+    )
+    .unwrap();
+    assert_eq!(app.query_as(member, mine).unwrap().value, json!(1));
+    app.rebuild("mine").unwrap();
     store.overview(&[&projection], deadline()).unwrap();
     store.revisions(&projection.name, deadline()).unwrap();
     assert_eq!(
@@ -570,7 +629,11 @@ fn the_store_runs_exactly_its_registered_statements_and_reports_the_append() {
         .iter()
         .filter(|s| name(s) == APPEND_STATEMENT)
         .collect::<Vec<_>>();
-    assert_eq!(appends.len(), 2, "the replay reads its receipt instead");
+    assert_eq!(
+        appends.len(),
+        3,
+        "two commands and the tenant command; the replay reads its receipt instead"
+    );
     assert_eq!(appends[0].name, "INSERT merezha_app.events");
     assert_eq!(
         harness.metric("db.client.operation.duration").value(&[
@@ -578,6 +641,6 @@ fn the_store_runs_exactly_its_registered_statements_and_reports_the_append() {
             ("db.collection.name", "merezha_app.events"),
             ("merezha.module", MODULE),
         ]),
-        Some(2.0)
+        Some(3.0)
     );
 }

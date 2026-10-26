@@ -50,14 +50,15 @@ pub const LOAD: Statement = Statement::new(
     ),
 );
 /// The feed after a position, with each event's stored trace context
-/// (host-only, for span links; never part of a `StoredEvent`).
+/// (host-only, for span links; never part of a `StoredEvent`) and its
+/// stream's tenant (partitioned projections, AP-C2).
 pub const READ_ALL: Statement = Statement::new(
     "app.events.read_all",
     "SELECT merezha_app.events",
     concat!(
         "SELECT ",
         event_columns!(),
-        ", trace_parent, trace_state FROM merezha_app.events WHERE position > $1 ORDER BY position LIMIT $2"
+        ", trace_parent, trace_state, tenant FROM merezha_app.events WHERE position > $1 ORDER BY position LIMIT $2"
     ),
 );
 
@@ -67,13 +68,76 @@ pub const HEAD: Statement = Statement::new(
     "SELECT position FROM merezha_app.head WHERE id = 1",
 );
 
-/// The served pair, its row revision and the position the revision is
-/// warm from (§A.7).
+/// The served pair (no state when partitioned), its row revision, the
+/// position the revision is warm from (§A.7), its generation and whether
+/// it is partitioned.
 pub const PROJECTION: Statement = Statement::new(
     "app.projections.read",
     "SELECT merezha_app.projections",
-    "SELECT state::text, checkpoint, row_revision, warm_position \
+    "SELECT state::text, checkpoint, row_revision, warm_position, generation, partitioned \
     FROM merezha_app.projections WHERE name = $1 AND revision = $2",
+);
+/// A tenant's partition at the served generation, in one statement with
+/// the row, so no rebuild swap falls between the two reads (§A.6). No
+/// partition row: the configured initial state.
+pub const PARTITION: Statement = Statement::new(
+    "app.partitions.read",
+    "SELECT merezha_app.projection_partitions",
+    "SELECT p.checkpoint, p.warm_position, pp.state::text, p.partitioned \
+    FROM merezha_app.projections p LEFT JOIN merezha_app.projection_partitions pp \
+      ON (pp.name, pp.revision, pp.generation, pp.tenant) = (p.name, p.revision, p.generation, $3) \
+    WHERE p.name = $1 AND p.revision = $2",
+);
+/// The partitions of the tenants one batch touches, at one generation.
+pub const LOAD_PARTITIONS: Statement = Statement::new(
+    "app.partitions.load",
+    "SELECT merezha_app.projection_partitions",
+    "SELECT tenant, state::text FROM merezha_app.projection_partitions \
+    WHERE name = $1 AND revision = $2 AND generation = $3 AND tenant = ANY($4::text[])",
+);
+/// The partitioned catch-up commit, CAS first (§A.7): the checkpoint with
+/// row-revision CAS at the generation the batch loaded. Zero rows: the
+/// batch writes no partition.
+pub const COMMIT_PARTITIONED: Statement = Statement::new(
+    "app.projections.commit_partitioned",
+    "UPDATE merezha_app.projections",
+    "UPDATE merezha_app.projections \
+    SET checkpoint = $3, row_revision = row_revision + 1, \
+        status = 'active', failure_code = NULL, failure_class = NULL, failures = 0, updated_at = now() \
+    WHERE name = $1 AND revision = $2 AND row_revision = $4 AND generation = $5 AND partitioned \
+      AND $3 <= (SELECT position FROM merezha_app.head WHERE id = 1) \
+    RETURNING row_revision",
+);
+/// The partitions one batch produced (`$4` tenants and `$5` states
+/// zipped), at one generation, after its CAS.
+pub const WRITE_PARTITIONS: Statement = Statement::new(
+    "app.partitions.write",
+    "INSERT merezha_app.projection_partitions",
+    "INSERT INTO merezha_app.projection_partitions (name, revision, generation, tenant, state) \
+    SELECT $1, $2, $3, u.tenant, u.state::json FROM unnest($4::text[], $5::text[]) AS u (tenant, state) \
+    ON CONFLICT (name, revision, generation, tenant) DO UPDATE SET state = EXCLUDED.state",
+);
+/// After a swap: up to 1000 partitions of generations before the served
+/// one (§A.7 step 3). Queries join on the served generation, so none reads
+/// a half-deleted one.
+pub const SWEEP_OLD_PARTITIONS: Statement = Statement::new(
+    "app.partitions.sweep_old",
+    "DELETE merezha_app.projection_partitions",
+    "DELETE FROM merezha_app.projection_partitions \
+    WHERE (name, revision, generation, tenant) IN ( \
+        SELECT name, revision, generation, tenant FROM merezha_app.projection_partitions \
+        WHERE name = $1 AND revision = $2 AND generation < $3 LIMIT 1000)",
+);
+/// Before a rebuild's first batch: up to 1000 partitions of any generation
+/// other than the served one, left by an abandoned rebuild or an
+/// interrupted sweep.
+pub const SWEEP_STALE_PARTITIONS: Statement = Statement::new(
+    "app.partitions.sweep_stale",
+    "DELETE merezha_app.projection_partitions",
+    "DELETE FROM merezha_app.projection_partitions \
+    WHERE (name, revision, generation, tenant) IN ( \
+        SELECT name, revision, generation, tenant FROM merezha_app.projection_partitions \
+        WHERE name = $1 AND revision = $2 AND generation <> $3 LIMIT 1000)",
 );
 
 /// Catch-up commit with row-revision CAS (§A.7). Zero rows: the row moved
@@ -105,15 +169,15 @@ pub const MANIFEST: Statement = Statement::new(
 
 /// A configured projection revision without a row starts at checkpoint 0
 /// with `warm_position` at the current head, and warms up in the
-/// background. The `NOT EXISTS` read keeps a starting host from waiting on
-/// a run's open commit of an existing row, which `ON CONFLICT` alone
-/// would.
+/// background; a partitioned one (`$4`) has no state (`$3` NULL). The `NOT
+/// EXISTS` read keeps a starting host from waiting on a run's open commit
+/// of an existing row, which `ON CONFLICT` alone would.
 pub const INSERT_PROJECTION: Statement = Statement::new(
     "app.projections.insert",
     "INSERT merezha_app.projections",
     "INSERT INTO merezha_app.projections \
     (name, revision, partitioned, state, warm_position) \
-    SELECT $1, $2, false, $3::text::json, h.position FROM merezha_app.head h WHERE h.id = 1 \
+    SELECT $1, $2, $4, $3::text::json, h.position FROM merezha_app.head h WHERE h.id = 1 \
        AND NOT EXISTS (SELECT 1 FROM merezha_app.projections p WHERE p.name = $1 AND p.revision = $2) \
     ON CONFLICT (name, revision) DO NOTHING",
 );
@@ -180,7 +244,7 @@ pub const DELETE_REBUILD: Statement = Statement::new(
 pub const REBUILD: Statement = Statement::new(
     "app.rebuilds.read",
     "SELECT merezha_app.projection_rebuilds",
-    "SELECT state::text, checkpoint, target, row_revision, status \
+    "SELECT state::text, checkpoint, target, row_revision, status, generation, candidate \
     FROM merezha_app.projection_rebuilds WHERE name = $1 AND revision = $2",
 );
 pub const REBUILD_STATUS: Statement = Statement::new(
@@ -188,14 +252,15 @@ pub const REBUILD_STATUS: Statement = Statement::new(
     "SELECT merezha_app.projection_rebuilds",
     "SELECT status FROM merezha_app.projection_rebuilds WHERE name = $1 AND revision = $2",
 );
-/// Persist the candidate after a batch, with CAS on the rebuild row. Zero
-/// rows: the rebuild was abandoned, failed or resumed elsewhere.
+/// Persist the candidate after a batch, with CAS on the rebuild row and
+/// its candidate id (`$6`). Zero rows: the rebuild was abandoned (and
+/// perhaps requested again), failed or resumed elsewhere.
 pub const COMMIT_CANDIDATE: Statement = Statement::new(
     "app.rebuilds.commit",
     "UPDATE merezha_app.projection_rebuilds",
     "UPDATE merezha_app.projection_rebuilds \
     SET state = $3::text::json, checkpoint = $4, row_revision = row_revision + 1 \
-    WHERE name = $1 AND revision = $2 AND row_revision = $5 AND status = 'running' \
+    WHERE name = $1 AND revision = $2 AND row_revision = $5 AND candidate = $6 AND status = 'running' \
     RETURNING row_revision",
 );
 pub const FAIL_REBUILD: Statement = Statement::new(
@@ -203,7 +268,7 @@ pub const FAIL_REBUILD: Statement = Statement::new(
     "UPDATE merezha_app.projection_rebuilds",
     "UPDATE merezha_app.projection_rebuilds \
     SET status = 'failed', failure_code = $4 \
-    WHERE name = $1 AND revision = $2 AND row_revision = $3 AND status = 'running'",
+    WHERE name = $1 AND revision = $2 AND row_revision = $3 AND candidate = $5 AND status = 'running'",
 );
 /// Swap step 1: the served row, locked so a live batch orders against it.
 pub const LOCK_PROJECTION: Statement = Statement::new(
@@ -218,7 +283,7 @@ pub const TAKE_CANDIDATE: Statement = Statement::new(
     "app.rebuilds.take",
     "DELETE merezha_app.projection_rebuilds",
     "DELETE FROM merezha_app.projection_rebuilds \
-    WHERE name = $1 AND revision = $2 AND row_revision = $3 AND status = 'running' \
+    WHERE name = $1 AND revision = $2 AND row_revision = $3 AND candidate = $4 AND status = 'running' \
       AND checkpoint >= target \
     RETURNING state::text, checkpoint, generation",
 );
@@ -285,6 +350,12 @@ pub const STATEMENTS: &[Statement] = &[
     READ_ALL,
     HEAD,
     PROJECTION,
+    PARTITION,
+    LOAD_PARTITIONS,
+    COMMIT_PARTITIONED,
+    WRITE_PARTITIONS,
+    SWEEP_OLD_PARTITIONS,
+    SWEEP_STALE_PARTITIONS,
     COMMIT_PROJECTION,
     INSERT_MANIFEST,
     MANIFEST,

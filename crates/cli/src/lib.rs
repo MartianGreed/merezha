@@ -97,20 +97,71 @@ pub fn blocks(
 
 /// The identity block with the full permission catalog of this binary
 /// (identity section 5): identity's and the host's own permissions, the
-/// content and notifications blocks' lists, and content's `content_type`
-/// resource kind. The application's `[[permissions]]` and route `resource`
-/// kinds join with AP-C2, which owns their syntax.
+/// content and notifications blocks' lists, content's `content_type`
+/// resource kind, and the application's `[[permissions]]` and route
+/// `resource` kinds when `input` names an application configuration that
+/// reads (AP §C.4; its problems stop startup on their own, listed at once).
 pub fn identity_module(input: &merezha_platform::ConfigInput) -> merezha_identity::IdentityModule {
-    let mut identity =
-        merezha_identity::IdentityModule::new(merezha_identity::HostFacts::load(input));
+    let mut identity = blocks_catalog(merezha_identity::HostFacts::load(input));
+    if let Some(application) = merezha_platform::ProjectConfig::load(input)
+        .ok()
+        .and_then(|project| project.application)
+        .and_then(|section| read_application_document(&section.path).ok())
+    {
+        add_application(&mut identity, &application);
+    }
+    identity
+}
+/// The resource kinds the blocks of this binary declare; a route's
+/// `resource` cannot name one (`block_resource_kind`).
+pub const BLOCK_RESOURCE_KINDS: &[&str] = &[merezha_content::RESOURCE_KIND];
+/// The identity block with the blocks' permissions and resource kinds.
+fn blocks_catalog(facts: Option<merezha_identity::HostFacts>) -> merezha_identity::IdentityModule {
+    let mut identity = merezha_identity::IdentityModule::new(facts);
     let added = identity
         .add_block_permissions("content", &merezha_content::CONTENT_PERMISSIONS)
         .and_then(|()| {
             identity.add_block_permissions("notifications", &merezha_notifications::PERMISSIONS)
         });
     debug_assert!(added.is_ok(), "block permissions follow the grammar");
-    identity.add_resource_kinds(&[merezha_content::RESOURCE_KIND]);
+    identity.add_resource_kinds(BLOCK_RESOURCE_KINDS);
     identity
+}
+/// The application's `[[permissions]]` and route `resource` kinds join the
+/// catalog. Names off the grammar or in a block's namespace are left out:
+/// the application's own validation refuses them (`invalid_permission`,
+/// `block_prefix`).
+fn add_application(
+    identity: &mut merezha_identity::IdentityModule,
+    application: &merezha_application::config::Config,
+) {
+    use merezha_application::config::{BLOCK_PREFIXES, valid_permission};
+    let added = identity.add_application_permissions(
+        application
+            .permissions
+            .iter()
+            .flatten()
+            .filter(|p| {
+                let name = p.name.as_str();
+                valid_permission(name)
+                    && !BLOCK_PREFIXES.contains(&name.split('.').next().unwrap_or(""))
+            })
+            .map(|p| (p.name.as_str(), p.description.as_str())),
+    );
+    debug_assert!(added.is_ok(), "filtered application permissions");
+    // Routes check resources at tenant scope only, so an application-level
+    // grant on these kinds could never take effect.
+    let kinds: Vec<&str> = application.resource_kinds().into_iter().collect();
+    identity.add_tenant_resource_kinds(&kinds);
+}
+/// This binary's permission catalog with `application`'s permissions: what
+/// a route `permission` must name (AP §C.4, `unknown_permission`).
+pub fn permission_catalog(
+    application: &merezha_application::config::Config,
+) -> merezha_identity::Catalog {
+    let mut identity = blocks_catalog(None);
+    add_application(&mut identity, application);
+    identity.catalog().clone()
 }
 
 fn blocks_with(
@@ -148,12 +199,33 @@ pub fn open_application(
     authorizer: Arc<dyn merezha_application::Authorizer>,
 ) -> Result<merezha_application::Application, merezha_domain::Failure> {
     let config = read_application_config(path)?;
+    // Route permissions must name a catalog permission (AP §C.4); `serve`
+    // has no identity block, so undeclared routes stay allowed.
+    let catalog = permission_catalog(&config);
+    let mut issues = config.host_issues(
+        &|permission| catalog.contains(permission),
+        &|_| false,
+        false,
+    );
+    issues.extend(config.block_kind_issues(BLOCK_RESOURCE_KINDS));
+    if let Some(issue) = issues.first() {
+        return Err(merezha_domain::Failure::permanent(issue.code));
+    }
     merezha_application::Application::open(config, Arc::new(runtime), authorizer)
 }
 /// Read and validate an application configuration file. Blocking. Fails
 /// `invalid_application_config` for an unreadable or oversized file, or the
 /// configuration codes of the application layer.
 pub fn read_application_config(
+    path: &std::path::Path,
+) -> Result<merezha_application::config::Config, merezha_domain::Failure> {
+    let config = read_application_document(path)?;
+    config.validate()?;
+    Ok(config)
+}
+/// [`read_application_config`] without validation, for `merezha run`,
+/// which lists every access issue of the document before refusing it.
+pub fn read_application_document(
     path: &std::path::Path,
 ) -> Result<merezha_application::config::Config, merezha_domain::Failure> {
     use merezha_domain::Failure;
@@ -170,7 +242,7 @@ pub fn read_application_config(
     file.take(65_537)
         .read_to_string(&mut text)
         .map_err(|_| invalid())?;
-    merezha_application::config::Config::parse(&text)
+    merezha_application::config::Config::decode(&text)
 }
 
 async fn admission(State(state): State<AppState>, request: Request, next: Next) -> Response {

@@ -199,16 +199,20 @@ pub struct CommandRoute {
     pub tag: Identity,
     pub service: Identity,
     pub aggregate: Identity,
-    /// Version 2, enforced from AP-C2.
+    /// Version 2: the permission the caller needs at the route's scope
+    /// (exclusive with `access`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission: Option<Identity>,
-    /// Version 2, enforced from AP-C2.
+    /// Version 2: `public` or `authenticated` instead of a permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access: Option<Access>,
-    /// Version 2, enforced from AP-C2.
+    /// Version 2: where the permission is checked and whose streams the
+    /// route writes; `application` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<RouteScope>,
-    /// Version 2, commands only: an identity resource kind, from AP-C2.
+    /// Version 2, commands only: an identity resource kind. The permission
+    /// is then checked on the resource `{tenant, kind, id}` whose id is the
+    /// command's local stream id (tenant scope only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<Identity>,
 }
@@ -219,6 +223,14 @@ impl CommandRoute {
             || self.scope.is_some()
             || self.resource.is_some()
     }
+    /// What the route requires of its caller.
+    pub fn rule(&self) -> Rule<'_> {
+        rule(self.permission.as_ref(), self.access)
+    }
+    /// The route's scope, `application` when absent.
+    pub fn route_scope(&self) -> RouteScope {
+        self.scope.unwrap_or(RouteScope::Application)
+    }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -226,19 +238,59 @@ pub struct QueryRoute {
     pub tag: Identity,
     pub service: Identity,
     pub projection: Identity,
-    /// Version 2, enforced from AP-C2.
+    /// Version 2: as [`CommandRoute::permission`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission: Option<Identity>,
-    /// Version 2, enforced from AP-C2.
+    /// Version 2: as [`CommandRoute::access`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access: Option<Access>,
-    /// Version 2, enforced from AP-C2.
+    /// Version 2: a tenant-scoped query reads the caller's tenant partition
+    /// of a `partition = "tenant"` projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<RouteScope>,
+    /// Version 2: an application-scoped query on an unpartitioned
+    /// projection, in an application with tenant routes, that anonymous
+    /// callers or every user may call **returns every tenant's data**. It
+    /// is refused at startup (`cross_tenant_query`) unless this opts in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cross_tenant: bool,
 }
 impl QueryRoute {
     fn access_keys(&self) -> bool {
-        self.permission.is_some() || self.access.is_some() || self.scope.is_some()
+        self.permission.is_some()
+            || self.access.is_some()
+            || self.scope.is_some()
+            || self.cross_tenant
+    }
+    /// What the route requires of its caller.
+    pub fn rule(&self) -> Rule<'_> {
+        rule(self.permission.as_ref(), self.access)
+    }
+    /// The route's scope, `application` when absent.
+    pub fn route_scope(&self) -> RouteScope {
+        self.scope.unwrap_or(RouteScope::Application)
+    }
+}
+/// What a route requires of its caller (AP §C.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rule<'a> {
+    /// Neither `permission` nor `access`: a version 1 route. A host with the
+    /// identity block refuses such routes at startup
+    /// (`route_access_undeclared`); without it the host's policy decides.
+    Undeclared,
+    /// `access = "public"`: anyone, anonymous callers included.
+    Public,
+    /// `access = "authenticated"`: any principal.
+    Authenticated,
+    /// `permission = "..."`: a principal holding it at the route's scope.
+    Permission(&'a Identity),
+}
+fn rule(permission: Option<&Identity>, access: Option<Access>) -> Rule<'_> {
+    match (permission, access) {
+        (Some(permission), _) => Rule::Permission(permission),
+        (None, Some(Access::Public)) => Rule::Public,
+        (None, Some(Access::Authenticated)) => Rule::Authenticated,
+        (None, None) => Rule::Undeclared,
     }
 }
 /// How a projection's state is partitioned (version 2).
@@ -258,14 +310,23 @@ pub struct Projection {
     /// database or a separately reviewed migration, never an implicit reset.
     #[serde(default = "projection_revision")]
     pub revision: u32,
-    /// Version 2, from AP-C2.
+    /// Version 2: `tenant` keeps one state per tenant (PostgreSQL only).
+    /// Changing it needs a new `revision`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition: Option<Partition>,
+}
+impl Projection {
+    /// Whether the state is kept per tenant (`partition = "tenant"`).
+    pub fn partitioned(&self) -> bool {
+        self.partition == Some(Partition::Tenant)
+    }
 }
 fn projection_revision() -> u32 {
     1
 }
-/// An application permission for the route catalog (version 2, AP-C2).
+/// An application permission for the route catalog (version 2, AP-C2). It
+/// joins the identity block's permission catalog, so roles and keys can
+/// grant it.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Permission {
@@ -338,12 +399,11 @@ pub enum StorageConfig {
     Postgres { application: Identity },
 }
 /// The application configuration. Version 1 is the original format.
-/// Version 2 adds `limits.max_stream_events`, which this build enforces,
-/// and the access, tenancy and reactor keys (`[[permissions]]`, route
-/// `permission`, `access`, `scope` and `resource`, projection `partition`
-/// and `[[reactors]]`), which it parses and refuses with
-/// `unsupported_in_this_build`. A version 1 document using a version 2 key
-/// fails `invalid_config`.
+/// Version 2 adds `limits.max_stream_events`, the access and tenancy keys
+/// (`[[permissions]]`, route `permission`, `access`, `scope` and
+/// `resource`, projection `partition`, AP §C.4) and `[[reactors]]`, which
+/// this build parses and refuses with `unsupported_in_this_build` (AP-C3).
+/// A version 1 document using a version 2 key fails `invalid_config`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -368,17 +428,20 @@ pub struct Config {
 }
 impl Config {
     pub fn parse(input: &str) -> Result<Self, Failure> {
-        if input.len() > 65_536 {
-            return Err(Failure::permanent("config_limit"));
-        }
-        let config: Self =
-            toml::from_str(input).map_err(|_| Failure::permanent("invalid_config"))?;
+        let config = Self::decode(input)?;
         config.validate()?;
         Ok(config)
     }
+    /// The document without [`Config::validate`], for a host that lists
+    /// every access issue before refusing it ([`Config::host_issues`]).
+    pub fn decode(input: &str) -> Result<Self, Failure> {
+        if input.len() > 65_536 {
+            return Err(Failure::permanent("config_limit"));
+        }
+        toml::from_str(input).map_err(|_| Failure::permanent("invalid_config"))
+    }
     pub fn validate(&self) -> Result<(), Failure> {
-        let unsupported = self.unsupported_keys();
-        let version_2 = unsupported || self.limits.present.contains("max_stream_events");
+        let version_2 = self.version_2_keys() || self.limits.present.contains("max_stream_events");
         if !matches!(self.version, 1 | 2) || (self.version == 1 && version_2) {
             return Err(Failure::permanent("invalid_config"));
         }
@@ -419,7 +482,10 @@ impl Config {
         {
             return Err(Failure::permanent("invalid_routes"));
         }
-        if unsupported {
+        if let Some(issue) = self.route_issues().into_iter().next() {
+            return Err(Failure::permanent(issue.code));
+        }
+        if self.reactors.is_some() {
             return Err(Failure::permanent("unsupported_in_this_build"));
         }
         // Total capacity is an operator disk concern on PostgreSQL (§A.6).
@@ -428,15 +494,274 @@ impl Config {
         }
         Ok(())
     }
-    /// Whether any key enforced only by later slices is set: permissions
-    /// and route access (AP-C2), tenant scope and partitions (AP-C2) and
-    /// reactors (AP-C3). Accepting them unenforced would silently open
-    /// routes that declare a permission.
-    fn unsupported_keys(&self) -> bool {
+    /// Whether any version 2 key other than `max_stream_events` is set.
+    fn version_2_keys(&self) -> bool {
         self.permissions.is_some()
             || self.reactors.is_some()
             || self.commands.iter().any(CommandRoute::access_keys)
             || self.queries.iter().any(QueryRoute::access_keys)
             || self.projections.iter().any(|p| p.partition.is_some())
     }
+    /// Every problem of the access, tenancy and permission declarations
+    /// that the document shows on its own (AP §C.4), in document order:
+    ///
+    /// - `invalid_permission`: a `[[permissions]]` or route permission off
+    ///   the grammar (two to four `[a-z][a-z0-9_]{0,31}` segments);
+    ///   `block_prefix`: an application permission in a block's namespace
+    ///   (`identity.`, `content.`, `notifications.`, `jobs.`,
+    ///   `application.`, `system.`); `duplicate_permission`;
+    /// - `route_access_conflict`: a route with both `permission` and
+    ///   `access`;
+    /// - `resource_requires_tenant`: `resource` without `scope = "tenant"`;
+    /// - `tenant_query_unpartitioned`: a tenant-scoped query on a projection
+    ///   without `partition = "tenant"`; `partitioned_query_unscoped`: an
+    ///   application-scoped query on one;
+    /// - `tenant_aggregate`: with any tenant scope, an aggregate containing
+    ///   `:`, so a tenant stream `{tenant}:{aggregate}/{id}` never reads as
+    ///   another route's;
+    /// - `partitions_require_postgres`: a partitioned projection on memory
+    ///   or SQLite storage;
+    /// - `cross_tenant_query`: with any tenant-scoped route, an
+    ///   application-scoped query on an unpartitioned projection open to
+    ///   anonymous callers (`public`, or undeclared) or to any principal
+    ///   (`authenticated`), unless it sets `cross_tenant = true`, since it
+    ///   returns every tenant's data; `cross_tenant_scoped`: the opt-in on
+    ///   a tenant-scoped query.
+    ///
+    /// [`Config::validate`] fails with the first; a host lists them all
+    /// with [`Config::host_issues`].
+    pub fn route_issues(&self) -> Vec<RouteIssue> {
+        let mut issues = Vec::new();
+        let mut issue = |key: String, code: &'static str| issues.push(RouteIssue { key, code });
+        let mut names = BTreeSet::new();
+        for permission in self.permissions.iter().flatten() {
+            let key = format!("permissions.{}", permission.name.as_str());
+            if !valid_permission(permission.name.as_str()) {
+                issue(key, "invalid_permission");
+            } else if block_namespace(permission.name.as_str()) {
+                issue(key, "block_prefix");
+            } else if !names.insert(permission.name.as_str()) {
+                issue(key, "duplicate_permission");
+            }
+        }
+        let tenant_scoped = self
+            .commands
+            .iter()
+            .map(CommandRoute::route_scope)
+            .chain(self.queries.iter().map(QueryRoute::route_scope))
+            .any(|scope| scope == RouteScope::Tenant);
+        for route in &self.commands {
+            let key = format!("commands.{}", route.tag.as_str());
+            if route.permission.is_some() && route.access.is_some() {
+                issue(key.clone(), "route_access_conflict");
+            }
+            if route
+                .permission
+                .as_ref()
+                .is_some_and(|p| !valid_permission(p.as_str()))
+            {
+                issue(key.clone(), "invalid_permission");
+            }
+            if route.resource.is_some() && route.route_scope() != RouteScope::Tenant {
+                issue(key.clone(), "resource_requires_tenant");
+            }
+            if tenant_scoped && route.aggregate.as_str().contains(':') {
+                issue(key, "tenant_aggregate");
+            }
+        }
+        for route in &self.queries {
+            let key = format!("queries.{}", route.tag.as_str());
+            if route.permission.is_some() && route.access.is_some() {
+                issue(key.clone(), "route_access_conflict");
+            }
+            if route
+                .permission
+                .as_ref()
+                .is_some_and(|p| !valid_permission(p.as_str()))
+            {
+                issue(key.clone(), "invalid_permission");
+            }
+            let partitioned = self
+                .projections
+                .iter()
+                .find(|p| p.name == route.projection)
+                .is_some_and(Projection::partitioned);
+            match (route.route_scope(), partitioned) {
+                (RouteScope::Tenant, false) => issue(key.clone(), "tenant_query_unpartitioned"),
+                (RouteScope::Application, true) => issue(key.clone(), "partitioned_query_unscoped"),
+                _ => {}
+            }
+            if route.cross_tenant && route.route_scope() == RouteScope::Tenant {
+                issue(key.clone(), "cross_tenant_scoped");
+            }
+            // Fail closed: once tenants exist, an open application query on
+            // an unpartitioned projection reads every tenant's events.
+            if self.cross_tenant_exposed(route, partitioned)
+                && matches!(
+                    route.rule(),
+                    Rule::Public | Rule::Authenticated | Rule::Undeclared
+                )
+            {
+                issue(key, "cross_tenant_query");
+            }
+        }
+        if !matches!(self.storage, StorageConfig::Postgres { .. }) {
+            for projection in self.projections.iter().filter(|p| p.partitioned()) {
+                issue(
+                    format!("projections.{}", projection.name.as_str()),
+                    "partitions_require_postgres",
+                );
+            }
+        }
+        issues
+    }
+    /// [`Config::route_issues`] plus what only the host knows:
+    /// `unknown_permission` for a route permission `catalog` does not hold
+    /// (the union of `[[permissions]]` and the block permissions), and,
+    /// when the identity block is enabled, `route_access_undeclared` for a
+    /// route setting neither `permission` nor `access`. Without identity a
+    /// route may stay undeclared: only a private loopback listener's
+    /// allow-all policy serves it.
+    ///
+    /// `everyone` says whether every user holds a permission (identity's
+    /// `builtin_grants.user`): an application query checking one is as
+    /// open as `access = "authenticated"`, so `cross_tenant_query` applies
+    /// to it too.
+    pub fn host_issues(
+        &self,
+        catalog: &dyn Fn(&str) -> bool,
+        everyone: &dyn Fn(&str) -> bool,
+        identity: bool,
+    ) -> Vec<RouteIssue> {
+        let mut issues = self.route_issues();
+        for route in &self.queries {
+            let partitioned = self
+                .projections
+                .iter()
+                .find(|p| p.name == route.projection)
+                .is_some_and(Projection::partitioned);
+            if let Rule::Permission(permission) = route.rule()
+                && self.cross_tenant_exposed(route, partitioned)
+                && everyone(permission.as_str())
+            {
+                issues.push(RouteIssue {
+                    key: format!("queries.{}", route.tag.as_str()),
+                    code: "cross_tenant_query",
+                });
+            }
+        }
+        let declared: BTreeSet<&str> = self
+            .permissions
+            .iter()
+            .flatten()
+            .map(|p| p.name.as_str())
+            .collect();
+        let routes = self
+            .commands
+            .iter()
+            .map(|r| (format!("commands.{}", r.tag.as_str()), r.rule()))
+            .chain(
+                self.queries
+                    .iter()
+                    .map(|r| (format!("queries.{}", r.tag.as_str()), r.rule())),
+            );
+        for (key, rule) in routes {
+            match rule {
+                Rule::Undeclared if identity => issues.push(RouteIssue {
+                    key,
+                    code: "route_access_undeclared",
+                }),
+                Rule::Permission(permission)
+                    if valid_permission(permission.as_str())
+                        && !declared.contains(permission.as_str())
+                        && !catalog(permission.as_str()) =>
+                {
+                    issues.push(RouteIssue {
+                        key,
+                        code: "unknown_permission",
+                    })
+                }
+                _ => {}
+            }
+        }
+        issues
+    }
+    /// Whether `route` would read every tenant's data: the application has
+    /// a tenant-scoped route, the query is application-scoped on an
+    /// unpartitioned projection, and it does not opt in (`cross_tenant`).
+    fn cross_tenant_exposed(&self, route: &QueryRoute, partitioned: bool) -> bool {
+        let tenants = self
+            .commands
+            .iter()
+            .map(CommandRoute::route_scope)
+            .chain(self.queries.iter().map(QueryRoute::route_scope))
+            .any(|scope| scope == RouteScope::Tenant);
+        tenants
+            && route.route_scope() == RouteScope::Application
+            && !partitioned
+            && !route.cross_tenant
+    }
+    /// `block_resource_kind` for each command whose `resource` names a
+    /// kind a block declares (`block_kinds`, such as content's
+    /// `content_type`), as `block_prefix` refuses block permission names:
+    /// a route would otherwise check grants the block hands out for its
+    /// own resources.
+    pub fn block_kind_issues(&self, block_kinds: &[&str]) -> Vec<RouteIssue> {
+        self.commands
+            .iter()
+            .filter(|r| {
+                r.resource
+                    .as_ref()
+                    .is_some_and(|kind| block_kinds.contains(&kind.as_str()))
+            })
+            .map(|r| RouteIssue {
+                key: format!("commands.{}", r.tag.as_str()),
+                code: "block_resource_kind",
+            })
+            .collect()
+    }
+    /// The resource kinds routes name in `resource`, for the identity
+    /// block's role assignments.
+    pub fn resource_kinds(&self) -> BTreeSet<&str> {
+        self.commands
+            .iter()
+            .filter_map(|r| r.resource.as_ref().map(Identity::as_str))
+            .collect()
+    }
+}
+/// One problem of a configuration's access declarations: `key` names the
+/// entry (`commands.CreateTask`, `queries.ListTasks`,
+/// `permissions.tasks.create`, `projections.tasks`) and `code` the reason.
+/// Neither ever carries a value from outside the document.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RouteIssue {
+    pub key: String,
+    pub code: &'static str,
+}
+/// Block namespaces application permissions may not use (identity §5).
+pub const BLOCK_PREFIXES: [&str; 6] = [
+    "identity",
+    "content",
+    "notifications",
+    "jobs",
+    "application",
+    "system",
+];
+/// The permission grammar of identity §5: two to four segments of
+/// `[a-z][a-z0-9_]{0,31}`.
+pub fn valid_permission(name: &str) -> bool {
+    let segments: Vec<&str> = name.split('.').collect();
+    (2..=4).contains(&segments.len())
+        && segments.iter().all(|segment| {
+            let bytes = segment.as_bytes();
+            !bytes.is_empty()
+                && bytes.len() <= 32
+                && bytes[0].is_ascii_lowercase()
+                && bytes
+                    .iter()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+        })
+}
+fn block_namespace(name: &str) -> bool {
+    BLOCK_PREFIXES.contains(&name.split('.').next().unwrap_or(""))
 }

@@ -6,27 +6,96 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use merezha_application::Application;
+use merezha_application::{AllowAll, Application, Caller, Scope};
 use merezha_domain::{Classification, Failure, Identity};
 use merezha_platform::{
     edge::Authenticated,
-    ports::{Authorizer, ResourceScope},
+    ports::{Authorizer, Principal, ResourceScope},
 };
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
+
+/// The caller of an application command or query on the platform host (AP
+/// §C.4): the principal the edge authenticated, or none, under the host's
+/// policy, the identity block's RBAC `Authorizer` (or the loopback
+/// allow-all and deny-all fallbacks without it). Route permissions are
+/// checked through it at the route's scope before any guest call.
+pub struct EdgeCaller {
+    principal: Option<Arc<Principal>>,
+    policy: Arc<dyn Authorizer>,
+}
+impl EdgeCaller {
+    pub fn new(principal: Option<Arc<Principal>>, policy: Arc<dyn Authorizer>) -> Self {
+        Self { principal, policy }
+    }
+}
+/// The platform's `ResourceScope` for an application scope.
+pub fn resource_scope(scope: &Scope) -> ResourceScope {
+    match scope {
+        Scope::Application => ResourceScope::Application,
+        Scope::Tenant(tenant) => ResourceScope::Tenant(tenant.clone()),
+        Scope::Resource { tenant, kind, id } => ResourceScope::Resource {
+            tenant: tenant.clone(),
+            kind: kind.clone(),
+            id: id.clone(),
+        },
+    }
+}
+impl Caller for EdgeCaller {
+    /// The limited projection with the roles held at `scope`.
+    fn principal(&self, scope: &Scope) -> Option<merezha_domain::Principal> {
+        let scope = resource_scope(scope);
+        self.principal
+            .as_deref()
+            .map(|principal| principal.guest(&scope))
+    }
+    fn tenant(&self) -> Option<Identity> {
+        self.principal.as_ref().and_then(|p| p.tenant.clone())
+    }
+    fn authenticated(&self) -> bool {
+        self.principal.is_some()
+    }
+    /// `Authorizer::check`, which writes the break-glass audit row of a
+    /// `platform_admin` before allowing it.
+    fn check(&self, permission: &Identity, scope: &Scope) -> Result<(), Failure> {
+        self.policy
+            .check(
+                self.principal.as_deref(),
+                permission,
+                &resource_scope(scope),
+            )
+            .map(|_| ())
+            .map_err(Failure::from)
+    }
+    fn allows_all(&self) -> bool {
+        self.policy.allows_all()
+    }
+    /// Only the loopback allow-all serves a route that declares nothing;
+    /// with the identity block such a route stops startup
+    /// (`route_access_undeclared`), and the deny-all policy refuses it.
+    fn undeclared(&self) -> Result<(), Failure> {
+        if self.policy.allows_all() {
+            Ok(())
+        } else {
+            Err(Failure::permanent("unauthorized"))
+        }
+    }
+}
 
 #[derive(Clone)]
 struct Routes {
     application: Application,
     policy: Option<Arc<dyn Authorizer>>,
 }
-/// Application routes. Projection catch-up and rebuild are administrative:
-/// with a `policy`, each needs `application.projections.catch_up` or
-/// `application.projections.rebuild` at application scope, checked for the
-/// principal the edge authenticated. With a policy (the platform host)
-/// errors also take their status from the platform error registry. `serve`
-/// passes no policy, keeps them open on its loopback listener and keeps its
-/// own error statuses.
+/// Application routes. With a `policy` (the platform host), commands and
+/// queries run for the principal the edge authenticated under it
+/// ([`EdgeCaller`]): each route's `permission` or `access` is enforced at
+/// its scope before any guest call. Projection catch-up and rebuild are
+/// administrative: each needs `application.projections.catch_up` or
+/// `application.projections.rebuild` at application scope. Errors then
+/// take their status from the platform error registry. `serve` passes no
+/// policy: its loopback listener is the trusted local allow-all
+/// ([`AllowAll`]), with its own error statuses.
 pub fn router(application: Application, policy: Option<Arc<dyn Authorizer>>) -> Router {
     Router::new().nest("/v1/application", routes(application, policy))
 }
@@ -220,6 +289,7 @@ async fn dispatch(state: Routes, request: Request, action: Action) -> Response {
             return failure_response(failure);
         }
     }
+    let policy = state.policy.clone();
     let app = state.application;
     let admission = match app.admit() {
         Ok(a) => a,
@@ -248,35 +318,33 @@ async fn dispatch(state: Routes, request: Request, action: Action) -> Response {
                 value.map_err(|_| Failure::permanent("serialization_failed"))
             };
             let ok = StatusCode::OK;
-            // The edge's principal reaches the guest's metadata (version 2
-            // guests only) through the trusted entry points; route scopes
-            // are AP-C2's, so the roles are the application-scope ones.
-            let guest = || {
-                principal
-                    .as_deref()
-                    .map(|principal| principal.guest(&ResourceScope::Application))
-            };
+            // The edge's principal and the host policy enforce the route and
+            // reach the guest's metadata (version 2 guests only) through the
+            // trusted entry points, with the roles at the route's scope.
             Ok(match action {
                 Action::Command => {
                     let command = merezha_domain::decode(&with_host_ids(input)?)?;
-                    let receipt = match guest() {
-                        Some(principal) => admission.command_as(principal, command)?,
-                        None => admission.command(command)?,
+                    let receipt = match policy {
+                        Some(policy) => {
+                            admission.command_as(EdgeCaller::new(principal, policy), command)?
+                        }
+                        None => admission.command_as(AllowAll, command)?,
                     };
                     (ok, encoded(serde_json::to_value(receipt))?)
                 }
                 Action::Query => {
                     let query = merezha_domain::decode(&with_host_ids(input)?)?;
-                    let answer = match guest() {
-                        Some(principal) => admission.query_as(principal, query)?,
-                        None => admission.query(query)?,
+                    let answer = match policy {
+                        Some(policy) => {
+                            admission.query_as(EdgeCaller::new(principal, policy), query)?
+                        }
+                        None => admission.query_as(AllowAll, query)?,
                     };
                     (ok, encoded(serde_json::to_value(answer))?)
                 }
-                Action::Project { name, rebuild } => (
-                    ok,
-                    encoded(serde_json::to_value(admission.project(&name, rebuild)?))?,
-                ),
+                Action::Project { name, rebuild } => {
+                    (ok, admission.project_document(&name, rebuild)?)
+                }
                 Action::RequestRebuild { name } => {
                     let requested = admission.request_rebuild(
                         &name,
@@ -359,7 +427,8 @@ fn random_id() -> Result<String, Failure> {
 }
 fn failure_response(error: Failure) -> Response {
     let status = match error.code.as_str() {
-        "unauthorized" => StatusCode::FORBIDDEN,
+        "unauthenticated" => StatusCode::UNAUTHORIZED,
+        "unauthorized" | "tenant_required" | "actor_mismatch" => StatusCode::FORBIDDEN,
         "handler_not_found" | "projection_not_found" => StatusCode::NOT_FOUND,
         "input_limit" | "payload_limit" | "output_limit" => StatusCode::PAYLOAD_TOO_LARGE,
         "timeout" => StatusCode::GATEWAY_TIMEOUT,
