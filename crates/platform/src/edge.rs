@@ -361,11 +361,13 @@ impl EdgeSettings {
         }
     }
     /// Routes that take no credential (`Module::credential_free_routes`),
-    /// as `(method, full path)`: for a match (`{name}` segments match any
-    /// one non-empty segment, the others exactly) the edge never calls the
-    /// authenticator (no session lookup, no Origin or CSRF check, no
-    /// rejection of a stale cookie) and inserts `Authenticated(None)`, so
-    /// the route cannot see a principal even when the request carries one.
+    /// as `(method, full route template)`: for a request the router matched
+    /// to that template (axum's `MatchedPath`, so a static route of the same
+    /// shape is not exempt) with every `{name}` segment non-empty, the edge
+    /// never calls the authenticator (no session lookup, no Origin or CSRF
+    /// check, no rejection of a stale cookie) and inserts
+    /// `Authenticated(None)`, so the route cannot see a principal even when
+    /// the request carries one.
     pub fn credential_free_routes(mut self, routes: Vec<(Method, String)>) -> Self {
         self.credential_free = routes;
         self
@@ -974,8 +976,17 @@ async fn limit_body(State(state): State<EdgeState>, request: Request, next: Next
 
 async fn authenticate(State(state): State<EdgeState>, request: Request, next: Next) -> Response {
     // A credential-free route never sees the authenticator or a principal.
+    // The router's matched template decides, so another route of the same
+    // shape (a static `/a/mine` beside `/a/{id}`) keeps its
+    // authentication; every `{name}` segment must also be non-empty.
+    let matched = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str);
     if state.credential_free.iter().any(|(method, path)| {
-        request.method() == method && path_matches(path, request.uri().path())
+        request.method() == method
+            && matched == Some(path.as_str())
+            && path_matches(path, request.uri().path())
     }) {
         let mut request = request;
         request.extensions_mut().insert(Authenticated(None));

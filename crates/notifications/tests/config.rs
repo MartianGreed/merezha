@@ -626,3 +626,29 @@ fn host_facts_split_flags_and_queue_variables_as_the_kernel_does() {
         "{issues:?}"
     );
 }
+
+#[test]
+fn the_organisation_prefix_is_bounded_in_characters_not_bytes() {
+    let with = |prefix: &str| {
+        Project::new(&format!(
+            "{MINIMAL}[modules.notifications.sms]\ndriver = \"capture\"\nsender = \"Tasks\"\n\
+             organisation_prefix = \"{prefix}\"\n"
+        ))
+    };
+    // 32 two-byte characters are 64 bytes and still within the limit.
+    let accented = "é".repeat(32);
+    let checked = with(&accented).configure().unwrap();
+    assert_eq!(
+        checked.settings.sms.organisation_prefix.as_deref(),
+        Some(accented.as_str())
+    );
+    let issues = with(&"é".repeat(33)).issues();
+    assert!(
+        has(
+            &issues,
+            &format!("{N}.sms.organisation_prefix"),
+            "out_of_range"
+        ),
+        "{issues:?}"
+    );
+}

@@ -227,6 +227,42 @@ mod tests {
     }
 
     #[test]
+    fn the_current_key_still_verifies_beside_a_previous_one() {
+        let one = uuid::Uuid::from_u128(1);
+        let rotated = Keys::new(&material(2), Some(&material(1)));
+        // Made with the current key, checked with the previous one last.
+        assert!(rotated.verify_sms_status_mac(one, &rotated.sms_status_mac(one)));
+        assert!(
+            rotated.verify_sms_status_mac(one, &Keys::new(&material(1), None).sms_status_mac(one))
+        );
+        assert!(
+            !rotated.verify_sms_status_mac(one, &Keys::new(&material(3), None).sms_status_mac(one))
+        );
+    }
+
+    #[test]
+    fn the_sms_status_mac_has_a_fixed_wire_format() {
+        // Computed independently: HKDF-SHA256 (zero salt, info
+        // "merezha-notify/sms-status/v1") of 32 bytes of 0x01, then
+        // base64url(HMAC-SHA256(k_sms, hyphenated lowercase id))[..22].
+        let keys = Keys::new(&material(1), None);
+        for (id, mac) in [
+            (
+                "00000000-0000-0000-0000-000000000001",
+                "bflgWTluFX2eZFfDTxKvaK",
+            ),
+            (
+                "0190f6c2-7d3a-7b1e-9c4d-5e6f7a8b9c0d",
+                "hEAoq-1sOD3RXqNQ1uZPaD",
+            ),
+        ] {
+            let id = uuid::Uuid::parse_str(id).unwrap();
+            assert_eq!(keys.sms_status_mac(id), mac);
+            assert!(keys.verify_sms_status_mac(id, mac));
+        }
+    }
+
+    #[test]
     fn tokens_verify_with_either_key_and_forgeries_fail() {
         let claims = Unsubscribe {
             u: Some("usr_1".into()),

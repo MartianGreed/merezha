@@ -408,6 +408,149 @@ async fn a_provider_outage_exhausts_into_a_dead_letter_and_redelivery_sends_afte
     instance.stop().await;
 }
 
+/// Review: a `duplicate_parameter` answer to an SMS, sent without an
+/// idempotency key, does not say whether Brevo sent it. The delivery is
+/// `unknown` / `ambiguous` and never resent (NT1), not a `failed` an
+/// operator would redeliver.
+#[tokio::test]
+async fn a_duplicate_answer_is_ambiguous_and_never_resent() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakeBrevo::start(API_KEY).await.unwrap();
+    fake.fail_next_with(400, "duplicate_parameter");
+    let dir = templates();
+    let instance = Instance::start(&world, options(&section(&fake, &dir, "", "", ""))).await;
+    commit(
+        &instance,
+        request("tasks.code", "+33611111111", "Code", "d:1"),
+    )
+    .await;
+    wait_status(&instance, "unknown", 1).await;
+    instance.settle().await;
+    assert_eq!(delivery(&world, "+33611111111").await, "unknown:ambiguous");
+    assert_eq!(attempts(&world).await, ["ambiguous"]);
+    assert_eq!(sends(&fake).len(), 1);
+    instance.stop().await;
+}
+
+/// Review: the signed URL names the delivery, which a redelivery keeps. A
+/// late report about the first generation's message (`unknown` after a
+/// dropped connection, then redelivered and accepted with another message
+/// id) moves no status: a `rejected` for the first SMS must not fail the
+/// second, which would invite a third send (NT1). A report about the
+/// current message still applies.
+#[tokio::test]
+async fn a_late_report_about_an_earlier_generation_moves_no_status() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakeBrevo::start(API_KEY).await.unwrap();
+    fake.close_after_accept();
+    let dir = templates();
+    let instance = Instance::start(&world, options(&section(&fake, &dir, "", "", ""))).await;
+    commit(
+        &instance,
+        request("tasks.code", "+33611111111", "Code", "g:1"),
+    )
+    .await;
+    wait_status(&instance, "unknown", 1).await;
+    assert_eq!(delivery(&world, "+33611111111").await, "unknown:ambiguous");
+    let first = fake.processed().remove(0);
+    instance
+        .tokens
+        .add("admin", user("usr_admin", &["notifications.admin"], None));
+    let id = delivery_id(&world, "+33611111111").await;
+    let (status, _) = instance
+        .call(
+            "POST",
+            &format!("/v1/notifications/deliveries/{id}/redeliver"),
+            Some("admin"),
+            None,
+        )
+        .await;
+    assert_eq!(status.as_u16(), 202);
+    wait_status(&instance, "accepted", 1).await;
+    let second = fake.processed().remove(1);
+    assert_ne!(first.message_id, second.message_id);
+    assert_eq!(first.body["webUrl"], second.body["webUrl"]);
+    assert_eq!(
+        report(&instance, &first, &fake.sms_event("rejected", &first)).await,
+        (200, json!({}))
+    );
+    assert_eq!(delivery(&world, "+33611111111").await, "accepted:");
+    assert_eq!(
+        world
+            .text(&format!(
+                "SELECT event FROM merezha_notify.provider_events WHERE delivery_id = '{id}'"
+            ))
+            .await,
+        ["rejected"],
+        "stored, correlated, no effect"
+    );
+    assert_eq!(
+        report(&instance, &second, &fake.sms_event("delivered", &second))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(delivery(&world, "+33611111111").await, "delivered:");
+    assert_eq!(fake.processed().len(), 2);
+    instance.stop().await;
+}
+
+/// A callback body holds at most 100 reports in at most 64 KiB; past
+/// either, 413 `body_limit` and nothing is stored.
+#[tokio::test]
+async fn an_oversized_callback_gets_413_and_stores_nothing() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakeBrevo::start(API_KEY).await.unwrap();
+    let dir = templates();
+    let instance = Instance::start(&world, options(&section(&fake, &dir, "", "", ""))).await;
+    commit(
+        &instance,
+        request("tasks.code", "+33611111111", "Code", "z:1"),
+    )
+    .await;
+    wait_status(&instance, "accepted", 1).await;
+    let message = fake.processed().remove(0);
+    let many: Vec<Value> = (0..101)
+        .map(|_| fake.sms_event("soft_bounce", &message))
+        .collect();
+    assert!(json!(many).to_string().len() < 64 * 1024);
+    let mut padded = fake.sms_event("delivered", &message);
+    padded["description"] = json!("x".repeat(64 * 1024));
+    for (payload, why) in [(json!(many), "101 reports"), (padded, "65 KiB")] {
+        let (status, body) = report(&instance, &message, &payload).await;
+        assert_eq!(
+            (status, body["error"]["code"].clone()),
+            (413, json!("body_limit")),
+            "{why}"
+        );
+    }
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.provider_events")
+            .await,
+        0
+    );
+    assert_eq!(delivery(&world, "+33611111111").await, "accepted:");
+    // At the limit: 100 reports are taken.
+    let hundred: Vec<Value> = (0..100)
+        .map(|_| fake.sms_event("soft_bounce", &message))
+        .collect();
+    assert_eq!(report(&instance, &message, &json!(hundred)).await.0, 200);
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.provider_events")
+            .await,
+        100
+    );
+    instance.stop().await;
+}
+
 /// NT-N4 acceptance: a bad MAC gets 401 (so does a MAC for another
 /// delivery, a non-canonical id and a source outside the CIDRs) and stores
 /// nothing; the right URL passes the edge even with a bearer the session
@@ -895,6 +1038,71 @@ mod timing {
         assert!(gap >= Duration::from_secs(7), "{gap:?}");
         assert!(started.elapsed() < Duration::from_secs(25));
         assert_eq!(attempts(&world).await, ["rate_limited", "accepted"]);
+        instance.stop().await;
+    }
+
+    /// Review: a late report about an earlier generation that arrives
+    /// while the redelivered SMS is being sent waits `pending` and, once
+    /// the worker records the new message id, moves nothing.
+    #[tokio::test]
+    async fn a_pending_report_about_an_earlier_generation_moves_no_status() {
+        let Some(world) = World::new().await else {
+            return;
+        };
+        let fake = FakeBrevo::start(API_KEY).await.unwrap();
+        fake.close_after_accept();
+        let dir = templates();
+        let options = options(&section(&fake, &dir, "", "", ""));
+        let armed = options.faults.clone();
+        let instance = Instance::start(&world, options).await;
+        commit(
+            &instance,
+            request("tasks.code", "+33611111111", "Code", "q:1"),
+        )
+        .await;
+        wait_status(&instance, "unknown", 1).await;
+        let first = fake.processed().remove(0);
+        armed.pause_once(faults::AFTER_PROVIDER_CALL, Duration::from_secs(3));
+        instance
+            .tokens
+            .add("admin", user("usr_admin", &["notifications.admin"], None));
+        let id = delivery_id(&world, "+33611111111").await;
+        let (status, _) = instance
+            .call(
+                "POST",
+                &format!("/v1/notifications/deliveries/{id}/redeliver"),
+                Some("admin"),
+                None,
+            )
+            .await;
+        assert_eq!(status.as_u16(), 202);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fake.processed().len() < 2 {
+            assert!(Instant::now() < deadline, "never resent");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            report(&instance, &first, &fake.sms_event("rejected", &first))
+                .await
+                .0,
+            200
+        );
+        assert_eq!(delivery(&world, "+33611111111").await, "sending:");
+        assert_eq!(
+            world
+                .scalar("SELECT count(*) FROM merezha_notify.provider_events WHERE pending")
+                .await,
+            1
+        );
+        wait_status(&instance, "accepted", 1).await;
+        instance
+            .until(
+                "SELECT count(*) FROM merezha_notify.provider_events WHERE NOT pending",
+                1,
+            )
+            .await;
+        assert_eq!(delivery(&world, "+33611111111").await, "accepted:");
+        assert_eq!(fake.processed().len(), 2);
         instance.stop().await;
     }
 

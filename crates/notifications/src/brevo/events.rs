@@ -16,7 +16,7 @@
 //! the address stand in for a missing message id) and applied once.
 //! Deliveries are resolved first and locked in ascending id order. An
 //! event about a delivery still `queued`, `sending` or `retrying` is
-//! stored `pending` and applied by the worker's Tx B ([`apply_pending`]):
+//! stored `pending` and applied by the worker's Tx B (`apply_pending`):
 //!
 //! | Event | Effect |
 //! | --- | --- |
@@ -33,6 +33,14 @@
 //! and still answered 200, so Brevo stops retrying. Suppressions always use
 //! the delivery's own address. No log line or span carries an address,
 //! subject, reason text or message id.
+//!
+//! Our correlation names the delivery, which a redelivery keeps. An event
+//! whose message id differs from the provider message id of the
+//! delivery's current generation is about an earlier generation: it is
+//! stored, may still suppress the delivery's own address, and moves no
+//! status, so a late report about the first send cannot settle (or fail,
+//! and so invite another redelivery of) the second. The same check runs
+//! when a `pending` event is applied.
 //!
 //! The SMS status callback ([`super::sms_status`], NT-N4) runs its events
 //! through the same transaction (`apply`) and source check
@@ -483,13 +491,16 @@ pub(crate) async fn apply_pending(
         .query(tx, &sql::EVENTS_TAKE_PENDING, &[&delivery])
         .await
         .map_err(|e| classify(&e))?;
-    let mut events: Vec<(i64, String, String)> = rows
+    let mut events: Vec<(i64, String, String, bool)> = rows
         .iter()
-        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
         .collect();
     events.sort();
-    for (_, name, channel) in &events {
-        transition(db, tx, delivery, stored_transition(channel, name), now).await?;
+    for (_, name, channel, stale) in &events {
+        // A report about an earlier generation's message moves nothing.
+        if !stale {
+            transition(db, tx, delivery, stored_transition(channel, name), now).await?;
+        }
     }
     Ok(events.len())
 }
@@ -567,18 +578,36 @@ pub(crate) async fn apply<E: StatusEvent>(
                 resolved.sort_by_key(|(id, _, _)| (id.is_none(), *id));
                 let mut applied = Vec::new();
                 for (found, event, suppression_id) in resolved {
-                    let delivery: Option<(Uuid, String, Option<String>, String)> = match found {
-                        Some(id) => db
-                            .query_opt(tx, &sql::EVENT_DELIVERY_BY_ID, &[&id, &channel])
-                            .await
-                            .map_err(|e| classify(&e))?
-                            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))),
-                        None => None,
-                    };
+                    let delivery: Option<(Uuid, String, Option<String>, String)>;
+                    let mut stale = false;
+                    match found {
+                        Some(id) => {
+                            let row = db
+                                .query_opt(tx, &sql::EVENT_DELIVERY_BY_ID, &[&id, &channel])
+                                .await
+                                .map_err(|e| classify(&e))?;
+                            delivery = row
+                                .as_ref()
+                                .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)));
+                            // Our correlation (the header or the signed
+                            // path) names the delivery, which survives a
+                            // redelivery; a report whose message id is not
+                            // the current generation's is about an earlier
+                            // one and moves no status (it may still
+                            // suppress the delivery's own address).
+                            let current: Option<String> = row.as_ref().and_then(|r| r.get(4));
+                            stale = matches!(
+                                (&event.message_id, &current),
+                                (Some(theirs), Some(ours)) if theirs != ours
+                            );
+                        }
+                        None => delivery = None,
+                    }
                     // A delivery its worker still owns gets the event later.
-                    let pending = delivery.as_ref().is_some_and(|d| {
-                        OPEN.contains(&d.1.as_str()) && event.event.status_change().is_some()
-                    });
+                    let pending = !stale
+                        && delivery.as_ref().is_some_and(|d| {
+                            OPEN.contains(&d.1.as_str()) && event.event.status_change().is_some()
+                        });
                     let inserted = db
                         .query_opt(
                             tx,
@@ -606,7 +635,7 @@ pub(crate) async fn apply<E: StatusEvent>(
                         applied.push((event.event, false));
                         continue;
                     };
-                    if !pending {
+                    if !pending && !stale {
                         transition(&db, tx, *id, event.event.status_change(), now).await?;
                     }
                     // The address is ours: the delivery's, never the event's.

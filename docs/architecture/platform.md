@@ -860,7 +860,7 @@ Guest calls, dispatch and projections are instrumented (TE-T3; TE §1.2,
 | `ready()` | readiness contribution, answered within 1 s |
 | `blob_store()` | the `BlobStore` it provides to every context, opened from its settings; `Ok(None)` (default) provides none. Asked once after `configure`, before any module starts; a failure stops startup naming the module, a second provider stops it with `blob_store_conflict`. Content provides the store `[modules.content.media]` configures |
 | `notifier()` | the `NotifierFactory` it provides to every context in place of the capture fallback; `None` (default) provides none. Asked once after `configure`, before any module starts, so a module that starts earlier already binds it; a second provider stops startup with `notifier_conflict`. The factory answers `unavailable` until its module started. The notifications block provides it |
-| `credential_free_routes()` | `CredentialFreeRoute { method, path }` for routes that take no credential (a signed link, a provider callback): for a match (segment by segment, a `{name}` segment matching any one non-empty segment and every other segment exactly, as for `body_limits()`) the edge never runs the authenticator (no session lookup, Origin or CSRF check, no refusal of a stale cookie) and inserts `Authenticated(None)`, so such a route cannot see a principal and must never act on one; default none. A path must start with `/` and hold no `..`, `%`, `//`, query or fragment; the host prefixes `/v1/<name>` and refuses any other path at startup with `invalid_credential_free_route`. Notifications declares `GET` and `POST /unsubscribe`, `POST /providers/brevo/email` and `POST /providers/brevo/sms/{delivery_id}/{mac}` |
+| `credential_free_routes()` | `CredentialFreeRoute { method, path }` for routes that take no credential (a signed link, a provider callback): for a request the router matched to that route template (axum's matched path, so a static route of the same shape stays authenticated) with every `{name}` segment non-empty, the edge never runs the authenticator (no session lookup, Origin or CSRF check, no refusal of a stale cookie) and inserts `Authenticated(None)`, so such a route cannot see a principal and must never act on one; default none. A path must start with `/` and hold no `..`, `%`, `//`, query or fragment; the host prefixes `/v1/<name>` and refuses any other path at startup with `invalid_credential_free_route`. Notifications declares `GET` and `POST /unsubscribe`, `POST /providers/brevo/email` and `POST /providers/brevo/sms/{delivery_id}/{mac}` |
 | `body_limits()` | `RouteBodyLimit { method, path, limit }` for routes that bound their own body (the upload route): the edge reads such a body up to `limit` instead of `http.body_limit` and leaves a declared length to the route; default none. Notifications declares 1 MiB for `POST /providers/brevo/email` |
 | `draining()` | the listener is about to stop accepting and drain in-flight requests: end long-lived responses (event streams) and refuse new ones, so the drain does not wait on them until its timeout. Called once, after `http.drain_delay_ms`, before the drain and `shutdown`; must not block; default nothing. Notifications ends every inbox stream there |
 | `shutdown(deadline)` | stop and drain background work after the listener drained |
@@ -1493,7 +1493,7 @@ topics with an unsubscribe link, and `X-Sib-Sandbox: drop` with
 | Brevo answer | Attempt outcome | Delivery |
 | --- | --- | --- |
 | 2xx | `accepted` | `accepted` |
-| 400 `duplicate_parameter` | `duplicate` | `accepted` without a message id |
+| 400 `duplicate_parameter` | `duplicate` | `accepted` without a message id (SMS: `unknown` / `ambiguous`) |
 | 400 `duplicate_request` | `transient` | `retrying`, at least 60 s later |
 | 401, 402, 403, or code `unauthorized`, `not_enough_credits`, `permission_denied`, `account_under_validation` | `transient` (`provider_account`) | `retrying`, at least 5 min later (at most the `notify.email` `backoff_max_ms`, which must be at least 5 min, else startup fails `backoff_max_too_short`). The answer consumes no attempt: the next try is a new job of the same generation (outbox key `deliver:{id}:g{n}:a{attempt}`), until the notification's `expires_at`, or 24 h after the run's first refusal, then `failed` / `provider_account_unresolved`. One error log `notification.provider_account_error` per run of refusals; `merezha.notification.provider_account_errors` counts each |
 | 408, 425, 429 | `rate_limited` | `retrying` after `max(Retry-After, x-sib-ratelimit-reset)` (at most 1 h, and at most the queue's `backoff_max_ms`); warn log `notification.provider_rate_limited` |
@@ -1609,10 +1609,10 @@ accepted SMS adds its parts to `merezha.notification.sms_segments`
 (`notify.encoding` `gsm7` or `ucs2`).
 
 Brevo answers are classified as for email, except that no idempotency key
-is sent: a `duplicate_parameter` answer is `failed` /
-`provider_rejected`, and an ambiguous attempt (a timeout or a dropped
-connection once connected, or a crash that left a `started` attempt) sets
-the delivery `unknown` / `ambiguous` and is never resent (NT1). A later
+is sent: an ambiguous attempt (a timeout or a dropped connection once
+connected, a crash that left a `started` attempt, or a
+`duplicate_parameter` answer, which cannot tell whether the SMS went out)
+sets the delivery `unknown` / `ambiguous` and is never resent (NT1). A later
 status report can still settle it, and `redeliver` starts a new
 generation. Account refusals wait for an operator as email does, without
 spending attempts.
@@ -1642,6 +1642,19 @@ path's delivery only (never by message id) and deduplicated on
 | `rejected` | `accepted` or `unknown` to `failed` / `provider_rejected` |
 | `blacklisted`, `unsubscribed` (a STOP reply) | an `unsubscribed` suppression of the number for every non-security SMS topic |
 | `sent`, `accepted`, `soft_bounce` | recorded only |
+
+A redelivery keeps the delivery id, and so the status URL: a report whose
+message id is not the one of the delivery's current generation is about an
+earlier send. It is stored and its suppression applies, but it moves no
+status, so a late `rejected` about the first SMS cannot fail (and invite a
+third send of) the second. The email callback applies the same rule to
+`X-Mailin-custom` correlation.
+
+A `webUrl` never expires and lets whoever holds it report on that
+delivery (and suppress its number's non-security SMS topics). Set
+`brevo.webhook_allowed_cidrs` to Brevo's ranges (`1.179.112.0/20`,
+`172.246.240.0/20`) and keep `/v1/notifications/providers/brevo/sms/`
+paths out of proxy and load-balancer access logs.
 
 Replies are dropped unstored (their text is the recipient's message), and
 so are unknown statuses. A report about a delivery still `queued`,

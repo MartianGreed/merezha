@@ -15,7 +15,11 @@
 //! the email callback's transaction (`events::apply`): the event
 //! is correlated by the signed path id only (never by a message id, so a
 //! URL for one delivery cannot report on another), deduplicated on
-//! `sha256(brevo|sms|message id|event|ts_event)` and applied once:
+//! `sha256(brevo|sms|message id|event|ts_event)` and applied once. The
+//! signed id survives a redelivery, so a report whose `messageId` is not
+//! the current generation's moves no status (NT1: a late `rejected` about
+//! the first SMS must not fail, and so invite a third send of, the
+//! second); its suppression still applies to the delivery's own number:
 //!
 //! | `msg_status` | Effect |
 //! | --- | --- |

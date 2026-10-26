@@ -428,11 +428,12 @@ pub const PURGED_THROUGH: Statement = s(
 // ----- provider events (NT-N3) -----
 
 /// The delivery an event names by id, locked, with its notification's
-/// topic.
+/// topic and the provider message id of its current generation.
 pub const EVENT_DELIVERY_BY_ID: Statement = s(
     "notify.event.delivery_by_id",
     "SELECT merezha_notify.deliveries",
-    "SELECT d.id, d.status, d.address, n.topic FROM merezha_notify.deliveries d \
+    "SELECT d.id, d.status, d.address, n.topic, d.provider_message_id \
+     FROM merezha_notify.deliveries d \
      JOIN merezha_notify.notifications n ON n.id = d.notification_id \
      WHERE d.id = $1 AND d.channel = $2 FOR UPDATE OF d",
 );
@@ -468,12 +469,17 @@ pub const DELIVERY_EVENT_SET: Statement = s(
      WHERE id = $1 AND status = ANY($5::text[])",
 );
 
-/// Take the events waiting for delivery `$1` (migration 3).
+/// Take the events waiting for delivery `$1` (migration 3), each with
+/// whether it names another message than the delivery's current one (a
+/// report about an earlier generation, which moves no status).
 pub const EVENTS_TAKE_PENDING: Statement = s(
     "notify.event.take_pending",
     "UPDATE merezha_notify.provider_events",
-    "UPDATE merezha_notify.provider_events SET pending = false \
-     WHERE delivery_id = $1 AND pending RETURNING id, event, channel",
+    "UPDATE merezha_notify.provider_events e SET pending = false \
+     FROM merezha_notify.deliveries d \
+     WHERE e.delivery_id = $1 AND e.pending AND d.id = e.delivery_id \
+     RETURNING e.id, e.event, e.channel, \
+     coalesce(e.provider_message_id <> d.provider_message_id, false)",
 );
 
 /// Every statement of this module.

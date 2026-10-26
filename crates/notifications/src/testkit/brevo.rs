@@ -92,7 +92,7 @@ struct State {
     keys: BTreeMap<String, Duration>,
     /// How far the fake clock was advanced.
     offset: Duration,
-    fail: VecDeque<u16>,
+    fail: VecDeque<(u16, Option<&'static str>)>,
     rate_limit: VecDeque<Vec<(String, String)>>,
     delay: Duration,
     close_after_accept: u32,
@@ -174,8 +174,13 @@ impl FakeBrevo {
     pub fn fail_next(&self, n: usize, status: u16) {
         let mut state = self.inner.state();
         for _ in 0..n {
-            state.fail.push_back(status);
+            state.fail.push_back((status, None));
         }
+    }
+    /// The next send request gets `status` with the Brevo error `code`
+    /// (such as `duplicate_parameter`) and is not processed.
+    pub fn fail_next_with(&self, status: u16, code: &'static str) {
+        self.inner.state().fail.push_back((status, Some(code)));
     }
     /// The next send request gets 429 with `headers` (such as
     /// `Retry-After` or `x-sib-ratelimit-reset`).
@@ -421,14 +426,14 @@ fn decide(inner: &Inner, request: Recorded) -> Reply {
         _ if send => {}
         _ => return error(404, "document_not_found"),
     }
-    if let Some(status) = state.fail.pop_front() {
-        let code = match status {
+    if let Some((status, code)) = state.fail.pop_front() {
+        let code = code.unwrap_or(match status {
             401 => "unauthorized",
             402 => "not_enough_credits",
             403 => "permission_denied",
             400..=499 => "invalid_parameter",
             _ => "internal_error",
-        };
+        });
         return error(status, code);
     }
     if let Some(headers) = state.rate_limit.pop_front() {

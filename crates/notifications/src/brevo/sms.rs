@@ -11,7 +11,8 @@
 //! ([`crate::keys::Keys::sms_status_mac`]). Brevo documents no SMS
 //! idempotency, so the worker never resends an ambiguous SMS (NT1); the
 //! driver only classifies. A `duplicate_parameter` answer cannot be an
-//! idempotency hit here and is a rejection.
+//! idempotency hit here; whether Brevo sent the SMS is unknown, so it is
+//! ambiguous (`unknown` / `ambiguous`) and never resent.
 use super::{BrevoClient, classify, classify_failure, events::CUSTOM_PREFIX};
 use crate::{
     drivers::{Provider, SendOutcome, SmsDriver, SmsMessage},
@@ -67,9 +68,12 @@ impl BrevoClient {
     pub async fn send_sms(&self, body: &Value, deadline: Instant) -> SendOutcome {
         match self.post(SMS_PATH, "send_sms", body, deadline).await {
             Ok(response) => match classify(&response) {
-                // No idempotency key was sent: a duplicate is a refusal.
-                SendOutcome::Duplicate { .. } => SendOutcome::Permanent {
-                    code: "provider_rejected".into(),
+                // No idempotency key was sent, so Brevo's duplicate answer
+                // does not say whether this SMS went out: ambiguous, never
+                // resent (NT1), rather than a `failed` that invites a
+                // redelivery.
+                SendOutcome::Duplicate { .. } => SendOutcome::Ambiguous {
+                    code: "duplicate_parameter".into(),
                 },
                 outcome => outcome,
             },

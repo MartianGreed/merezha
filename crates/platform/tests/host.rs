@@ -1471,6 +1471,7 @@ impl Module for Callback {
             .route("/open", post(seen))
             .route("/open/{id}/{mac}", post(seen))
             .route("/open/{id}/{mac}/more", post(seen))
+            .route("/open/static/route", post(seen))
             .route("/closed", post(seen))
     }
 }
@@ -1571,6 +1572,20 @@ async fn credential_free_routes_skip_the_authenticator_and_see_no_principal() {
         let (status, _, _) = call(&router, post_with(path, Some("Bearer stale"))).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
     }
+    // A static route of the credential-free shape is its own route: the
+    // router matches its template, so it keeps its authentication.
+    let (status, _, _) = call(
+        &router,
+        post_with("/v1/callback/open/static/route", Some("Bearer stale")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (_, body, _) = call(
+        &router,
+        post_with("/v1/callback/open/static/route", Some("Bearer good")),
+    )
+    .await;
+    assert_eq!(body["principal"], true);
     // Only the exact method and path: GET on the open path is not exempt.
     let get = Request::get("/v1/callback/open")
         .header("authorization", "Bearer stale")

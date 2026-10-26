@@ -787,8 +787,10 @@ not used. The fields:
   also decides `unicodeEnabled`).
 
 The `messageId` number in the 201 response is stored as text. No
-idempotency key is sent, so a 400 `duplicate_parameter` answer is a
-rejection (`provider_rejected`), not a duplicate (N4). `brevo.sandbox`
+idempotency key is sent, so a 400 `duplicate_parameter` answer says
+nothing about whether the SMS went out: it is ambiguous, `unknown` /
+`ambiguous`, never resent (NT1), rather than a `failed` that would invite
+a redelivery (N4 review). `brevo.sandbox`
 applies to email only: Brevo has no SMS sandbox.
 
 ```json
@@ -802,7 +804,7 @@ applies to email only: Brevo has no SMS sandbox.
 | Response | Class | Effect |
 | --- | --- | --- |
 | 201 / 202 | accepted | `accepted` |
-| 400 `duplicate_parameter` (email) | duplicate | `accepted`, no message id |
+| 400 `duplicate_parameter` | email: duplicate; SMS: ambiguous | email `accepted`, no message id; SMS `unknown` / `ambiguous` (NT1) |
 | 400 `duplicate_request` | transient | retry after at least 60 s |
 | other 400, 404 | permanent | `failed`, `provider_rejected_<code>` (closed enum, else `provider_rejected`) |
 | 401, 402, 403, `unauthorized`, `not_enough_credits`, `permission_denied`, `account_under_validation` | transient `provider_account` | retry after at least 5 min (capped by the `notify.email` `backoff_max_ms`, which startup requires to be at least 5 min); the answer consumes no attempt: the next try is a new job of the same generation, so mail stays `retrying` while an operator fixes the key or the credits, until the notification's `expires_at` (24 h after the first refusal of the run without one), then `failed` / `provider_account_unresolved`. One error log `notification.provider_account_error` per run of refusals; `merezha.notification.provider_account_errors` counts each (N3 review). |
@@ -830,8 +832,10 @@ own check.
   its hyphenated lowercase form and `k_sms = HKDF-SHA256(secret_key, info
   = "merezha-notify/sms-status/v1")`. The callback recomputes the MAC under
   `secret_key` and `secret_key_previous` and compares in constant time.
-  The edge matches the route's `{delivery_id}` and `{mac}` segments for
-  `Module::credential_free_routes` as it does for body limits (N4). The
+  The edge exempts the route from authentication when the router matched
+  its template (`Module::credential_free_routes`, compared with axum's
+  matched path, so a static route of the same shape is not exempt, with
+  non-empty `{delivery_id}` and `{mac}` segments; N4). The
   event is correlated by the path id only, never by message id, so a URL
   for one delivery cannot report on another. Without `public_base_url`, no
   `webUrl` is sent and SMS deliveries stay `accepted`; startup requires it
@@ -839,7 +843,11 @@ own check.
 - **Source CIDRs (optional).** `brevo.webhook_allowed_cidrs` is checked
   against the client IP that the edge resolved through `http.trusted_proxies`.
   It is empty by default. Brevo's published webhook ranges are
-  `1.179.112.0/20` and `172.246.240.0/20`.
+  `1.179.112.0/20` and `172.246.240.0/20`. Setting it is recommended with
+  Brevo SMS: a `webUrl` never expires and lets its holder report on one
+  number's deliveries (and suppress its non-security SMS topics), so
+  status-URL paths should also be kept out of proxy access logs (N4
+  review).
 
 Each callback request is processed in one transaction:
 
@@ -854,7 +862,13 @@ Each callback request is processed in one transaction:
 3. Correlate the event by `X-Mailin-custom` or the path id, with the message
    id as fallback. Every event is resolved first, without a lock; the
    deliveries are then locked in ascending id order, so concurrent callbacks
-   cannot deadlock on each other.
+   cannot deadlock on each other. Our correlation names the delivery,
+   which a redelivery keeps: an event whose message id differs from the
+   provider message id of the delivery's current generation is about an
+   earlier generation. It is stored and may suppress the delivery's own
+   address, but moves no status, also when applied from `pending`, so a
+   late report about the first send cannot settle or fail the second (N4
+   review; email and SMS).
 4. Deduplicate on `event_key = sha256(provider|channel|message id|event|ts_event)`;
    without a message id, the delivery id and the address take its place.
 5. Apply the effect to a correlated event only. An uncorrelated event (no

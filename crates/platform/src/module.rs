@@ -132,9 +132,11 @@ pub trait Module: Send + Sync + 'static {
     }
     /// Routes of this module that take no credential, such as a signed
     /// unsubscribe link or a provider callback that proves itself another
-    /// way: `method` and `path` relative to `/v1/<name>`, matched segment by
-    /// segment (a `{name}` segment matches any one non-empty segment, every
-    /// other segment exactly, as [`RouteBodyLimit`] paths do).
+    /// way: `method` and `path` relative to `/v1/<name>`, the route template
+    /// exactly as given to [`Module::routes`] (`{name}` segments included).
+    /// The edge compares it with the template the router matched, so a
+    /// static route of the same shape is never exempt, and needs every
+    /// `{name}` segment of the request non-empty.
     /// The edge never runs the authenticator on them (no session lookup,
     /// Origin or CSRF check, and no refusal of a stale cookie) and hands
     /// them `Authenticated(None)`. Such a route must never act on a

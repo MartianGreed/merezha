@@ -1086,7 +1086,9 @@ fn parse_into(
         }
         let organisation_prefix = match l.string("organisation_prefix") {
             Some(text) if text.is_empty() => None,
-            Some(text) if text.len() <= 32 && !text.chars().any(char::is_control) => Some(text),
+            Some(text) if text.chars().count() <= 32 && !text.chars().any(char::is_control) => {
+                Some(text)
+            }
             Some(_) => {
                 l.issue("organisation_prefix", "out_of_range");
                 None
