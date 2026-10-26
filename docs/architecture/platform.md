@@ -858,14 +858,9 @@ Guest calls, dispatch and projections are instrumented (TE-T3; TE §1.2,
 | `ready()` | readiness contribution, answered within 1 s |
 | `blob_store()` | the `BlobStore` it provides to every context, opened from its settings; `Ok(None)` (default) provides none. Asked once after `configure`, before any module starts; a failure stops startup naming the module, a second provider stops it with `blob_store_conflict`. Content provides the store `[modules.content.media]` configures |
 | `notifier()` | the `NotifierFactory` it provides to every context in place of the capture fallback; `None` (default) provides none. Asked once after `configure`, before any module starts, so a module that starts earlier already binds it; a second provider stops startup with `notifier_conflict`. The factory answers `unavailable` until its module started. The notifications block provides it |
-<<<<<<< HEAD
 | `credential_free_routes()` | `CredentialFreeRoute { method, path }` for routes that take no credential (a signed link, a provider callback): for an exact match the edge never runs the authenticator (no session lookup, Origin or CSRF check, no refusal of a stale cookie) and inserts `Authenticated(None)`, so such a route cannot see a principal and must never act on one; default none. A path must start with `/` and hold no `..`, `%`, `//`, query or fragment; the host prefixes `/v1/<name>` and refuses any other path at startup with `invalid_credential_free_route`. Notifications declares `GET` and `POST /unsubscribe` and `POST /providers/brevo/email` |
 | `body_limits()` | `RouteBodyLimit { method, path, limit }` for routes that bound their own body (the upload route): the edge reads such a body up to `limit` instead of `http.body_limit` and leaves a declared length to the route; default none. Notifications declares 1 MiB for `POST /providers/brevo/email` |
-=======
-| `credential_free_routes()` | `CredentialFreeRoute { method, path }` for routes that take no credential (a signed link, a provider callback): for an exact match the edge never runs the authenticator (no session lookup, Origin or CSRF check, no refusal of a stale cookie) and inserts `Authenticated(None)`, so such a route cannot see a principal and must never act on one; default none. A path must start with `/` and hold no `..`, `%`, `//`, query or fragment; the host prefixes `/v1/<name>` and refuses any other path at startup with `invalid_credential_free_route`. Notifications declares `GET` and `POST /unsubscribe` |
-| `body_limits()` | `RouteBodyLimit { method, path, limit }` for routes that bound their own body (the upload route): the edge reads such a body up to `limit` instead of `http.body_limit` and leaves a declared length to the route; default none |
 | `draining()` | the listener is about to stop accepting and drain in-flight requests: end long-lived responses (event streams) and refuse new ones, so the drain does not wait on them until its timeout. Called once, after `http.drain_delay_ms`, before the drain and `shutdown`; must not block; default nothing. Notifications ends every inbox stream there |
->>>>>>> dd460a7 (feat(notifications): add the inbox SSE stream with the per-user registry, limits, LISTEN fan-out, Last-Event-ID replay and reset, re-authentication, backpressure and drain (NT-N5))
 | `shutdown(deadline)` | stop and drain background work after the listener drained |
 
 `HostParts::jobs` takes the `JobsRuntime`, a `Module` named `jobs` that
@@ -1326,17 +1321,11 @@ public keys.
 templates, previews and capture drivers. Slice NT-N2 adds the `Notifier`
 other blocks request through, expansion, the email and SMS delivery worker
 over the capture drivers, the inbox REST routes, preferences, suppressions,
-<<<<<<< HEAD
 unsubscribe, `send`, `status` and `redeliver`. Slice NT-N3 adds Brevo
 email: the email driver, the email status callback and `merezha
-notifications brevo register-webhook` ([Brevo email](#brevo-email)). Brevo
-SMS (NT-N4), the SSE stream (NT-N5), push (NT-N6) and webhook fan-out
-(NT-N7) come later.
-=======
-unsubscribe, `send`, `status` and `redeliver`. Slice NT-N5 adds the inbox
-stream ([Inbox stream](#inbox-stream)). Brevo (NT-N3, NT-N4), push (NT-N6)
-and webhook fan-out (NT-N7) come later.
->>>>>>> dd460a7 (feat(notifications): add the inbox SSE stream with the per-user registry, limits, LISTEN fan-out, Last-Event-ID replay and reset, re-authentication, backpressure and drain (NT-N5))
+notifications brevo register-webhook` ([Brevo email](#brevo-email)). Slice
+NT-N5 adds the inbox stream ([Inbox stream](#inbox-stream)). Brevo SMS
+(NT-N4), push (NT-N6) and webhook fan-out (NT-N7) come later.
 
 ```toml
 [modules.notifications]
