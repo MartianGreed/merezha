@@ -692,14 +692,15 @@ fn parts(config: &merezha_platform::ProjectConfig) -> HostParts {
     }
 }
 
-/// Whether `host` reports ready within a few seconds (the jobs runtime
-/// turns ready after its first subscription sync).
+/// Whether `host` reports ready before [`soon`] (the jobs runtime turns
+/// ready after its first subscription sync). Returns as soon as it is.
 async fn eventually_ready(host: &Host) -> bool {
-    for _ in 0..50 {
+    let deadline = soon();
+    while std::time::Instant::now() < deadline {
         if host.readiness().check().await {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     false
 }
@@ -756,8 +757,16 @@ async fn the_host_activates_the_model_at_start_and_on_restart() {
         2,
         "the restarted host loaded v2"
     );
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!host.readiness().check().await, "the v1 host drains");
+    // The v1 host drains: its readiness turns false once its cached
+    // result (250 ms) is re-evaluated against the active v2.
+    let deadline = soon();
+    while host.readiness().check().await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the v1 host never drained"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(
         state.readiness().await.unwrap_err().code,
         "content_model_outdated"

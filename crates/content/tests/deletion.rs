@@ -491,7 +491,7 @@ async fn run_purge_job(fx: &Fixture, key: &str) {
         .await
         .unwrap()
         .get(0);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = soon();
     loop {
         let state = strings(
             &fx.db,
@@ -602,7 +602,7 @@ async fn the_trash_purge_runs_on_its_declared_cron_schedule() {
     // by the runtime's first schedule sync.
     let sql = "SELECT source || '|' || cron || '|' || timezone || '|' || queue || '|' || kind \
                  FROM merezha_jobs.schedules WHERE name = 'content.trash_purge'";
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = soon();
     while strings(&fx.db, sql).await.is_empty() {
         assert!(Instant::now() < deadline, "the schedule was never stored");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -629,7 +629,7 @@ async fn the_trash_purge_runs_on_its_declared_cron_schedule() {
     )
     .await;
     fx.jobs.schedule_now().await.unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = soon();
     loop {
         let state = strings(
             &fx.db,

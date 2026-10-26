@@ -1200,7 +1200,8 @@ async fn a_variant_save_waits_for_an_in_flight_default_save() {
     // FOR SHARE with the lock, at its own UPDATE without it).
     let watcher = fx.db.acquire(soon()).await.unwrap();
     let mut blocked = false;
-    for _ in 0..200 {
+    let deadline = soon();
+    while std::time::Instant::now() < deadline {
         let n: i64 = watcher
             .query_one(
                 "SELECT count(*) FROM pg_stat_activity \

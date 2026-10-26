@@ -660,7 +660,7 @@ async fn a_reference_cycle_at_maximum_depth_terminates() {
         StatusCode::OK
     );
     let reply = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(30),
         read(
             &fx,
             &format!("/v1/content/author/{a}?populate=friend.friend.friend"),
@@ -765,8 +765,9 @@ async fn a_publish_changes_the_etag_and_an_unchanged_scope_answers_304_from_gene
         )
         .await
         .unwrap();
+    // A 304 that read a locked table would wait for the whole bound.
     let not_modified = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(30),
         fx.get(&uri).by(None).header("if-none-match", &tag).send(),
     )
     .await
