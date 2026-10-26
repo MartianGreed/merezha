@@ -1474,7 +1474,7 @@ Maintenance, each a cron schedule on queue `notify.maintenance` (UTC):
 | `settle_notifications` | every minute | sets `settled_at` on notifications whose deliveries all settled, 1,000 per batch |
 | `purge_data` | every 5 minutes | nulls `data` (and the deliveries' recipient names) of notifications settled more than `retention.data_after_settled` ago; counts `merezha.notification.data_purged` |
 | `inbox_expire` | hourly | deletes items past `expires_at` or archived more than `inbox.archived_retention` ago, 100 users per transaction in ascending order, raising each user's `purged_through` |
-| `push_expire` | hourly (minute 43) | with `[modules.notifications.push]`: deletes subscriptions past `expires_at`, made with another VAPID key, or with 10 consecutive failures and no success in 30 days, 1,000 per batch; counts `merezha.notification.push_subscriptions_removed` (`expired`, `key_changed`, `failures`) |
+| `push_expire` | hourly (minute 43) | with `[modules.notifications.push]`: deletes subscriptions past `expires_at`, made with another VAPID key and unused for 7 days, or with 10 consecutive failures and no success in 30 days, 1,000 per batch; counts `merezha.notification.push_subscriptions_removed` (`expired`, `key_changed`, `failures`) |
 
 ### Brevo email
 
@@ -1728,7 +1728,9 @@ Routes under `/v1/notifications/`:
 
 - **Allowlist (strict).** An endpoint must be `https` on port 443, with no
   userinfo or fragment, at most 2,048 bytes, and a host equal to or a
-  dot-suffix of an `allowed_hosts` entry. It is checked at subscribe and
+  dot-suffix of an `allowed_hosts` entry. The host must be a valid DNS name
+  (labels of 1 to 63 bytes, at most 253 bytes in all, no empty label);
+  otherwise the answer is `subscription_invalid`. It is checked at subscribe and
   again before every send, so removing an entry stops pushes to its
   subscriptions (`failed` / `push_host_not_allowed`). With
   `egress.allow_private_networks = true` (refused with `http.public`),
@@ -1743,7 +1745,25 @@ Routes under `/v1/notifications/`:
   moves to the subscribing user (a browser profile that changed account),
   and when it changes user or tenant it gets a new id, so a push queued for
   the previous owner is not sent. Past `max_subscriptions_per_user` the
-  least recently used subscriptions are deleted, under a per-user lock.
+  least recently used subscriptions are deleted, under a per-user lock;
+  the subscription the request just made is never the one deleted.
+- **One browser, one tenant (for client authors).** A browser profile has
+  one endpoint per application server key, and the endpoint is unique, so a
+  subscription serves one user in one tenant at a time. Subscribing again
+  after switching tenants moves the subscription (new id) to the new
+  tenant: the browser stops receiving the previous tenant's notifications.
+  A subscription made without an active tenant receives only the
+  notifications without a tenant. In v1 one browser cannot receive several
+  tenants' pushes at once; a client should resubscribe when the user
+  switches tenants and say so in its interface.
+- **Key rotation.** Deploy the new `vapid_private_key`; clients compare the
+  `key_id` of `GET push/vapid-public-key` with the one they subscribed
+  with and resubscribe. Each instance targets only the subscriptions of
+  its own key, and `push_expire` deletes another key's subscriptions only
+  once they have gone unused for 7 days (`last_used_at`). During a rolling
+  deploy the instances on the old and on the new key each keep using their
+  own subscriptions, so neither deletes the other's; after the rollout the
+  old key's subscriptions stop being used and go a week later.
 - **Delivery.** Expansion creates one push delivery per live subscription
   made with the current VAPID key (`push_subscription_id`, target key
   `pushsub:<id>`). The `notify.deliver.push` worker (queue `notify.push`)
@@ -1753,15 +1773,20 @@ Routes under `/v1/notifications/`:
   Headers: `TTL` (`push.ttl` in seconds), `Urgency` from the topic
   priority, and `Topic` (the first 32 base64url characters of SHA-256 of
   the collapse key) when a collapse key is set. The payload is
-  `{id, notification_id, topic, title, body, url, tag}`, at most 3,000
-  bytes, with `body` cut at a character boundary to fit.
+  `{id, notification_id, topic, title, body, url, tag}`, never more than
+  3,000 bytes, with `body` cut at a character boundary to fit. The render
+  refuses (`render_failed`) a push whose other fields would not fit with
+  the worst-case collapse key (64 bytes JSON-escaped to 384); should a
+  payload still not fit with an empty body, `tag` is dropped, and if even
+  that does not fit the delivery fails `push_payload_too_large`.
 - **Outcomes.** 2xx: `accepted`, with `Location` (at most 256 characters) as
   the message id. 404 or 410: the subscription is deleted and the delivery
   `failed` / `subscription_gone`. 400 (`push_rejected`), 413
   (`push_payload_too_large`) and 3xx (`push_redirected`, redirects are never
   followed) are permanent. 401 or 403: transient `push_auth`, logged as
   `notification.provider_account_error` and counted, permanent from the
-  third attempt. 429 waits for `Retry-After`; 5xx and network errors retry.
+  third attempt. 429 waits for `Retry-After`, at most `push.ttl` (and 24 h);
+  5xx and network errors retry.
   A crash between the call and its record resends: the payload's `id` lets
   the client deduplicate. Each attempt refreshes the subscription's
   `last_used_at`, and success resets `consecutive_failures`.
@@ -1769,8 +1794,10 @@ Routes under `/v1/notifications/`:
   redirects, no proxy, a 5 s connect timeout, at most 2 idle connections per
   host, and a DNS resolver that drops blocked addresses (the private,
   loopback, link-local, documentation, multicast and reserved ranges of NT
-  §5.6, IPv4-mapped, IPv4-compatible, NAT64 and 6to4 addresses by their
-  embedded IPv4, and `egress.deny_cidrs`). The client dials only the
+  §5.6, IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96` and 6to4
+  addresses by their embedded IPv4, the whole local-use NAT64 prefix
+  `64:ff9b:1::/48`, and `egress.deny_cidrs`, matched against both the
+  address and the IPv4 it embeds). The client dials only the
   addresses the resolver returned, so a name cannot rebind between check
   and connect; IP literals are checked before the request. A refused
   destination fails the delivery `egress_blocked` (permanent), logs

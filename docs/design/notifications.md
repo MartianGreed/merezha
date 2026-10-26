@@ -898,7 +898,10 @@ accepts another host with the `host_override` warning.
   SHA-256 of the uncompressed public key. `merezha notifications vapid
   generate` prints a new pair. A rotation orphans existing subscriptions:
   clients compare `key_id` and resubscribe, and old subscriptions are never
-  targeted and get deleted by `push_expire`.
+  targeted and get deleted by `push_expire` once unused for 7 days. The
+  grace keeps a rolling deploy safe: instances on the old and the new key
+  each refresh `last_used_at` of the subscriptions they target, so neither
+  deletes the other's.
 - **Subscribe.** The route takes `PushSubscription.toJSON()` plus `label?`.
   - The endpoint must be https on port 443, with a host equal to or a
     dot-suffix of an entry in `push.allowed_hosts`.
@@ -932,7 +935,7 @@ accepts another host with the `host_override` warning.
     with `subscription_gone`.
   - 413 or 400: permanent.
   - 401 or 403: transient `push_auth` with an error log, at most 3 attempts.
-  - 429: delay from `Retry-After`.
+  - 429: delay from `Retry-After`, at most `push.ttl` (and 24 h).
   - 5xx or a network error: transient.
 - **Cleanup.** A subscription is deleted on 404 or 410, when `expires_at`
   passes, after 10 consecutive failures with no success in 30 days, or when
@@ -1141,8 +1144,11 @@ idle connections per host.
   `203.0.113.0/24`, `224.0.0.0/4`, `240.0.0.0/4`.
 - **Blocked IPv6:** `::/128`, `::1/128`, `100::/64`, `2001::/23`,
   `2001:db8::/32`, `fc00::/7`, `fe80::/10`, `fec0::/10`, `ff00::/8`.
-- **Embedded IPv4.** `::ffff:0:0/96`, `64:ff9b::/96`, `64:ff9b:1::/48` and
-  `2002::/16` are checked by their embedded IPv4 address.
+- **Embedded IPv4.** `::ffff:0:0/96`, `::/96`, `64:ff9b::/96` and
+  `2002::/16` are checked by their embedded IPv4 address, against the
+  blocked ranges and `egress.deny_cidrs`. The local-use NAT64 prefix
+  `64:ff9b:1::/48` (RFC 8215) is blocked whole: its IPv4 address can sit
+  anywhere in the low 80 bits.
 - **Configuration.** `egress.deny_cidrs` adds ranges.
   `egress.allow_private_networks = true` (development and tests) lifts the
   private-range check and is refused with `http.public = true`. There is no
