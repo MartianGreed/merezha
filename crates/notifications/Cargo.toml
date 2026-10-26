@@ -37,6 +37,8 @@ toml.workspace = true
 tracing.workspace = true
 url = "2.5.8"
 web-push-native = "0.5.0"
+# Wipes decrypted webhook secrets on drop; already in the tree (RustCrypto).
+zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
 uuid = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]

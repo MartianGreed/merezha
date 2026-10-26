@@ -31,7 +31,7 @@
 //! or an answer other than create and rotate; URLs never reach telemetry
 //! (the endpoint id stands for them).
 pub mod fanout;
-pub(crate) mod routes;
+pub mod routes;
 pub mod secrets;
 pub mod signing;
 pub mod sql;
@@ -123,6 +123,13 @@ pub struct DeliverJob {
     #[serde(with = "crate::payload::uuid_text")]
     pub endpoint_id: Uuid,
     pub generation: i32,
+    /// How many jobs before this one found the endpoint busy and handed
+    /// the delivery on (0 for the first job of a generation).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub busy: u32,
+}
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 impl DeliverJob {
     pub fn to_value(&self) -> serde_json::Value {
@@ -196,10 +203,11 @@ pub struct Sent {
 }
 
 /// Bounded per-endpoint request limits: at most `concurrency_per_endpoint`
-/// requests per endpoint on this instance. The map keeps at most
-/// [`Limiter::MAX_ENDPOINTS`] endpoints; when full it drops the idle ones,
-/// and should every one be busy, the request runs unlimited rather than
-/// wait on an unbounded map.
+/// requests per endpoint on this instance. A job never waits for a slot
+/// ([`Limiter::try_acquire`]); without one it hands the delivery to a later
+/// job. The map keeps at most [`Limiter::MAX_ENDPOINTS`] endpoints; when
+/// full it drops the idle ones, and should every one be busy, the request
+/// runs unlimited rather than grow the map.
 pub struct Limiter {
     per_endpoint: usize,
     endpoints: Mutex<HashMap<Uuid, Arc<Semaphore>>>,
@@ -236,13 +244,9 @@ impl Limiter {
         }
         semaphore
     }
-    /// A permit for `endpoint`, waiting until `until` at most.
-    pub async fn acquire(&self, endpoint: Uuid, until: Instant) -> Option<OwnedSemaphorePermit> {
-        let semaphore = self.semaphore(endpoint);
-        tokio::time::timeout_at(until.into(), semaphore.acquire_owned())
-            .await
-            .ok()?
-            .ok()
+    /// A permit for `endpoint` if one is free now.
+    pub fn try_acquire(&self, endpoint: Uuid) -> Option<OwnedSemaphorePermit> {
+        self.semaphore(endpoint).try_acquire_owned().ok()
     }
 }
 
@@ -402,20 +406,16 @@ mod tests {
         assert_eq!(Class::Blocked.error_code(), Some("egress_blocked"));
     }
 
-    #[tokio::test]
-    async fn the_limiter_holds_concurrency_per_endpoint() {
+    #[test]
+    fn the_limiter_holds_concurrency_per_endpoint() {
         let limiter = Limiter::new(2);
         let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
-        let soon = || Instant::now() + Duration::from_millis(50);
-        let first = limiter.acquire(a, soon()).await;
-        let second = limiter.acquire(a, soon()).await;
+        let first = limiter.try_acquire(a);
+        let second = limiter.try_acquire(a);
         assert!(first.is_some() && second.is_some());
-        assert!(limiter.acquire(a, soon()).await.is_none(), "a third waits");
-        assert!(
-            limiter.acquire(b, soon()).await.is_some(),
-            "another endpoint"
-        );
+        assert!(limiter.try_acquire(a).is_none(), "no third slot");
+        assert!(limiter.try_acquire(b).is_some(), "another endpoint");
         drop(first);
-        assert!(limiter.acquire(a, soon()).await.is_some());
+        assert!(limiter.try_acquire(a).is_some());
     }
 }

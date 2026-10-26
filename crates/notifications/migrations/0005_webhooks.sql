@@ -9,9 +9,10 @@
 -- The signing secret is stored only as AES-256-GCM ciphertext and tag
 -- under k_wh, with a random 96-bit nonce and the endpoint id as associated
 -- data. `previous_secret_*` is the secret before the last rotation, signed
--- with as well until `previous_expires_at`. `key_version` is 0: written
--- under the `secret_key` of its time (the `retention` task re-encrypts the
--- rows that only `secret_key_previous` opens).
+-- with as well until `previous_expires_at`. `key_id` and `previous_key_id`
+-- name the k_wh each was sealed under (the first 8 bytes of SHA-256 over a
+-- label and the key), so the `retention` task finds and reseals the rows
+-- still under `secret_key_previous`, and counts them.
 CREATE TABLE merezha_notify.webhook_endpoints (
   id uuid PRIMARY KEY,
   tenant_id text CHECK (length(tenant_id) BETWEEN 1 AND 128),
@@ -23,7 +24,8 @@ CREATE TABLE merezha_notify.webhook_endpoints (
   previous_secret_ct bytea CHECK (octet_length(previous_secret_ct) <= 128),
   previous_secret_nonce bytea CHECK (octet_length(previous_secret_nonce) = 12),
   previous_expires_at timestamptz,
-  key_version smallint NOT NULL,
+  key_id bytea NOT NULL CHECK (octet_length(key_id) = 8),
+  previous_key_id bytea CHECK (octet_length(previous_key_id) = 8),
   status text NOT NULL CHECK (status IN ('active','disabled')),
   disabled_reason text CHECK (disabled_reason IN ('manual','gone','failing')),
   disabled_at timestamptz,
@@ -33,7 +35,8 @@ CREATE TABLE merezha_notify.webhook_endpoints (
   created_at timestamptz NOT NULL,
   updated_at timestamptz NOT NULL,
   revision bigint NOT NULL DEFAULT 1,
-  CHECK ((previous_secret_ct IS NULL) = (previous_secret_nonce IS NULL))
+  CHECK ((previous_secret_ct IS NULL) = (previous_secret_nonce IS NULL)),
+  CHECK ((previous_secret_ct IS NULL) = (previous_key_id IS NULL))
 );
 -- Registry listing, counting and the fan-out, for both registries.
 CREATE INDEX webhook_endpoints_registry_idx
@@ -57,6 +60,10 @@ CREATE TABLE merezha_notify.webhook_events (
   UNIQUE (source, source_event_id)
 );
 CREATE INDEX webhook_events_created_idx ON merezha_notify.webhook_events (created_at);
+-- The per-registry rate of `POST …/test`.
+CREATE INDEX webhook_events_test_idx
+  ON merezha_notify.webhook_events ((COALESCE(tenant_id, '')), created_at)
+  WHERE event_type = 'webhook.test';
 
 CREATE TABLE merezha_notify.webhook_deliveries (
   id uuid PRIMARY KEY,                          -- UUIDv5(event id, endpoint id)

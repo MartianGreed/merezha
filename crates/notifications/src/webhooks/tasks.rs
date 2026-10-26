@@ -15,7 +15,9 @@
 //!   no open delivery are deleted with their deliveries and attempts, audit
 //!   rows go after [`AUDIT_RETENTION`], previous secrets whose rotation
 //!   window closed are dropped, and, while `secret_key_previous` is set,
-//!   secrets only it opens are sealed again under `secret_key`.
+//!   secrets still sealed under another key are sealed again under
+//!   `secret_key` ([`reseal`]); what remains is the gauge
+//!   `merezha.webhook.secrets.previous_key`.
 use super::{AUTO_DISABLE_FAILURES, secrets::SecretBox, sql, worker};
 use crate::notifier::{Core, request_in};
 use merezha_domain::{Failure, Identity};
@@ -219,73 +221,128 @@ pub async fn retention(core: &Arc<Core>, deadline: Instant) -> Result<u64, Failu
     )
     .await?;
     total += batches(core, &sql::PREVIOUS_EXPIRE, now, deadline).await?;
+    total += reseal(core, deadline, ResealBounds::default())
+        .await?
+        .resealed;
+    Ok(total)
+}
+
+/// How much one [`reseal`] run may do: `batches` pages of `batch` rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResealBounds {
+    pub batch: i64,
+    pub batches: usize,
+}
+impl Default for ResealBounds {
+    fn default() -> Self {
+        Self {
+            batch: BATCH,
+            batches: MAX_BATCHES,
+        }
+    }
+}
+
+/// What a [`reseal`] run did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resealed {
+    /// Endpoints sealed again under `secret_key`.
+    pub resealed: u64,
+    /// Endpoints still holding a secret under another key afterwards: the
+    /// value of `merezha.webhook.secrets.previous_key`. `secret_key_previous`
+    /// may be removed once it is 0.
+    pub remaining: u64,
+}
+
+/// While `secret_key_previous` is set, seal again under `secret_key` the
+/// secrets of the endpoints whose `key_id` or `previous_key_id` names
+/// another key, at most `bounds` per run; each run picks up the rows the
+/// last one left, since resealed rows no longer match. A secret neither
+/// key opens is left as it is (its deliveries fail `secret_unreadable`)
+/// and stays counted. Then counts what remains and records the gauge.
+pub async fn reseal(
+    core: &Core,
+    deadline: Instant,
+    bounds: ResealBounds,
+) -> Result<Resealed, Failure> {
     let secrets = SecretBox::new(
         &core.settings.secret_key,
         core.settings.secret_key_previous.as_ref(),
     );
+    let current = secrets.key_id().to_vec();
+    let mut resealed = 0;
     if secrets.has_previous() {
-        total += reseal(core, &secrets, deadline).await?;
-    }
-    Ok(total)
-}
-
-/// Seal again under `secret_key` every stored secret only
-/// `secret_key_previous` opens. A secret neither key opens is left as it
-/// is (its deliveries fail `secret_unreadable`).
-async fn reseal(core: &Core, secrets: &SecretBox, deadline: Instant) -> Result<u64, Failure> {
-    let mut after = Uuid::nil();
-    let mut total = 0;
-    for _ in 0..MAX_BATCHES {
-        let client = core.database.acquire(deadline).await?;
-        let rows = core
-            .database
-            .query(&client, &sql::SECRETS_PAGE, &[&after, &BATCH])
-            .await
-            .map_err(|e| classify(&e))?;
-        for row in &rows {
-            let id: Uuid = row.get(0);
-            after = id;
-            let (ct, nonce): (Vec<u8>, Vec<u8>) = (row.get(1), row.get(2));
-            let previous: (Option<Vec<u8>>, Option<Vec<u8>>) = (row.get(3), row.get(4));
-            let Ok((current, old_key)) = secrets.open(id, &ct, &nonce) else {
-                continue;
-            };
-            let prior = match &previous {
-                (Some(pct), Some(pnonce)) => secrets.open(id, pct, pnonce).ok(),
-                _ => None,
-            };
-            if !old_key && !prior.as_ref().is_some_and(|(_, old)| *old) {
-                continue;
-            }
-            let sealed = secrets.seal(id, &current, core.random.as_ref())?;
-            let (prior_ct, prior_nonce) = match &prior {
-                Some((secret, _)) => {
-                    let sealed = secrets.seal(id, secret, core.random.as_ref())?;
-                    (Some(sealed.ciphertext), Some(sealed.nonce))
-                }
-                // A previous secret no key opens is dropped with the reseal.
-                None => (None, None),
-            };
-            total += core
+        let mut after = Uuid::nil();
+        for _ in 0..bounds.batches {
+            let client = core.database.acquire(deadline).await?;
+            let rows = core
                 .database
-                .execute(
+                .query(
                     &client,
-                    &sql::SECRETS_RESEAL,
-                    &[
-                        &id,
-                        &sealed.ciphertext,
-                        &sealed.nonce,
-                        &prior_ct,
-                        &prior_nonce,
-                        &ct,
-                    ],
+                    &sql::STALE_SECRETS,
+                    &[&after, &current, &bounds.batch],
                 )
                 .await
                 .map_err(|e| classify(&e))?;
-        }
-        if (rows.len() as i64) < BATCH {
-            break;
+            for row in &rows {
+                let id: Uuid = row.get(0);
+                after = id;
+                let (ct, nonce, key): (Vec<u8>, Vec<u8>, Vec<u8>) =
+                    (row.get(1), row.get(2), row.get(3));
+                let previous_ct: Option<Vec<u8>> = row.get(4);
+                let previous_nonce: Option<Vec<u8>> = row.get(5);
+                let previous_key: Option<Vec<u8>> = row.get(6);
+                let Ok((secret, _)) = secrets.open(id, &ct, &nonce, Some(&key)) else {
+                    continue;
+                };
+                let sealed = secrets.seal(id, &secret, core.random.as_ref())?;
+                let (prior_ct, prior_nonce) = match (&previous_ct, &previous_nonce) {
+                    (Some(pct), Some(pnonce)) => {
+                        match secrets.open(id, pct, pnonce, previous_key.as_deref()) {
+                            Ok((prior, _)) => {
+                                let sealed = secrets.seal(id, &prior, core.random.as_ref())?;
+                                (Some(sealed.ciphertext), Some(sealed.nonce))
+                            }
+                            // A previous secret no key opens is dropped.
+                            Err(_) => (None, None),
+                        }
+                    }
+                    _ => (None, None),
+                };
+                resealed += core
+                    .database
+                    .execute(
+                        &client,
+                        &sql::SECRETS_RESEAL,
+                        &[
+                            &id,
+                            &sealed.ciphertext,
+                            &sealed.nonce,
+                            &prior_ct,
+                            &prior_nonce,
+                            &ct,
+                            &current,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| classify(&e))?;
+            }
+            if (rows.len() as i64) < bounds.batch {
+                break;
+            }
         }
     }
-    Ok(total)
+    let remaining: i64 = {
+        let client = core.database.acquire(deadline).await?;
+        core.database
+            .query_one(&client, &sql::STALE_COUNT, &[&current])
+            .await
+            .map_err(|e| classify(&e))?
+            .get(0)
+    };
+    let remaining = u64::try_from(remaining).unwrap_or(0);
+    core.metrics.webhook_secrets_previous_key(remaining);
+    Ok(Resealed {
+        resealed,
+        remaining,
+    })
 }

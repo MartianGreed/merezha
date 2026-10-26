@@ -1481,7 +1481,7 @@ Maintenance, each a cron schedule on queue `notify.maintenance` (UTC):
 | `purge_data` | every 5 minutes | nulls `data` (and the deliveries' recipient names) of notifications settled more than `retention.data_after_settled` ago; counts `merezha.notification.data_purged` |
 | `inbox_expire` | hourly | deletes items past `expires_at` or archived more than `inbox.archived_retention` ago, 100 users per transaction in ascending order, raising each user's `purged_through` |
 | `webhook_auto_disable` | every 5 minutes | with `[modules.notifications.webhooks]`: disables the endpoints failing for `webhooks.auto_disable_after` with at least 10 failed attempts since, and alerts ([Outgoing webhooks](#outgoing-webhooks)) |
-| `retention` | daily (03:29) | the webhook rows so far: nulls event bodies older than `retention.webhook_deliveries`, deletes events older than `retention.deliveries` with no open delivery (their deliveries and attempts with them), deletes audit rows older than 400 days, drops previous secrets whose rotation window closed, and with `secret_key_previous` set seals again under `secret_key` the secrets only the previous key opens; 500 rows per batch |
+| `retention` | daily (03:29) | the webhook rows so far: nulls event bodies older than `retention.webhook_deliveries`, deletes events older than `retention.deliveries` with no open delivery (their deliveries and attempts with them), deletes audit rows older than 400 days, drops previous secrets whose rotation window closed, and with `secret_key_previous` set seals again under `secret_key` the secrets still under another key (by their key id), then records `merezha.webhook.secrets.previous_key`; 500 rows per batch |
 | `push_expire` | hourly (minute 43) | with `[modules.notifications.push]`: deletes subscriptions past `expires_at`, made with another VAPID key and unused for 7 days, or with 10 consecutive failures and no success in 30 days, 1,000 per batch; counts `merezha.notification.push_subscriptions_removed` (`expired`, `key_changed`, `failures`) |
 
 ### Brevo email
@@ -1887,8 +1887,9 @@ Routes under `/v1/notifications/`:
   redirects, no proxy, a 5 s connect timeout, at most 2 idle connections per
   host, and a DNS resolver that drops blocked addresses (the private,
   loopback, link-local, documentation, multicast and reserved ranges of NT
-  §5.6, IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96` and 6to4
-  addresses by their embedded IPv4, the whole local-use NAT64 prefix
+  §5.6, IPv4-mapped, IPv4-translated (`::ffff:0:0:0/96`),
+  IPv4-compatible, NAT64 `64:ff9b::/96` and 6to4 addresses by their
+  embedded IPv4, the whole local-use NAT64 prefix
   `64:ff9b:1::/48`, and `egress.deny_cidrs`, matched against both the
   address and the IPv4 it embeds). The client dials only the
   addresses the resolver returned, so a name cannot rebind between check
@@ -1941,9 +1942,9 @@ every route answers 422 `webhooks_disabled`.
 | `GET` / `PATCH` / `DELETE …webhooks/{id}` | read / manage / manage | PATCH `{url?, description?, event_types?, revision}` (`description: null` clears it): 200 `Endpoint`; 412 `revision_conflict` on a stale revision. DELETE 204, the endpoint's deliveries and attempts with it |
 | `POST …webhooks/{id}/rotate-secret` | manage | `{keep_previous_hours?}` (0 to 72, default 24; 0 keeps no previous secret): 200 `{secret, previous_expires_at}` |
 | `POST …webhooks/{id}/enable`, `…/disable` | manage | 200 `Endpoint`. Disable (`manual`) cancels the queued deliveries; enable clears `failing_since` |
-| `POST …webhooks/{id}/test` | manage | 202 `{delivery_id}`: a `webhook.test` event (`data: {endpoint_id}`) for this endpoint alone, whatever its filter; 409 `endpoint_disabled` |
-| `GET …webhooks/{id}/deliveries?status=&cursor=` | read | `{items: [{id, event_type, status, attempt_count, last_http_status, created_at, attempts: [{attempt, outcome, http_status, duration_ms, started_at}]}], next_cursor}`, newest first, 50 per page; 400 `invalid_cursor` |
-| `POST …webhooks/{id}/deliveries/{delivery_id}/redeliver` | manage | a settled delivery (`succeeded`, `failed`, `cancelled`) as a new generation: 202 `{generation}`; 409 `not_redeliverable` (still open), `endpoint_disabled`; 410 `event_body_expired` |
+| `POST …webhooks/{id}/test` | manage | 202 `{delivery_id}`: a `webhook.test` event (`data: {endpoint_id}`) for this endpoint alone, whatever its filter; 409 `endpoint_disabled`; 429 `rate_limited` (with `Retry-After: 60`) past 5 tests per endpoint or 30 per registry within a minute, counted in the database for every instance |
+| `GET …webhooks/{id}/deliveries?status=&cursor=` | read | `{items: [{id, event_type, status, attempt_count, last_http_status, created_at, attempts: [{attempt, outcome, http_status, duration_ms, started_at}]}], next_cursor}`, newest first, 50 per page; each item shows its latest 20 attempts (`attempt_count` is the total); 400 `invalid_cursor` |
+| `POST …webhooks/{id}/deliveries/{delivery_id}/redeliver` | manage | a settled delivery (`succeeded`, `failed`, `cancelled`), or an open one untouched for an hour (its job is dead; a job still alive finds the newer generation and stops), as a new generation: 202 `{generation}`; 409 `not_redeliverable` (open and recently active), `endpoint_disabled`; 410 `event_body_expired` |
 
 `Endpoint` is `{id, url, description, event_types, status, disabled_reason,
 failing_since, last_success_at, revision, created_at}`. A filter is an exact
@@ -1966,8 +1967,17 @@ type of the catalog or `prefix.*`; an empty filter matches every type.
   `secret_key`, then `secret_key_previous`. To rotate `secret_key`, deploy
   the new key with the old one as `secret_key_previous` and keep it until a
   daily `retention` run has resealed the secrets. A secret neither key
-  opens fails its deliveries `secret_unreadable`. Secrets never appear in
-  logs, spans, metrics, errors, `Debug` output or other answers.
+  opens fails its deliveries `secret_unreadable`. Each sealed secret
+  records the id of its key (`key_id`, `previous_key_id`: 8 bytes of
+  SHA-256 over a label and the key), so `retention` reseals only the rows
+  still under another key, 500 per page and 20 pages per run, each run
+  picking up what the last one left. After each run the gauge
+  `merezha.webhook.secrets.previous_key` holds how many endpoints still
+  have a secret under another key: remove `secret_key_previous` only once
+  it is 0 (trigger the `notify.maintenance.retention` schedule through the
+  jobs admin API to run it sooner). Decrypted secrets are wiped from memory
+  when dropped. Secrets never appear in logs, spans, metrics, errors,
+  `Debug` output or other answers.
 - **Fan-out.** `notify.webhook_event` (queue `notify.expand`) stores the
   event once (`UUIDv5(source, source_event_id)`) with its envelope frozen,
   `{"type":…,"timestamp":"<RFC 3339>","data":…}`, and, in the same
@@ -1985,7 +1995,11 @@ type of the catalog or `prefix.*`; an empty filter matches every type.
   signature made with the previous secret follows, separated by a space.
   Receivers should accept any listed signature and a 5-minute timestamp
   tolerance. Each instance sends at most `concurrency_per_endpoint`
-  requests per endpoint at once; the request deadline is
+  requests per endpoint at once. A job that finds no free slot never waits:
+  it hands the delivery to a new job of the same generation 1 s later,
+  doubling per hand-off up to 30 s (±50 % jitter), records no attempt and
+  ends, so neither the schedule nor the job's attempts are spent and one
+  slow receiver cannot hold the queue's workers. The request deadline is
   `min(timeout, job deadline - 2 s)`.
 - **Outcomes.** Any 2xx succeeds and clears `failing_since`. The first
   1 KiB of the response body is kept as the attempt's `response_snippet`
@@ -1998,9 +2012,16 @@ type of the catalog or `prefix.*`; an empty filter matches every type.
   and `notification.egress_blocked`), is a failure: it sets
   `failing_since` if unset and retries at +5 s, +5 min, +30 min, +2 h,
   +5 h, +10 h, +14 h, +20 h and +24 h (±10 %, never past 24 h). After the
-  tenth attempt of a generation, or when the job's `max_attempts` run out,
-  the delivery is `failed`. A crash between the request and its record
-  resends with the same `webhook-id`.
+  tenth failed attempt of a generation the delivery is `failed`
+  (`retries_exhausted`). A job's own attempts (`max_attempts`) are spent
+  by the schedule and by retryable errors such as a database failure; when
+  the last one would retry, the delivery is settled `failed` with that
+  error's code instead (an attempt still `started` becomes `ambiguous`), so
+  no delivery stays open behind a dead job. Should even that write fail,
+  redeliver accepts the open delivery once it has been untouched for an
+  hour. A crash between the request and its record resends with the same
+  `webhook-id`, and a run that lost its lease records nothing once another
+  run took the delivery over.
 - **Auto-disable.** `webhook_auto_disable` disables an endpoint whose
   `failing_since` is older than `auto_disable_after` and that failed at
   least 10 attempts since (`disabled_reason = failing`), cancels its queued
@@ -2018,10 +2039,20 @@ type of the catalog or `prefix.*`; an empty filter matches every type.
   (endpoint, tenant, action, reason, actor subject, revision, time), never
   the secret or the URL. The block's own disables name `sys_notifications`.
 - **Telemetry.** `merezha.webhook.attempts{notify.class}`,
-  `merezha.webhook.deliveries{notify.outcome}` and
-  `merezha.webhook.endpoints_disabled{notify.reason}`. The job span carries
+  `merezha.webhook.deliveries{notify.outcome}`,
+  `merezha.webhook.endpoints_disabled{notify.reason}` and the gauge
+  `merezha.webhook.secrets.previous_key`. The job span carries
   `notify.webhook_delivery_id`, `notify.endpoint_id` and
   `http.response.status_code`; URLs never reach telemetry.
+- **Accepted risk: an internal DNS oracle.** A principal allowed to manage
+  endpoints learns a little about the deployment's resolver: registration
+  answers `blocked_address` for a name that resolves only to blocked
+  addresses and `unresolvable` for one that does not resolve, and the
+  deliveries view shows an attempt `blocked` (with its duration) when a
+  name later resolves only to blocked addresses. Nothing is ever dialled,
+  and response bodies of refused destinations do not exist, so this tells
+  whether an internal name exists, not what it serves. A deployment that
+  must hide its internal names gives the block a resolver without them.
 
 ### Templates
 

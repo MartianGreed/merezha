@@ -313,8 +313,11 @@ CREATE INDEX push_subscriptions_user_idx ON push_subscriptions (user_id);
 -- Migration 5 (slice N7): webhooks. As applied, tenant ids are text (as
 -- migration 2 made them), the registry is matched as COALESCE(tenant_id, '')
 -- ('' = application level) through one expression index in place of the
--- partial tenant index below, and the migration adds the append-only
--- `webhook_audit` table (5.5 "Audit").
+-- partial tenant index below, the migration adds the append-only
+-- `webhook_audit` table (5.5 "Audit"), and `key_version` is replaced by
+-- `key_id` and `previous_key_id`, the 8-byte ids of the keys the secrets are
+-- sealed under, so `retention` reseals exactly the rows still under
+-- `secret_key_previous` and counts them (N7 review).
 CREATE TABLE webhook_endpoints (
   id uuid PRIMARY KEY,
   tenant_id uuid,                               -- NULL = application-level endpoint (NT6)
@@ -1182,7 +1185,8 @@ idle connections per host.
   `203.0.113.0/24`, `224.0.0.0/4`, `240.0.0.0/4`.
 - **Blocked IPv6:** `::/128`, `::1/128`, `100::/64`, `2001::/23`,
   `2001:db8::/32`, `fc00::/7`, `fe80::/10`, `fec0::/10`, `ff00::/8`.
-- **Embedded IPv4.** `::ffff:0:0/96`, `::/96`, `64:ff9b::/96` and
+- **Embedded IPv4.** `::ffff:0:0/96`, `::ffff:0:0:0/96` (IPv4-translated,
+  added in the N7 review), `::/96`, `64:ff9b::/96` and
   `2002::/16` are checked by their embedded IPv4 address, against the
   blocked ranges and `egress.deny_cidrs`. The local-use NAT64 prefix
   `64:ff9b:1::/48` (RFC 8215) is blocked whole: its IPv4 address can sit
@@ -1741,7 +1745,13 @@ step is honoured with `backoff_max_ms = 86400000`. *As built:* the
 `webhook_disabled` alert, which N8 lists, ships here because the
 acceptance needs it; N8 keeps the `notify.module_event` subscription, which
 maps AP's envelope onto `webhooks::fanout::Event` and calls `fan_out`. The
-`retention` task holds only the webhook rows and secrets so far.
+`retention` task holds only the webhook rows and secrets so far. After the N7
+review a job whose endpoint has no free slot never waits: it hands the
+delivery to a new job of the same generation (1 s doubling to 30 s, ±50 %),
+spending no attempt, because AP has no way to reschedule a job without
+counting an attempt; a job whose last attempt would retry settles its
+delivery `failed` with the code, and redeliver also accepts an open
+delivery untouched for an hour.
 
 **N8: integrations, operations.** *Scope:* the identity topics of
 R2, which can merge right after N3; the AP subscriptions to content events;

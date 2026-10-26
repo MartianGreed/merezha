@@ -154,6 +154,12 @@ impl WebhookReceiver {
             ..Answer::default()
         });
     }
+    /// Answer every unscripted request after `delay`.
+    pub fn delay_all(&self, delay: Duration) {
+        if let Ok(mut default) = self.inner.default.lock() {
+            default.delay = delay;
+        }
+    }
     /// Answer every unscripted request with `status` (204 by default).
     pub fn respond(&self, status: u16) {
         if let Ok(mut default) = self.inner.default.lock() {

@@ -37,8 +37,13 @@ use uuid::Uuid;
 
 /// Kept free before the job deadline for Tx B.
 const RECORD_MARGIN: Duration = Duration::from_secs(2);
-/// The retry delay of a job whose endpoint slot did not free up.
-const BUSY_DELAY: Duration = Duration::from_secs(1);
+/// A job whose endpoint has no free slot hands the delivery to a new job
+/// of the same generation this long after the first such hand-off,
+/// doubling per hand-off up to [`BUSY_MAX_DELAY`], with ±50 % jitter.
+pub const BUSY_DELAY: Duration = Duration::from_secs(1);
+pub const BUSY_MAX_DELAY: Duration = Duration::from_secs(30);
+/// The code of a delivery whose last job attempt found its endpoint busy.
+pub const ENDPOINT_BUSY: &str = "endpoint_busy";
 /// The actor of the audit rows the block writes itself.
 pub const SYSTEM_ACTOR: &str = "sys_notifications";
 
@@ -49,8 +54,9 @@ struct Locked {
     ladder: u32,
     generation: i32,
     url: String,
-    secret: (Vec<u8>, Vec<u8>),
-    previous: Option<(Vec<u8>, Vec<u8>)>,
+    /// Ciphertext, nonce and key id.
+    secret: super::secrets::StoredSecret,
+    previous: Option<super::secrets::StoredSecret>,
     body: Vec<u8>,
 }
 
@@ -89,25 +95,130 @@ pub(crate) async fn run(core: &Core, ctx: &JobContext, job: DeliverJob) -> Outco
         notify.generation = job.generation,
         http.response.status_code = tracing::field::Empty,
     );
-    deliver(core, ctx, job).instrument(span).await
+    let outcome = deliver(core, ctx, &job).instrument(span).await;
+    match outcome {
+        // A retry on the job's last attempt would leave the delivery open
+        // behind a dead job: it is settled `failed` with the code instead.
+        Outcome::Retry { code, .. } if ctx.attempt >= ctx.max_attempts => {
+            settle_exhausted(core, &job, &code).await
+        }
+        outcome => outcome,
+    }
 }
 
-async fn deliver(core: &Core, ctx: &JobContext, job: DeliverJob) -> Outcome {
+/// Settle open delivery `job` `failed` with `code` (an attempt still
+/// `started` becomes `ambiguous`): the job's attempts are spent.
+async fn settle_exhausted(core: &Core, job: &DeliverJob, code: &str) -> Outcome {
+    let valid = !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    let code = if valid { code } else { "retries_exhausted" }.to_owned();
+    let db = core.database.clone();
+    let now = core.now();
+    let (id, generation) = (job.webhook_delivery_id, job.generation);
+    let settled_code = code.clone();
+    let written = db
+        .clone()
+        .transaction(Instant::now() + Duration::from_secs(10), move |tx| {
+            Box::pin(async move {
+                let state = db
+                    .query_one(tx, &sql::ATTEMPT_STATE, &[&id, &generation])
+                    .await
+                    .map_err(|e| classify(&e))?;
+                let (highest, last): (i32, Option<String>) = (state.get(0), state.get(2));
+                if last.as_deref() == Some("started") {
+                    db.execute(tx, &sql::ATTEMPT_LOST, &[&id, &highest, &now])
+                        .await
+                        .map_err(|e| classify(&e))?;
+                }
+                db.execute(
+                    tx,
+                    &sql::DELIVERY_SETTLE,
+                    &[&id, &generation, &"failed", &settled_code, &now],
+                )
+                .await
+                .map_err(|e| classify(&e))
+            })
+        })
+        .await;
+    // When even this fails, the delivery stays open; redeliver accepts it
+    // once it has been untouched for an hour.
+    if let (Ok(changed), Some(sender)) = (&written, &core.webhooks) {
+        sender.metrics.webhook_delivery("failed", *changed);
+    }
+    Outcome::Permanent(code)
+}
+
+/// Hand the delivery to a new job of the same generation after a jittered
+/// delay: its endpoint has no free slot on this instance. No attempt is
+/// recorded and this job ends, so neither the schedule nor the job's
+/// attempts are spent and no queue worker waits.
+async fn reschedule(core: &Core, ctx: &JobContext, job: &DeliverJob) -> Outcome {
+    let doublings = job.busy.min(5);
+    let base = (BUSY_DELAY * 2u32.pow(doublings)).min(BUSY_MAX_DELAY);
+    let mut bytes = [0u8; 8];
+    let share = match core.random.fill(&mut bytes) {
+        Ok(()) => u64::from_le_bytes(bytes) as f64 / u64::MAX as f64,
+        Err(_) => 0.5,
+    };
+    let delay = base.mul_f64(0.5 + share);
+    let next = DeliverJob {
+        busy: job.busy.saturating_add(1),
+        ..job.clone()
+    };
+    let suffix = u64::from_le_bytes(bytes);
+    let at = core
+        .now()
+        .checked_add(jiff::SignedDuration::try_from(delay).unwrap_or_default())
+        .ok();
+    let record = super::fanout::job_record(&next, &ctx.correlation_id, None).map(|mut record| {
+        if let Ok(key) = merezha_platform::ports::DedupeKey::new(format!(
+            "webhook:{}:g{}:b{}:{suffix:016x}",
+            job.webhook_delivery_id, job.generation, next.busy
+        )) {
+            record.dedupe_key = key;
+        }
+        record.run_at = at;
+        record.context.tenant = ctx.tenant.clone();
+        record
+    });
+    let record = match record {
+        Ok(record) => record,
+        Err(failure) => return Outcome::retry(&failure.code),
+    };
+    let outbox = core.outbox.clone();
+    let appended = core
+        .database
+        .transaction(Instant::now() + Duration::from_secs(10), move |tx| {
+            Box::pin(async move {
+                outbox
+                    .append(tx, &[record], merezha_platform::ports::OnDuplicate::Ignore)
+                    .await
+            })
+        })
+        .await;
+    match appended {
+        Ok(_) => Outcome::Done,
+        Err(_) => Outcome::Retry {
+            after: Some(delay),
+            code: ENDPOINT_BUSY.to_owned(),
+        },
+    }
+}
+
+async fn deliver(core: &Core, ctx: &JobContext, job: &DeliverJob) -> Outcome {
     let Some(sender) = core.webhooks.clone() else {
         return Outcome::Permanent(super::code::WEBHOOKS_DISABLED.to_owned());
     };
     let deadline = ctx.deadline.into_std();
-    let until = deadline
-        .checked_sub(sender.settings.timeout + RECORD_MARGIN)
-        .unwrap_or_else(Instant::now);
-    let Some(_permit) = sender.limiter.acquire(job.endpoint_id, until).await else {
-        return Outcome::Retry {
-            after: Some(BUSY_DELAY),
-            code: "endpoint_busy".to_owned(),
-        };
+    // Never wait for a slot: a queue worker stays free for other endpoints.
+    let Some(_permit) = sender.limiter.try_acquire(job.endpoint_id) else {
+        return reschedule(core, ctx, job).await;
     };
     let id = job.webhook_delivery_id;
-    let locked = match prepare(core, &sender, deadline, &job).await {
+    let locked = match prepare(core, &sender, deadline, job).await {
         Ok(Prepared::Send(locked)) => locked,
         Ok(Prepared::Finished(outcome)) => return outcome,
         Err(failure) => return Outcome::retry(&failure.code),
@@ -115,13 +226,16 @@ async fn deliver(core: &Core, ctx: &JobContext, job: DeliverJob) -> Outcome {
     tracing::Span::current().record("notify.attempt", locked.attempt);
     core.faults.hit(faults::AFTER_ATTEMPT_COMMITTED).await;
     let now = core.now();
-    let current = sender
-        .secrets
-        .open(job.endpoint_id, &locked.secret.0, &locked.secret.1);
+    let current = sender.secrets.open(
+        job.endpoint_id,
+        &locked.secret.0,
+        &locked.secret.1,
+        locked.secret.2.as_deref(),
+    );
     let Ok((current, _)) = current else {
         return settle_attempt(
             core,
-            &job,
+            job,
             &locked,
             "failed",
             super::secrets::SECRET_UNREADABLE,
@@ -130,10 +244,10 @@ async fn deliver(core: &Core, ctx: &JobContext, job: DeliverJob) -> Outcome {
     };
     // The previous secret signs too while its rotation window is open; one
     // that does not open is left out rather than failing the delivery.
-    let previous = locked.previous.as_ref().and_then(|(ct, nonce)| {
+    let previous = locked.previous.as_ref().and_then(|(ct, nonce, key)| {
         sender
             .secrets
-            .open(job.endpoint_id, ct, nonce)
+            .open(job.endpoint_id, ct, nonce, key.as_deref())
             .ok()
             .map(|(s, _)| s)
     });
@@ -160,7 +274,7 @@ async fn deliver(core: &Core, ctx: &JobContext, job: DeliverJob) -> Outcome {
         tracing::Span::current().record("http.response.status_code", status);
     }
     core.faults.hit(faults::AFTER_PROVIDER_CALL).await;
-    let outcome = record(core, &sender, ctx, &job, &locked, &sent, took).await;
+    let outcome = record(core, &sender, ctx, job, &locked, &sent, took).await;
     core.faults.hit(faults::AFTER_TX_B).await;
     outcome
 }
@@ -240,8 +354,9 @@ async fn prepare(
                 let previous_open = row
                     .get::<_, Option<jiff::Timestamp>>(8)
                     .is_some_and(|until| until > now);
-                let previous: Option<(Vec<u8>, Vec<u8>)> = match (row.get(6), row.get(7)) {
-                    (Some(ct), Some(nonce)) if previous_open => Some((ct, nonce)),
+                let previous: Option<super::secrets::StoredSecret> = match (row.get(6), row.get(7))
+                {
+                    (Some(ct), Some(nonce)) if previous_open => Some((ct, nonce, row.get(12))),
                     _ => None,
                 };
                 Ok((
@@ -250,7 +365,7 @@ async fn prepare(
                         ladder: u32::try_from(in_generation + 1).unwrap_or(MAX_ATTEMPTS),
                         generation,
                         url: row.get(3),
-                        secret: (row.get(4), row.get(5)),
+                        secret: (row.get(4), row.get(5), row.get(11)),
                         previous,
                         body,
                     })),

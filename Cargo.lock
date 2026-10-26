@@ -2622,6 +2622,7 @@ dependencies = [
  "url",
  "uuid",
  "web-push-native",
+ "zeroize",
 ]
 
 [[package]]

@@ -11,9 +11,16 @@ use merezha_platform::ports::Channel;
 use merezha_telemetry::{instruments, names::metric};
 use opentelemetry::{
     KeyValue,
-    metrics::{Counter, Histogram, Meter},
+    metrics::{Counter, Histogram, Meter, ObservableGauge},
 };
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 /// The `notify.topic` value of a topic the configuration does not declare.
 pub const UNKNOWN_TOPIC: &str = "unknown";
@@ -34,6 +41,9 @@ struct Instruments {
     webhook_deliveries: Counter<u64>,
     webhook_attempts: Counter<u64>,
     webhook_endpoints_disabled: Counter<u64>,
+    /// What the last `retention` run counted; the gauge reads it.
+    previous_key_secrets: Arc<AtomicU64>,
+    _previous_key_gauge: ObservableGauge<u64>,
     /// Declared topics; any other is labelled [`UNKNOWN_TOPIC`].
     topics: BTreeSet<String>,
 }
@@ -65,6 +75,13 @@ impl Metrics {
     /// The instruments on `meter`; only `topics` become `notify.topic`
     /// values, so a caller's undeclared topic cannot grow the label set.
     pub fn new(meter: &Meter, topics: impl IntoIterator<Item = String>) -> Self {
+        let previous_key_secrets = Arc::new(AtomicU64::new(0));
+        let read = previous_key_secrets.clone();
+        let previous_key_gauge = instruments::u64_gauge(
+            meter,
+            &metric::WEBHOOK_SECRETS_PREVIOUS_KEY,
+            move |observer| observer.observe(read.load(Ordering::Relaxed), &[]),
+        );
         Self(Some(Arc::new(Instruments {
             requests: instruments::counter(meter, &metric::NOTIFICATION_REQUESTS),
             deliveries: instruments::counter(meter, &metric::NOTIFICATION_DELIVERIES),
@@ -90,6 +107,8 @@ impl Metrics {
                 meter,
                 &metric::WEBHOOK_ENDPOINTS_DISABLED,
             ),
+            previous_key_secrets,
+            _previous_key_gauge: previous_key_gauge,
             topics: topics.into_iter().collect(),
         })))
     }
@@ -240,6 +259,13 @@ impl Metrics {
         if let Some(i) = &self.0 {
             i.webhook_endpoints_disabled
                 .add(1, &[KeyValue::new("notify.reason", reason)]);
+        }
+    }
+    /// Endpoints whose secret is still sealed under another key than
+    /// `secret_key`, as `retention` counted them.
+    pub fn webhook_secrets_previous_key(&self, count: u64) {
+        if let Some(i) = &self.0 {
+            i.previous_key_secrets.store(count, Ordering::Relaxed);
         }
     }
     pub fn data_purged(&self, rows: u64) {

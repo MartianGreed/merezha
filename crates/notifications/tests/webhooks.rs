@@ -648,6 +648,7 @@ async fn registration_refuses_private_destinations() {
         ("https://127.0.0.1/hook", "blocked_address"),
         ("https://[::ffff:127.0.0.1]/hook", "blocked_address"),
         ("https://0x7f000001/hook", "blocked_address"),
+        ("http://[::ffff:0:7f00:1]/hook", "blocked_address"),
         ("https://internal.test/hook", "blocked_address"),
         ("https://nowhere.test/hook", "unresolvable"),
         ("ftp://hooks.test/hook", "scheme"),
@@ -1030,13 +1031,13 @@ async fn secrets_are_sealed_and_never_shown_again() {
     let client = world.db.acquire(soon()).await.unwrap();
     let row = client
         .query_one(
-            "SELECT secret_ct, secret_nonce, key_version FROM merezha_notify.webhook_endpoints",
+            "SELECT secret_ct, secret_nonce, key_id FROM merezha_notify.webhook_endpoints",
             &[],
         )
         .await
         .unwrap();
-    let (ct, nonce, version): (Vec<u8>, Vec<u8>, i16) = (row.get(0), row.get(1), row.get(2));
-    assert_eq!((ct.len(), nonce.len(), version), (48, 12, 0));
+    let (ct, nonce, key_id): (Vec<u8>, Vec<u8>, Vec<u8>) = (row.get(0), row.get(1), row.get(2));
+    assert_eq!((ct.len(), nonce.len(), key_id.len()), (48, 12, 8));
     assert!(!ct.windows(raw.len()).any(|w| w == raw.as_slice()));
     drop(client);
     for canary in [secret.as_str(), encoded.as_str(), "url-canary-5c1e"] {
@@ -1152,6 +1153,421 @@ async fn retention_expires_bodies_and_reseals_secrets_under_the_current_key() {
     instance.stop().await;
 }
 
+/// A disabled endpoint gets no new delivery from the fan-out.
+#[tokio::test]
+async fn a_disabled_endpoint_gets_no_new_delivery() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let instance = start(&world, &section(true, "")).await;
+    let mut ids = Vec::new();
+    for name in ["on", "off"] {
+        let (_, endpoint) = create(
+            &instance,
+            "ada",
+            "/tenants/org_a",
+            json!({ "url": receiver.url(name) }),
+        )
+        .await;
+        ids.push(endpoint["id"].as_str().unwrap().to_owned());
+    }
+    let (status, _) = instance
+        .call(
+            "POST",
+            &format!(
+                "/v1/notifications/tenants/org_a/webhooks/{}/disable",
+                ids[1]
+            ),
+            Some("ada"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200);
+    emit(
+        &instance,
+        "application",
+        Some("org_a"),
+        "tasks.task_completed",
+        "d1",
+    )
+    .await;
+    instance.settle().await;
+    assert_eq!(deliveries(&world).await, ["succeeded:"]);
+    let names: Vec<String> = receiver.received().into_iter().map(|r| r.name).collect();
+    assert_eq!(names, ["on"]);
+    instance.stop().await;
+}
+
+/// Every `{id}` route answers 404 when the caller is authorized on one
+/// registry and names an endpoint (or a delivery) of another: tenant B
+/// naming tenant A's, the application registry naming a tenant's, and a
+/// tenant naming an application-level one. The endpoint is left intact.
+#[tokio::test]
+async fn an_endpoint_of_another_registry_is_not_found_on_every_route() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let instance = start(&world, &section(true, "")).await;
+    let (_, a) = create(
+        &instance,
+        "ada",
+        "/tenants/org_a",
+        json!({ "url": receiver.url("a") }),
+    )
+    .await;
+    let (_, app) = create(&instance, "ops", "", json!({ "url": receiver.url("app") })).await;
+    let (a, app) = (
+        a["id"].as_str().unwrap().to_owned(),
+        app["id"].as_str().unwrap().to_owned(),
+    );
+    let delivery = |endpoint: String, token: &'static str, prefix: &'static str| {
+        let instance = &instance;
+        async move {
+            let (status, body) = instance
+                .call(
+                    "POST",
+                    &format!("/v1/notifications{prefix}/webhooks/{endpoint}/test"),
+                    Some(token),
+                    None,
+                )
+                .await;
+            assert_eq!(status, 202, "{body}");
+            body["delivery_id"].as_str().unwrap().to_owned()
+        }
+    };
+    let a_delivery = delivery(a.clone(), "ada", "/tenants/org_a").await;
+    let app_delivery = delivery(app.clone(), "ops", "").await;
+    instance.settle().await;
+    assert_eq!(deliveries(&world).await, ["succeeded:", "succeeded:"]);
+    for (token, prefix, id, delivery) in [
+        ("bea", "/tenants/org_b", &a, &a_delivery),
+        ("ops", "/tenants/org_b", &a, &a_delivery),
+        ("ops", "", &a, &a_delivery),
+        ("ada", "/tenants/org_a", &app, &app_delivery),
+    ] {
+        let base = format!("/v1/notifications{prefix}/webhooks/{id}");
+        for (method, path, body) in [
+            ("GET", base.clone(), None),
+            (
+                "PATCH",
+                base.clone(),
+                Some(json!({ "description": "x", "revision": 1 })),
+            ),
+            ("POST", format!("{base}/rotate-secret"), None),
+            ("POST", format!("{base}/enable"), None),
+            ("POST", format!("{base}/disable"), None),
+            ("POST", format!("{base}/test"), None),
+            ("GET", format!("{base}/deliveries"), None),
+            (
+                "POST",
+                format!("{base}/deliveries/{delivery}/redeliver"),
+                None,
+            ),
+            ("DELETE", base.clone(), None),
+        ] {
+            let (status, answer) = instance.call(method, &path, Some(token), body).await;
+            assert_eq!(status, 404, "{token} {method} {path}: {answer}");
+            assert!(!answer.to_string().contains("/hooks/"), "{answer}");
+        }
+    }
+    for (token, prefix, id) in [("ada", "/tenants/org_a", &a), ("ops", "", &app)] {
+        let (status, shown) = instance
+            .call(
+                "GET",
+                &format!("/v1/notifications{prefix}/webhooks/{id}"),
+                Some(token),
+                None,
+            )
+            .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            (shown["status"].clone(), shown["revision"].clone()),
+            (json!("active"), json!(1))
+        );
+    }
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.webhook_deliveries WHERE generation > 0")
+            .await,
+        0
+    );
+    instance.stop().await;
+}
+
+/// An open delivery whose job is gone (untouched for an hour) can be
+/// redelivered; a fresh open one cannot.
+#[tokio::test]
+async fn a_stranded_open_delivery_can_be_redelivered() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let instance = start(&world, &section(true, "")).await;
+    let (_, endpoint) = create(
+        &instance,
+        "ada",
+        "/tenants/org_a",
+        json!({ "url": receiver.url("a") }),
+    )
+    .await;
+    let id = endpoint["id"].as_str().unwrap().to_owned();
+    receiver.fail_next(1, 503, "");
+    emit(
+        &instance,
+        "application",
+        Some("org_a"),
+        "tasks.task_completed",
+        "s1",
+    )
+    .await;
+    instance
+        .until(
+            "SELECT count(*) FROM merezha_notify.webhook_deliveries WHERE status = 'retrying'",
+            1,
+        )
+        .await;
+    let delivery = world
+        .text("SELECT id::text FROM merezha_notify.webhook_deliveries")
+        .await
+        .remove(0);
+    let path =
+        format!("/v1/notifications/tenants/org_a/webhooks/{id}/deliveries/{delivery}/redeliver");
+    let (status, body) = instance.call("POST", &path, Some("ada"), None).await;
+    assert_eq!(
+        (status.as_u16(), body["error"]["code"].clone()),
+        (409, json!("not_redeliverable"))
+    );
+    // The job died and the delivery has not moved for two hours.
+    world
+        .execute(
+            "UPDATE merezha_jobs.jobs SET state = 'dead', finished_at = now() \
+             WHERE kind = 'notify.webhook.deliver' AND state = 'available'; \
+             UPDATE merezha_notify.webhook_deliveries SET updated_at = now() - interval '2 hours', \
+             next_attempt_at = now() - interval '2 hours'",
+        )
+        .await;
+    let (status, body) = instance.call("POST", &path, Some("ada"), None).await;
+    assert_eq!(status, 202, "{body}");
+    instance.settle().await;
+    assert_eq!(deliveries(&world).await, ["succeeded:"]);
+    instance.stop().await;
+}
+
+/// When a job's last attempt fails with a retryable error, the delivery is
+/// settled `failed` with that code instead of staying open behind a dead
+/// job (here Tx B fails on every run).
+#[tokio::test]
+async fn a_job_whose_attempts_run_out_never_leaves_its_delivery_open() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let instance = start(&world, &section(true, "max_attempts = 1\n")).await;
+    create(
+        &instance,
+        "ada",
+        "/tenants/org_a",
+        json!({ "url": receiver.url("a") }),
+    )
+    .await;
+    world
+        .execute(
+            "CREATE FUNCTION merezha_notify.refuse() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'refused'; END $$; \
+             CREATE TRIGGER refuse BEFORE UPDATE ON merezha_notify.webhook_endpoints \
+             FOR EACH ROW EXECUTE FUNCTION merezha_notify.refuse()",
+        )
+        .await;
+    emit(
+        &instance,
+        "application",
+        Some("org_a"),
+        "tasks.task_completed",
+        "x1",
+    )
+    .await;
+    instance
+        .until(
+            "SELECT count(*) FROM merezha_notify.webhook_deliveries WHERE status = 'failed'",
+            1,
+        )
+        .await;
+    assert_eq!(attempts(&world).await, ["ambiguous:"]);
+    assert_eq!(receiver.received().len(), 1);
+    instance
+        .until(
+            "SELECT count(*) FROM merezha_jobs.jobs WHERE kind = 'notify.webhook.deliver' \
+             AND state = 'dead'",
+            1,
+        )
+        .await;
+    assert_eq!(
+        world
+            .scalar(
+                "SELECT count(*) FROM merezha_notify.webhook_deliveries \
+                 WHERE status IN ('queued', 'sending', 'retrying')"
+            )
+            .await,
+        0
+    );
+    instance.stop().await;
+}
+
+/// `POST …/test` is limited per endpoint and per registry: 429
+/// `rate_limited` with `Retry-After`.
+#[tokio::test]
+async fn test_events_are_rate_limited_per_endpoint_and_registry() {
+    use tower::ServiceExt;
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let mut opts = Options::new(&section(true, ""), people());
+    opts.workers = false;
+    let instance = Instance::start(&world, opts).await;
+    instance
+        .tokens
+        .add("ada", member("usr_ada", "org_a", &[READ, MANAGE]));
+    let mut ids = Vec::new();
+    for n in 0..7 {
+        let (_, endpoint) = create(
+            &instance,
+            "ada",
+            "/tenants/org_a",
+            json!({ "url": receiver.url(&format!("e{n}")) }),
+        )
+        .await;
+        ids.push(endpoint["id"].as_str().unwrap().to_owned());
+    }
+    let test = |id: &str| format!("/v1/notifications/tenants/org_a/webhooks/{id}/test");
+    let per_endpoint = webhooks::routes::TESTS_PER_ENDPOINT;
+    for _ in 0..per_endpoint {
+        assert_eq!(
+            instance
+                .call("POST", &test(&ids[0]), Some("ada"), None)
+                .await
+                .0,
+            202
+        );
+    }
+    let request = axum::http::Request::post(test(&ids[0]))
+        .header("authorization", "Bearer ada")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = instance.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 429);
+    assert_eq!(response.headers()["retry-after"], "60");
+    // Another endpoint still has room, until the registry's budget is spent.
+    let per_registry = webhooks::routes::TESTS_PER_REGISTRY;
+    let mut sent = per_endpoint;
+    'outer: for id in &ids[1..] {
+        for _ in 0..per_endpoint {
+            if sent == per_registry {
+                break 'outer;
+            }
+            assert_eq!(
+                instance.call("POST", &test(id), Some("ada"), None).await.0,
+                202
+            );
+            sent += 1;
+        }
+    }
+    let (status, body) = instance
+        .call("POST", &test(&ids[6]), Some("ada"), None)
+        .await;
+    assert_eq!(
+        (status.as_u16(), body["error"]["code"].clone()),
+        (429, json!("rate_limited"))
+    );
+}
+
+/// `retention` reseals at most its bounds per run and picks up where the
+/// last run stopped, since resealed rows no longer match; the gauge counts
+/// what remains, and `secret_key_previous` can go once it is 0.
+#[tokio::test]
+async fn resealing_resumes_across_runs_and_counts_what_remains() {
+    let harness = merezha_telemetry::testing::Harness::new();
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let instance = start(&world, &section(true, "")).await;
+    let mut secrets = Vec::new();
+    for n in 0..7 {
+        let (_, endpoint) = create(
+            &instance,
+            "ada",
+            "/tenants/org_a",
+            json!({ "url": receiver.url(&format!("r{n}")) }),
+        )
+        .await;
+        secrets.push(endpoint["secret"].as_str().unwrap().to_owned());
+    }
+    instance.stop().await;
+    const NEW_KEY: &str = "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=";
+    let rotated = section(true, "").replace(
+        "secret_key = { env = \"NOTIFY_KEY\" }\n",
+        "secret_key = { env = \"NEW_KEY\" }\nsecret_key_previous = { env = \"NOTIFY_KEY\" }\n",
+    );
+    let instance = start_with(&world, &rotated, |o| {
+        o.env.push(("NEW_KEY".into(), NEW_KEY.into()));
+        o.meters = Some(harness.telemetry().meters());
+    })
+    .await;
+    let bounds = webhooks::tasks::ResealBounds {
+        batch: 2,
+        batches: 2,
+    };
+    let core = instance.core();
+    let first = webhooks::tasks::reseal(&core, soon(), bounds)
+        .await
+        .unwrap();
+    assert_eq!((first.resealed, first.remaining), (4, 3));
+    assert_eq!(
+        harness
+            .metric("merezha.webhook.secrets.previous_key")
+            .value(&[]),
+        Some(3.0)
+    );
+    let second = webhooks::tasks::reseal(&core, soon(), bounds)
+        .await
+        .unwrap();
+    assert_eq!((second.resealed, second.remaining), (3, 0));
+    instance.stop().await;
+    // Without the previous key every endpoint still signs.
+    let current_only = section(true, "").replace(
+        "secret_key = { env = \"NOTIFY_KEY\" }\n",
+        "secret_key = { env = \"NEW_KEY\" }\n",
+    );
+    let instance = start_with(&world, &current_only, |o| {
+        o.env.push(("NEW_KEY".into(), NEW_KEY.into()));
+    })
+    .await;
+    for secret in &secrets {
+        receiver.trust(secret);
+    }
+    emit(
+        &instance,
+        "application",
+        Some("org_a"),
+        "tasks.task_completed",
+        "all",
+    )
+    .await;
+    instance.settle().await;
+    let received = receiver.received();
+    assert_eq!(received.len(), 7);
+    let mut verified: Vec<usize> = received
+        .iter()
+        .flat_map(|r| r.verified_by.clone())
+        .collect();
+    verified.sort();
+    assert_eq!(verified, (0..7).collect::<Vec<_>>());
+    instance.stop().await;
+}
+
 /// Crashes and retry delays race lease deadlines (issue #37): CI runs them
 /// alone, one at a time (`cargo test -- --test-threads=1 timing::`).
 mod timing {
@@ -1164,6 +1580,119 @@ mod timing {
             "allow_http = true\n",
             "allow_http = true\ntimeout = \"1s\"\n",
         )
+    }
+
+    /// The review's proof of concept: one slot per endpoint, eight queue
+    /// workers, two job attempts and a receiver answering in 900 ms. A
+    /// busy job hands its delivery to a later job instead of waiting or
+    /// spending an attempt, so all eight deliveries succeed, one request
+    /// at a time, and no job dies.
+    #[tokio::test]
+    async fn a_busy_endpoint_reschedules_without_spending_attempts() {
+        let Some(world) = World::new().await else {
+            return;
+        };
+        let receiver = WebhookReceiver::start().await;
+        receiver.delay_all(Duration::from_millis(900));
+        let config = section(true, "concurrency = 8\nmax_attempts = 2\n").replace(
+            "allow_http = true\n",
+            "allow_http = true\nconcurrency_per_endpoint = 1\n",
+        );
+        let instance = start(&world, &config).await;
+        create(
+            &instance,
+            "ada",
+            "/tenants/org_a",
+            json!({ "url": receiver.url("slow") }),
+        )
+        .await;
+        for n in 0..8 {
+            emit(
+                &instance,
+                "application",
+                Some("org_a"),
+                "tasks.task_completed",
+                &format!("b{n}"),
+            )
+            .await;
+        }
+        instance
+            .until(
+                "SELECT count(*) FROM merezha_notify.webhook_deliveries WHERE status = 'succeeded'",
+                8,
+            )
+            .await;
+        assert_eq!(
+            world
+                .scalar("SELECT count(*) FROM merezha_jobs.jobs WHERE kind = 'notify.webhook.deliver' AND state = 'dead'")
+                .await,
+            0
+        );
+        assert_eq!(
+            world
+                .scalar("SELECT count(*) FROM merezha_notify.webhook_attempts")
+                .await,
+            8
+        );
+        let mut arrivals: Vec<Instant> = receiver.received().iter().map(|r| r.at).collect();
+        arrivals.sort();
+        for pair in arrivals.windows(2) {
+            assert!(
+                pair[1].duration_since(pair[0]) >= Duration::from_millis(850),
+                "two requests overlapped on a one-slot endpoint"
+            );
+        }
+        instance.stop().await;
+    }
+
+    /// The Tx B fence: a run that loses its lease while its request is in
+    /// flight is taken over; the takeover's outcome stands, and the late
+    /// run records nothing (not its 503, not `failing_since`).
+    #[tokio::test]
+    async fn a_late_run_records_nothing_after_a_takeover() {
+        let Some(world) = World::new().await else {
+            return;
+        };
+        let receiver = WebhookReceiver::start().await;
+        receiver.fail_next(1, 503, "");
+        let instance = start_with(&world, &crashing(), |o| {
+            o.heartbeat = false;
+            o.faults
+                .pause_once(faults::AFTER_PROVIDER_CALL, Duration::from_millis(4500));
+        })
+        .await;
+        create(
+            &instance,
+            "ada",
+            "/tenants/org_a",
+            json!({ "url": receiver.url("a") }),
+        )
+        .await;
+        emit(
+            &instance,
+            "application",
+            Some("org_a"),
+            "tasks.task_completed",
+            "f1",
+        )
+        .await;
+        instance
+            .until(
+                "SELECT count(*) FROM merezha_notify.webhook_deliveries WHERE status = 'succeeded'",
+                1,
+            )
+            .await;
+        // Past the paused run's resumption and its Tx B.
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+        assert_eq!(attempts(&world).await, ["ambiguous:", "succeeded:204"]);
+        assert_eq!(deliveries(&world).await, ["succeeded:"]);
+        assert_eq!(
+            world
+                .scalar("SELECT count(*) FROM merezha_notify.webhook_endpoints WHERE failing_since IS NULL")
+                .await,
+            1
+        );
+        instance.stop().await;
     }
 
     /// NT-N7 test: a crash between the request and Tx B

@@ -131,7 +131,7 @@ pub const PERMISSIONS: [&str; 7] = [
 
 /// The codes this block's routes and port return, with their statuses
 /// (R8). Canonical kernel codes are listed again with the same status.
-pub const ERRORS: [ErrorCode; 40] = [
+pub const ERRORS: [ErrorCode; 41] = [
     ErrorCode::new("invalid_input", 400),
     ErrorCode::new("invalid_cursor", 400),
     ErrorCode::new("token_invalid", 400),
@@ -148,6 +148,7 @@ pub const ERRORS: [ErrorCode; 40] = [
     ErrorCode::new("revision_conflict", 412),
     ErrorCode::new("body_limit", 413),
     ErrorCode::new("stream_limit", 429),
+    ErrorCode::new("rate_limited", 429),
     ErrorCode::new("validation_failed", 422),
     ErrorCode::new("invalid_locale", 422),
     ErrorCode::new("unknown_topic", 422),

@@ -53,6 +53,17 @@ const DEADLINE: Duration = Duration::from_secs(10);
 const PAGE: i64 = 50;
 /// Most characters of an endpoint description.
 const MAX_DESCRIPTION: usize = 200;
+/// `POST …/test` is limited per endpoint and per registry within a
+/// sliding window, counted in the database so every instance shares it.
+pub const TEST_WINDOW: Duration = Duration::from_secs(60);
+pub const TESTS_PER_ENDPOINT: i64 = 5;
+pub const TESTS_PER_REGISTRY: i64 = 30;
+/// An open delivery untouched this long has lost its job: redeliver
+/// accepts it (a job still alive finds a newer generation and stops).
+pub const STALE_OPEN: Duration = Duration::from_secs(3600);
+/// Attempts shown per delivery in the deliveries route, the latest first
+/// kept; `attempt_count` is the total.
+pub const ATTEMPTS_SHOWN: i64 = 20;
 /// Descriptions of the module event types and of the test event.
 const BUILTIN_DESCRIPTIONS: [(&str, &str); 4] = [
     ("content.entry_published", "A content entry was published"),
@@ -397,6 +408,7 @@ async fn create(
                             &sealed.nonce,
                             &subject,
                             &now,
+                            &sealed.key_id,
                         ],
                     )
                     .await
@@ -706,7 +718,15 @@ async fn rotate(
                     .query_one(
                         tx,
                         &sql::ENDPOINT_ROTATE,
-                        &[&id, &sealed.ciphertext, &sealed.nonce, &keep, &until, &now],
+                        &[
+                            &id,
+                            &sealed.ciphertext,
+                            &sealed.nonce,
+                            &keep,
+                            &until,
+                            &now,
+                            &sealed.key_id,
+                        ],
                     )
                     .await
                     .map_err(|e| classify(&e))?
@@ -825,7 +845,10 @@ fn correlation(core: &Core, request_id: Option<Extension<RequestId>>) -> Result<
 }
 
 /// `POST …webhooks/{id}/test` (manage): a `webhook.test` event for this
-/// endpoint alone, whatever its filter: 202 `{ delivery_id }`.
+/// endpoint alone, whatever its filter: 202 `{ delivery_id }`. At most
+/// [`TESTS_PER_ENDPOINT`] per endpoint and [`TESTS_PER_REGISTRY`] per
+/// registry within [`TEST_WINDOW`], else 429 `rate_limited` with
+/// `Retry-After`.
 async fn test(
     State(ctx): State<Ctx>,
     principal: Option<Extension<Authenticated>>,
@@ -860,6 +883,21 @@ async fn test(
                 let (_, status, tenant) = lock(&db, tx, id, &key).await?;
                 if status != "active" {
                     return Err(Failure::conflict(code::ENDPOINT_DISABLED));
+                }
+                // The registry lock serializes the count across instances.
+                db.query_one(tx, &sql::REGISTRY_LOCK, &[&key])
+                    .await
+                    .map_err(|e| classify(&e))?;
+                let window = now
+                    .checked_sub(jiff::SignedDuration::try_from(TEST_WINDOW).unwrap_or_default())
+                    .unwrap_or(now);
+                let counts = db
+                    .query_one(tx, &sql::TEST_RATE, &[&id, &key, &window])
+                    .await
+                    .map_err(|e| classify(&e))?;
+                let (endpoint_tests, registry_tests): (i64, i64) = (counts.get(0), counts.get(1));
+                if endpoint_tests >= TESTS_PER_ENDPOINT || registry_tests >= TESTS_PER_REGISTRY {
+                    return Err(Failure::transient("rate_limited"));
                 }
                 let event = fanout::Event {
                     id: event_id,
@@ -906,6 +944,9 @@ async fn test(
             Json(json!({ "delivery_id": delivery.to_string() })),
         )
             .into_response(),
+        Err(failure) if failure.code == "rate_limited" => ErrorReply::new(failure)
+            .retry_after(TEST_WINDOW)
+            .into_response(),
         Err(failure) => reply(failure),
     }
 }
@@ -925,7 +966,7 @@ fn decode_cursor(text: &str) -> Option<(jiff::Timestamp, Uuid)> {
 }
 
 /// `GET …webhooks/{id}/deliveries?status=&cursor=` (read): newest first,
-/// 50 per page, each with its attempts.
+/// 50 per page, each with its latest [`ATTEMPTS_SHOWN`] attempts.
 async fn deliveries(
     State(ctx): State<Ctx>,
     principal: Option<Extension<Authenticated>>,
@@ -978,7 +1019,7 @@ async fn deliveries(
         let rows = &rows[..rows.len().min(PAGE as usize)];
         let ids: Vec<Uuid> = rows.iter().map(|r| r.get(0)).collect();
         let attempts = db
-            .query(&client, &sql::ATTEMPTS_FOR, &[&ids, &(PAGE * 40)])
+            .query(&client, &sql::ATTEMPTS_FOR, &[&ids, &ATTEMPTS_SHOWN])
             .await
             .map_err(|e| classify(&e))?;
         let mut by_delivery: BTreeMap<Uuid, Vec<Value>> = BTreeMap::new();
@@ -1021,8 +1062,9 @@ async fn deliveries(
 }
 
 /// `POST …webhooks/{id}/deliveries/{delivery_id}/redeliver` (manage): a
-/// settled delivery as a new generation, signed again over the same body
-/// with the same `webhook-id`: 202 `{ generation }`.
+/// settled delivery, or an open one untouched for [`STALE_OPEN`], as a new
+/// generation, signed again over the same body with the same
+/// `webhook-id`: 202 `{ generation }`.
 async fn redeliver(
     State(ctx): State<Ctx>,
     principal: Option<Extension<Authenticated>>,
@@ -1046,6 +1088,9 @@ async fn redeliver(
     };
     let key = call.registry.key();
     let now = core.now();
+    let stale_before = now
+        .checked_sub(jiff::SignedDuration::try_from(STALE_OPEN).unwrap_or_default())
+        .unwrap_or(now);
     let db = core.database.clone();
     let outbox = core.outbox.clone();
     let result = db
@@ -1053,23 +1098,31 @@ async fn redeliver(
         .transaction(Instant::now() + DEADLINE, move |tx| {
             Box::pin(async move {
                 let row = db
-                    .query_opt(tx, &sql::REDELIVER_LOCK, &[&delivery, &id, &key])
+                    .query_opt(
+                        tx,
+                        &sql::REDELIVER_LOCK,
+                        &[&delivery, &id, &key, &stale_before],
+                    )
                     .await
                     .map_err(|e| classify(&e))?
                     .ok_or_else(|| Failure::permanent("not_found"))?;
-                let (status, purged, endpoint_status, tenant): (
+                let (status, purged, endpoint_status, tenant, stale): (
                     String,
                     bool,
                     String,
                     Option<String>,
-                ) = (row.get(0), row.get(1), row.get(2), row.get(3));
+                    bool,
+                ) = (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
                 if purged {
                     return Err(Failure::permanent(code::EVENT_BODY_EXPIRED));
                 }
                 if endpoint_status != "active" {
                     return Err(Failure::conflict(code::ENDPOINT_DISABLED));
                 }
-                if !matches!(status.as_str(), "succeeded" | "failed" | "cancelled") {
+                // An open delivery is redelivered only once it has been
+                // untouched for `STALE_OPEN`: its job is dead (a job that
+                // still runs finds the newer generation and stops).
+                if !matches!(status.as_str(), "succeeded" | "failed" | "cancelled") && !stale {
                     return Err(Failure::conflict("not_redeliverable"));
                 }
                 let generation: i32 = db
@@ -1081,6 +1134,7 @@ async fn redeliver(
                     webhook_delivery_id: delivery,
                     endpoint_id: id,
                     generation,
+                    busy: 0,
                 };
                 let record = fanout::job_record(&job, &correlation, tenant.as_deref())?;
                 outbox.append(tx, &[record], OnDuplicate::Ignore).await?;

@@ -323,6 +323,7 @@ metrics! {
     WEBHOOK_ATTEMPTS = "merezha.webhook.attempts", Counter, "{attempt}", NONE, ["notify.class"], "8 classes";
     WEBHOOK_ENDPOINTS_DISABLED = "merezha.webhook.endpoints_disabled", Counter, "{endpoint}", NONE,
         ["notify.reason"], "3 reasons";
+    WEBHOOK_SECRETS_PREVIOUS_KEY = "merezha.webhook.secrets.previous_key", Gauge, "{endpoint}", NONE, [], "1";
     // Content
     CONTENT_DELIVERY_NOT_MODIFIED = "merezha.content.delivery.not_modified", Counter, "{response}", NONE,
         ["content.type"], "types";

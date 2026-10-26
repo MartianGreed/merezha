@@ -26,10 +26,17 @@ const MAX_SECRET_BYTES: usize = 64;
 const MAX_SIGNATURES: usize = 8;
 
 /// The bytes of an endpoint's signing secret. `Debug` never shows them,
-/// and there is no `Display`: [`SigningSecret::reveal`] is the one way to
-/// the text, used by the create and rotate answers only.
+/// there is no `Display` ([`SigningSecret::reveal`] is the one way to the
+/// text, used by the create and rotate answers only), and they are zeroed
+/// on drop.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SigningSecret(Vec<u8>);
+/// The bytes are wiped when the secret is dropped.
+impl Drop for SigningSecret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
 impl std::fmt::Debug for SigningSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SigningSecret(<redacted>)")

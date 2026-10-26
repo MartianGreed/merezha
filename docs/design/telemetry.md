@@ -357,6 +357,7 @@ spans.
 | `merezha.webhook.deliveries` | C `{delivery}` | `notify.outcome` (`succeeded`, `failed`, `cancelled`) |
 | `merezha.webhook.attempts` | C `{attempt}` | `notify.class` (`2xx`, `3xx`, `4xx`, `410`, `5xx`, `timeout`, `network`, `blocked`) |
 | `merezha.webhook.endpoints_disabled` | C `{endpoint}` | `notify.reason` (`manual`, `gone`, `failing`) |
+| `merezha.webhook.secrets.previous_key` | G `{endpoint}` | none: endpoints whose signing secret is still sealed under another key than `secret_key`, as the last `retention` run counted them (NT-N7); `secret_key_previous` may go once it is 0 |
 
 **Content** (content's §9 rows, in this catalog's spelling)
 

@@ -60,7 +60,7 @@ pub const DELIVERY_LOCK: Statement = s(
     "SELECT merezha_notify.webhook_deliveries",
     "SELECT d.status, d.generation, e.status, e.url, e.secret_ct, e.secret_nonce, \
      e.previous_secret_ct, e.previous_secret_nonce, e.previous_expires_at, v.body, \
-     d.endpoint_id \
+     d.endpoint_id, e.key_id, e.previous_key_id \
      FROM merezha_notify.webhook_deliveries d \
      JOIN merezha_notify.webhook_endpoints e ON e.id = d.endpoint_id \
      JOIN merezha_notify.webhook_events v ON v.id = d.event_id \
@@ -179,8 +179,8 @@ pub const ENDPOINT_INSERT: Statement = s(
     "INSERT merezha_notify.webhook_endpoints",
     concat!(
         "INSERT INTO merezha_notify.webhook_endpoints (id, tenant_id, url, description, \
-         event_types, secret_ct, secret_nonce, key_version, status, created_by, created_at, \
-         updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 'active', $8, $9, $9) RETURNING ",
+         event_types, secret_ct, secret_nonce, key_id, status, created_by, created_at, \
+         updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $10, 'active', $8, $9, $9) RETURNING ",
         endpoint_columns!()
     ),
 );
@@ -219,8 +219,8 @@ pub const ENDPOINT_UPDATE: Statement = s(
         endpoint_columns!()
     ),
 );
-/// A new secret `$2`/`$3`; with `$4` the current one becomes the previous
-/// until `$5`, else no previous secret is kept.
+/// A new secret `$2`/`$3` sealed under key `$7`; with `$4` the current one
+/// becomes the previous until `$5`, else no previous secret is kept.
 pub const ENDPOINT_ROTATE: Statement = s(
     "notify.webhook.endpoint_rotate",
     "UPDATE merezha_notify.webhook_endpoints",
@@ -228,7 +228,8 @@ pub const ENDPOINT_ROTATE: Statement = s(
        previous_secret_ct = CASE WHEN $4::boolean THEN secret_ct END, \
        previous_secret_nonce = CASE WHEN $4::boolean THEN secret_nonce END, \
        previous_expires_at = CASE WHEN $4::boolean THEN $5::timestamptz END, \
-       secret_ct = $2, secret_nonce = $3, key_version = 0, updated_at = $6, \
+       previous_key_id = CASE WHEN $4::boolean THEN key_id END, \
+       secret_ct = $2, secret_nonce = $3, key_id = $7, updated_at = $6, \
        revision = revision + 1 WHERE id = $1 RETURNING revision",
 );
 pub const ENDPOINT_ENABLE: Statement = s(
@@ -256,19 +257,34 @@ pub const DELIVERY_PAGE: Statement = s(
      AND ($3::timestamptz IS NULL OR (d.created_at, d.id) < ($3, $4::uuid)) \
      ORDER BY d.created_at DESC, d.id DESC LIMIT $5",
 );
-/// The attempts of deliveries `$1`, at most `$2`.
+/// The latest `$2` attempts of each of deliveries `$1`, oldest first.
 pub const ATTEMPTS_FOR: Statement = s(
     "notify.webhook.attempts_for",
     "SELECT merezha_notify.webhook_attempts",
-    "SELECT delivery_id, attempt, outcome, http_status, duration_ms, started_at \
-     FROM merezha_notify.webhook_attempts WHERE delivery_id = ANY($1::uuid[]) \
-     ORDER BY delivery_id, attempt LIMIT $2",
+    "SELECT delivery_id, attempt, outcome, http_status, duration_ms, started_at FROM \
+     (SELECT a.*, row_number() OVER (PARTITION BY delivery_id ORDER BY attempt DESC) AS n \
+      FROM merezha_notify.webhook_attempts a WHERE delivery_id = ANY($1::uuid[])) AS latest \
+     WHERE n <= $2 ORDER BY delivery_id, attempt",
 );
-/// Lock delivery `$1` of endpoint `$2` in registry `$3`.
+/// The `webhook.test` deliveries of endpoint `$1` and the test events of
+/// registry `$2` created after `$3`.
+pub const TEST_RATE: Statement = s(
+    "notify.webhook.test_rate",
+    "SELECT merezha_notify.webhook_events",
+    "SELECT (SELECT count(*) FROM merezha_notify.webhook_deliveries d \
+       JOIN merezha_notify.webhook_events v ON v.id = d.event_id \
+       WHERE d.endpoint_id = $1 AND d.created_at > $3 AND v.event_type = 'webhook.test'), \
+     (SELECT count(*) FROM merezha_notify.webhook_events \
+       WHERE COALESCE(tenant_id, '') = $2 AND event_type = 'webhook.test' AND created_at > $3)",
+);
+/// Lock delivery `$1` of endpoint `$2` in registry `$3`, with whether it
+/// is open and untouched since `$4` (its job is presumed dead).
 pub const REDELIVER_LOCK: Statement = s(
     "notify.webhook.redeliver_lock",
     "SELECT merezha_notify.webhook_deliveries",
-    "SELECT d.status, v.body IS NULL, e.status, e.tenant_id FROM merezha_notify.webhook_deliveries d \
+    "SELECT d.status, v.body IS NULL, e.status, e.tenant_id, \
+     d.updated_at < $4 AND (d.next_attempt_at IS NULL OR d.next_attempt_at < $4) \
+     FROM merezha_notify.webhook_deliveries d \
      JOIN merezha_notify.webhook_events v ON v.id = d.event_id \
      JOIN merezha_notify.webhook_endpoints e ON e.id = d.endpoint_id \
      WHERE d.id = $1 AND d.endpoint_id = $2 AND COALESCE(e.tenant_id, '') = $3 FOR UPDATE OF d",
@@ -330,20 +346,31 @@ pub const PREVIOUS_EXPIRE: Statement = s(
      previous_secret_nonce = NULL, previous_expires_at = NULL WHERE id IN \
      (SELECT id FROM merezha_notify.webhook_endpoints WHERE previous_expires_at <= $1 LIMIT $2)",
 );
-/// The sealed secrets of endpoints after id `$1`, at most `$2`.
-pub const SECRETS_PAGE: Statement = s(
-    "notify.webhook.secrets_page",
+/// After id `$1`, the endpoints with a secret sealed under another key
+/// than `$2`, at most `$3`.
+pub const STALE_SECRETS: Statement = s(
+    "notify.webhook.stale_secrets",
     "SELECT merezha_notify.webhook_endpoints",
-    "SELECT id, secret_ct, secret_nonce, previous_secret_ct, previous_secret_nonce \
-     FROM merezha_notify.webhook_endpoints WHERE id > $1 ORDER BY id LIMIT $2",
+    "SELECT id, secret_ct, secret_nonce, key_id, previous_secret_ct, previous_secret_nonce, \
+     previous_key_id FROM merezha_notify.webhook_endpoints \
+     WHERE id > $1 AND (key_id <> $2 OR previous_key_id <> $2) ORDER BY id LIMIT $3",
 );
-/// Store secrets re-sealed under the current key, unless the endpoint's
-/// secret changed since it was read (`$6`).
+/// How many endpoints still hold a secret sealed under another key than
+/// `$1`.
+pub const STALE_COUNT: Statement = s(
+    "notify.webhook.stale_count",
+    "SELECT merezha_notify.webhook_endpoints",
+    "SELECT count(*) FROM merezha_notify.webhook_endpoints \
+     WHERE key_id <> $1 OR previous_key_id <> $1",
+);
+/// Store secrets re-sealed under key `$7`, unless the endpoint's secret
+/// changed since it was read (`$6`).
 pub const SECRETS_RESEAL: Statement = s(
     "notify.webhook.secrets_reseal",
     "UPDATE merezha_notify.webhook_endpoints",
     "UPDATE merezha_notify.webhook_endpoints SET secret_ct = $2, secret_nonce = $3, \
-     previous_secret_ct = $4, previous_secret_nonce = $5, key_version = 0 \
+     previous_secret_ct = $4, previous_secret_nonce = $5, key_id = $7::bytea, \
+     previous_key_id = CASE WHEN $4::bytea IS NULL THEN NULL ELSE $7::bytea END \
      WHERE id = $1 AND secret_ct = $6",
 );
 
@@ -384,6 +411,8 @@ pub const STATEMENTS: &[Statement] = &[
     RETENTION_EVENTS,
     RETENTION_AUDIT,
     PREVIOUS_EXPIRE,
-    SECRETS_PAGE,
+    STALE_SECRETS,
+    STALE_COUNT,
     SECRETS_RESEAL,
+    TEST_RATE,
 ];
