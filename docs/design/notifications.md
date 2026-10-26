@@ -783,9 +783,15 @@ not used. The fields:
 - `sender`: checked at startup, at most 11 alphanumeric characters or 15
   digits.
 - `organisationPrefix`: sent only when configured; it counts toward the
-  segment budget.
+  segment budget (as the prefix and a space before the content, which
+  also decides `unicodeEnabled`).
 
-The `messageId` number in the 201 response is stored as text.
+The `messageId` number in the 201 response is stored as text. No
+idempotency key is sent, so a 400 `duplicate_parameter` answer says
+nothing about whether the SMS went out: it is ambiguous, `unknown` /
+`ambiguous`, never resent (NT1), rather than a `failed` that would invite
+a redelivery (N4 review). `brevo.sandbox`
+applies to email only: Brevo has no SMS sandbox.
 
 ```json
 { "sender": "Acme", "recipient": "33612345678", "content": "…", "type": "transactional",
@@ -798,7 +804,7 @@ The `messageId` number in the 201 response is stored as text.
 | Response | Class | Effect |
 | --- | --- | --- |
 | 201 / 202 | accepted | `accepted` |
-| 400 `duplicate_parameter` (email) | duplicate | `accepted`, no message id |
+| 400 `duplicate_parameter` | email: duplicate; SMS: ambiguous | email `accepted`, no message id; SMS `unknown` / `ambiguous` (NT1) |
 | 400 `duplicate_request` | transient | retry after at least 60 s |
 | other 400, 404 | permanent | `failed`, `provider_rejected_<code>` (closed enum, else `provider_rejected`) |
 | 401, 402, 403, `unauthorized`, `not_enough_credits`, `permission_denied`, `account_under_validation` | transient `provider_account` | retry after at least 5 min (capped by the `notify.email` `backoff_max_ms`, which startup requires to be at least 5 min); the answer consumes no attempt: the next try is a new job of the same generation, so mail stays `retrying` while an operator fixes the key or the credits, until the notification's `expires_at` (24 h after the first refusal of the run without one), then `failed` / `provider_account_unresolved`. One error log `notification.provider_account_error` per run of refusals; `merezha.notification.provider_account_errors` counts each (N3 review). |
@@ -822,13 +828,26 @@ own check.
   at least 32 characters). `POST /v1/notifications/providers/brevo/email`
   compares the `Authorization: Bearer` value in constant time.
 - **SMS** uses the per-message `webUrl`, whose path carries the delivery id
-  and `mac = base64url(HMAC-SHA256(k_sms, delivery_id))[..22]`. The callback
-  recomputes the MAC and compares in constant time. Without
-  `public_base_url`, no `webUrl` is sent and SMS deliveries stay `accepted`.
+  and `mac = base64url(HMAC-SHA256(k_sms, delivery_id))[..22]`, the id in
+  its hyphenated lowercase form and `k_sms = HKDF-SHA256(secret_key, info
+  = "merezha-notify/sms-status/v1")`. The callback recomputes the MAC under
+  `secret_key` and `secret_key_previous` and compares in constant time.
+  The edge exempts the route from authentication when the router matched
+  its template (`Module::credential_free_routes`, compared with axum's
+  matched path, so a static route of the same shape is not exempt, with
+  non-empty `{delivery_id}` and `{mac}` segments; N4). The
+  event is correlated by the path id only, never by message id, so a URL
+  for one delivery cannot report on another. Without `public_base_url`, no
+  `webUrl` is sent and SMS deliveries stay `accepted`; startup requires it
+  with Brevo SMS.
 - **Source CIDRs (optional).** `brevo.webhook_allowed_cidrs` is checked
   against the client IP that the edge resolved through `http.trusted_proxies`.
   It is empty by default. Brevo's published webhook ranges are
-  `1.179.112.0/20` and `172.246.240.0/20`.
+  `1.179.112.0/20` and `172.246.240.0/20`. Setting it is recommended with
+  Brevo SMS: a `webUrl` never expires and lets its holder report on one
+  number's deliveries (and suppress its non-security SMS topics), so
+  status-URL paths should also be kept out of proxy access logs (N4
+  review).
 
 Each callback request is processed in one transaction:
 
@@ -836,12 +855,20 @@ Each callback request is processed in one transaction:
 2. Normalize the event name. Email: `request`, `delivered`, `deferred`,
    `soft_bounce`, `hard_bounce`, `invalid_email`, `blocked`, `spam`,
    `unsubscribed`, `error`. SMS `msg_status`: `delivered`, `soft_bounce`,
-   `hard_bounce`, `blacklisted`, `rejected`, `unsubscribed`. Opens and clicks
-   are dropped, because the block stores no engagement data.
+   `hard_bounce`, `blacklisted`, `rejected`, `unsubscribed`,
+   with `sent` and `accepted` recorded only. Opens and clicks are dropped,
+   because the block stores no engagement data, and so are SMS replies,
+   whose text is the recipient's message.
 3. Correlate the event by `X-Mailin-custom` or the path id, with the message
    id as fallback. Every event is resolved first, without a lock; the
    deliveries are then locked in ascending id order, so concurrent callbacks
-   cannot deadlock on each other.
+   cannot deadlock on each other. Our correlation names the delivery,
+   which a redelivery keeps: an event whose message id differs from the
+   provider message id of the delivery's current generation is about an
+   earlier generation. It is stored and may suppress the delivery's own
+   address, but moves no status, also when applied from `pending`, so a
+   late report about the first send cannot settle or fail the second (N4
+   review; email and SMS).
 4. Deduplicate on `event_key = sha256(provider|channel|message id|event|ts_event)`;
    without a message id, the delivery id and the address take its place.
 5. Apply the effect to a correlated event only. An uncorrelated event (no
@@ -858,8 +885,8 @@ Each callback request is processed in one transaction:
    | `delivered` | `delivered` |
    | `hard_bounce`, `invalid_email` | `bounced`, plus a suppression (`hard_bounce` or `invalid`) |
    | `spam` | `complained`, plus a `spam_complaint` suppression |
-   | `blocked`, `error`, SMS `rejected` | `failed` |
-   | SMS `blacklisted`, `unsubscribed` | an `unsubscribed` suppression for SMS |
+   | `blocked`, `error`, SMS `rejected` | `failed` (SMS: `provider_rejected`) |
+   | SMS `blacklisted`, `unsubscribed` | an `unsubscribed` suppression of the number for every non-security SMS topic |
    | email `unsubscribed` | an `unsubscribed` suppression for the delivery's topic, as an address unsubscribe token writes (N3); none when uncorrelated |
    | `soft_bounce`, `deferred` | recorded only (Brevo retries) |
 
@@ -1463,7 +1490,12 @@ workspace's axum and adds no mock-server dependency.
   request with the bearer token. It assumes, as the block does, that the
   duplicate answer is HTTP 400, that only a processed request takes its key
   (a refused one leaves it free) and that single-recipient sends are
-  covered; see section 12.
+  covered; see section 12. Its SMS endpoint (N4) has no idempotency,
+  answers a numeric `messageId`, and refuses with 400 `invalid_parameter`
+  a `recipient` with a `+` or outside 8 to 15 digits, an invalid sender,
+  empty content or an unknown `type`; `sms_event(status, message)` builds
+  a status report and `sms_event_request(message, payload)` the call to
+  the message's `webUrl`.
 - `FakePushService` decrypts with `web_push_native::decrypt` under a test
   user-agent key, verifies the VAPID JWT (`aud`, `exp` at most 24 h, the
   signature) and answers with a scripted 201, 404, 410, 413 or 429.
@@ -1743,7 +1775,13 @@ The owner answered this design's open questions on 2026-10-24. The record is
   nor the fate of a failed request's key. N3 assumes 400 and "only a
   processed request takes the key", as `FakeBrevo` models; a real-account
   check is still owed before production use.
-- Whether Brevo SMS accepts a leading `+` in `recipient`.
+- Whether Brevo SMS accepts a leading `+` in `recipient` (the block never
+  sends one).
+- The SMS status report fields (N4 reads `msg_status`, `messageId`,
+  `ts_event`, `to` and `description`, with `event`, `message-id` and `ts`
+  as fallbacks), whether `tag` takes an array, and how Brevo joins
+  `organisationPrefix` to the content (the segment count assumes one
+  space).
 - Whether `error` is an accepted event name for webhook creation, and the
   exact SMS webhook event set for `channel: "sms"`.
 - Brevo's retry policy for failed webhook calls.

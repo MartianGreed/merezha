@@ -860,7 +860,7 @@ Guest calls, dispatch and projections are instrumented (TE-T3; TE §1.2,
 | `ready()` | readiness contribution, answered within 1 s |
 | `blob_store()` | the `BlobStore` it provides to every context, opened from its settings; `Ok(None)` (default) provides none. Asked once after `configure`, before any module starts; a failure stops startup naming the module, a second provider stops it with `blob_store_conflict`. Content provides the store `[modules.content.media]` configures |
 | `notifier()` | the `NotifierFactory` it provides to every context in place of the capture fallback; `None` (default) provides none. Asked once after `configure`, before any module starts, so a module that starts earlier already binds it; a second provider stops startup with `notifier_conflict`. The factory answers `unavailable` until its module started. The notifications block provides it |
-| `credential_free_routes()` | `CredentialFreeRoute { method, path }` for routes that take no credential (a signed link, a provider callback): for an exact match the edge never runs the authenticator (no session lookup, Origin or CSRF check, no refusal of a stale cookie) and inserts `Authenticated(None)`, so such a route cannot see a principal and must never act on one; default none. A path must start with `/` and hold no `..`, `%`, `//`, query or fragment; the host prefixes `/v1/<name>` and refuses any other path at startup with `invalid_credential_free_route`. Notifications declares `GET` and `POST /unsubscribe` and `POST /providers/brevo/email` |
+| `credential_free_routes()` | `CredentialFreeRoute { method, path }` for routes that take no credential (a signed link, a provider callback): for a request the router matched to that route template (axum's matched path, so a static route of the same shape stays authenticated) with every `{name}` segment non-empty, the edge never runs the authenticator (no session lookup, Origin or CSRF check, no refusal of a stale cookie) and inserts `Authenticated(None)`, so such a route cannot see a principal and must never act on one; default none. A path must start with `/` and hold no `..`, `%`, `//`, query or fragment; the host prefixes `/v1/<name>` and refuses any other path at startup with `invalid_credential_free_route`. Notifications declares `GET` and `POST /unsubscribe`, `POST /providers/brevo/email` and `POST /providers/brevo/sms/{delivery_id}/{mac}` |
 | `body_limits()` | `RouteBodyLimit { method, path, limit }` for routes that bound their own body (the upload route): the edge reads such a body up to `limit` instead of `http.body_limit` and leaves a declared length to the route; default none. Notifications declares 1 MiB for `POST /providers/brevo/email` |
 | `draining()` | the listener is about to stop accepting and drain in-flight requests: end long-lived responses (event streams) and refuse new ones, so the drain does not wait on them until its timeout. Called once, after `http.drain_delay_ms`, before the drain and `shutdown`; must not block; default nothing. Notifications ends every inbox stream there |
 | `shutdown(deadline)` | stop and drain background work after the listener drained |
@@ -1326,9 +1326,10 @@ over the capture drivers, the inbox REST routes, preferences, suppressions,
 unsubscribe, `send`, `status` and `redeliver`. Slice NT-N3 adds Brevo
 email: the email driver, the email status callback and `merezha
 notifications brevo register-webhook` ([Brevo email](#brevo-email)). Slice
-NT-N5 adds the inbox stream ([Inbox stream](#inbox-stream)) and NT-N6 Web
-Push ([Web Push](#web-push)). Brevo SMS (NT-N4) and webhook fan-out (NT-N7)
-come later.
+NT-N4 adds Brevo SMS: the SMS driver and its signed status callback
+([Brevo SMS](#brevo-sms)). Slice NT-N5 adds the inbox stream ([Inbox
+stream](#inbox-stream)) and NT-N6 Web Push ([Web Push](#web-push)).
+Webhook fan-out (NT-N7) comes later.
 
 ```toml
 [modules.notifications]
@@ -1444,9 +1445,7 @@ inbox deliveries are created `delivered`.
 
 The delivery worker (`notify.deliver.email`, `notify.deliver.sms`, and
 `notify.deliver.push` with a push section) registers email and SMS for a
-`capture` driver and for the `brevo` email driver; with
-`sms.driver = "brevo"` the SMS delivery jobs wait in `notify.sms` until
-NT-N4 deploys. Per attempt it locks the delivery (another generation or a
+`capture` or `brevo` driver. Per attempt it locks the delivery (another generation or a
 settled delivery is done; past `expires_at` it becomes `expired`;
 suppressions and preferences are checked again), commits attempt `n + 1`
 as `started`, renders from the stored data and the job's secret data, sends
@@ -1494,7 +1493,7 @@ topics with an unsubscribe link, and `X-Sib-Sandbox: drop` with
 | Brevo answer | Attempt outcome | Delivery |
 | --- | --- | --- |
 | 2xx | `accepted` | `accepted` |
-| 400 `duplicate_parameter` | `duplicate` | `accepted` without a message id |
+| 400 `duplicate_parameter` | `duplicate` | `accepted` without a message id (SMS: `unknown` / `ambiguous`) |
 | 400 `duplicate_request` | `transient` | `retrying`, at least 60 s later |
 | 401, 402, 403, or code `unauthorized`, `not_enough_credits`, `permission_denied`, `account_under_validation` | `transient` (`provider_account`) | `retrying`, at least 5 min later (at most the `notify.email` `backoff_max_ms`, which must be at least 5 min, else startup fails `backoff_max_too_short`). The answer consumes no attempt: the next try is a new job of the same generation (outbox key `deliver:{id}:g{n}:a{attempt}`), until the notification's `expires_at`, or 24 h after the run's first refusal, then `failed` / `provider_account_unresolved`. One error log `notification.provider_account_error` per run of refusals; `merezha.notification.provider_account_errors` counts each |
 | 408, 425, 429 | `rate_limited` | `retrying` after `max(Retry-After, x-sib-ratelimit-reset)` (at most 1 h, and at most the queue's `backoff_max_ms`); warn log `notification.provider_rate_limited` |
@@ -1583,6 +1582,87 @@ the `host_override` warning (in `warnings` and on stderr). It prints
 an invalid project prints the `check` report (exit 2). The key and the
 token are never printed. Switch Brevo's open and click tracking off in the
 console: the block stores no engagement data.
+
+### Brevo SMS
+
+With `sms.driver = "brevo"` the worker sends through Brevo's `POST
+{brevo.base_url}/v3/transactionalSMS/send` on the same client and
+classifier as email (`brevo.timeout`, no automatic retry, no
+`traceparent`). Each request has one number, written without its `+`
+(`"recipient": "33612345678"`), `sender = sms.sender`, the rendered
+`content`, `type: "marketing"` for a marketing topic (else
+`transactional`), `unicodeEnabled: true` when the content (with the
+prefix) is outside GSM-7, `organisationPrefix` when
+`sms.organisation_prefix` is set, the tags `[<topic>, "mzd:<delivery_id>"]`
+and `webUrl`, the delivery's signed status URL (below). The 201's numeric
+`messageId` is stored as text. `brevo.sandbox` covers email only: Brevo has
+no SMS sandbox, so a staging project with Brevo SMS sends real messages.
+
+The content is rendered from `sms.txt` on every attempt and segmented as
+GSM-7 (160 septets, 153 per concatenated part, an extension character
+counting two) or UCS-2 (70 units, 67 per part), with `organisation_prefix`
+and a space counted in. A request whose content exceeds `sms.max_segments`
+in the default locale is refused before the caller commits (422
+`render_failed`); a delivery whose content exceeds it at send time (another
+locale, a template change) fails `render_failed` and sends nothing. Each
+accepted SMS adds its parts to `merezha.notification.sms_segments`
+(`notify.encoding` `gsm7` or `ucs2`).
+
+Brevo answers are classified as for email, except that no idempotency key
+is sent: an ambiguous attempt (a timeout or a dropped connection once
+connected, a crash that left a `started` attempt, or a
+`duplicate_parameter` answer, which cannot tell whether the SMS went out)
+sets the delivery `unknown` / `ambiguous` and is never resent (NT1). A later
+status report can still settle it, and `redeliver` starts a new
+generation. Account refusals wait for an operator as email does, without
+spending attempts.
+
+**Status callback.** `POST
+/v1/notifications/providers/brevo/sms/{delivery_id}/{mac}` is a
+credential-free route. Its path is the `webUrl` the block sent,
+`public_base_url` + `/v1/notifications/providers/brevo/sms/<delivery
+id>/<mac>`, with `mac = base64url(HMAC-SHA256(k_sms, delivery
+id))[..22]`, `k_sms = HKDF-SHA256(secret_key, "merezha-notify/sms-status/v1")`
+and the id in its hyphenated lowercase form. The handler checks
+`brevo.webhook_allowed_cidrs` (when not empty) against the edge-resolved
+client address, then recomputes the MAC under `secret_key` and
+`secret_key_previous` and compares in constant time; either failure (or a
+non-canonical id) answers 401 `unauthenticated`, stores nothing and logs
+`notification.provider_event_rejected` (code `source_not_allowed` or
+`bad_mac`). Without the Brevo SMS driver the route is 404. The body (a
+report or an array of at most 100, within `http.body_limit`, at most 64
+KiB) runs through the email callback's transaction, correlated by the
+path's delivery only (never by message id) and deduplicated on
+`sha256(brevo|sms|message id|msg_status|ts_event)`:
+
+| `msg_status` | Effect |
+| --- | --- |
+| `delivered` | `accepted` or `unknown` to `delivered` |
+| `hard_bounce` | `accepted` or `unknown` to `bounced` / `hard_bounce`, plus a `hard_bounce` suppression of the number |
+| `rejected` | `accepted` or `unknown` to `failed` / `provider_rejected` |
+| `blacklisted`, `unsubscribed` (a STOP reply) | an `unsubscribed` suppression of the number for every non-security SMS topic |
+| `sent`, `accepted`, `soft_bounce` | recorded only |
+
+A redelivery keeps the delivery id, and so the status URL: a report whose
+message id is not the one of the delivery's current generation is about an
+earlier send. It is stored and its suppression applies, but it moves no
+status, so a late `rejected` about the first SMS cannot fail (and invite a
+third send of) the second. The email callback applies the same rule to
+`X-Mailin-custom` correlation.
+
+A `webUrl` never expires and lets whoever holds it report on that
+delivery (and suppress its number's non-security SMS topics). Set
+`brevo.webhook_allowed_cidrs` to Brevo's ranges (`1.179.112.0/20`,
+`172.246.240.0/20`) and keep `/v1/notifications/providers/brevo/sms/`
+paths out of proxy and load-balancer access logs.
+
+Replies are dropped unstored (their text is the recipient's message), and
+so are unknown statuses. A report about a delivery still `queued`,
+`sending` or `retrying` is stored `pending` and applied by the worker once
+the outcome is recorded. Brevo's `description` is kept as the event's
+reason (at most 200 characters, never logged). Numbers are never logged,
+put in spans or used as metric labels; the status route shows them masked
+(`+33•••••••78`).
 
 ### Routes of NT-N2
 
@@ -1854,7 +1934,7 @@ Keys and defaults are NT §7.2. Bounds and checks the block adds:
 | `retention` | durations 1 h to 3650 d; `captures` 1 to 100000 |
 | `templates` | `locales` at most 32 of `^[a-z]{2,3}(-[A-Z]{2})?$`, `default_locale` among them (`default_locale_not_listed`); `app_name` defaults to `app.name`; `fuel` 1000 to 10000000 |
 | `email.from`, `email.reply_to` | `Name <local@domain>` or `local@domain` (`invalid_sender`); `from` required with `driver = "brevo"` |
-| `sms` | `sender` required unless disabled: at most 11 alphanumerics or 15 digits; `max_segments` 1 to 10 |
+| `sms` | `sender` required unless disabled: at most 11 alphanumerics or 15 digits; `organisation_prefix` at most 32 characters, counted in the segments; `max_segments` 1 to 10 |
 | `brevo` | required with a `brevo` driver; `api_key` required then, `webhook_token` (at least 32 characters, `secret_too_short`) with the email driver; `timeout` 1 s to 60 s, `connect_timeout` 100 ms to 30 s |
 | `push` | `vapid_private_key` a secret holding a PKCS#8 PEM or base64url of a 32-byte P-256 scalar, parsed at startup (`invalid_vapid_key`), `vapid_subject` `mailto:` or `https:`; `ttl` 0 to 28 d; `allowed_hosts` at most 64 lowercase host names (default: the five services of NT §7.2); `max_subscriptions_per_user` 1 to 100 |
 | `egress` | `allow_private_networks` (development and tests; also lets push endpoints use `http` and any port), `deny_cidrs` at most 64 networks, always refused |

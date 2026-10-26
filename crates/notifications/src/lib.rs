@@ -30,10 +30,14 @@
 //! `push_expire` task and, with feature `testkit`, `testkit::FakePushService`
 //! and `testkit::TestResolver`.
 //!
-//! Seams for the next slices: Brevo SMS (NT-N4) implements
-//! [`drivers::SmsDriver`] over [`brevo::BrevoClient`] and is installed in
-//! [`notifier::Core`]; until then an SMS `brevo` driver leaves its delivery
-//! jobs queued and unleased. The SSE stream (NT-N5) listens on
+//! Slice NT-N4 adds Brevo SMS ([`brevo::sms`]): the SMS driver over the
+//! same client and classifier (an ambiguous SMS is never resent, NT1),
+//! the per-message status URL signed with `k_sms` and its credential-free
+//! callback `POST /v1/notifications/providers/brevo/sms/{delivery_id}/{mac}`
+//! ([`brevo::sms_status`]) with the opt-out and bounce suppressions its
+//! reports write.
+//!
+//! Seams for the next slices: the SSE stream (NT-N5) listens on
 //! [`sql::INBOX_CHANNEL`], which every inbox change notifies. Webhook
 //! fan-out (NT-N7) handles the `notify.webhook_event` jobs `emit_webhook`
 //! queues and sends through [`egress::client`].
@@ -296,7 +300,10 @@ fn delivering(settings: &Settings) -> Vec<Channel> {
     ) {
         channels.push(Channel::Email);
     }
-    if settings.sms.driver == config::Driver::Capture {
+    if matches!(
+        settings.sms.driver,
+        config::Driver::Capture | config::Driver::Brevo
+    ) {
         channels.push(Channel::Sms);
     }
     if settings.push.is_some() {
@@ -332,8 +339,9 @@ impl Module for Notifications {
     /// signed token is the only credential (NT §6). The Brevo email
     /// callback (NT-N3) proves itself with Brevo's bearer and the optional
     /// CIDRs, which the edge must never read as a session; the SMS callback
-    /// of NT-N4 joins this list. The VAPID public key is public (NT §7.1),
-    /// so a stale credential cannot keep a page from subscribing.
+    /// (NT-N4) with the MAC in its path and the same CIDRs. The VAPID public
+    /// key is public (NT §7.1), so a stale credential cannot keep a page
+    /// from subscribing.
     fn credential_free_routes(&self) -> Vec<merezha_platform::CredentialFreeRoute> {
         let mut routes: Vec<_> = [axum::http::Method::GET, axum::http::Method::POST]
             .into_iter()
@@ -342,10 +350,12 @@ impl Module for Notifications {
                 path: "/unsubscribe",
             })
             .collect();
-        routes.push(merezha_platform::CredentialFreeRoute {
-            method: axum::http::Method::POST,
-            path: brevo::events::PATH,
-        });
+        for path in [brevo::events::PATH, brevo::sms_status::PATH] {
+            routes.push(merezha_platform::CredentialFreeRoute {
+                method: axum::http::Method::POST,
+                path,
+            });
+        }
         routes.push(merezha_platform::CredentialFreeRoute {
             method: axum::http::Method::GET,
             path: "/push/vapid-public-key",
@@ -391,8 +401,19 @@ impl Module for Notifications {
                 }
                 _ => None,
             };
+            let keys = keys::Keys::new(&settings.secret_key, settings.secret_key_previous.as_ref());
             let sms: Option<Arc<dyn drivers::SmsDriver>> =
-                (settings.sms.driver == config::Driver::Capture).then(|| Arc::new(capture()) as _);
+                match (settings.sms.driver, &settings.brevo) {
+                    (config::Driver::Capture, _) => Some(Arc::new(capture())),
+                    (config::Driver::Brevo, Some(brevo)) => {
+                        Some(Arc::new(brevo::sms::BrevoSms::new(
+                            brevo::BrevoClient::new(brevo, ctx.http())?,
+                            &settings,
+                            keys.clone(),
+                        )))
+                    }
+                    _ => None,
+                };
             let metrics = metrics::Metrics::new(
                 &ctx.telemetry().meter(METER_SCOPE),
                 settings.topics.keys().cloned(),
@@ -417,7 +438,7 @@ impl Module for Notifications {
             let core = notifier::Core {
                 settings: settings.clone(),
                 registry: checked.registry.clone(),
-                keys: keys::Keys::new(&settings.secret_key, settings.secret_key_previous.as_ref()),
+                keys,
                 database: ctx.database().clone(),
                 outbox: ctx.outbox(NAME)?,
                 directory: ctx.directory().clone(),

@@ -66,8 +66,8 @@ pub struct Core {
     /// The email driver, `None` while it is `disabled` or not yet built in
     /// this slice (Brevo, NT-N3).
     pub email: Option<Arc<dyn crate::drivers::EmailDriver>>,
-    /// The SMS driver, `None` while it is `disabled` or not yet built in
-    /// this slice (Brevo, NT-N4).
+    /// The SMS driver (capture, or Brevo from NT-N4), `None` while it is
+    /// `disabled`.
     pub sms: Option<Arc<dyn crate::drivers::SmsDriver>>,
     /// The Web Push sender, `None` without `[modules.notifications.push]`.
     pub push: Option<Arc<crate::push::PushSender>>,

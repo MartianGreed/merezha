@@ -1452,10 +1452,13 @@ impl Module for Callback {
         "callback"
     }
     fn credential_free_routes(&self) -> Vec<merezha_platform::CredentialFreeRoute> {
-        vec![merezha_platform::CredentialFreeRoute {
-            method: axum::http::Method::POST,
-            path: "/open",
-        }]
+        ["/open", "/open/{id}/{mac}"]
+            .into_iter()
+            .map(|path| merezha_platform::CredentialFreeRoute {
+                method: axum::http::Method::POST,
+                path,
+            })
+            .collect()
     }
     fn routes(&self, _: &AppContext) -> Router {
         let seen = |principal: Option<Extension<merezha_platform::edge::Authenticated>>| async move {
@@ -1466,6 +1469,9 @@ impl Module for Callback {
         };
         Router::new()
             .route("/open", post(seen))
+            .route("/open/{id}/{mac}", post(seen))
+            .route("/open/{id}/{mac}/more", post(seen))
+            .route("/open/static/route", post(seen))
             .route("/closed", post(seen))
     }
 }
@@ -1542,6 +1548,41 @@ async fn credential_free_routes_skip_the_authenticator_and_see_no_principal() {
     let (_, body, _) = call(
         &router,
         post_with("/v1/callback/closed", Some("Bearer good")),
+    )
+    .await;
+    assert_eq!(body["principal"], true);
+    // A `{name}` segment matches any one non-empty segment, no more.
+    let (status, body, _) = call(
+        &router,
+        post_with("/v1/callback/open/d1/m1", Some("Bearer stale")),
+    )
+    .await;
+    assert_eq!(
+        (status, body),
+        (
+            StatusCode::OK,
+            json!({"extension": true, "principal": false})
+        )
+    );
+    for path in [
+        "/v1/callback/open/d1/m1/more",
+        "/v1/callback/open/d1",
+        "/v1/callback/open//m1",
+    ] {
+        let (status, _, _) = call(&router, post_with(path, Some("Bearer stale"))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+    }
+    // A static route of the credential-free shape is its own route: the
+    // router matches its template, so it keeps its authentication.
+    let (status, _, _) = call(
+        &router,
+        post_with("/v1/callback/open/static/route", Some("Bearer stale")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (_, body, _) = call(
+        &router,
+        post_with("/v1/callback/open/static/route", Some("Bearer good")),
     )
     .await;
     assert_eq!(body["principal"], true);

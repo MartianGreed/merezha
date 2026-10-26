@@ -5,6 +5,13 @@
 //! (RFC 5869 with an all-zero salt, as identity derives its keys). Tokens
 //! signed with `secret_key_previous` still verify. A token never expires:
 //! RFC 8058 links must keep working.
+//!
+//! `k_sms = HKDF-SHA256(secret_key, info = "merezha-notify/sms-status/v1")`
+//! signs the Brevo SMS status URL (NT §5.2): its path carries the delivery
+//! id and `mac = base64url(HMAC-SHA256(k_sms, delivery_id))[..22]`, the id
+//! in its hyphenated lowercase form. A MAC made with `secret_key_previous`
+//! still verifies, so a rotation does not orphan the status reports of SMS
+//! sent before it.
 use crate::config::KeyMaterial;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{KeyInit, Mac};
@@ -16,6 +23,10 @@ type HmacSha256 = hmac::Hmac<Sha256>;
 
 /// HKDF info of the unsubscribe key.
 pub const UNSUBSCRIBE_INFO: &[u8] = b"merezha-notify/unsubscribe/v1";
+/// HKDF info of the SMS status URL key.
+pub const SMS_STATUS_INFO: &[u8] = b"merezha-notify/sms-status/v1";
+/// Characters of the SMS status URL MAC (132 bits of base64url).
+pub const SMS_MAC_CHARS: usize = 22;
 /// Longest token accepted.
 pub const MAX_TOKEN_BYTES: usize = 2048;
 
@@ -49,6 +60,12 @@ pub fn hkdf(ikm: &[u8], info: &[u8]) -> Key {
     Key(expand.finalize().into_bytes().into())
 }
 
+fn sms_mac(key: &Key, delivery: uuid::Uuid) -> String {
+    let mut mac = URL_SAFE_NO_PAD.encode(key.mac(delivery.hyphenated().to_string().as_bytes()));
+    mac.truncate(SMS_MAC_CHARS);
+    mac
+}
+
 /// What an unsubscribe token names: a user or an address, a topic and the
 /// channel (always `email`). `Debug` hides the address.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,13 +94,32 @@ impl std::fmt::Debug for Unsubscribe {
 pub struct Keys {
     unsubscribe: Key,
     previous_unsubscribe: Option<Key>,
+    sms_status: Key,
+    previous_sms_status: Option<Key>,
 }
 impl Keys {
     pub fn new(secret_key: &KeyMaterial, previous: Option<&KeyMaterial>) -> Self {
         Self {
             unsubscribe: hkdf(secret_key.expose(), UNSUBSCRIBE_INFO),
             previous_unsubscribe: previous.map(|k| hkdf(k.expose(), UNSUBSCRIBE_INFO)),
+            sms_status: hkdf(secret_key.expose(), SMS_STATUS_INFO),
+            previous_sms_status: previous.map(|k| hkdf(k.expose(), SMS_STATUS_INFO)),
         }
+    }
+    /// The MAC of the SMS status URL of `delivery`, with the current key.
+    pub fn sms_status_mac(&self, delivery: uuid::Uuid) -> String {
+        sms_mac(&self.sms_status, delivery)
+    }
+    /// Whether `presented` is the SMS status MAC of `delivery` under the
+    /// current or the previous key, compared in constant time.
+    pub fn verify_sms_status_mac(&self, delivery: uuid::Uuid, presented: &str) -> bool {
+        let presented = presented.as_bytes();
+        let mut verified = false;
+        for key in std::iter::once(&self.sms_status).chain(self.previous_sms_status.as_ref()) {
+            // Every key is tried, so the answer takes the same time.
+            verified |= bool::from(sms_mac(key, delivery).as_bytes().ct_eq(presented));
+        }
+        verified
     }
     /// `v1.<b64url(payload)>.<b64url(HMAC-SHA256(k_unsub, "v1." + b64url(payload)))>`.
     pub fn unsubscribe_token(&self, claims: &Unsubscribe) -> String {
@@ -164,6 +200,66 @@ mod tests {
         sms.c = "sms".into();
         let token = keys.unsubscribe_token(&sms);
         assert_eq!(keys.verify_unsubscribe(&token, any), None);
+    }
+
+    #[test]
+    fn sms_status_macs_verify_with_either_key_and_name_one_delivery() {
+        let (one, two) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let old = Keys::new(&material(1), None);
+        let mac = old.sms_status_mac(one);
+        assert_eq!(mac.len(), SMS_MAC_CHARS);
+        assert!(old.verify_sms_status_mac(one, &mac));
+        assert!(!old.verify_sms_status_mac(two, &mac));
+        assert_ne!(old.sms_status_mac(two), mac);
+        // Another purpose of the same secret gives another key.
+        assert_ne!(
+            URL_SAFE_NO_PAD.encode(old.unsubscribe.mac(one.to_string().as_bytes()))[..22],
+            mac
+        );
+        let rotated = Keys::new(&material(2), Some(&material(1)));
+        assert!(rotated.verify_sms_status_mac(one, &mac));
+        assert_ne!(rotated.sms_status_mac(one), mac);
+        assert!(!Keys::new(&material(3), None).verify_sms_status_mac(one, &mac));
+        assert!(!old.verify_sms_status_mac(one, &mac[..21]));
+        assert!(!old.verify_sms_status_mac(one, &format!("{mac}A")));
+        assert!(!old.verify_sms_status_mac(one, ""));
+        assert!(!format!("{old:?}").contains(&mac));
+    }
+
+    #[test]
+    fn the_current_key_still_verifies_beside_a_previous_one() {
+        let one = uuid::Uuid::from_u128(1);
+        let rotated = Keys::new(&material(2), Some(&material(1)));
+        // Made with the current key, checked with the previous one last.
+        assert!(rotated.verify_sms_status_mac(one, &rotated.sms_status_mac(one)));
+        assert!(
+            rotated.verify_sms_status_mac(one, &Keys::new(&material(1), None).sms_status_mac(one))
+        );
+        assert!(
+            !rotated.verify_sms_status_mac(one, &Keys::new(&material(3), None).sms_status_mac(one))
+        );
+    }
+
+    #[test]
+    fn the_sms_status_mac_has_a_fixed_wire_format() {
+        // Computed independently: HKDF-SHA256 (zero salt, info
+        // "merezha-notify/sms-status/v1") of 32 bytes of 0x01, then
+        // base64url(HMAC-SHA256(k_sms, hyphenated lowercase id))[..22].
+        let keys = Keys::new(&material(1), None);
+        for (id, mac) in [
+            (
+                "00000000-0000-0000-0000-000000000001",
+                "bflgWTluFX2eZFfDTxKvaK",
+            ),
+            (
+                "0190f6c2-7d3a-7b1e-9c4d-5e6f7a8b9c0d",
+                "hEAoq-1sOD3RXqNQ1uZPaD",
+            ),
+        ] {
+            let id = uuid::Uuid::parse_str(id).unwrap();
+            assert_eq!(keys.sms_status_mac(id), mac);
+            assert!(keys.verify_sms_status_mac(id, mac));
+        }
     }
 
     #[test]

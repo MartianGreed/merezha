@@ -881,6 +881,81 @@ async fn a_resend_past_the_idempotency_window_is_never_made() {
     instance.stop().await;
 }
 
+/// NT-N4 review: `X-Mailin-custom` names the delivery, which a redelivery
+/// keeps. A late event about the first generation's message (`unknown`
+/// past the idempotency window, then redelivered and accepted with another
+/// message id) moves no status: a `blocked` for the first email must not
+/// fail the second. An event about the current message still applies.
+#[tokio::test]
+async fn a_late_event_about_an_earlier_generation_moves_no_status() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakeBrevo::start(API_KEY).await.unwrap();
+    fake.close_after_accept();
+    let queue = "max_attempts = 10\nbackoff_base_ms = 2000\nbackoff_max_ms = 3600000\n";
+    let instance = Instance::start(&world, options(&section(&fake, queue, "", ""))).await;
+    commit(
+        &instance,
+        request("tasks.assigned", email("gen@example.org", None), "e:1"),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.processed().is_empty() {
+        assert!(Instant::now() < deadline, "never sent");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    fake.rate_limit(&[("Retry-After", "3600")]);
+    wait_status(&instance, "unknown", 1).await;
+    let first = fake.processed().remove(0);
+    instance
+        .tokens
+        .add("admin", user("usr_admin", &["notifications.admin"], None));
+    let id = world
+        .text("SELECT id::text FROM merezha_notify.deliveries")
+        .await
+        .remove(0);
+    let (status, _) = instance
+        .call(
+            "POST",
+            &format!("/v1/notifications/deliveries/{id}/redeliver"),
+            Some("admin"),
+            None,
+        )
+        .await;
+    assert_eq!(status.as_u16(), 202);
+    wait_status(&instance, "accepted", 1).await;
+    let second = fake.processed().remove(1);
+    assert_ne!(first.message_id, second.message_id);
+    assert_eq!(
+        first.body["headers"]["X-Mailin-custom"],
+        second.body["headers"]["X-Mailin-custom"]
+    );
+    assert_eq!(
+        callback(&instance, &fake.event("blocked", &first)).await,
+        (200, json!({}))
+    );
+    assert_eq!(delivery(&world, "gen@example.org").await, "accepted:");
+    assert_eq!(
+        world
+            .scalar(&format!(
+                "SELECT count(*) FROM merezha_notify.provider_events \
+                 WHERE event = 'blocked' AND delivery_id = '{id}'"
+            ))
+            .await,
+        1,
+        "stored, correlated, no effect"
+    );
+    assert_eq!(
+        callback(&instance, &fake.event("delivered", &second))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(delivery(&world, "gen@example.org").await, "delivered:");
+    instance.stop().await;
+}
+
 /// Review M3: `provider_account` answers consume no attempt. A 70-minute
 /// run of 401s (twelve, five minutes apart on the block's clock) on a
 /// queue of two attempts keeps the security mail retrying, logs one error
