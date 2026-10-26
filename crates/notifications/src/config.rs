@@ -377,7 +377,7 @@ pub struct BrevoSettings {
     pub webhook_allowed_cidrs: Vec<Cidr>,
 }
 /// `[modules.notifications.push]`; present means push is on. The VAPID key
-/// is checked for shape here and parsed by the push slice.
+/// is parsed here, so a key that is not a P-256 scalar fails startup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushSettings {
     pub vapid_private_key: Secret,
@@ -742,16 +742,10 @@ fn key_material(secret: &Secret) -> Option<KeyMaterial> {
         .map(KeyMaterial)
 }
 
-/// A VAPID private key in shape: a PKCS#8 PEM, or base64url of 32 bytes.
+/// A usable VAPID private key: a PKCS#8 PEM, or base64url of a 32-byte
+/// P-256 scalar (NT §5.3).
 fn vapid_shape(secret: &Secret) -> bool {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let text = secret.expose().trim();
-    if text.starts_with("-----BEGIN PRIVATE KEY-----") {
-        return text.ends_with("-----END PRIVATE KEY-----");
-    }
-    URL_SAFE_NO_PAD
-        .decode(text.trim_end_matches('='))
-        .is_ok_and(|bytes| bytes.len() == 32)
+    crate::push::parse_private_key(secret.expose()).is_some()
 }
 
 /// A lowercase DNS host name.

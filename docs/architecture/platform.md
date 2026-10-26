@@ -1326,8 +1326,9 @@ over the capture drivers, the inbox REST routes, preferences, suppressions,
 unsubscribe, `send`, `status` and `redeliver`. Slice NT-N3 adds Brevo
 email: the email driver, the email status callback and `merezha
 notifications brevo register-webhook` ([Brevo email](#brevo-email)). Slice
-NT-N5 adds the inbox stream ([Inbox stream](#inbox-stream)). Brevo SMS
-(NT-N4), push (NT-N6) and webhook fan-out (NT-N7) come later.
+NT-N5 adds the inbox stream ([Inbox stream](#inbox-stream)) and NT-N6 Web
+Push ([Web Push](#web-push)). Brevo SMS (NT-N4) and webhook fan-out (NT-N7)
+come later.
 
 ```toml
 [modules.notifications]
@@ -1358,8 +1359,10 @@ mail to `skipped`), and exit code 0; or `status` `invalid` with
   `provider_events`, `preferences`, `user_settings`, `suppressions` and
   `captures`. Migration 2 (`inbox`, NT-N2) adds `inbox_counters` and
   `inbox_items`, stores user and tenant ids as text and adds the deliveries'
-  recipient `name`. Both checksums are pinned by a test; later slices add
-  migrations.
+  recipient `name`. Migration 3 (`provider_events`, NT-N3) adds pending
+  provider events. Migration 4 (`push`, NT-N6) adds
+  `push_subscriptions`. The checksums are pinned by a test; later slices
+  add migrations.
 - At start the block registers `notify.expand` (queue `notify.expand`),
   the delivery kinds of its capture drivers and the maintenance kinds and
   schedules with the jobs runtime.
@@ -1430,7 +1433,7 @@ get `skipped` with a reason:
 | `preference` | the user's `(topic, channel)` or `('*', channel)` preference is off, or the channel is outside a transactional topic's `default_channels` without an opt-in; security topics ignore preferences |
 | `not_opted_in` | a marketing topic without the user's explicit `enabled = true` for the topic and channel |
 | `suppressed` | a suppression covers the address: `invalid` for every topic, the other reasons for non-security topics (topic-scoped ones for their topic only) |
-| `no_subscription` | push targets, until NT-N6 adds subscriptions |
+| `no_subscription` | a push target whose user has no live subscription made with the current VAPID key in the notification's tenant scope; at send, a subscription that is gone, moved to another user or expired since |
 
 More targets than `limits.max_targets` (or `max_marketing_targets` for a
 marketing topic) reject the notification (`status = rejected`,
@@ -1439,8 +1442,9 @@ marketing topic) reject the notification (`status = rejected`,
 during expansion and stored with `expires_at = now + inbox.retention`;
 inbox deliveries are created `delivered`.
 
-The delivery worker (`notify.deliver.email`, `notify.deliver.sms`)
-registers for a `capture` driver and for the `brevo` email driver; with
+The delivery worker (`notify.deliver.email`, `notify.deliver.sms`, and
+`notify.deliver.push` with a push section) registers email and SMS for a
+`capture` driver and for the `brevo` email driver; with
 `sms.driver = "brevo"` the SMS delivery jobs wait in `notify.sms` until
 NT-N4 deploys. Per attempt it locks the delivery (another generation or a
 settled delivery is done; past `expires_at` it becomes `expired`;
@@ -1470,6 +1474,7 @@ Maintenance, each a cron schedule on queue `notify.maintenance` (UTC):
 | `settle_notifications` | every minute | sets `settled_at` on notifications whose deliveries all settled, 1,000 per batch |
 | `purge_data` | every 5 minutes | nulls `data` (and the deliveries' recipient names) of notifications settled more than `retention.data_after_settled` ago; counts `merezha.notification.data_purged` |
 | `inbox_expire` | hourly | deletes items past `expires_at` or archived more than `inbox.archived_retention` ago, 100 users per transaction in ascending order, raising each user's `purged_through` |
+| `push_expire` | hourly (minute 43) | with `[modules.notifications.push]`: deletes subscriptions past `expires_at`, made with another VAPID key and unused for 7 days, or with 10 consecutive failures and no success in 30 days, 1,000 per batch; counts `merezha.notification.push_subscriptions_removed` (`expired`, `key_changed`, `failures`) |
 
 ### Brevo email
 
@@ -1589,7 +1594,7 @@ check their permission at `Application` scope.
 | --- | --- | --- |
 | `POST send` | `notifications.send` | body: `topic`, `recipients` (`{user: "usr_.." \| {id}}`, `{tenant: {id, roles?}}`, `{application: {roles}}`, `{address: {email, name?, locale?}}`, `{address: {phone, locale?}}`), `channels?`, `template?`, `data?`, `secret_data?`, `locale?`, `dedupe_key` (stored as `api:{subject}:{key}`, at most 160 bytes in all, R4a), `tenant?`, `not_before?` (at most 30 days ahead, else 422 `validation_failed` at `/not_before`), `expires_at?` (after `not_before`, else at `/expires_at`), `collapse_key?`. With a tenant, user recipients are checked with `Directory::is_member` before the transaction. 202 `{notification_id, duplicate}`; 422 `invalid_dedupe_key`, `unknown_topic`, `unknown_template`, `channel_not_allowed`, `too_many_recipients`, `invalid_recipient`, `recipient_not_in_tenant`, `reserved_data_key`, `data_too_large`, `render_failed`; 503 `unavailable` (Directory) |
 | `GET status/{notification_id}` | `notifications.status.read` for the caller's own sends (source `api`, key `api:{subject}:…`); `notifications.admin` for every notification; 404 otherwise | `{id, topic, status, status_reason, created_at, settled_at, deliveries: [{id, channel, status, status_reason, attempt_count, target, accepted_at, settled_at}]}`, targets masked (`a***@example.com`, `+33•••••••78`, `push`, `inbox`), at most 1,000 deliveries; 404 |
-| `POST deliveries/{id}/redeliver` | `notifications.admin` | 202 `{generation}`: a new generation and job; 409 `not_redeliverable` (not `failed`, `unknown` or `expired`, or an inbox or push delivery), 409 `secret_purged` (the request had secret data), 410 `data_purged`; 404 |
+| `POST deliveries/{id}/redeliver` | `notifications.admin` | 202 `{generation}`: a new generation and job; 409 `not_redeliverable` (not `failed`, `unknown` or `expired`, or an inbox delivery), 409 `secret_purged` (the request had secret data), 410 `data_purged`; 404 |
 | `GET inbox?cursor=&limit=&state=unread\|all&topic=&tenant=` | self | `{items: [InboxItem], next_cursor}`, newest first, 1 to 100 (default 30), archived items hidden; 400 `invalid_cursor` |
 | `GET inbox/unread-count?tenant=` | self | `{unread}` |
 | `POST inbox/{id}/read`, `…/unread`, `…/archive` | self | the `InboxItem`; a change takes the next number of the user's counter as `change_seq`; a no-op takes none. 404 for another user's item |
@@ -1686,6 +1691,126 @@ changes as Server-Sent Events.
   root span `notify sse` (`notify.resumed`) for the opening and for each
   batch a wake triggers.
 
+### Web Push
+
+`[modules.notifications.push]` turns push on (NT §5.3). Generate a key pair
+and keep the private half as a secret:
+
+```sh
+cargo run --locked -p merezha-cli -- notifications vapid generate
+```
+
+It prints one JSON object, `{status: "generated", private_key,
+private_key_pem, public_key, key_id}`, and exits 0; it reads no
+configuration. `private_key` (base64url of the scalar) or `private_key_pem`
+goes into `vapid_private_key = { env = "…" }` or `{ file = "…" }`;
+`public_key` is the browser's `applicationServerKey`; `key_id` is the first
+16 hex of SHA-256 of the uncompressed public key. The key is never logged.
+
+```toml
+[modules.notifications.push]
+vapid_private_key = { file = "/run/secrets/vapid.pem" }
+vapid_subject = "mailto:ops@acme.com"
+# ttl = "1d"
+# allowed_hosts = ["fcm.googleapis.com", "updates.push.services.mozilla.com",
+#                  "push.services.mozilla.com", "web.push.apple.com", "notify.windows.com"]
+# max_subscriptions_per_user = 10
+```
+
+Routes under `/v1/notifications/`:
+
+| Method and path | Access | Answer |
+| --- | --- | --- |
+| `GET push/vapid-public-key` | public (credential-free) | `{public_key, key_id}`; 404 `push_disabled` without the section |
+| `POST push/subscriptions` | self | `PushSubscription.toJSON()` (`{endpoint, expirationTime, keys: {p256dh, auth}}`) plus `label?` (at most 64 characters): 201 `{id, key_id, created_at}`. 422 `push_host_not_allowed` (`details: [{path: "/endpoint", code: "host_not_allowed"}]`), `subscription_invalid` (`/endpoint` `invalid_url`, `/keys/p256dh` or `/keys/auth` `invalid_key`, `/label` or `/expirationTime` `invalid_value`); 404 `push_disabled` |
+| `GET push/subscriptions` | self | `[{id, label, endpoint_origin, created_at, last_success_at}]`, newest first; the endpoint and keys are never returned |
+| `DELETE push/subscriptions/{id}` | self | 204; 404 for a missing subscription, another user's, or another tenant's |
+
+- **Allowlist (strict).** An endpoint must be `https` on port 443, with no
+  userinfo or fragment, at most 2,048 bytes, and a host equal to or a
+  dot-suffix of an `allowed_hosts` entry. The host must be a valid DNS name
+  (labels of 1 to 63 bytes, at most 253 bytes in all, no empty label);
+  otherwise the answer is `subscription_invalid`. It is checked at subscribe and
+  again before every send, so removing an entry stops pushes to its
+  subscriptions (`failed` / `push_host_not_allowed`). With
+  `egress.allow_private_networks = true` (refused with `http.public`),
+  `http` and other ports pass too, for local push services; the host rule
+  stays.
+- **Ownership and tenants.** `p256dh` must be a valid uncompressed P-256
+  point and `auth` 16 bytes. A subscription records the user and the
+  session's active tenant, like the inbox: a notification with a tenant
+  reaches only the subscriptions made in that tenant, one without a tenant
+  every subscription of its user; listing and deleting see the tenantless
+  subscriptions and the active tenant's. A known endpoint is upserted: it
+  moves to the subscribing user (a browser profile that changed account),
+  and when it changes user or tenant it gets a new id, so a push queued for
+  the previous owner is not sent. Past `max_subscriptions_per_user` the
+  least recently used subscriptions are deleted, under a per-user lock;
+  the subscription the request just made is never the one deleted.
+- **One browser, one tenant (for client authors).** A browser profile has
+  one endpoint per application server key, and the endpoint is unique, so a
+  subscription serves one user in one tenant at a time. Subscribing again
+  after switching tenants moves the subscription (new id) to the new
+  tenant: the browser stops receiving the previous tenant's notifications.
+  A subscription made without an active tenant receives only the
+  notifications without a tenant. In v1 one browser cannot receive several
+  tenants' pushes at once; a client should resubscribe when the user
+  switches tenants and say so in its interface.
+- **Key rotation.** Deploy the new `vapid_private_key`; clients compare the
+  `key_id` of `GET push/vapid-public-key` with the one they subscribed
+  with and resubscribe. Each instance targets only the subscriptions of
+  its own key, and `push_expire` deletes another key's subscriptions only
+  once they have gone unused for 7 days (`last_used_at`). During a rolling
+  deploy the instances on the old and on the new key each keep using their
+  own subscriptions, so neither deletes the other's; after the rollout the
+  old key's subscriptions stop being used and go a week later. Until the
+  rollout completes, a push job picked up by an instance on the other key
+  is `skipped` / `no_subscription`: that push is not sent, though the
+  subscription stays. The inbox keeps the durable copy of the notification.
+  Issue #66 tracks sending these pushes instead.
+- **Delivery.** Expansion creates one push delivery per live subscription
+  made with the current VAPID key (`push_subscription_id`, target key
+  `pushsub:<id>`). The `notify.deliver.push` worker (queue `notify.push`)
+  runs the steps of the email worker; it encrypts the payload with RFC
+  8291 `aes128gcm` and signs an RFC 8292 VAPID JWT (`aud` the endpoint
+  origin, `exp` 12 h, `sub` the subject, cached per origin for an hour).
+  Headers: `TTL` (`push.ttl` in seconds), `Urgency` from the topic
+  priority, and `Topic` (the first 32 base64url characters of SHA-256 of
+  the collapse key) when a collapse key is set. The payload is
+  `{id, notification_id, topic, title, body, url, tag}`, never more than
+  3,000 bytes, with `body` cut at a character boundary to fit. The render
+  refuses (`render_failed`) a push whose other fields would not fit with
+  the worst-case collapse key (64 bytes JSON-escaped to 384); should a
+  payload still not fit with an empty body, `tag` is dropped, and if even
+  that does not fit the delivery fails `push_payload_too_large`.
+- **Outcomes.** 2xx: `accepted`, with `Location` (at most 256 characters) as
+  the message id. 404 or 410: the subscription is deleted and the delivery
+  `failed` / `subscription_gone`. 400 (`push_rejected`), 413
+  (`push_payload_too_large`) and 3xx (`push_redirected`, redirects are never
+  followed) are permanent. 401 or 403: transient `push_auth`, logged as
+  `notification.provider_account_error` and counted, permanent from the
+  third attempt. 429 waits for `Retry-After`, at most `push.ttl` (and 24 h);
+  5xx and network errors retry.
+  A crash between the call and its record resends: the payload's `id` lets
+  the client deduplicate. Each attempt refreshes the subscription's
+  `last_used_at`, and success resets `consecutive_failures`.
+- **Egress guard (NT §5.6).** Pushes go through a dedicated client: no
+  redirects, no proxy, a 5 s connect timeout, at most 2 idle connections per
+  host, and a DNS resolver that drops blocked addresses (the private,
+  loopback, link-local, documentation, multicast and reserved ranges of NT
+  §5.6, IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96` and 6to4
+  addresses by their embedded IPv4, the whole local-use NAT64 prefix
+  `64:ff9b:1::/48`, and `egress.deny_cidrs`, matched against both the
+  address and the IPv4 it embeds). The client dials only the
+  addresses the resolver returned, so a name cannot rebind between check
+  and connect; IP literals are checked before the request. A refused
+  destination fails the delivery `egress_blocked` (permanent), logs
+  `notification.egress_blocked` and counts
+  `merezha.notification.egress_blocked{notify.target=push}`. With
+  `MEREZHA_NOTIFY_NO_EGRESS=1` only loopback addresses are dialled.
+- Endpoints, `p256dh`, `auth`, payloads and the VAPID key never appear in
+  logs, spans, metrics or `Debug` output.
+
 ### Templates
 
 Project files live under `templates.dir` (default `notifications/templates`,
@@ -1731,7 +1856,8 @@ Keys and defaults are NT §7.2. Bounds and checks the block adds:
 | `email.from`, `email.reply_to` | `Name <local@domain>` or `local@domain` (`invalid_sender`); `from` required with `driver = "brevo"` |
 | `sms` | `sender` required unless disabled: at most 11 alphanumerics or 15 digits; `max_segments` 1 to 10 |
 | `brevo` | required with a `brevo` driver; `api_key` required then, `webhook_token` (at least 32 characters, `secret_too_short`) with the email driver; `timeout` 1 s to 60 s, `connect_timeout` 100 ms to 30 s |
-| `push` | `vapid_private_key` a PKCS#8 PEM or base64url of 32 bytes (`invalid_vapid_key`), `vapid_subject` `mailto:` or `https:`; `ttl` 0 to 28 d; `allowed_hosts` at most 64 lowercase host names; `max_subscriptions_per_user` 1 to 100 |
+| `push` | `vapid_private_key` a secret holding a PKCS#8 PEM or base64url of a 32-byte P-256 scalar, parsed at startup (`invalid_vapid_key`), `vapid_subject` `mailto:` or `https:`; `ttl` 0 to 28 d; `allowed_hosts` at most 64 lowercase host names (default: the five services of NT §7.2); `max_subscriptions_per_user` 1 to 100 |
+| `egress` | `allow_private_networks` (development and tests; also lets push endpoints use `http` and any port), `deny_cidrs` at most 64 networks, always refused |
 | `inbox` | durations 1 d to 3650 d |
 | `sse` | `heartbeat` 1 s to 5 min, `reconcile_interval` 1 s to 10 min, `replay_max` 1 to 10000, `max_streams_per_user` 1 to 64, `max_streams` 1 to 100000, `max_lifetime` 1 min to 1 d, `reauth_interval` 10 s to 1 h |
 | `webhooks` | `max_endpoints_per_tenant` 1 to 1000, `max_payload_bytes` 1024 to 1048576, `timeout` 1 s to 60 s, `concurrency_per_endpoint` 1 to 64, `auto_disable_after` 1 h to 30 d; `event_types` names follow R11, at most 256 |

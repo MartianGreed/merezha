@@ -23,6 +23,14 @@
 //! `callback_path_mismatch`, `callback_host_mismatch`, `provider_account`,
 //! `provider_rejected[_<code>]`, or a transport code).
 //! The API key and the token are never printed.
+//!
+//! `merezha notifications vapid generate` (NT §5.3, NT-N6) prints a new
+//! VAPID key pair as one JSON object and exits 0: `private_key` (base64url
+//! of the 32-byte P-256 scalar, the value of `push.vapid_private_key`),
+//! `private_key_pem` (the same key as PKCS#8), `public_key` (base64url of
+//! the uncompressed point, the browser's `applicationServerKey`) and
+//! `key_id`. It reads no configuration and writes nothing else; store the
+//! private key as a secret (`{ env = "…" }` or `{ file = "…" }`).
 use merezha_notifications::{HostFacts, Notifications};
 use merezha_platform::{ConfigInput, Module, host};
 use serde_json::{Value, json};
@@ -30,7 +38,7 @@ use std::process::ExitCode;
 
 pub const USAGE: &str = "merezha notifications check --config PATH [--listen ADDRESS] \
      [--set SECTION.KEY=VALUE]... | merezha notifications brevo register-webhook --config PATH \
-     [--url URL [--allow-host]] [--set SECTION.KEY=VALUE]...";
+     [--url URL [--allow-host]] [--set SECTION.KEY=VALUE]... | merezha notifications vapid generate";
 
 /// How long `brevo register-webhook` waits for Brevo.
 const REGISTER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -92,6 +100,14 @@ pub fn main(mut args: impl Iterator<Item = String>) -> ExitCode {
     let register = match args.next().as_deref() {
         Some("check") => false,
         Some("brevo") if args.next().as_deref() == Some("register-webhook") => true,
+        Some("vapid") => {
+            if args.next().as_deref() != Some("generate") || args.next().is_some() {
+                return invalid();
+            }
+            let (report, code) = vapid_generate();
+            println!("{report}");
+            return code;
+        }
         _ => return invalid(),
     };
     let mut url = None;
@@ -186,5 +202,25 @@ pub fn register_webhook(
             )
         }
         Err(failure) => failed(&failure.code),
+    }
+}
+
+/// The report and exit code of `vapid generate`, for embedding and tests.
+pub fn vapid_generate() -> (Value, ExitCode) {
+    match merezha_notifications::push::generate() {
+        Ok(keys) => (
+            json!({
+                "status": "generated",
+                "private_key": keys.private_key,
+                "private_key_pem": keys.private_key_pem,
+                "public_key": keys.public_key,
+                "key_id": keys.key_id,
+            }),
+            ExitCode::SUCCESS,
+        ),
+        Err(failure) => (
+            json!({"status": "failed", "code": failure.code}),
+            ExitCode::from(1),
+        ),
     }
 }

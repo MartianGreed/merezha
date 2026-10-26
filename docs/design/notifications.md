@@ -291,10 +291,13 @@ CREATE INDEX inbox_items_expiry_idx ON inbox_items (expires_at);
 ALTER TABLE provider_events ADD COLUMN pending boolean NOT NULL DEFAULT false;
 CREATE INDEX provider_events_pending_idx ON provider_events (delivery_id, id) WHERE pending;
 
--- Migration 4 (slice N6): push
+-- Migration 4 (slice N6): push. As applied, user and tenant ids are text
+-- (as migration 2 made them) and the row keeps the subscribing session's
+-- active tenant, which scopes pushes like the inbox (5.3).
 CREATE TABLE push_subscriptions (
   id uuid PRIMARY KEY,
-  user_id uuid NOT NULL,
+  user_id text NOT NULL,
+  tenant_id text,
   endpoint text NOT NULL UNIQUE CHECK (length(endpoint) <= 2048),
   endpoint_origin text NOT NULL,
   p256dh bytea NOT NULL CHECK (octet_length(p256dh) = 65),
@@ -883,22 +886,38 @@ accepts another host with the `host_override` warning.
 - **Crate.** `web-push-native` 0.5.0, pure Rust, implements RFC 8291
   `aes128gcm` and RFC 8292 VAPID. It builds an `http::Request<Vec<u8>>` that
   the egress-guarded client (5.6) sends. Its `with_vapid` builder ties the JWT
-  lifetime to `TTL`, so the block signs separately with
-  `VapidSignature::sign(endpoint, 12 h, subject, key)`, caching per push
-  origin for one hour. RFC 8292 caps `exp` at 24 h.
+  lifetime to `TTL`, so the block signs separately, a 12 h JWT cached per
+  push origin for one hour; RFC 8292 caps `exp` at 24 h. N6 signs with the
+  re-exported `jwt_simple` and `aud` = the endpoint's full origin, because
+  `VapidSignature::sign` drops a non-default port from `aud`; for the push
+  services (port 443) the two are the same. The block calls
+  `web_push_native::encrypt` and builds the request itself.
 - **Keys.** `push.vapid_private_key` is a secret: a PKCS#8 PEM or a base64url
   32-byte P-256 scalar. The public key is derived from it. `push.vapid_subject`
   (`mailto:` or `https:`) is required. `vapid_key_id` is the first 16 hex of
   SHA-256 of the uncompressed public key. `merezha notifications vapid
   generate` prints a new pair. A rotation orphans existing subscriptions:
   clients compare `key_id` and resubscribe, and old subscriptions are never
-  targeted and get deleted by `push_expire`.
+  targeted and get deleted by `push_expire` once unused for 7 days. The
+  grace keeps a rolling deploy safe: instances on the old and the new key
+  each refresh `last_used_at` of the subscriptions they target, so neither
+  deletes the other's.
 - **Subscribe.** The route takes `PushSubscription.toJSON()` plus `label?`.
   - The endpoint must be https on port 443, with a host equal to or a
     dot-suffix of an entry in `push.allowed_hosts`.
   - `p256dh` must be a valid 65-byte uncompressed point and `auth` 16 bytes.
   - The row is upserted on `endpoint`: a known endpoint moves to the current
-    user (the browser profile changed account).
+    user (the browser profile changed account). An endpoint that changes
+    user or tenant gets a new id, so a push queued for the previous owner
+    is not sent.
+  - The row keeps the session's active tenant. Like the inbox (5.4), a
+    notification with a tenant reaches the subscriptions made in that
+    tenant only, and one without a tenant every subscription of its user;
+    the list and delete routes see the tenantless subscriptions and the
+    active tenant's.
+  - With `egress.allow_private_networks` (development only), `http` and
+    other ports pass too; the host rule stays. The allowlist is checked
+    again at send (`push_host_not_allowed`).
   - At most `push.max_subscriptions_per_user` (10) per user; the least
     recently used is deleted when a new one comes in.
 - **Payload**, at most 3,000 bytes (the RFC 8291 single-record plaintext limit
@@ -916,7 +935,7 @@ accepts another host with the `host_override` warning.
     with `subscription_gone`.
   - 413 or 400: permanent.
   - 401 or 403: transient `push_auth` with an error log, at most 3 attempts.
-  - 429: delay from `Retry-After`.
+  - 429: delay from `Retry-After`, at most `push.ttl` (and 24 h).
   - 5xx or a network error: transient.
 - **Cleanup.** A subscription is deleted on 404 or 410, when `expires_at`
   passes, after 10 consecutive failures with no success in 30 days, or when
@@ -1125,8 +1144,11 @@ idle connections per host.
   `203.0.113.0/24`, `224.0.0.0/4`, `240.0.0.0/4`.
 - **Blocked IPv6:** `::/128`, `::1/128`, `100::/64`, `2001::/23`,
   `2001:db8::/32`, `fc00::/7`, `fe80::/10`, `fec0::/10`, `ff00::/8`.
-- **Embedded IPv4.** `::ffff:0:0/96`, `64:ff9b::/96`, `64:ff9b:1::/48` and
-  `2002::/16` are checked by their embedded IPv4 address.
+- **Embedded IPv4.** `::ffff:0:0/96`, `::/96`, `64:ff9b::/96` and
+  `2002::/16` are checked by their embedded IPv4 address, against the
+  blocked ranges and `egress.deny_cidrs`. The local-use NAT64 prefix
+  `64:ff9b:1::/48` (RFC 8215) is blocked whole: its IPv4 address can sit
+  anywhere in the low 80 bits.
 - **Configuration.** `egress.deny_cidrs` adds ranges.
   `egress.allow_private_networks = true` (development and tests) lifts the
   private-range check and is refused with `http.public = true`. There is no

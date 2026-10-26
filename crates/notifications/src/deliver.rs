@@ -1,4 +1,4 @@
-//! The common delivery worker of email and SMS (NT §5.1).
+//! The common delivery worker of email, SMS and push (NT §5.1).
 //!
 //! 1. Tx A locks the delivery. A settled delivery or another generation is
 //!    done; past `expires_at` it is `expired`; suppressions and preferences
@@ -16,6 +16,14 @@
 //! deadline is `brevo.timeout`; an account problem (`provider_account`) is
 //! logged at error level and counted, a rate limit at warn. Brevo SMS
 //! (NT-N4) implements the same trait.
+//!
+//! Push (NT-N6) runs the same steps: Tx A also reads the delivery's
+//! subscription (gone, moved to another user, made with an old VAPID key,
+//! expired or out of the tenant scope: `skipped` / `no_subscription`), the
+//! request goes through [`crate::push::PushSender`], and Tx B refreshes the
+//! subscription, counts a failure, or deletes it on 404 or 410
+//! (`subscription_gone`). An ambiguous push is resent: the payload carries
+//! the delivery id for client-side deduplication.
 use crate::{
     brevo::events,
     drivers::{EmailMessage, SendOutcome, SmsMessage},
@@ -72,6 +80,8 @@ struct Locked {
     account_streak_since: Option<jiff::Timestamp>,
     correlation_id: Option<String>,
     tenant: Option<String>,
+    /// The subscription of a push delivery, read in Tx A.
+    push: Option<crate::push::PushTarget>,
 }
 
 enum Prepared {
@@ -201,6 +211,36 @@ async fn deliver(
                 driver.provider(),
             )
         }
+        (Channel::Push, Ok(Rendered::Push(content))) => {
+            let (Some(sender), Some(target)) = (&core.push, &locked.push) else {
+                return finish(
+                    core,
+                    channel,
+                    id,
+                    &locked,
+                    "failed",
+                    reason::CHANNEL_DISABLED,
+                )
+                .await;
+            };
+            let message = crate::push::PushMessage {
+                delivery: id,
+                notification: locked.notification,
+                topic: &locked.topic,
+                content: &content,
+                target,
+            };
+            (
+                sender
+                    .send(
+                        &message,
+                        send_by(Some(crate::push::PUSH_TIMEOUT)),
+                        ctx.attempt,
+                    )
+                    .await,
+                crate::drivers::Provider::Webpush,
+            )
+        }
         (Channel::Sms, Ok(Rendered::Sms(content))) => {
             let (Some(driver), Some(address)) = (&core.sms, &locked.address) else {
                 return finish(
@@ -291,6 +331,11 @@ async fn prepare(
     let db = core.database.clone();
     let now = core.now();
     let settings = core.settings.clone();
+    let push_key = core
+        .push
+        .as_ref()
+        .filter(|_| channel == Channel::Push)
+        .map(|sender| sender.vapid().key_id().to_owned());
     let (prepared, logged) = db
         .clone()
         .transaction(deadline, move |tx| {
@@ -368,6 +413,15 @@ async fn prepare(
                     });
                     if blocked {
                         decided = Some(set("skipped", reason::SUPPRESSED));
+                    }
+                }
+                let mut push = None;
+                if decided.is_none()
+                    && let Some(key_id) = &push_key
+                {
+                    match crate::push::load_target(&db, tx, id, key_id, now).await? {
+                        Some(target) => push = Some(target),
+                        None => decided = Some(set("skipped", reason::NO_SUBSCRIPTION)),
                     }
                 }
                 if let Some((status, why)) = decided {
@@ -514,6 +568,7 @@ async fn prepare(
                         account_streak_since,
                         correlation_id: row.get(17),
                         tenant: row.get(18),
+                        push,
                     })),
                     None,
                 ))
@@ -858,6 +913,8 @@ async fn record(
     let attempt_outcome = step.attempt;
     let run_at = step.after.map(|after| plus(now, after));
     let deadline = Instant::now() + CHANNEL_TIMEOUT;
+    let subscription = locked.push.as_ref().map(|t| t.subscription);
+    let sent = outcome.clone();
     let written = db
         .clone()
         .transaction(deadline, move |tx| {
@@ -895,6 +952,7 @@ async fn record(
                     .await
                     .map_err(|e| classify(&e))?
                 };
+                let mut gone = false;
                 if changed > 0 {
                     db.execute(
                         tx,
@@ -903,6 +961,10 @@ async fn record(
                     )
                     .await
                     .map_err(|e| classify(&e))?;
+                    if let Some(subscription) = subscription {
+                        gone =
+                            crate::push::after_attempt(&db, tx, subscription, &sent, now).await?;
+                    }
                     if let Some(record) = continuation {
                         outbox
                             .append(tx, &[record], OnDuplicate::Ignore)
@@ -915,15 +977,19 @@ async fn record(
                         events::apply_pending(&db, tx, id, now).await?;
                     }
                 }
-                Ok(changed)
+                Ok((changed, gone))
             })
         })
         .await;
     match written {
         Err(failure) => return Outcome::retry(&failure.code),
         // Another run took the delivery over: it records the outcome.
-        Ok(0) => return Outcome::Done,
-        Ok(_) => {}
+        Ok((0, _)) => return Outcome::Done,
+        Ok((_, gone)) => {
+            if gone {
+                crate::push::removed(&core.metrics, "gone", 1);
+            }
+        }
     }
     tracing::Span::current().record("notify.outcome", attempt_outcome);
     core.metrics

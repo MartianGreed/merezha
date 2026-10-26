@@ -837,7 +837,10 @@ impl TemplateRegistry {
                 let skeleton = serde_json::json!({
                     "id": Uuid::nil().to_string(), "notification_id": Uuid::nil().to_string(),
                     "topic": ctx.topic, "title": title, "body": "", "url": url,
-                    "tag": "x".repeat(merezha_platform::ports::MAX_COLLAPSE_KEY),
+                    // The worst case of a collapse key, which only has a
+                    // byte limit: control characters, six bytes each once
+                    // escaped (`\u0001`).
+                    "tag": "\u{1}".repeat(merezha_platform::ports::MAX_COLLAPSE_KEY),
                 });
                 if skeleton.to_string().len() > MAX_PUSH_PAYLOAD_BYTES {
                     return Err(fail("output_too_large"));

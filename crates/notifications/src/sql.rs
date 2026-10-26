@@ -49,19 +49,21 @@ pub const NOTIFICATION_INSERT: Statement = s(
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
      $19, $20, $21, $22, $23) ON CONFLICT DO NOTHING RETURNING id",
 );
-/// Deliveries of notification `$1`, one per array position.
+/// Deliveries of notification `$1`, one per array position; `$14` is the
+/// push subscription of each push target (NT-N6).
 pub const DELIVERIES_INSERT: Statement = s(
     "notify.delivery.insert",
     "INSERT merezha_notify.deliveries",
     "INSERT INTO merezha_notify.deliveries (id, notification_id, channel, target_key, user_id, \
-     address, name, locale, status, status_reason, provider, run_at, created_at, updated_at, \
-     settled_at) \
+     address, name, locale, status, status_reason, provider, push_subscription_id, run_at, \
+     created_at, updated_at, settled_at) \
      SELECT d.id, $1, d.channel, d.target_key, d.user_id, d.address, d.name, d.locale, d.status, \
-     d.status_reason, d.provider, $2::timestamptz, $3::timestamptz, $3::timestamptz, \
-     CASE WHEN d.status = 'queued' THEN NULL ELSE $3::timestamptz END \
+     d.status_reason, d.provider, d.subscription, $2::timestamptz, $3::timestamptz, \
+     $3::timestamptz, CASE WHEN d.status = 'queued' THEN NULL ELSE $3::timestamptz END \
      FROM unnest($4::uuid[], $5::text[], $6::text[], $7::text[], $8::text[], $9::text[], \
-     $10::text[], $11::text[], $12::text[], $13::text[]) \
-     AS d(id, channel, target_key, user_id, address, name, locale, status, status_reason, provider) \
+     $10::text[], $11::text[], $12::text[], $13::text[], $14::uuid[]) \
+     AS d(id, channel, target_key, user_id, address, name, locale, status, status_reason, provider, \
+     subscription) \
      ON CONFLICT DO NOTHING",
 );
 /// Take `$2[i]` numbers for each user `$1[i]`, locking the counter rows in

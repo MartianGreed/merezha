@@ -349,11 +349,16 @@ pub struct Options {
     pub email_driver: Option<Arc<dyn merezha_notifications::drivers::EmailDriver>>,
     /// The host's meters; no-op by default.
     pub meters: Option<merezha_telemetry::Meters>,
-    /// More environment variables for the configuration (secrets).
+    /// More environment variables for the configuration (secrets), such
+    /// as a VAPID key.
     pub env: Vec<(String, String)>,
     /// The block's wall clock; the system's by default. The jobs runtime
     /// keeps PostgreSQL's.
     pub clock: Option<Arc<dyn merezha_platform::Clock>>,
+    /// Files written beside `merezha.toml`, such as project templates.
+    pub files: Vec<(String, String)>,
+    /// The resolver of push hosts under the egress guard.
+    pub push_lookup: Option<Arc<dyn merezha_notifications::egress::Lookup>>,
 }
 impl Options {
     pub fn new(section: &str, directory: Arc<dyn Directory>) -> Self {
@@ -369,6 +374,8 @@ impl Options {
             meters: None,
             env: Vec::new(),
             clock: None,
+            files: Vec::new(),
+            push_lookup: None,
         }
     }
 }
@@ -389,6 +396,11 @@ impl Instance {
             format!("{BASE}{}", options.section),
         )
         .unwrap();
+        for (name, text) in &options.files {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
         let input = merezha_platform::ConfigInput {
             path: dir.path().join("merezha.toml"),
             env: [
@@ -405,6 +417,9 @@ impl Instance {
             .with_faults(options.faults.clone());
         if let Some(driver) = options.email_driver.clone() {
             module = module.with_email_driver(driver);
+        }
+        if let Some(lookup) = options.push_lookup.clone() {
+            module = module.with_push_lookup(lookup);
         }
         module
             .configure(&config.modules["notifications"])
@@ -530,7 +545,8 @@ impl Instance {
                        WHERE source IN ('notifications') AND relayed_at IS NULL \
                        AND quarantined_at IS NULL AND (run_at IS NULL OR run_at <= now())) \
                      + (SELECT count(*) FROM merezha_jobs.jobs WHERE kind IN \
-                       ('notify.expand', 'notify.deliver.email', 'notify.deliver.sms') \
+                       ('notify.expand', 'notify.deliver.email', 'notify.deliver.sms', \
+                        'notify.deliver.push') \
                        AND state IN ('available', 'running') AND run_at <= now())",
                     &[],
                 )

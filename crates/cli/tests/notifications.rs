@@ -315,3 +315,86 @@ fn brevo_register_webhook_creates_the_bearer_webhook() {
     assert_eq!(fake.requests_to("/v3/webhooks").len(), 3);
     drop(fake);
 }
+
+/// NT-N6: `vapid generate` prints a key pair that `check` accepts as
+/// `push.vapid_private_key`, and `merezha run` serves its public half at
+/// `GET /v1/notifications/push/vapid-public-key` without logging the key.
+#[test]
+fn vapid_generate_prints_a_pair_the_push_section_accepts() {
+    let output = Command::new(env!("CARGO_BIN_EXE_merezha"))
+        .args(["notifications", "vapid", "generate"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let keys: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(keys["status"], "generated");
+    let private = keys["private_key"].as_str().unwrap().to_owned();
+    let public = keys["public_key"].as_str().unwrap().to_owned();
+    assert_eq!(private.len(), 43, "base64url of 32 bytes");
+    assert_eq!(public.len(), 87, "base64url of 65 bytes");
+    assert_eq!(keys["key_id"].as_str().unwrap().len(), 16);
+    assert!(
+        keys["private_key_pem"]
+            .as_str()
+            .unwrap()
+            .starts_with("-----BEGIN PRIVATE KEY-----")
+    );
+    let extra = Command::new(env!("CARGO_BIN_EXE_merezha"))
+        .args(["notifications", "vapid", "generate", "--now"])
+        .output()
+        .unwrap();
+    assert_eq!(extra.status.code(), Some(2));
+
+    let dir = tempfile::tempdir().unwrap();
+    let section = "[modules.notifications]\nsecret_key = { env = \"NOTIFY_KEY\" }\n\
+         [modules.notifications.push]\nvapid_private_key = { env = \"VAPID_KEY\" }\n\
+         vapid_subject = \"mailto:ops@example.com\"\n";
+    let config = project(dir.path(), section);
+    let (code, report) = check(&config, &[("NOTIFY_KEY", KEY), ("VAPID_KEY", &private)]);
+    assert_eq!(
+        (code, report["push"].clone()),
+        (Some(0), Value::Bool(true)),
+        "{report}"
+    );
+    // A key that is not a P-256 scalar fails startup, without its value.
+    let (code, report) = check(
+        &config,
+        &[
+            ("NOTIFY_KEY", KEY),
+            ("VAPID_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        ],
+    );
+    assert_eq!(code, Some(2));
+    assert_eq!(
+        codes(&report),
+        [(
+            "modules.notifications.push.vapid_private_key".to_owned(),
+            "invalid_vapid_key".to_owned()
+        )]
+    );
+
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let mut host = Host::spawn(
+        &config,
+        &[
+            ("NOTIFY_TEST_DATABASE_URL", test.url()),
+            ("NOTIFY_KEY", KEY),
+            ("VAPID_KEY", &private),
+        ],
+        "run",
+    );
+    let address = host.ready();
+    let reply = request(
+        address,
+        "GET",
+        "/v1/notifications/push/vapid-public-key",
+        "",
+    );
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.body["public_key"], Value::String(public));
+    assert_eq!(reply.body["key_id"], keys["key_id"]);
+    let text = fs::read_to_string(&host.log).unwrap();
+    assert!(!text.contains(&private), "the VAPID key is never logged");
+}

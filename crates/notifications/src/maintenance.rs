@@ -1,6 +1,7 @@
 //! Maintenance tasks of this slice (NT §2.5), declared as cron schedules on
 //! `notify.maintenance` with the skip missed-run policy: `settle_notifications`
-//! every minute, `purge_data` every five minutes, `inbox_expire` hourly.
+//! every minute, `purge_data` every five minutes, `inbox_expire` and
+//! (NT-N6) `push_expire` hourly.
 //! Each run works in bounded batches within its deadline.
 use crate::{notifier::Core, sql};
 use merezha_domain::Failure;
@@ -22,18 +23,21 @@ pub enum Task {
     SettleNotifications,
     PurgeData,
     InboxExpire,
+    PushExpire,
 }
 impl Task {
-    pub const ALL: [Task; 3] = [
+    pub const ALL: [Task; 4] = [
         Task::SettleNotifications,
         Task::PurgeData,
         Task::InboxExpire,
+        Task::PushExpire,
     ];
     pub fn name(self) -> &'static str {
         match self {
             Task::SettleNotifications => "settle_notifications",
             Task::PurgeData => "purge_data",
             Task::InboxExpire => "inbox_expire",
+            Task::PushExpire => "push_expire",
         }
     }
     /// The job kind and the schedule name: `notify.maintenance.<task>`.
@@ -45,6 +49,7 @@ impl Task {
             Task::SettleNotifications => "* * * * *",
             Task::PurgeData => "*/5 * * * *",
             Task::InboxExpire => "17 * * * *",
+            Task::PushExpire => "43 * * * *",
         }
     }
 }
@@ -55,6 +60,21 @@ pub async fn run(core: &Core, task: Task, deadline: Instant) -> Result<u64, Fail
         Task::SettleNotifications => settle(core, deadline).await,
         Task::PurgeData => purge_data(core, deadline).await,
         Task::InboxExpire => inbox_expire(core, deadline).await,
+        // Without a push section the subscriptions are kept: a key id to
+        // compare with exists only while push is on.
+        Task::PushExpire => match &core.push {
+            Some(sender) => {
+                crate::push::expire(
+                    &core.database,
+                    &core.metrics,
+                    sender.vapid().key_id(),
+                    core.now(),
+                    deadline,
+                )
+                .await
+            }
+            None => Ok(0),
+        },
     }
 }
 

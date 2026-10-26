@@ -69,6 +69,8 @@ pub struct Core {
     /// The SMS driver, `None` while it is `disabled` or not yet built in
     /// this slice (Brevo, NT-N4).
     pub sms: Option<Arc<dyn crate::drivers::SmsDriver>>,
+    /// The Web Push sender, `None` without `[modules.notifications.push]`.
+    pub push: Option<Arc<crate::push::PushSender>>,
 }
 impl std::fmt::Debug for Core {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
