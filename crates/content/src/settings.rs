@@ -127,12 +127,20 @@ impl Delivery {
 /// `delivery.public_base_url`: an absolute `https` URL, or `http` to a
 /// loopback host (`localhost`, `127.0.0.0/8`, `::1`) when the listener is
 /// private loopback (`http.public = false`, no `http.trusted_proxies`,
-/// a loopback `http.listen`); a host, no userinfo, query or fragment, at
-/// most [`MAX_PUBLIC_BASE_URL`] bytes. A path is kept, so a host mounted
-/// under a prefix gets it. Returned normalized, without a trailing slash.
-/// Fails `invalid_url`, or `insecure_origin` for `http` elsewhere.
+/// a loopback `http.listen`). The text is visible ASCII only (no
+/// whitespace, around it or inside, and no backslash, which URL parsers
+/// read as `/`); the host is an IP address or a DNS name of letters,
+/// digits and inner hyphens (punycode for an international name, no
+/// `*`, `_` or empty label); a port is 1 to 65535; no userinfo, query or
+/// fragment; at most [`MAX_PUBLIC_BASE_URL`] bytes. A path is kept, so a
+/// host mounted under a prefix gets it. Returned normalized, without a
+/// trailing slash. Fails `invalid_url`, or `insecure_origin` for `http`
+/// elsewhere.
 pub fn public_base_url(text: &str, private_loopback: bool) -> Result<String, &'static str> {
-    if text.len() > MAX_PUBLIC_BASE_URL {
+    if text.is_empty()
+        || text.len() > MAX_PUBLIC_BASE_URL
+        || !text.bytes().all(|b| b.is_ascii_graphic() && b != b'\\')
+    {
         return Err("invalid_url");
     }
     let url = url::Url::parse(text).map_err(|_| "invalid_url")?;
@@ -143,10 +151,12 @@ pub fn public_base_url(text: &str, private_loopback: bool) -> Result<String, &'s
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
+        || url.port() == Some(0)
     {
         return Err("invalid_url");
     }
     let loopback = match host {
+        url::Host::Domain(domain) if !dns_name(domain) => return Err("invalid_url"),
         url::Host::Domain(domain) => domain == "localhost",
         url::Host::Ipv4(ip) => ip.is_loopback(),
         url::Host::Ipv6(ip) => ip.is_loopback(),
@@ -162,6 +172,20 @@ pub fn public_base_url(text: &str, private_loopback: bool) -> Result<String, &'s
         return Err("invalid_url");
     }
     Ok(normalized.to_owned())
+}
+
+/// A DNS host name: at most 253 bytes of labels of 1 to 63 letters,
+/// digits and hyphens, none starting or ending with a hyphen.
+fn dns_name(name: &str) -> bool {
+    name.len() <= 253
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
 }
 
 /// The settings of the content block.

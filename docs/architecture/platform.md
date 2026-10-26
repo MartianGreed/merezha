@@ -2833,7 +2833,7 @@ delivery = { cache_control_public = "public, max-age=60, stale-while-revalidate=
 | `limits.max_response_bytes` | 16777216 | 65536 to 268435456 | Largest delivery body, and largest populated management read; past it the request fails `response_too_large` (400): ask for a smaller `limit`, fewer `fields` or less `populate`. |
 | `delivery.cache_control_public` | `"public, max-age=60, stale-while-revalidate=300"` | visible ASCII, 1 to 256 bytes, no edge spaces | `Cache-Control` of a published read of an `access = "public"` type without a principal (`invalid_value`). |
 | `delivery.cache_control_private` | `"private, no-cache"` | as above | `Cache-Control` of every other published read. |
-| `delivery.public_base_url` | unset | an absolute `https` URL with a host and an optional path, no userinfo, query or fragment, at most 2048 bytes (`invalid_url`); `http` only to `localhost`, `127.0.0.0/8` or `::1` on a private listener (`insecure_origin`) | The public origin (and prefix) of the host. Expanded asset `url`s in delivery, the management asset JSON `url` and the `Location` of created entries and uploaded assets are absolute under it, normalized without a trailing slash; unset, they are paths. Its value enters published ETags. |
+| `delivery.public_base_url` | unset | an absolute `https` URL with a host (an IP address, or a DNS name of letter, digit and inner-hyphen labels: punycode for international names) and an optional path; visible ASCII, never trimmed, no whitespace or backslash; port 1 to 65535; no userinfo, query or fragment; at most 2048 bytes (`invalid_url`); `http` only to `localhost`, `127.0.0.0/8` or `::1` on a private listener (`insecure_origin`) | The public origin (and prefix) of the host. Expanded asset `url`s in delivery, the management asset JSON `url` and the `Location` of created entries and uploaded assets are absolute under it, normalized without a trailing slash; unset, they are paths. Its value enters published ETags. |
 
 The tables take only these keys; `media` is C7's ([Content
 assets](#content-assets)). Problems are reported with the
@@ -3136,15 +3136,22 @@ last) for a draft never published.
   must be among `fields` when `fields` is given (`not_selected`).
 - Every asset reference of every entry shown, populated ones and preview
   included (asset fields, `asset` rich text embeds, inside components and
-  `blocks` too), gains `asset`: `{id, filename, content_type, size, width,
-  height, url}`, read in one statement (`content.delivery.assets`) per
-  1000 `(entry, asset)` pairs. It is `"asset": null` when the asset route
-  would not serve the asset to this reader: trashed or purged (a forced
-  delete), in a scope the entry cannot reference, or not in the entry's
-  refs of the stage read (a draft-only asset in a published response).
-  `url` is `/v1/content/assets/{id}/{filename}` for application entries
-  and `/v1/content/o/{organization}/assets/{id}/{filename}` for an
-  organization's, prefixed with `delivery.public_base_url` when set.
+  `blocks` too; of a root only the fields `fields` selects), gains
+  `asset`: `{id, filename, content_type, size, width, height, url}`, read
+  in one statement (`content.delivery.assets`) per 1000 `(entry, locale,
+  asset)` triples. It is `"asset": null` when the asset route would not
+  serve the asset to this reader: trashed or purged (a forced delete), in
+  a scope the entry cannot reference, or not in the refs of the variant
+  and stage the value comes from (the variant served, or the default
+  variant for a shared field; a draft-only asset in a published response
+  is `null`). `url` is `/v1/content/assets/{id}/{filename}` for
+  application entries and `/v1/content/o/{organization}/assets/{id}/{filename}`
+  for an organization's, prefixed with `delivery.public_base_url` when
+  set; preview returns the same delivery URLs, so a draft-only asset's URL
+  answers 404 until it is published. A response holds at most 20000
+  asset references, counted before any lookup (`asset_limit`, 400: ask
+  for a smaller `limit` or fewer `fields`), so it runs at most 20 asset
+  statements.
   Management reads show asset references as stored.
 
 Published responses carry `ETag: W/"<8 hex of the model fingerprint>-<the
@@ -3167,7 +3174,8 @@ a permission type); `delivery.cache_control_private` otherwise; every delivery
 response, errors included, has `Vary: Authorization, Cookie`, and errors
 are `private, no-store`.
 
-Codes added by C5: `populate_limit`, `response_too_large` (400). Every
+Codes added by C5: `populate_limit`, `response_too_large` (400); by
+issue #46: `asset_limit` (400). Every
 content statement is registered: `merezha_content::STATEMENTS` (`content.*`:
 activation and indexes, entries, revisions and references, publishing and
 the trash, delivery, preview and population, and `merezha content diff`'s

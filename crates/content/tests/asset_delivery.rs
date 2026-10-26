@@ -30,7 +30,13 @@ fields = [
   { name = "figures", type = "blocks", components = ["figure"] },
   { name = "author", type = "reference", to = ["author"] },
   { name = "brief", type = "reference", to = ["secret"] },
+  # Shared by every locale: its value and refs are the default variant's.
+  { name = "logo", type = "asset", localized = false },
 ]
+
+[types.album]
+access = "public"
+fields = [{ name = "title", type = "string" }, { name = "photos", type = "asset", cardinality = "many", max_items = 1000 }]
 
 [types.author]
 access = "public"
@@ -57,6 +63,18 @@ fields = [
 scope = "organization"
 access = "public"
 fields = [{ name = "title", type = "string", required = true }, { name = "image", type = "asset" }]
+
+# Organization types whose assets sit only in a rich text embed, or only
+# inside `blocks`: their tags carry the application generation too.
+[types.notebook]
+scope = "organization"
+access = "public"
+fields = [{ name = "title", type = "string", required = true }, { name = "body", type = "rich_text", embeds = ["asset"] }]
+
+[types.strip]
+scope = "organization"
+access = "public"
+fields = [{ name = "title", type = "string", required = true }, { name = "panels", type = "blocks", components = ["figure"] }]
 "#;
 
 const C: &str = "/v1/content";
@@ -431,6 +449,205 @@ async fn a_forced_delete_delivers_asset_null_and_asset_changes_change_the_etag()
     let last = read(&fx, &uri, None).await;
     assert_eq!(last.body["fields"]["cover"]["asset"], Value::Null);
     assert_ne!(last.etag(), renamed.etag());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn organization_types_with_assets_only_in_rich_text_or_blocks_follow_application_asset_deletes()
+ {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (fx, _harness) = start(&test, &dir, "").await;
+    let shared = upload(&fx, "app_key", "shared.png", 20, 10).await;
+    let shared_id = str_of(&shared["id"]).to_owned();
+    let notebook = published(
+        &fx,
+        "key_a",
+        "notebook",
+        json!({"title": "Notes", "body": [{"_type": "asset", "_key": "e1", "id": shared_id}]}),
+    )
+    .await;
+    let strip = published(
+        &fx,
+        "key_a",
+        "strip",
+        json!({"title": "Strip", "panels": [{"_type": "figure", "_key": "p1", "image": {"id": shared_id}}]}),
+    )
+    .await;
+    let notebook_uri = format!("{C}/o/{ORG_A}/notebook/{notebook}");
+    let strip_uri = format!("{C}/o/{ORG_A}/strip/{strip}");
+    let expected = metadata(&shared, &org_url(ORG_A, &shared));
+    let notebook_before = read(&fx, &notebook_uri, None).await;
+    assert_eq!(notebook_before.body["fields"]["body"][0]["asset"], expected);
+    let strip_before = read(&fx, &strip_uri, None).await;
+    assert_eq!(
+        strip_before.body["fields"]["panels"][0]["image"]["asset"],
+        expected
+    );
+    // An unchanged scope still answers 304.
+    let again = fx
+        .get(&notebook_uri)
+        .by(None)
+        .header("if-none-match", &notebook_before.etag())
+        .send()
+        .await;
+    assert_eq!(again.status, StatusCode::NOT_MODIFIED);
+
+    // The application asset goes (forced): both organization responses
+    // answer 200 with a new tag and `"asset": null`, never a stale 304.
+    let deleted = fx
+        .call(
+            Method::DELETE,
+            &format!("{C}/manage/assets/{shared_id}?force=true"),
+        )
+        .by(Some("app_key"))
+        .send()
+        .await;
+    assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{}", deleted.text);
+    for (uri, before, pointer) in [
+        (&notebook_uri, &notebook_before, "/fields/body/0/asset"),
+        (&strip_uri, &strip_before, "/fields/panels/0/image/asset"),
+    ] {
+        let after = fx
+            .get(uri)
+            .by(None)
+            .header("if-none-match", &before.etag())
+            .send()
+            .await;
+        assert_eq!(after.status, StatusCode::OK, "{uri}: {}", after.text);
+        assert_ne!(after.etag(), before.etag(), "{uri}");
+        assert_eq!(after.body.pointer(pointer), Some(&Value::Null), "{uri}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn asset_expansion_follows_the_variant_and_locale_its_value_comes_from() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (fx, _harness) = start(&test, &dir, "").await;
+    let cover = upload(&fx, "app_key", "cover.png", 20, 10).await;
+    let logo = upload(&fx, "app_key", "logo.png", 30, 10).await;
+    let french = upload(&fx, "app_key", "french.png", 40, 10).await;
+    let page = published(
+        &fx,
+        "app_key",
+        "page",
+        json!({"title": "Home", "cover": {"id": cover["id"]}, "logo": {"id": logo["id"]}}),
+    )
+    .await;
+    // `fr` falls back to `en`: `en`'s refs decide.
+    let fallback = read(&fx, &format!("{C}/page/{page}?locale=fr"), None).await;
+    assert_eq!(fallback.body["sys"]["source_locale"], "en");
+    assert_eq!(
+        fallback.body["fields"]["cover"]["asset"],
+        metadata(&cover, &app_url(&cover))
+    );
+    // An own `fr` variant: its cover by `fr`'s refs, the shared logo by
+    // the default variant's.
+    let added = fx
+        .put(&variant("page", &page, "fr"))
+        .by(Some("app_key"))
+        .header("if-none-match", "*")
+        .json(&json!({"fields": {"title": "Accueil", "cover": {"id": french["id"]}}}))
+        .send()
+        .await;
+    assert_eq!(added.status, StatusCode::CREATED, "{}", added.text);
+    let reply = fx
+        .post(&format!("{}/publish", variant("page", &page, "fr")))
+        .by(Some("app_key"))
+        .if_match(1)
+        .send()
+        .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text);
+    let fr_uri = format!("{C}/page/{page}?locale=fr");
+    let own = read(&fx, &fr_uri, None).await;
+    assert_eq!(own.body["sys"]["source_locale"], "fr");
+    assert_eq!(
+        own.body["fields"]["cover"]["asset"],
+        metadata(&french, &app_url(&french))
+    );
+    assert_eq!(
+        own.body["fields"]["logo"]["asset"],
+        metadata(&logo, &app_url(&logo))
+    );
+    // `en`'s cover planted into `fr`'s published value: `fr`'s refs do
+    // not record it, so it is not expanded there; `en` still shows it.
+    let cover_id = str_of(&cover["id"]);
+    execute(
+        &fx.db,
+        &format!(
+            "UPDATE merezha_content.published \
+                SET data = jsonb_set(data, '{{cover}}', jsonb_build_object('id', '{cover_id}')) \
+              WHERE entry_id = '{page}' AND locale = 'fr'"
+        ),
+    )
+    .await;
+    let planted = read(&fx, &fr_uri, None).await;
+    assert_eq!(
+        planted.body["fields"]["cover"],
+        json!({"id": cover_id, "asset": null})
+    );
+    assert_eq!(
+        planted.body["fields"]["logo"]["asset"],
+        metadata(&logo, &app_url(&logo))
+    );
+    let en = read(&fx, &format!("{C}/page/{page}"), None).await;
+    assert_eq!(
+        en.body["fields"]["cover"]["asset"],
+        metadata(&cover, &app_url(&cover))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_response_past_the_asset_reference_bound_fails_before_any_lookup() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (fx, harness) = start(&test, &dir, "").await;
+    let photo = upload(&fx, "app_key", "photo.png", 20, 10).await;
+    let photos: Vec<Value> = (0..1000).map(|_| json!({"id": photo["id"]})).collect();
+    for n in 0..21 {
+        published(
+            &fx,
+            "app_key",
+            "album",
+            json!({"title": format!("Album {n}"), "photos": photos}),
+        )
+        .await;
+    }
+    assert_eq!(merezha_content::MAX_ASSET_REFERENCES, 20_000);
+    // 21 x 1000 references: refused, and no asset statement ran.
+    let before = statements_on(&harness, ASSETS_TABLE);
+    let refused = fx.get(&format!("{C}/album?limit=21")).by(None).send().await;
+    assert_eq!(
+        (refused.status.as_u16(), refused.code()),
+        (400, "asset_limit"),
+        "{}",
+        refused.text
+    );
+    assert_eq!(statements_on(&harness, ASSETS_TABLE), before);
+    // 20 x 1000, the bound itself: served, one statement (the repeated
+    // asset is one triple per entry).
+    let (reply, statements) = counted(&fx, &harness, &format!("{C}/album?limit=20"), None).await;
+    assert_eq!(statements, 1.0);
+    assert_eq!(
+        reply.body["items"][19]["fields"]["photos"][999]["asset"],
+        metadata(&photo, &app_url(&photo))
+    );
+    // Fields `fields` leaves out are neither counted nor looked up.
+    let (reply, statements) = counted(
+        &fx,
+        &harness,
+        &format!("{C}/album?limit=21&fields=title"),
+        None,
+    )
+    .await;
+    assert_eq!(statements, 0.0);
+    assert_eq!(reply.body["items"].as_array().unwrap().len(), 21);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

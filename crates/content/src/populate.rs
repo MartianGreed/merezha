@@ -16,10 +16,13 @@
 //! Delivery also expands every asset reference of every entry it shows
 //! (issue #46): `{"id", "alt"?}` gains `asset`, the metadata
 //! `{id, filename, content_type, size, width, height, url}` read for the
-//! whole response in one batched statement ([`IDS_PER_STATEMENT`] pairs
-//! each), or `null` when the asset is not one the asset route would serve
-//! to this reader: trashed (a forced delete), in a scope the entry may not
-//! reference, or not recorded in the entry's refs of the stage read.
+//! whole response in one batched statement ([`IDS_PER_STATEMENT`]
+//! `(entry, locale, asset)` triples each, at most
+//! [`MAX_ASSET_REFERENCES`] references per response), or `null` when the
+//! asset is not one the asset route would serve to this reader: trashed
+//! (a forced delete), in a scope the entry may not reference, or not
+//! recorded in the refs of the entry's variant and stage the value comes
+//! from.
 use crate::{
     model::{ContentModel, ContentType, Field, FieldKind},
     query::detail,
@@ -36,6 +39,12 @@ use uuid::Uuid;
 pub const IDS_PER_STATEMENT: usize = 1000;
 /// The code past `limits.max_populated_entries`.
 pub const POPULATE_LIMIT: &str = "populate_limit";
+/// Most asset references one delivery response expands (issue #46);
+/// past it the request fails [`ASSET_LIMIT`] before any lookup, so a
+/// response runs at most 20 asset statements.
+pub const MAX_ASSET_REFERENCES: usize = 20_000;
+/// The code past [`MAX_ASSET_REFERENCES`].
+pub const ASSET_LIMIT: &str = "asset_limit";
 /// The code of a response past `limits.max_response_bytes`.
 pub const RESPONSE_TOO_LARGE: &str = "response_too_large";
 /// Deepest component nesting the reference walker follows; the model
@@ -454,11 +463,15 @@ pub(crate) struct AssetExpansion {
     /// `delivery.public_base_url`: asset URLs are absolute under it, paths
     /// without it.
     pub base: Option<String>,
+    /// `fields`: the root fields the response shows; the others are
+    /// neither counted nor looked up.
+    pub selection: Option<Vec<String>>,
 }
 
-/// The asset metadata of one response: by referring entry and the scope
-/// its refs were recorded in, each asset's `asset` member.
-type AssetMetadata = HashMap<(String, String), HashMap<String, Value>>;
+/// The asset metadata of one response: by referring entry, the locale of
+/// the variant whose refs record it and the scope they were recorded in,
+/// each asset's `asset` member.
+type AssetMetadata = HashMap<(String, String, String), HashMap<String, Value>>;
 
 /// A populated document and what to populate inside it.
 struct Node {
@@ -591,7 +604,8 @@ impl Population {
         let unknown: Vec<String> = unknown.into_iter().collect();
         let shown = self.visible(db, tx, &unknown).await?;
         if let Some(expansion) = &self.assets {
-            self.expand_assets(db, tx, &mut nodes, expansion).await?;
+            self.expand_assets(db, tx, &mut nodes, root_count, expansion)
+                .await?;
         }
 
         // Mark and link, children before parents: a child always comes
@@ -644,19 +658,25 @@ impl Population {
     /// Give every asset reference of `nodes` its `asset` member: the
     /// metadata of the asset when the asset route would serve it to this
     /// reader (live, in the entry's scope or the application's, and
-    /// recorded in the entry's refs of the stage read), `null` otherwise.
-    /// Only entries of types the caller reads here, in the scope its type
-    /// allows, are looked up; one statement per [`IDS_PER_STATEMENT`]
-    /// `(entry, asset)` pairs, whatever the page size or population.
+    /// recorded in the refs of the entry's variant and stage the value
+    /// comes from), `null` otherwise. Only entries of types the caller
+    /// reads here, in the scope its type allows, are looked up, and of a
+    /// root only the fields `fields` selects. Past
+    /// [`MAX_ASSET_REFERENCES`] references the request fails
+    /// [`ASSET_LIMIT`] before any lookup; below it, one statement per
+    /// [`IDS_PER_STATEMENT`] `(entry, locale, asset)` triples.
     async fn expand_assets(
         &self,
         db: &Database,
         tx: &mut Tx<'_>,
         nodes: &mut [Node],
+        root_count: usize,
         expansion: &AssetExpansion,
     ) -> Result<(), Rejection> {
-        let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
-        for node in nodes.iter_mut() {
+        let default = self.model.default_locale().code.clone();
+        let mut triples: BTreeSet<(String, String, String)> = BTreeSet::new();
+        let mut references = 0usize;
+        for (index, node) in nodes.iter_mut().enumerate() {
             let doc = &mut node.doc;
             if self.readable.get(&doc.content_type) != Some(&doc.scope) {
                 continue;
@@ -664,29 +684,58 @@ impl Population {
             let Some(content_type) = self.model.content_type(&doc.content_type) else {
                 continue;
             };
-            let entry = doc.id.clone();
+            let shared = crate::store::shared_fields(content_type);
+            let selection = (index < root_count)
+                .then_some(expansion.selection.as_deref())
+                .flatten();
             for field in &content_type.fields {
+                if selection.is_some_and(|s| !s.contains(&field.name)) {
+                    continue;
+                }
+                // A shared field's value and refs are the default
+                // variant's; every other field's, the variant served.
+                let locale = if shared.contains(&field.name) {
+                    &default
+                } else {
+                    &doc.source_locale
+                };
                 if let Some(value) = doc.data.get_mut(&field.name) {
                     visit_assets(&self.model, &field.kind, value, 0, &mut |object| {
                         if let Some(asset) = asset_target(object) {
-                            pairs.insert((entry.clone(), asset));
+                            references += 1;
+                            triples.insert((doc.id.clone(), locale.clone(), asset));
                         }
                     });
                 }
             }
         }
-        let found = if pairs.is_empty() {
+        if references > MAX_ASSET_REFERENCES {
+            return Err(Failure::permanent(ASSET_LIMIT).into());
+        }
+        let found = if triples.is_empty() {
             AssetMetadata::new()
         } else {
-            self.asset_metadata(db, tx, pairs, expansion).await?
+            self.asset_metadata(db, tx, triples, expansion).await?
         };
-        for node in nodes.iter_mut() {
+        for (index, node) in nodes.iter_mut().enumerate() {
             let doc = &mut node.doc;
             let Some(content_type) = self.model.content_type(&doc.content_type) else {
                 continue;
             };
-            let assets = found.get(&(doc.id.clone(), doc.scope.clone()));
+            let shared = crate::store::shared_fields(content_type);
+            let selection = (index < root_count)
+                .then_some(expansion.selection.as_deref())
+                .flatten();
             for field in &content_type.fields {
+                if selection.is_some_and(|s| !s.contains(&field.name)) {
+                    continue;
+                }
+                let locale = if shared.contains(&field.name) {
+                    &default
+                } else {
+                    &doc.source_locale
+                };
+                let assets = found.get(&(doc.id.clone(), locale.clone(), doc.scope.clone()));
                 if let Some(value) = doc.data.get_mut(&field.name) {
                     visit_assets(&self.model, &field.kind, value, 0, &mut |object| {
                         let metadata = asset_target(object)
@@ -701,13 +750,13 @@ impl Population {
         Ok(())
     }
 
-    /// Read the metadata of the assets in `pairs` that the refs of their
-    /// entries record, in [`IDS_PER_STATEMENT`] pairs per statement.
+    /// Read the metadata of the assets the refs of the variants in
+    /// `triples` record, [`IDS_PER_STATEMENT`] triples per statement.
     async fn asset_metadata(
         &self,
         db: &Database,
         tx: &mut Tx<'_>,
-        pairs: BTreeSet<(String, String)>,
+        triples: BTreeSet<(String, String, String)>,
         expansion: &AssetExpansion,
     ) -> Result<AssetMetadata, Rejection> {
         let stage = match self.read {
@@ -715,38 +764,35 @@ impl Population {
             Read::Draft => "draft",
         };
         let (scopes, _, _) = self.scopes_and_types();
-        let pairs: Vec<(String, String)> = pairs.into_iter().collect();
+        let triples: Vec<(String, String, String)> = triples.into_iter().collect();
         let mut out = AssetMetadata::new();
-        for chunk in pairs.chunks(IDS_PER_STATEMENT) {
-            let entries: Vec<String> = chunk
-                .iter()
-                .map(|p| p.0.clone())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            let assets: Vec<String> = chunk
-                .iter()
-                .map(|p| p.1.clone())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
+        for chunk in triples.chunks(IDS_PER_STATEMENT) {
+            let entries: Vec<&str> = chunk.iter().map(|t| t.0.as_str()).collect();
+            let locales: Vec<&str> = chunk.iter().map(|t| t.1.as_str()).collect();
+            let assets: Vec<&str> = chunk.iter().map(|t| t.2.as_str()).collect();
             let rows = db
                 .query(
                     tx,
                     &statements::DELIVERY_ASSETS,
-                    &[&entries, &assets, &stage, &scopes],
+                    &[&entries, &locales, &assets, &stage, &scopes],
                 )
                 .await
                 .map_err(|e| sql(&e))?;
             for row in &rows {
-                let (entry, scope, id, asset_scope): (String, String, String, String) =
-                    (row.get(0), row.get(1), row.get(2), row.get(3));
-                // An entry references its own scope's assets and the
-                // application's, never another organization's.
+                let (entry, locale, scope, id, asset_scope): (
+                    String,
+                    String,
+                    String,
+                    String,
+                    String,
+                ) = (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+                // The statement's rule again: an entry references its own
+                // scope's assets and the application's, never another
+                // organization's.
                 if asset_scope != scope && asset_scope != "app" {
                     continue;
                 }
-                let filename: String = row.get(4);
+                let filename: String = row.get(5);
                 let path = crate::media::delivery_path(&scope, &id, &filename);
                 let url = match &expansion.base {
                     Some(base) => format!("{base}{path}"),
@@ -755,13 +801,15 @@ impl Population {
                 let metadata = serde_json::json!({
                     "id": id,
                     "filename": filename,
-                    "content_type": row.get::<_, String>(5),
-                    "size": row.get::<_, i64>(6),
-                    "width": row.get::<_, Option<i32>>(7),
-                    "height": row.get::<_, Option<i32>>(8),
+                    "content_type": row.get::<_, String>(6),
+                    "size": row.get::<_, i64>(7),
+                    "width": row.get::<_, Option<i32>>(8),
+                    "height": row.get::<_, Option<i32>>(9),
                     "url": url,
                 });
-                out.entry((entry, scope)).or_default().insert(id, metadata);
+                out.entry((entry, locale, scope))
+                    .or_default()
+                    .insert(id, metadata);
             }
         }
         Ok(out)

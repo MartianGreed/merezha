@@ -268,22 +268,26 @@ pub const VISIBLE_DRAFT: Statement = Statement::new(
 );
 
 /// The asset metadata of a delivery response (issue #46), one batch of
-/// `(entry, asset)` pairs: the live assets among `$2` that the refs of
-/// the entries `$1` record in stage `$3` (`published`, or `draft` for
-/// preview), in the scopes `$4` (the path's and the application's), each
-/// with the referring entry and the scope its ref was recorded in. Only
-/// what the asset route would serve to a reader of those entries: a ref
-/// of the entry's own stage, never a trashed asset, never another scope.
+/// `(entry, locale, asset)` triples (`$1`, `$2`, `$3`, the same length):
+/// each live asset the refs of that entry's variant in that locale record
+/// in stage `$4` (`published`, or `draft` for preview), recorded in one of
+/// the scopes `$5` (the path's and the application's) and of that ref's
+/// scope or the application's, with the triple and the ref's scope. Only
+/// what the asset route would serve to a reader of the entry: a ref of
+/// its own variant and stage, never a trashed asset, never another
+/// organization's, never an organization's from an application entry.
 pub const DELIVERY_ASSETS: Statement = Statement::new(
     "content.delivery.assets",
     "SELECT merezha_content.assets",
-    "SELECT DISTINCT r.from_entry::text, r.scope, a.id::text, a.scope, a.filename, \
+    "SELECT DISTINCT w.entry, w.locale, r.scope, a.id::text, a.scope, a.filename, \
             a.content_type, a.size, a.width, a.height \
-       FROM merezha_content.refs r \
+       FROM unnest($1::text[], $2::text[], $3::text[]) AS w (entry, locale, asset) \
+       JOIN merezha_content.refs r \
+         ON r.from_entry = w.entry::uuid AND r.from_locale = w.locale AND r.stage = $4 \
+        AND r.target_kind = 'asset' AND r.target_id = w.asset::uuid \
        JOIN merezha_content.assets a ON a.id = r.target_id \
-      WHERE r.from_entry = ANY($1::text[]::uuid[]) AND r.target_kind = 'asset' \
-        AND r.target_id = ANY($2::text[]::uuid[]) AND r.stage = $3 \
-        AND r.scope = ANY($4::text[]) AND a.scope = ANY($4::text[]) \
+      WHERE r.scope = ANY($5::text[]) \
+        AND (a.scope = r.scope OR a.scope = 'app') \
         AND a.deleted_at IS NULL",
 );
 

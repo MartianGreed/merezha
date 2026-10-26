@@ -519,6 +519,15 @@ fn public_base_url_is_an_absolute_https_url_and_http_only_on_a_private_loopback_
             "https://cms.example.com:8443/site",
         ),
         ("\"https://[2001:db8::1]\"", "https://[2001:db8::1]"),
+        ("\"https://203.0.113.7:65535\"", "https://203.0.113.7:65535"),
+        (
+            "\"https://xn--bcher-kva.example\"",
+            "https://xn--bcher-kva.example",
+        ),
+        (
+            "\"https://cms-1.example.com:1\"",
+            "https://cms-1.example.com:1",
+        ),
     ] {
         for private in [false, true] {
             assert_eq!(
@@ -561,6 +570,32 @@ fn public_base_url_is_an_absolute_https_url_and_http_only_on_a_private_loopback_
         "\"https://cms.example.com/#top\"",
         "\"https://\"",
         "\"data:text/plain,x\"",
+        // A password without a user name.
+        "\"https://:secret@cms.example.com\"",
+        // Not a DNS name: a wildcard, an underscore, empty labels, a
+        // label edged with a hyphen or longer than 63 bytes.
+        "\"https://*.example.com\"",
+        "\"https://exa_mple.com\"",
+        "\"https://.\"",
+        "\"https://cms..example.com\"",
+        "\"https://cms.example.com.\"",
+        "\"https://-cms.example.com\"",
+        "\"https://cms-.example.com\"",
+        format!("\"https://{}.example.com\"", "a".repeat(64)).as_str(),
+        // Port 0.
+        "\"https://cms.example.com:0\"",
+        // Whitespace around or inside, never trimmed; control characters.
+        "\" https://cms.example.com\"",
+        "\"https://cms.example.com \"",
+        "\"https://cms.example.com/\\tsite\"",
+        "\"https://cms.example.com/\\nsite\"",
+        "\"https://cms.exa mple.com\"",
+        // A backslash, which parsers read as a slash: the host would be
+        // `evil.com` and the rest its path.
+        "'https://evil.com\\@cms.example.com'",
+        "'https://cms.example.com\\site'",
+        // Non-ASCII: give an international name as punycode.
+        "\"https://bücher.example\"",
     ] {
         assert_eq!(
             base_url_on(value, true),
@@ -602,6 +637,7 @@ fn content_errors_register_with_the_kernel_codes() {
         ("index_build_failed", 422),
         ("validation_failed", 422),
         ("populate_limit", 400),
+        ("asset_limit", 400),
         ("response_too_large", 400),
         ("content_type_not_found", 404),
         ("organization_not_found", 404),

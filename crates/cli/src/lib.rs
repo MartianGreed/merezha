@@ -194,16 +194,13 @@ fn identity_configured(input: &merezha_platform::ConfigInput) -> bool {
         .is_ok_and(|config| config.modules.contains_key(merezha_identity::NAME))
 }
 
-/// Whether the host listens on a private loopback address: `http.listen`
-/// is loopback, `http.public = false` and no `http.trusted_proxies`, the
-/// rule identity applies to its development settings. A configuration
-/// that does not load is not private; the kernel reports why.
+/// Whether the host listens on a private loopback address, by identity's
+/// rule ([`merezha_identity::HostFacts::private_loopback`]: a loopback
+/// `http.listen`, `http.public = false`, no `http.trusted_proxies`). A
+/// configuration that does not load is not private; the kernel reports
+/// why.
 fn private_loopback(input: &merezha_platform::ConfigInput) -> bool {
-    merezha_platform::ProjectConfig::load(input).is_ok_and(|config| {
-        !config.http.public
-            && config.http.trusted_proxies.is_empty()
-            && config.http.listen.ip().is_loopback()
-    })
+    merezha_identity::HostFacts::load(input).is_some_and(|facts| facts.private_loopback())
 }
 
 /// Read, validate and open an application configuration with the runtime as

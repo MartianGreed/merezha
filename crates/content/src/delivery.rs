@@ -415,6 +415,7 @@ impl Delivery {
             mark_all: true,
             assets: Some(AssetExpansion {
                 base: base_url.clone(),
+                selection: plan.fields.clone(),
             }),
         };
         // The ETag of a published read, without its generations.
