@@ -23,7 +23,9 @@ pub(crate) fn fit(operation: Operation, protocol: u16) -> Result<Operation, Fail
     };
     match (protocol, operation) {
         (PROTOCOL_V2, operation) => Ok(operation),
-        (PROTOCOL_V1, Operation::Describe {}) => Err(Failure::permanent("protocol_version")),
+        (PROTOCOL_V1, Operation::Describe {} | Operation::React { .. }) => {
+            Err(Failure::permanent("protocol_version"))
+        }
         (PROTOCOL_V1, mut operation) => {
             match &mut operation {
                 Operation::Decide {
@@ -39,7 +41,7 @@ pub(crate) fn fit(operation: Operation, protocol: u16) -> Result<Operation, Fail
                     strip(events);
                 }
                 Operation::Query { metadata, .. } => metadata.principal = None,
-                Operation::Validate { .. } | Operation::Describe {} => {}
+                Operation::Validate { .. } | Operation::Describe {} | Operation::React { .. } => {}
             }
             Ok(operation)
         }

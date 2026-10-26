@@ -300,7 +300,7 @@ colour = "blue"
 }
 
 #[test]
-fn an_application_using_keys_of_later_slices_stops_startup_before_the_database() {
+fn reactors_on_memory_storage_stop_startup_before_the_database() {
     let dir = tempfile::tempdir().unwrap();
     let config = project(dir.path(), "");
     let application = dir.path().join("application.toml");
@@ -320,7 +320,8 @@ fn an_application_using_keys_of_later_slices_stops_startup_before_the_database()
         &[(DATABASE_ENV, "postgres://nobody:pw@127.0.0.1:1/none")],
         "unsupported",
     );
-    assert_eq!(host.failed()["code"], "unsupported_in_this_build");
+    // Reactors write through the outbox: PostgreSQL only (AP §C.5).
+    assert_eq!(host.failed()["code"], "reactors_require_postgres");
 }
 
 #[test]

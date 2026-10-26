@@ -121,6 +121,69 @@ impl Caller for Principal {
         Err(Failure::permanent("unauthorized"))
     }
 }
+/// A reactor's command effects (AP §C.5, R13): the system principal
+/// `sys_reactor_{name}` of kind `system`, on the event's tenant, holding
+/// exactly the reactor's configured `permissions` at any scope and no
+/// roles. Tenant routes therefore compose the event's tenant.
+#[derive(Clone, Debug)]
+pub struct ReactorCaller {
+    principal: Principal,
+    permissions: Vec<Identity>,
+    undeclared: bool,
+}
+impl ReactorCaller {
+    /// The caller of `reactor`'s command effects for an event of `tenant`.
+    /// `undeclared` says whether routes declaring neither `permission`
+    /// nor `access` admit it, as the host's policy decides for its other
+    /// callers (only the loopback allow-all does on the platform host).
+    pub fn new(
+        reactor: &crate::config::Reactor,
+        tenant: Option<Identity>,
+        undeclared: bool,
+    ) -> Result<Self, Failure> {
+        let subject = Identity::new(format!("sys_reactor_{}", reactor.name.as_str()))?;
+        Ok(Self {
+            principal: Principal::new(
+                subject,
+                merezha_domain::PrincipalKind::System,
+                tenant,
+                Vec::new(),
+            )?,
+            permissions: reactor.permissions.clone(),
+            undeclared,
+        })
+    }
+    /// `sys_reactor_{name}`.
+    pub fn subject(&self) -> &Identity {
+        &self.principal.subject
+    }
+}
+impl Caller for ReactorCaller {
+    fn principal(&self, _: &Scope) -> Option<Principal> {
+        Some(self.principal.clone())
+    }
+    fn tenant(&self) -> Option<Identity> {
+        self.principal.tenant.clone()
+    }
+    fn authenticated(&self) -> bool {
+        true
+    }
+    fn check(&self, permission: &Identity, _: &Scope) -> Result<(), Failure> {
+        if self.permissions.contains(permission) {
+            Ok(())
+        } else {
+            Err(Failure::permanent("unauthorized"))
+        }
+    }
+    fn undeclared(&self) -> Result<(), Failure> {
+        if self.undeclared {
+            Ok(())
+        } else {
+            Err(Failure::permanent("unauthorized"))
+        }
+    }
+}
+
 impl<C: Caller + ?Sized> Caller for &C {
     fn principal(&self, scope: &Scope) -> Option<Principal> {
         (**self).principal(scope)

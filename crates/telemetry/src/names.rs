@@ -1924,6 +1924,30 @@ pub mod dispatch {
     pub fn projection_trigger(trigger: Trigger) -> KeyValue {
         KeyValue::new(key::PROJECTION_TRIGGER, trigger.as_str())
     }
+    /// A configured reactor name.
+    pub fn reactor_name(name: impl Into<Arc<str>>) -> KeyValue {
+        KeyValue::new(key::REACTOR_NAME, name.into())
+    }
+    /// `merezha.reactor.effect`: `notify`, `webhook` or `command`.
+    pub fn reactor_effect(effect: ReactorEffect) -> KeyValue {
+        KeyValue::new(key::REACTOR_EFFECT, effect.as_str())
+    }
+    /// The `merezha.reactor.effect` values (AP §C.2).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ReactorEffect {
+        Notify,
+        Webhook,
+        Command,
+    }
+    impl ReactorEffect {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Notify => "notify",
+                Self::Webhook => "webhook",
+                Self::Command => "command",
+            }
+        }
+    }
     /// The attribute of a link from a projection or reactor span to the
     /// trace of a source event (`merezha.link.reason=source_event`).
     pub fn source_event_link() -> KeyValue {

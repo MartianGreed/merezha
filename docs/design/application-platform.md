@@ -2194,6 +2194,70 @@ presence and subject to the key scope. *Closed in C2 by the second option (below
 11. A test Directory that fails if called while a checkpoint transaction is open is never tripped;
     a Directory outage retries the batch without advancing.
 
+**C3 delivery notes.** As built in AP-C3:
+
+- The seam is `merezha_application::postgres::Effects` (`check`, pure;
+  `is_member`, before the transaction; `write`, inside it), with the
+  request types `EffectRequest`, `EffectBody` and `CommandJob`. The
+  platform's adapter is `merezha_cli::reactions::PlatformEffects` over the
+  application module's `Notifier`, `Outbox` and `Directory`, bound to the
+  source `application` (the module's own name), and
+  `merezha_cli::reactions::CommandEffects` is the `application.command`
+  handler. `PostgresOptions::effects` carries the port; a store whose
+  configuration has reactors fails `reactor_effects_unavailable` without
+  it. The handler is registered only when a reactor allows `command`
+  effects, so applications without them get no `application` queue.
+- Command effects run through `Application::command_effect`: the reactor
+  must still be configured (`reactor_not_found`) and still list the tag
+  (`command_not_allowed`), both permanent. The caller is
+  `merezha_application::ReactorCaller` (`sys_reactor_{name}`, kind `system`,
+  the event's tenant, no roles, the reactor's `permissions` at any scope).
+  It is application-side, since the reactor's grants are its configuration,
+  not identity's; routes declaring neither `permission` nor `access` admit
+  it only under the loopback allow-all policy, as for edge callers.
+- Rejection codes the host assigns: `effect_not_allowed`,
+  `command_not_allowed`, `address_not_allowed`, `invalid_recipient` (a
+  `tenant` recipient naming another tenant), `tenant_required` (a `tenant`
+  recipient on an event without tenant) and `invalid_delay` (over 30 days,
+  rejected rather than malformed); the notifications block's codes pass
+  through (`unknown_topic`, `recipient_not_in_tenant`, ...). A port's
+  permanent refusal inside the transaction rejects the effect; any other
+  failure rolls the transaction back.
+- `Address` recipients are `{"address":{"email"}}` or
+  `{"address":{"phone"}}`, without a display name; an invalid address is
+  rejected `invalid_recipient`.
+- Reactor names are 1 to 48 bytes of `[A-Za-z0-9._-]` (no `:` or `/`), and
+  startup also refuses `duplicate_reactor`, `unknown_command` (a `commands`
+  tag no route declares), `invalid_permission`, `too_many_events` (64) and,
+  against the binary's catalog, `unknown_permission` for `permissions`.
+- Isolation reads the failed range one event at a time (not a bisection);
+  the range is remembered in memory per instance, so another instance that
+  takes over isolates it again from the full batch. A run that caught up
+  lingers once for a wake and ends when it brought no new event, so the
+  interval's wakes never keep a background slot.
+- `reactor.halted` carries `reason` `malformed_reply` or `guest_failed` and
+  is logged when the reactor turns halted, not on its later retries.
+  `reactor.effect_rejected` carries the effect type as `reason`.
+- Pausing a halted reactor clears `halted_position` (the table's CHECK);
+  resume and retry make it due now. `skip` with `{"to":"head"}` records one
+  `reactor_skips` row at the new checkpoint; with nothing to skip it changes
+  nothing. The reactor admin routes act on any row, configured or not, so a
+  removed reactor can be skipped before it is re-added; `GET reactors` lists
+  configured reactors only. Codes: `404 reactor_not_found`, `409
+  invalid_skip`.
+- Test 2's kill -9 cuts are `reactor_before_commit` (inside the checkpoint
+  transaction, after its writes) and `reactor_after_commit`, run in the
+  crate's crash-cut child process; the relay side of "relayed once" is AP-B1
+  test 3. A forced rollback uses the test hook `RunHooks::reactor_fail`.
+- `task-notifier` notifies the user who completed the task (the event's
+  principal): `TaskCompleted` carries no owner and reactors cannot read
+  projection state (AP3), and only the owner or an admin can complete a
+  task. `ArchiveTask` is not a `task-domain` command yet; the stage 3
+  example application adds the route and the command.
+- Not in this slice (NT-N8's other parts): the identity topics, content
+  subscriptions, `max_per_target_per_hour`, the `webhook_disabled` alert,
+  the operations guide and the end-to-end example application.
+
 # F. Decisions
 
 Owner answers and internal decisions recorded in

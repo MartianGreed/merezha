@@ -43,3 +43,4 @@ build merezha-json-envelope json_envelope json-envelope
 build merezha-task-domain task_domain task-domain
 build merezha-task-view task_view task-view
 build merezha-task-view task_view task-view-faulty --features faulty
+build merezha-task-notifier task_notifier task-notifier

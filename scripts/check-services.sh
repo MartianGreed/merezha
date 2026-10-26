@@ -15,7 +15,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 manifest="$root/services/Cargo.toml"
 components=(-p merezha-text-normalize -p merezha-greeting -p merezha-json-envelope
-  -p merezha-task-domain -p merezha-task-view)
+  -p merezha-task-domain -p merezha-task-view -p merezha-task-notifier)
 
 run() {
   printf '\n$ %s\n' "$*"

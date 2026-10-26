@@ -523,8 +523,16 @@ async fn start(
                             warm_readiness: section.projections.warm_readiness,
                             max_concurrent: section.background.max_concurrent as usize,
                             instance_id: config.app.instance_id.clone(),
+                            reactor_interval: section.reactors.interval,
+                            reactor_retry: (
+                                section.reactors.retry_base,
+                                section.reactors.retry_max,
+                            ),
                             ..BackgroundOptions::default()
                         },
+                        // The module binds its notifier, outbox and
+                        // directory once its context exists (AP §C.5).
+                        effects: None,
                     },
                     // The jobs runtime's pool needs (AP §B.10).
                     2 + config.jobs.queues.len(),

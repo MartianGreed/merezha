@@ -113,8 +113,9 @@ pub fn routes(application: Application, policy: Option<Arc<dyn Authorizer>>) -> 
         })
 }
 /// The PostgreSQL application's routes: [`routes`] with the background
-/// rebuild (`202`) and the admin API of AP §D.1. Reads need
-/// `application.admin.read`, revision deletion and abandoning a rebuild
+/// rebuild (`202`) and the admin API of AP §D.1, reactors included. Reads
+/// need `application.admin.read`; revision deletion, abandoning a rebuild
+/// and the reactor writes (pause, resume, retry, skip)
 /// `application.admin.write`, at application scope.
 pub fn postgres_routes(application: Application, policy: Arc<dyn Authorizer>) -> Router {
     Router::new()
@@ -132,6 +133,12 @@ pub fn postgres_routes(application: Application, policy: Arc<dyn Authorizer>) ->
             delete(delete_revision),
         )
         .route("/status", get(status))
+        .route("/reactors", get(reactors))
+        .route("/reactors/{name}/rejections", get(rejections))
+        .route("/reactors/{name}/pause", post(pause_reactor))
+        .route("/reactors/{name}/resume", post(resume_reactor))
+        .route("/reactors/{name}/retry", post(retry_reactor))
+        .route("/reactors/{name}/skip", post(skip_reactor))
         .with_state(Routes {
             application,
             policy: Some(policy),
@@ -147,6 +154,11 @@ enum Action {
     Projection { name: String },
     DeleteRevision { name: String, revision: String },
     Status,
+    Reactors,
+    Rejections { name: String, query: Option<String> },
+    SetReactor { name: String, active: bool },
+    RetryReactor { name: String },
+    SkipReactor { name: String },
 }
 impl Action {
     /// The permission checked at application scope, for administrative
@@ -158,18 +170,22 @@ impl Action {
             Self::Project { rebuild: true, .. } | Self::RequestRebuild { .. } => {
                 Some("application.projections.rebuild")
             }
-            Self::AbandonRebuild { .. } | Self::DeleteRevision { .. } => {
-                Some("application.admin.write")
-            }
-            Self::Projections | Self::Projection { .. } | Self::Status => {
-                Some("application.admin.read")
-            }
+            Self::AbandonRebuild { .. }
+            | Self::DeleteRevision { .. }
+            | Self::SetReactor { .. }
+            | Self::RetryReactor { .. }
+            | Self::SkipReactor { .. } => Some("application.admin.write"),
+            Self::Projections
+            | Self::Projection { .. }
+            | Self::Status
+            | Self::Reactors
+            | Self::Rejections { .. } => Some("application.admin.read"),
         }
     }
     fn body_limit(&self) -> usize {
         match self {
             Self::Command | Self::Query => 65_536,
-            Self::RequestRebuild { .. } => 1024,
+            Self::RequestRebuild { .. } | Self::SkipReactor { .. } => 1024,
             _ => 0,
         }
     }
@@ -188,6 +204,80 @@ fn resume(input: &str) -> Result<bool, Failure> {
         (1, Some(Value::Bool(resume))) => Ok(*resume),
         _ => Err(invalid()),
     }
+}
+/// The body of `POST reactors/{name}/skip`: `{"position":P}` (exactly the
+/// stuck event) or `{"to":"head"}`; anything else is `invalid_input`.
+fn skip_to(input: &str) -> Result<merezha_application::status::SkipTo, Failure> {
+    use merezha_application::status::SkipTo;
+    let invalid = || Failure::permanent("invalid_input");
+    let body: serde_json::Map<String, Value> =
+        serde_json::from_str(input).map_err(|_| invalid())?;
+    match (body.len(), body.get("position"), body.get("to")) {
+        (1, Some(position), None) => position.as_u64().map(SkipTo::Position).ok_or_else(invalid),
+        (1, None, Some(Value::String(to))) if to == "head" => Ok(SkipTo::Head),
+        _ => Err(invalid()),
+    }
+}
+/// `limit` (1 to 200, default 50) and `after` from a rejections query
+/// string; any other parameter is `invalid_input`.
+fn page(query: Option<&str>) -> Result<(usize, Option<String>), Failure> {
+    let invalid = || Failure::permanent("invalid_input");
+    let (mut limit, mut after) = (50, None);
+    for pair in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
+        match pair.split_once('=') {
+            Some(("limit", value)) => limit = value.parse().map_err(|_| invalid())?,
+            Some(("after", value)) if value.len() <= 32 => after = Some(value.to_owned()),
+            _ => return Err(invalid()),
+        }
+    }
+    Ok((limit, after))
+}
+async fn reactors(State(app): State<Routes>, request: Request) -> Response {
+    dispatch(app, request, Action::Reactors).await
+}
+async fn rejections(
+    State(app): State<Routes>,
+    Path(name): Path<String>,
+    request: Request,
+) -> Response {
+    let query = request.uri().query().map(str::to_owned);
+    dispatch(app, request, Action::Rejections { name, query }).await
+}
+async fn pause_reactor(
+    State(app): State<Routes>,
+    Path(name): Path<String>,
+    request: Request,
+) -> Response {
+    dispatch(
+        app,
+        request,
+        Action::SetReactor {
+            name,
+            active: false,
+        },
+    )
+    .await
+}
+async fn resume_reactor(
+    State(app): State<Routes>,
+    Path(name): Path<String>,
+    request: Request,
+) -> Response {
+    dispatch(app, request, Action::SetReactor { name, active: true }).await
+}
+async fn retry_reactor(
+    State(app): State<Routes>,
+    Path(name): Path<String>,
+    request: Request,
+) -> Response {
+    dispatch(app, request, Action::RetryReactor { name }).await
+}
+async fn skip_reactor(
+    State(app): State<Routes>,
+    Path(name): Path<String>,
+    request: Request,
+) -> Response {
+    dispatch(app, request, Action::SkipReactor { name }).await
 }
 async fn request_rebuild(
     State(app): State<Routes>,
@@ -375,6 +465,27 @@ async fn dispatch(state: Routes, request: Request, action: Action) -> Response {
                     (StatusCode::NO_CONTENT, Value::Null)
                 }
                 Action::Status => (ok, encoded(serde_json::to_value(admission.status()?))?),
+                Action::Reactors => (ok, encoded(serde_json::to_value(admission.reactors()?))?),
+                Action::Rejections { name, query } => {
+                    let (limit, after) = page(query.as_deref())?;
+                    let page = admission.rejections(&name, limit, after.as_deref())?;
+                    (ok, encoded(serde_json::to_value(page))?)
+                }
+                Action::SetReactor { name, active } => (
+                    ok,
+                    encoded(serde_json::to_value(
+                        admission.set_reactor_active(&name, active)?,
+                    ))?,
+                ),
+                Action::RetryReactor { name } => (
+                    ok,
+                    encoded(serde_json::to_value(admission.retry_reactor(&name)?))?,
+                ),
+                Action::SkipReactor { name } => {
+                    let to = skip_to(input)?;
+                    let skipped = admission.skip_reactor(&name, to, requested_by.as_deref())?;
+                    (ok, encoded(serde_json::to_value(skipped))?)
+                }
             })
         },
     )

@@ -22,15 +22,43 @@ pub(super) fn crash_cut(point: &str) {
 struct Counter(Arc<std::sync::atomic::AtomicUsize>);
 impl Guest for Counter {
     fn services(&self) -> Result<Vec<String>, Failure> {
-        Ok(vec!["counter".into()])
+        Ok(vec!["counter".into(), "reactor".into()])
     }
     fn session(&self) -> Result<Box<dyn GuestSession>, Failure> {
         Ok(Box::new(self.clone()))
     }
 }
 impl GuestSession for Counter {
+    /// `reactor` speaks version 2; everything else version 1.
+    fn protocol(&self, service: &str) -> u16 {
+        if service == "reactor" {
+            merezha_domain::PROTOCOL_V2
+        } else {
+            merezha_domain::PROTOCOL_V1
+        }
+    }
     fn invoke(&self, _: &str, op: Operation) -> Result<Reply, Failure> {
         Ok(match op {
+            Operation::Describe {} => Reply::Described { protocol: 2 },
+            // Each event: one notification, and one on an unknown topic,
+            // which the test port refuses.
+            Operation::React { events, .. } => Reply::Reacted {
+                reactions: events
+                    .iter()
+                    .map(|event| {
+                        Ok(merezha_domain::Reaction {
+                            event_id: event.event_id.clone(),
+                            effects: serde_json::from_value(json!([
+                                {"effect": "notify", "topic": "tasks.completed",
+                                 "recipients": [{"user": {"id": "usr_1"}}]},
+                                {"effect": "notify", "topic": "unknown.topic",
+                                 "recipients": [{"user": {"id": "usr_1"}}]},
+                            ]))
+                            .map_err(|_| Failure::permanent("invalid_response"))?,
+                        })
+                    })
+                    .collect::<Result<_, Failure>>()?,
+            },
             Operation::Validate { payload, .. } => Reply::Validated { payload },
             Operation::Decide { payload, .. } => {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -45,10 +73,110 @@ impl GuestSession for Counter {
             Operation::Project { state, events, .. } => Reply::Projected {
                 state: json!(state.as_u64().unwrap_or(0) + events.len() as u64),
             },
-            Operation::Describe {} => unreachable!("a version 1 fake is never described"),
             Operation::Query { state, .. } => Reply::Queried { value: state },
         })
     }
+}
+/// The test port's table and write, registered like the store's own.
+const TEST_REACTIONS: merezha_postgres::Statement = merezha_postgres::Statement::new(
+    "app.test.reactions_table",
+    "CREATE TABLE",
+    "CREATE TABLE IF NOT EXISTS merezha_app.test_reactions (dedupe_key text PRIMARY KEY)",
+);
+const TEST_REACTION: merezha_postgres::Statement = merezha_postgres::Statement::new(
+    "app.test.reaction",
+    "INSERT merezha_app.test_reactions",
+    "INSERT INTO merezha_app.test_reactions (dedupe_key) VALUES ($1) ON CONFLICT DO NOTHING",
+);
+/// An effect port refusing topic `unknown.topic`, everyone a member,
+/// writing each accepted effect's key in the checkpoint transaction when it
+/// has a database.
+struct Recording(Option<Database>);
+impl Effects for Recording {
+    fn check(&self, request: &EffectRequest) -> Result<(), Failure> {
+        match &request.body {
+            EffectBody::Notify { topic, .. } if topic.as_str() == "unknown.topic" => {
+                Err(Failure::permanent("unknown_topic"))
+            }
+            _ => Ok(()),
+        }
+    }
+    fn is_member<'a>(
+        &'a self,
+        _: &'a Identity,
+        _: &'a Identity,
+    ) -> merezha_postgres::BoxFuture<'a, Result<bool, Failure>> {
+        Box::pin(async { Ok(true) })
+    }
+    fn write<'a>(
+        &'a self,
+        tx: &'a mut merezha_postgres::Tx<'_>,
+        request: &'a EffectRequest,
+    ) -> merezha_postgres::BoxFuture<'a, Result<(), Failure>> {
+        Box::pin(async move {
+            if let Some(db) = &self.0 {
+                db.execute(tx, &TEST_REACTION, &[&request.dedupe_key])
+                    .await
+                    .map_err(|e| merezha_postgres::classify(&e))?;
+            }
+            Ok(())
+        })
+    }
+}
+/// [`config`] with a reactor on `Added`, from the beginning.
+fn reactor_config() -> Config {
+    Config::parse(
+        r#"version=2
+[storage]
+backend="postgres"
+application="crash-test"
+[[commands]]
+tag="Add"
+service="counter"
+aggregate="Counter"
+[[queries]]
+tag="Total"
+service="counter"
+projection="total"
+[[projections]]
+name="total"
+service="counter"
+initial=0
+[[reactors]]
+name="notifier"
+service="reactor"
+events=["Added"]
+effects=["notify"]
+start="beginning"
+"#,
+    )
+    .unwrap()
+}
+fn open_reactor(runtime: &tokio::runtime::Runtime, url: &str) -> Application {
+    let db = Database::connect(&merezha_postgres::DatabaseConfig::new(
+        merezha_postgres::Secret::new(url),
+    ))
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let options = PostgresOptions {
+        effects: Some(Arc::new(Recording(Some(db.clone())))),
+        ..PostgresOptions::default()
+    };
+    let store = runtime
+        .block_on(PostgresStore::connect(
+            &db,
+            &reactor_config(),
+            options,
+            deadline,
+        ))
+        .unwrap();
+    Application::with_postgres(
+        reactor_config(),
+        Arc::new(Counter::default()),
+        Arc::new(AllowAll),
+        Arc::new(store),
+    )
+    .unwrap()
 }
 fn config() -> Config {
     Config::parse(
@@ -72,8 +200,8 @@ initial=0
     )
     .unwrap()
 }
-/// [`config`] with a tenant-scoped command and query and a partitioned
-/// projection (AP-C2).
+/// [`config`] with a tenant-scoped command and query, a partitioned
+/// projection (AP-C2) and a reactor (AP-C3).
 fn tenant_config() -> Config {
     Config::parse(
         r#"version=2
@@ -110,6 +238,12 @@ name="mine"
 service="counter"
 initial=0
 partition="tenant"
+[[reactors]]
+name="notifier"
+service="reactor"
+events=["Added"]
+effects=["notify"]
+start="beginning"
 "#,
     )
     .unwrap()
@@ -175,6 +309,10 @@ impl Drop for OwnedChild {
 fn crash_worker() {
     let url = std::env::var("MEREZHA_PG_CRASH_DATABASE").expect("child database");
     let runtime = runtime();
+    if std::env::var("MEREZHA_PG_CRASH_OP").as_deref() == Ok("react") {
+        let _ = open_reactor(&runtime, &url).react_now("notifier");
+        panic!("crash cut was not reached");
+    }
     let app = open(&runtime, &url, Counter::default());
     if std::env::var("MEREZHA_PG_CRASH_OP").as_deref() == Ok("rebuild") {
         let _ = app.rebuild("total");
@@ -288,6 +426,57 @@ fn killed_rebuild_resumes_before_the_swap_and_keeps_the_result_after_it() {
             .query(serde_json::from_value(json!({"tag":"Total","payload":{},"metadata":{"message_id":"q","correlation_id":"c"}})).unwrap())
             .unwrap();
         assert_eq!((model.value, model.checkpoint), (json!(5), 5), "{cut}");
+    }
+}
+/// C3 test 2, crash cuts: kill -9 inside the checkpoint transaction, after
+/// its writes and before `COMMIT`, and just after it. Before it, nothing
+/// was written: the restarted reactor runs the batch again and writes each
+/// effect once. After it, the effects, rejections and checkpoint are
+/// committed together and nothing is written twice.
+#[test]
+fn killed_reactor_writes_its_effects_once_at_each_checkpoint_cut() {
+    for cut in ["reactor_before_commit", "reactor_after_commit"] {
+        let Some(test) = TestDatabase::create() else {
+            return;
+        };
+        let runtime = runtime();
+        migrated(&runtime, &test);
+        runtime.block_on(async {
+            let db = Database::connect(&test.config()).unwrap();
+            let client = db
+                .acquire(Instant::now() + Duration::from_secs(10))
+                .await
+                .unwrap();
+            db.batch(&client, &TEST_REACTIONS).await.unwrap();
+        });
+        let app = open_reactor(&runtime, test.url());
+        for _ in 0..3 {
+            app.command(command(None)).unwrap();
+        }
+        drop(app);
+        kill_at(&test, cut, "react");
+        let committed = if cut == "reactor_after_commit" { 3 } else { 0 };
+        assert_eq!(
+            count(&runtime, test.url(), "test_reactions"),
+            committed,
+            "{cut}"
+        );
+        assert_eq!(
+            count(&runtime, test.url(), "reactor_rejections"),
+            committed,
+            "{cut}"
+        );
+        let app = open_reactor(&runtime, test.url());
+        app.react_now("notifier").unwrap();
+        app.react_now("notifier").unwrap();
+        assert_eq!(count(&runtime, test.url(), "test_reactions"), 3, "{cut}");
+        assert_eq!(
+            count(&runtime, test.url(), "reactor_rejections"),
+            3,
+            "{cut}"
+        );
+        let reactors = app.admit().unwrap().reactors().unwrap();
+        assert_eq!(reactors.reactors[0].checkpoint, 3, "{cut}");
     }
 }
 #[test]
@@ -426,11 +615,13 @@ fn an_append_that_answered_keeps_its_outcome_when_only_the_reset_fails_or_is_lat
     assert_eq!(count(&runtime, test.url(), "events"), 2);
 }
 
-/// A counter whose projection fails while `fail` is set.
+/// A counter whose projection fails while `fail` is set, and whose
+/// reactor is overloaded while `overloaded` is.
 #[derive(Clone, Default)]
 struct Flaky {
     counter: Counter,
     fail: Arc<std::sync::atomic::AtomicBool>,
+    overloaded: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Guest for Flaky {
     fn services(&self) -> Result<Vec<String>, Failure> {
@@ -447,7 +638,15 @@ impl GuestSession for Flaky {
         {
             return Err(Failure::permanent("guest_error"));
         }
+        if matches!(op, Operation::React { .. })
+            && self.overloaded.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Failure::transient("overloaded"));
+        }
         self.counter.invoke(service, op)
+    }
+    fn protocol(&self, service: &str) -> u16 {
+        self.counter.protocol(service)
     }
 }
 
@@ -456,6 +655,7 @@ impl GuestSession for Flaky {
 /// (commands, a replay, reads, a catch-up commit, a paused rebuild, a
 /// failing rebuild with resume and abandon, the admin reads, a recorded
 /// failure, a tenant command, a partitioned catch-up, query and rebuild,
+/// a reactor's failed and committed batches with its admin operations,
 /// and `verify`) exercises exactly the statements `STATEMENTS` lists.
 #[test]
 fn the_store_runs_exactly_its_registered_statements_and_reports_the_append() {
@@ -487,6 +687,7 @@ fn the_store_runs_exactly_its_registered_statements_and_reports_the_append() {
             },
             ..BackgroundOptions::default()
         },
+        effects: Some(Arc::new(Recording(None))),
         ..PostgresOptions::default()
     };
     let guest = Flaky::default();
@@ -585,6 +786,42 @@ fn the_store_runs_exactly_its_registered_statements_and_reports_the_append() {
             &Failure::transient("database_timeout"),
             deadline(),
         ))
+        .unwrap();
+    // Reactors: a failed batch, an operator's skip and retry, a batch with
+    // a rejected effect, a pause and resume, and the admin reads.
+    guest
+        .overloaded
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        app.react_now("notifier").unwrap(),
+        ReactorOutcome::Waiting(Some(_))
+    ));
+    guest
+        .overloaded
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let admin = || app.admit().unwrap();
+    admin()
+        .skip_reactor(
+            "notifier",
+            crate::status::SkipTo::Position(1),
+            Some("usr_1"),
+        )
+        .unwrap();
+    admin().retry_reactor("notifier").unwrap();
+    app.react_now("notifier").unwrap();
+    admin().set_reactor_active("notifier", false).unwrap();
+    admin().set_reactor_active("notifier", true).unwrap();
+    assert_eq!(admin().reactors().unwrap().reactors[0].rejected, 2);
+    assert_eq!(
+        admin()
+            .rejections("notifier", 10, None)
+            .unwrap()
+            .rejections
+            .len(),
+        2
+    );
+    runtime
+        .block_on(store.reactor_due("notifier", deadline()))
         .unwrap();
     assert!(runtime.block_on(verify(&db, deadline())).unwrap().ok);
     // A missing position makes `verify` list the gap.

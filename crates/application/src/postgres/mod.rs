@@ -18,6 +18,7 @@
 //! `LISTEN merezha_app_events` and an interval. The admin documents
 //! ([`crate::status`]) read the same rows.
 mod admin;
+mod reactor;
 mod runner;
 mod scheduler;
 mod sql;
@@ -25,10 +26,22 @@ mod sql;
 mod tests;
 mod verify;
 
+#[cfg(feature = "test-support")]
+pub(crate) use reactor::react;
 pub(crate) use runner::at_deadline;
+/// The bounds of a run a request drives within `deadline`.
+#[cfg(feature = "test-support")]
+pub(crate) fn request_bounds(deadline: Instant) -> runner::Bounds {
+    runner::Bounds::request(deadline)
+}
+#[doc(hidden)]
+pub use reactor::ReactorOutcome;
+pub use reactor::{
+    COMMAND_KIND, COMMAND_QUEUE, CommandJob, EffectBody, EffectRequest, Effects, SOURCE,
+};
 pub use runner::{BackgroundOptions, CatchUp, INTERVAL, MAX_CONCURRENT, RUN_TIMEOUT};
 #[doc(hidden)]
-pub use runner::{Pause, RunHooks};
+pub use runner::{FailOnce, Pause, RunHooks};
 pub use scheduler::{EVENTS_CHANNEL, Scheduler};
 pub use verify::{MAX_VIOLATIONS, Subject, VerifyReport, Violation, verify};
 
@@ -65,6 +78,7 @@ pub const MIGRATIONS: &[Migration] = &[
         "partitions",
         include_str!("migrations/0002_partitions.sql"),
     ),
+    Migration::new(3, "reactors", include_str!("migrations/0003_reactors.sql")),
 ];
 /// Every statement the store runs, registered with `merezha-postgres`
 /// (TE §1.3): `app.*` names, the append `app.events.append`.
@@ -147,6 +161,9 @@ pub struct PostgresOptions {
     pub trace: Option<Arc<dyn TraceSource>>,
     /// Background runners and explicit catch-ups.
     pub background: BackgroundOptions,
+    /// The host's effect ports, which reactors write through (AP §C.5).
+    /// Required when the configuration declares reactors.
+    pub effects: Option<Arc<dyn Effects>>,
 }
 impl Default for PostgresOptions {
     fn default() -> Self {
@@ -154,6 +171,7 @@ impl Default for PostgresOptions {
             lock_timeout_max: Duration::from_secs(5),
             trace: None,
             background: BackgroundOptions::default(),
+            effects: None,
         }
     }
 }
@@ -163,6 +181,7 @@ impl std::fmt::Debug for PostgresOptions {
             .field("lock_timeout_max", &self.lock_timeout_max)
             .field("trace", &self.trace.is_some())
             .field("background", &self.background)
+            .field("effects", &self.effects.is_some())
             .finish()
     }
 }
@@ -269,6 +288,10 @@ impl PostgresStore {
             return Err(configuration());
         }
         options.background.validate()?;
+        let reactors = config.reactors.clone().unwrap_or_default();
+        if !reactors.is_empty() && options.effects.is_none() {
+            return Err(Failure::permanent("reactor_effects_unavailable"));
+        }
         let report = run_migrations(
             db,
             &[ModuleMigrations {
@@ -298,6 +321,15 @@ impl PostgresStore {
             ));
         }
         let application_text = application.as_str().to_owned();
+        let reactor_rows: Vec<(String, bool)> = reactors
+            .iter()
+            .map(|r| {
+                (
+                    r.name.as_str().to_owned(),
+                    r.start == crate::config::ReactorStart::Beginning,
+                )
+            })
+            .collect();
         let store_db = db.clone();
         db.transaction(deadline, move |tx| {
             Box::pin(async move {
@@ -331,6 +363,14 @@ impl PostgresStore {
                         return Err(configuration());
                     }
                 }
+                // A new reactor starts at the head unless it opts into the
+                // beginning; an existing row keeps its checkpoint (§C.5).
+                for (name, beginning) in &reactor_rows {
+                    store_db
+                        .execute(tx, &sql::INSERT_REACTOR, &[name, beginning])
+                        .await
+                        .map_err(|e| read_error(&e))?;
+                }
                 Ok(())
             })
         })
@@ -349,6 +389,7 @@ impl PostgresStore {
             shared: Arc::new(runner::Shared::new(
                 options.background.clone(),
                 &config.projections,
+                &reactors,
             )),
             options,
             reset_statement: RESET_STATEMENT,
@@ -714,6 +755,7 @@ impl DurableStore for PostgresStore {
                 shared: Arc::new(runner::Shared::new(
                     self.options.background.clone(),
                     &config.projections,
+                    config.reactors.as_deref().unwrap_or_default(),
                 )),
             }),
             Default::default(),

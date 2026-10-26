@@ -12,7 +12,7 @@ mod protocol;
 mod sqlite;
 pub mod status;
 pub mod store;
-pub use access::{Anonymous, Caller, Scope};
+pub use access::{Anonymous, Caller, ReactorCaller, Scope};
 pub use application::{Admission, Application, ProjectionState, QueryResult};
 pub use instrument::SCOPE;
 
@@ -183,6 +183,7 @@ fn guest_operation(operation: &Operation) -> merezha_runtime::GuestOperation {
         Operation::Project { .. } => GuestOperation::Project,
         Operation::Query { .. } => GuestOperation::Query,
         Operation::Describe {} => GuestOperation::Describe,
+        Operation::React { .. } => GuestOperation::React,
     }
 }
 fn runtime_failure(error: merezha_runtime::Error) -> Failure {

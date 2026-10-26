@@ -60,6 +60,7 @@ pub mod application_module;
 pub mod content;
 pub mod identity;
 pub mod notifications;
+pub mod reactions;
 pub mod run;
 
 /// The blocks the `merezha` binary registers. Each stays disabled until

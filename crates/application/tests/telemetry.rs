@@ -135,7 +135,9 @@ impl GuestSession for Fake {
                     state: json!(state.as_u64().unwrap() + events.len() as u64),
                 })
             }
-            Operation::Describe {} => unreachable!("a version 1 fake is never described"),
+            Operation::Describe {} | Operation::React { .. } => {
+                unreachable!("a version 1 fake is never described and never reacts")
+            }
             Operation::Query { payload, state, .. } => match reply_failure(&payload) {
                 Some(failure) => Err(failure),
                 None => Ok(Reply::Queried { value: state }),

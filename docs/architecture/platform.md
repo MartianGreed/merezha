@@ -355,9 +355,10 @@ Optional. Without it no application endpoints are mounted. Any
 | `path` | path | required in the section | no | the [application configuration](application.md); its SQLite `path` keeps `serve`'s meaning |
 
 The PostgreSQL application core's tables (AP §D.2). `[application.projections]`,
-`[application.background]` and `[application.append]` apply to a PostgreSQL
-application ([application storage](#application-storage)); memory and SQLite
-applications ignore them. `[application.reactors]` is *reserved* until AP-C3:
+`[application.reactors]`, `[application.background]` and `[application.append]`
+apply to a PostgreSQL application ([application storage](#application-storage),
+[reactors](#reactors)); memory and SQLite applications ignore them (and refuse
+`[[reactors]]`):
 
 | Table | Key | Type | Default | Notes |
 | --- | --- | --- | --- | --- |
@@ -365,9 +366,9 @@ applications ignore them. `[application.reactors]` is *reserved* until AP-C3:
 | | `interval_ms` | duration | `5000` | 100 ms to 10 min; the wake that covers lost notifications and external restores |
 | | `run_timeout_ms` | duration | `30000` | 1 s to 5 min, per background run; its statements end 5 s later at the latest (`run_timeout`) |
 | | `warm_readiness` | boolean | `true` | `/health/ready` is 503 until this instance's configured projection revisions are warm |
-| `[application.reactors]` | `interval_ms` | duration | `5000` | 100 ms to 10 min |
-| | `retry_base_ms` | duration | `1000` | 100 ms to 10 min; at most `retry_max_ms` (`retry_base_exceeds_max`) |
-| | `retry_max_ms` | duration | `300000` | 1 s to 1 day |
+| `[application.reactors]` | `interval_ms` | duration | `5000` | 100 ms to 10 min; the reactors' wake that covers lost notifications |
+| | `retry_base_ms` | duration | `1000` | 100 ms to 10 min; at most `retry_max_ms` (`retry_base_exceeds_max`); the first retry of a failed reactor batch waits half of it to all of it (equal jitter), doubling per consecutive failure |
+| | `retry_max_ms` | duration | `300000` | 1 s to 1 day; the ceiling of that backoff, also for a halted reactor's retries |
 | `[application.background]` | `max_concurrent` | integer | `2` | 1 to 16, shared by projection, rebuild and reactor runs; at most `database.max_detached - 1`. It also caps the explicit catch-ups holding their own lock session. The runtime manifest's `max_concurrent_invocations` must be at least `limits.max_concurrent` plus this (`invalid_concurrency_budget` at startup), and `/v1/reload` refuses a manifest below it (`invalid_manifest`, the old generation keeps serving) |
 | `[application.append]` | `lock_timeout_max_ms` | duration | `5000` | 10 ms to 30 s; the append waits for the head lock at most `min(remaining deadline - 50 ms, lock_timeout_max_ms)`, then fails `503 storage_busy` |
 
@@ -2138,7 +2139,7 @@ answers `{checkpoint, head}`.
 
 | Route under `/v1/application/` | Permission | Answer |
 | --- | --- | --- |
-| `GET status` | `application.admin.read` | `{"application","head","projections":[{"name","checkpoint","lag_events","lag_seconds","status","failure_code"}],"reactors":[],"instance":{"id","background_runs"},"listener"}`; `listener` is `connected`, `reconnecting` or `off` |
+| `GET status` | `application.admin.read` | `{"application","head","projections":[{"name","checkpoint","lag_events","lag_seconds","status","failure_code"}],"reactors":[{"name","status","lag_events"}],"instance":{"id","background_runs"},"listener"}`; `listener` is `connected`, `reconnecting` or `off` |
 | `GET projections` | `application.admin.read` | `{"head","projections":[{"name","revision","partitioned","checkpoint","lag","warm","status","failure_code","rebuild"?:{"checkpoint","target","status"},"updated_at"}]}` |
 | `GET projections/{name}` | `application.admin.read` | one entry plus `"revisions":[{"revision","checkpoint","warm"}]` |
 | `POST projections/{name}/catch-up` | `application.projections.catch_up` | `{state, checkpoint}` |
@@ -2155,6 +2156,61 @@ that does not hold the lock open few lock sessions. At
 startup the host logs `db.pool_undersized` (warn, `pool_size`,
 `recommended`) when `database.pool_size` is below `limits.max_concurrent +
 background.max_concurrent + 2 + number of job queues + 2`.
+
+#### Reactors
+
+`[[reactors]]` in `application.toml` ([application: reactors](application.md#reactors-version-2-postgresql),
+[design](../design/application-platform.md) §C.5) run on the same scheduler,
+one lane per configured reactor, sharing `[application.background]
+max_concurrent`. A lane wakes on a commit on this host, on a
+`merezha_app_events` notification, every `[application.reactors]
+interval_ms` and at its retry time; a run holds
+`pg_try_advisory_lock(1297760592, hashtext('r:{name}'))` on a detached session
+named `merezha r:{name}`, so one host runs a reactor at a time. Migration
+0003 adds `merezha_app.reactors` (checkpoint, row revision, `active`, `paused`
+or `halted`, failure bookkeeping, `retry_at`), `reactor_skips` and
+`reactor_rejections`. A new reactor's row starts at the head (or 0 with
+`start = "beginning"`); a reactor removed from configuration keeps its row.
+
+Each batch's checkpoint transaction runs on the run's session and writes,
+in order: every accepted effect through the module's notifier
+(`Notifier::request`, `Notifier::emit_webhook`) and outbox (one
+`application`/`application.command` job record), bound to the source
+`application` and keyed `reaction:{reactor}:{event_id}:{index}`; the
+rejected effects; and the new checkpoint, compared with the row revision.
+Directory membership checks run before it opens. Without the notifications
+block the capture fallback logs `notification.captured` and delivers
+nothing. When any reactor allows `command` effects, the module registers
+the `application.command` handler on queue `application`
+(`[jobs.queues.application]`, defaults with a startup warning when absent):
+it runs the command as `sys_reactor_{name}` on the event's tenant with the
+reactor's `permissions` only, idempotency key `rx:{reactor}:{position}:{index}`;
+conflicts and transient failures retry, permanent ones (`unauthorized`,
+`command_not_allowed`, `reactor_not_found` for a reactor no longer
+configured) dead-letter. Routes that declare neither `permission` nor
+`access` admit reactors only under the loopback allow-all policy.
+
+Logs: `reactor.halted` (error, once per halt), `reactor.skipped` (info),
+`reactor.effect_rejected` (warn, with the effect type as `reason` and the
+code). Metrics: `merezha.reactor.batch.duration` (`accepted`, `failed`,
+`halted`), `merezha.reactor.effects` (`accepted`, `rejected` per effect
+type), `merezha.reactor.skipped`, `merezha.reactor.halted`,
+`merezha.reactor.lag.events`, `merezha.reactor.lag.age`,
+`merezha.reactor.lock.held` and `merezha.reactor.lock.contended`, with
+`merezha.reactor.name`. Batches with events to react to open a root `react
+{reactor}` span linked to their source events' traces.
+
+| Route under `/v1/application/` | Permission | Answer |
+| --- | --- | --- |
+| `GET reactors` | `application.admin.read` | `{"head","reactors":[{"name","checkpoint","lag","status","halted_position","failure_code","failures","retry_at","rejected"}]}` for the configured reactors; `lag` is `head - checkpoint` |
+| `GET reactors/{name}/rejections?limit=&after=` | `application.admin.read` | `{"rejections":[{"position","index","effect","code","rejected_at"}],"next"?}`, oldest first, `limit` 1 to 200 (default 50), `after` the previous page's `next` (`{position}.{index}`); `400 invalid_input` for another parameter |
+| `POST reactors/{name}/pause` and `/resume` | `application.admin.write` | `{"name","status"}`; a paused reactor runs no batch, and a batch that was running when it paused does not commit; resume makes it due now |
+| `POST reactors/{name}/retry` | `application.admin.write` | `{"name","status"}`; the next attempt runs now |
+| `POST reactors/{name}/skip` | `application.admin.write` | body `{"position":P}` with `P = checkpoint + 1` (else `409 invalid_skip`) or `{"to":"head"}`; a `reactor_skips` row with the principal (`admin` or `skip_to_head`), the reactor active again (a paused one stays paused); `{"name","checkpoint"}` |
+
+These routes work on any reactor row, configured or not, so an operator can
+skip a removed reactor to the head before re-adding it; a name without a row
+is `404 reactor_not_found`.
 
 `merezha application verify --config merezha.toml` checks, read-only and in
 chunks of 10,000 positions inside one repeatable-read snapshot, that positions
@@ -3357,11 +3413,12 @@ itself.
   work.
 - The events, outbox and jobs `trace_parent`/`trace_state` columns are
   filled (TE-T3, TE-T5).
-- Reactor lag, lock and batch instruments arrive with the reactors (AP-C3);
-  the `application` section of `/v1/admin/status` (TE-T2's route) embeds
-  `Application::status()` once both are on main.
 - Cron jobs keep the occurrence key as their correlation id instead of a
   host-minted trace id (TE §2.3, with TE-T3's host-minted ids).
 - PostgreSQL application storage (AP-A2) has no background projection
   runners, warm-up readiness or application admin API yet (AP-A3); catch-up
   and rebuild run in the request.
+- Reactors (AP-C3) have no process test with a Wasm reactor component yet:
+  the `task-notifier` example is contract-tested natively and builds as a
+  component, and the end-to-end example application (`merezha new`, stage 3)
+  wires it with an `ArchiveTask` route.

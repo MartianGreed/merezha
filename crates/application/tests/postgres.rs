@@ -192,7 +192,9 @@ impl GuestSession for Fake {
                 })
             }
             // `{"len":true}` asks for the state's encoded size instead.
-            Operation::Describe {} => unreachable!("a version 1 fake is never described"),
+            Operation::Describe {} | Operation::React { .. } => {
+                unreachable!("a version 1 fake is never described and never reacts")
+            }
             Operation::Query { state, payload, .. } if payload["len"] == true => {
                 Ok(Reply::Queried {
                     value: json!(state.to_string().len()),

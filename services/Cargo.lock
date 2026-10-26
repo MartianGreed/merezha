@@ -179,6 +179,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "merezha-task-notifier"
+version = "0.1.0"
+dependencies = [
+ "merezha-domain",
+ "merezha-task-events",
+ "serde_json",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "merezha-task-view"
 version = "0.1.0"
 dependencies = [

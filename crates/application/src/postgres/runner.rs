@@ -70,6 +70,12 @@ pub struct BackgroundOptions {
     pub max_concurrent: usize,
     /// `app.instance_id`, reported by [`Application::status`].
     pub instance_id: String,
+    /// The reactors' safety-net wake (`[application.reactors]
+    /// interval_ms`).
+    pub reactor_interval: Duration,
+    /// The reactors' equal-jitter retry backoff, from `retry_base_ms` up
+    /// to `retry_max_ms` (AP §C.5).
+    pub reactor_retry: (Duration, Duration),
     /// Test hooks; production leaves the default (none).
     #[doc(hidden)]
     pub hooks: RunHooks,
@@ -83,6 +89,8 @@ impl Default for BackgroundOptions {
             warm_readiness: true,
             max_concurrent: 2,
             instance_id: String::new(),
+            reactor_interval: Duration::from_secs(5),
+            reactor_retry: (Duration::from_secs(1), Duration::from_secs(300)),
             hooks: RunHooks::default(),
         }
     }
@@ -99,6 +107,9 @@ impl BackgroundOptions {
     pub(crate) fn validate(&self) -> Result<(), Failure> {
         let in_range = |value, (min, max)| (min..=max).contains(&value);
         if !in_range(self.interval, INTERVAL)
+            || !in_range(self.reactor_interval, INTERVAL)
+            || self.reactor_retry.0 > self.reactor_retry.1
+            || self.reactor_retry.1 > Duration::from_secs(86_400)
             || !in_range(self.run_timeout, RUN_TIMEOUT)
             || !(MAX_CONCURRENT.0..=MAX_CONCURRENT.1).contains(&self.max_concurrent)
             || self.instance_id.len() > 256
@@ -131,6 +142,39 @@ pub struct RunHooks {
     /// A one-shot pause of a rebuild run before it reads its candidate for
     /// the next batch.
     pub rebuild_batch: Option<Arc<Pause>>,
+    /// A one-shot failure of a reactor's checkpoint transaction after its
+    /// writes and before `COMMIT`, which rolls everything back.
+    pub reactor_fail: Option<Arc<FailOnce>>,
+}
+/// See [`RunHooks::reactor_fail`].
+#[derive(Debug, Default)]
+#[doc(hidden)]
+pub struct FailOnce {
+    armed: AtomicBool,
+    fired: AtomicBool,
+    reactor: Mutex<String>,
+}
+impl FailOnce {
+    /// Fail the next checkpoint transaction of `reactor` with transient
+    /// `test_rollback`.
+    pub fn arm(&self, reactor: &str) {
+        *self.reactor.lock().unwrap_or_else(|e| e.into_inner()) = reactor.to_owned();
+        self.fired.store(false, Ordering::SeqCst);
+        self.armed.store(true, Ordering::SeqCst);
+    }
+    /// Whether it failed a transaction since the last `arm`.
+    pub fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+    pub(crate) fn check(&self, reactor: &str) -> Result<(), Failure> {
+        if *self.reactor.lock().unwrap_or_else(|e| e.into_inner()) == reactor
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            self.fired.store(true, Ordering::SeqCst);
+            return Err(Failure::transient("test_rollback"));
+        }
+        Ok(())
+    }
 }
 /// See [`RunHooks::pause`].
 #[derive(Debug, Default)]
@@ -207,9 +251,15 @@ pub(crate) struct Shared {
     pub listener: AtomicU8,
     /// Bumped to cancel every in-flight background run step.
     pub cancel: watch::Sender<u64>,
+    /// Per configured reactor (AP §C.5).
+    pub reactors: BTreeMap<String, super::reactor::ReactorLane>,
 }
 impl Shared {
-    pub(crate) fn new(options: BackgroundOptions, projections: &[Projection]) -> Self {
+    pub(crate) fn new(
+        options: BackgroundOptions,
+        projections: &[Projection],
+        reactors: &[crate::config::Reactor],
+    ) -> Self {
         let lanes = projections
             .iter()
             .map(|p| {
@@ -227,6 +277,10 @@ impl Shared {
             runs: AtomicUsize::new(0),
             listener: AtomicU8::new(0),
             cancel: watch::Sender::new(0),
+            reactors: reactors
+                .iter()
+                .map(|r| (r.name.as_str().to_owned(), Default::default()))
+                .collect(),
         }
     }
     pub(crate) fn lane(&self, projection: &Projection) -> Result<&Lane, Failure> {
@@ -237,10 +291,17 @@ impl Shared {
             ))
             .ok_or_else(|| Failure::permanent("projection_not_found"))
     }
-    /// After an `appended` outcome: wake every live lane.
+    /// After an `appended` outcome: wake every live lane and every
+    /// reactor.
     pub(crate) fn appended(&self) {
         for lane in self.lanes.values() {
             lane.live.notify_one();
+        }
+        self.wake_reactors();
+    }
+    pub(crate) fn wake_reactors(&self) {
+        for lane in self.reactors.values() {
+            lane.wake.notify_one();
         }
     }
     pub(crate) fn publish(&self) {
@@ -276,6 +337,18 @@ impl crate::instrument::LockSource for Shared {
                         + lane.contended[1].load(Ordering::Relaxed),
                 )
             })
+            .collect()
+    }
+    fn reactors_held(&self) -> Vec<(String, f64)> {
+        self.reactors
+            .iter()
+            .filter_map(|(name, lane)| lane.held_for().map(|seconds| (name.clone(), seconds)))
+            .collect()
+    }
+    fn reactors_contended(&self) -> Vec<(String, u64)> {
+        self.reactors
+            .iter()
+            .map(|(name, lane)| (name.clone(), lane.contended.load(Ordering::Relaxed)))
             .collect()
     }
 }
@@ -375,7 +448,7 @@ struct Session<'a> {
 impl PostgresStore {
     /// Run `work` on the store's runtime within the run's hard deadline;
     /// a cancellation drops it at once.
-    fn step<T>(
+    pub(super) fn step<T>(
         &self,
         bounds: &Bounds,
         work: impl Future<Output = Result<T, Failure>>,
@@ -769,7 +842,7 @@ async fn write_partitions(
 /// The test hook's pause inside a commit transaction: the transaction
 /// stays open, idle or in a `pg_sleep`, so only the run's own bounds can
 /// end it.
-async fn pause_in(
+pub(super) async fn pause_in(
     db: &merezha_postgres::Database,
     tx: &merezha_postgres::Tx<'_>,
     pause: Option<Arc<Pause>>,

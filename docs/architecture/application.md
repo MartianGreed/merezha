@@ -130,10 +130,9 @@ cargo run --locked -p merezha-cli -- serve --manifest runtime.toml --application
 
 `version = 1` is the original format and stays accepted. `version = 2` adds
 `[limits] max_stream_events` (below), route permissions and tenancy (next
-section) and `[[reactors]]` ([design](../design/application-platform.md) §C.5),
-which this build parses and refuses at startup with `unsupported_in_this_build`.
-A version 1 file using any version 2 key fails `invalid_config`, as an unknown
-key did before.
+section) and `[[reactors]]` ([reactors](#reactors-version-2-postgresql),
+PostgreSQL only). A version 1 file using any version 2 key fails
+`invalid_config`, as an unknown key did before.
 
 ### Route permissions and tenant streams (version 2)
 
@@ -556,10 +555,89 @@ ways ([platform: projections in the background](platform.md#projections-in-the-b
 
 `Application::status()` returns the status document on every backend:
 head, per-projection checkpoint, lag and failure, plus on PostgreSQL the
-instance's background runs and listener state.
+instance's background runs, listener state and reactors.
+
+### Reactors (version 2, PostgreSQL)
+
+A reactor turns committed events into effects: notifications, webhook events
+and later commands, in the notifications block's vocabulary
+([design](../design/application-platform.md) §C.2, §C.5). It is a version 2
+service answering `react`; it sees events only, never projection state.
+
+```toml
+[[reactors]]
+name = "task-notifier"             # 1 to 48 bytes of [A-Za-z0-9._-]
+service = "task-notifier"          # application_protocol = 2 (reactor_requires_protocol_2)
+events = ["TaskCompleted"]         # tag filter applied by the host; [] = every event
+effects = ["notify", "command"]    # allowed effect types; others are rejected
+commands = ["ArchiveTask"]         # allowed command tags (each a [[commands]] route)
+permissions = ["tasks.archive"]    # held by sys_reactor_task-notifier
+allow_addresses = false            # explicit email or phone recipients
+start = "head"                     # head (default) | beginning; read only when the row is created
+on_error = "halt"                  # halt (default) | skip
+```
+
+```json
+{"version":2,"body":{"op":"react","reactor":"task-notifier","events":[ <StoredEvent>, ... ]}}
+{"version":2,"outcome":{"status":"ok","reply":{"kind":"reacted","reactions":[
+  {"event_id":"event/41","effects":[
+    {"effect":"notify","topic":"tasks.completed","recipients":[{"user":{"id":"usr_01JB2X6Q9F3W"}}],
+     "channels":["inbox","email"],"data":{"title":"Write docs"}},
+    {"effect":"webhook","event_type":"tasks.task_completed","data":{"task_id":"t-1"}},
+    {"effect":"command","tag":"ArchiveTask","stream":"t-1","payload":{},"delay_ms":604800000}]}]}}}
+```
+
+The SDK types are `Operation::React`, `Reply::Reacted`, `Reaction`, `Effect`,
+`Recipient` (`user`, `tenant`, `application`, `address`), `Address` and
+`Channel`. Guests never name the dedupe key, the tenant or the source event:
+every effect is keyed `reaction:{reactor}:{event_id}:{index}` (source
+`application`), takes the event's stream tenant and correlation id, and has
+the event as its causation.
+
+The reply is checked in two tiers. A *malformed* reply (`invalid_response`:
+not `reacted`, not exactly one reaction per event in order, more than 8
+effects per event or 64 per batch, an effect over `max_payload_bytes`)
+halts the reactor whatever `on_error` says. A *rejected* effect is recorded
+in `merezha_app.reactor_rejections`, logged as `reactor.effect_rejected`,
+and its siblings are written: `effect_not_allowed`, `command_not_allowed`,
+`address_not_allowed`, `invalid_recipient` (a `tenant` recipient naming
+another tenant), `tenant_required` (a `tenant` recipient on an event without
+tenant), `invalid_delay` (over 30 days), and every refusal of the
+notifications block (`unknown_topic`, `recipient_not_in_tenant`, ...).
+
+A batch reads up to `batch_size` events after the reactor's checkpoint,
+calls the guest outside SQL with the events its filter keeps, asks the
+Directory which `user` recipients belong to the event's tenant, then writes
+every accepted effect, its rejections and the new checkpoint in one
+transaction on the run's locked session. The host's
+`postgres::Effects` port writes them (the platform's `Notifier` and
+`Outbox`), so notifications, outbox records and the checkpoint commit or
+roll back together. A command effect becomes a job
+`application`/`application.command` that runs the command as
+`sys_reactor_{name}` (kind `system`, the event's tenant, the reactor's
+`permissions` only), with idempotency key and message id
+`rx:{reactor}:{position}:{index}`: a duplicate delivery replays the receipt.
+`Application::command_effect` is that handler's entry point. An embedding
+host passes its port in `PostgresOptions::effects`; a store whose
+configuration declares reactors fails `reactor_effects_unavailable` without
+one, and the `Scheduler` runs one lane per reactor beside the projection
+lanes, under the advisory lock `r:{name}`, so one host at a time runs it.
+
+| Failure | What happens |
+| --- | --- |
+| Transient (guest `timeout` or `overloaded`, storage, the Directory, the notifier's `unavailable`) | the checkpoint stays; `failures + 1` and a retry after an equal-jitter backoff (`[application.reactors] retry_base_ms` to `retry_max_ms`) |
+| Permanent guest failure or malformed reply on a batch of several events | the same range again, one event at a time, isolating the poison event |
+| Malformed reply on one event, or a permanent failure with `on_error = "halt"` | `halted` at that position (`reactor.halted`); retried at its retry time, so a fixed guest resumes it; an operator can `retry` now or `skip` |
+| Permanent guest failure on one event with `on_error = "skip"` | a `reactor_skips` row (`on_error_skip`) and the checkpoint past it, in one transaction |
+
+Reactors never re-fire: projection catch-up and rebuild never touch their
+rows, a new reactor starts at the head unless it says `start = "beginning"`,
+and a reactor removed from configuration keeps its row and resumes from it
+when re-added (the admin listing shows the gap). Memory and SQLite refuse
+`[[reactors]]` with `reactors_require_postgres`, since they have no outbox.
 
 ```sh
-cargo test --locked -p merezha-application --test postgres --test store_contract --test background --test tenancy
+cargo test --locked -p merezha-application --test postgres --test store_contract --test background --test tenancy --test reactors
 cargo test --locked -p merezha-application --test route_access
-cargo test --locked -p merezha-cli --test postgres_process --test route_permissions
+cargo test --locked -p merezha-cli --test postgres_process --test route_permissions --test reactors
 ```

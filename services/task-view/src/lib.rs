@@ -345,7 +345,7 @@ pub fn dispatch(operation: Operation) -> Result<Reply, Failure> {
             })
         }
         // `describe` never reaches a dispatcher: the SDK answers it.
-        Operation::Decide { .. } | Operation::Describe {} => {
+        Operation::Decide { .. } | Operation::Describe {} | Operation::React { .. } => {
             Err(Failure::permanent("unsupported_operation"))
         }
     }

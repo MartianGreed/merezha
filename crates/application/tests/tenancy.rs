@@ -168,6 +168,7 @@ impl GuestSession for Fake {
     fn invoke(&self, _: &str, operation: Operation) -> Result<Reply, Failure> {
         Ok(match operation {
             Operation::Describe {} => Reply::Described { protocol: 2 },
+            Operation::React { .. } => unreachable!("this fake is not a reactor"),
             Operation::Validate { payload, .. } => Reply::Validated { payload },
             Operation::Decide { .. } => Reply::Decided {
                 events: vec![Event {
