@@ -127,12 +127,11 @@ pub(crate) async fn subscribe(
         }
         label => label.filter(|l| !l.is_empty()),
     };
-    let now = core.now();
     let expires_at = match body.expiration_time {
         None => None,
         Some(millis) if millis.is_finite() => {
             match jiff::Timestamp::from_millisecond(millis as i64) {
-                Ok(at) if at > now => Some(at),
+                Ok(at) if at > core.now() => Some(at),
                 _ => return invalid(SUBSCRIPTION_INVALID, "/expirationTime", "invalid_value"),
             }
         }
@@ -151,6 +150,7 @@ pub(crate) async fn subscribe(
     );
     let key_id = sender.vapid().key_id().to_owned();
     let db = core.database.clone();
+    let clock = core.clone();
     let deadline = Instant::now() + DEADLINE;
     let result = db
         .clone()
@@ -159,6 +159,9 @@ pub(crate) async fn subscribe(
                 db.query_one(tx, &sql::USER_LOCK, &[&user])
                     .await
                     .map_err(|e| classify(&e))?;
+                // Read after the lock, so this row is the most recently
+                // used of the user's when TRIM runs.
+                let now = clock.now();
                 let row = db
                     .query_one(
                         tx,
@@ -179,16 +182,15 @@ pub(crate) async fn subscribe(
                     )
                     .await
                     .map_err(|e| classify(&e))?;
+                let id: Uuid = row.get(0);
+                // The subscription just made is never the one evicted.
+                let others = keep - 1;
                 let evicted = db
-                    .query(tx, &sql::TRIM, &[&user, &keep])
+                    .query(tx, &sql::TRIM, &[&user, &others, &id])
                     .await
                     .map_err(|e| classify(&e))?
                     .len();
-                Ok((
-                    row.get::<_, Uuid>(0),
-                    row.get::<_, jiff::Timestamp>(1),
-                    evicted,
-                ))
+                Ok((id, row.get::<_, jiff::Timestamp>(1), evicted))
             })
         })
         .await;

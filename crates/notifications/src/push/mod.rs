@@ -57,6 +57,9 @@ use web_push_native::jwt_simple::{
 /// The delivery failure and removal reason of a subscription the push
 /// service no longer knows (404 or 410).
 pub const SUBSCRIPTION_GONE: &str = "subscription_gone";
+/// 413 from the push service, or a payload that does not fit
+/// [`MAX_PUSH_PAYLOAD_BYTES`] even with an empty body and no tag.
+pub const PAYLOAD_TOO_LARGE: &str = "push_payload_too_large";
 /// 401 or 403 from the push service: the VAPID key or JWT was refused.
 pub const PUSH_AUTH: &str = "push_auth";
 /// `push_auth` is retried this many attempts at most (NT §5.3).
@@ -81,12 +84,20 @@ pub const PUSH_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_ENDPOINT: usize = 2048;
 /// Most characters of a `Location` header kept as the message id.
 const MAX_MESSAGE_ID: usize = 256;
-/// The longest `Retry-After` honoured.
+/// The longest `Retry-After` honoured; the sender also caps it at
+/// `push.ttl`, past which the push service would drop the message anyway.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(86_400);
 /// `push_expire`: consecutive failures and the success window after which
 /// a subscription is deleted (NT §5.3).
 pub const MAX_CONSECUTIVE_FAILURES: i32 = 10;
 pub const FAILURE_WINDOW: Duration = Duration::from_secs(30 * 86_400);
+/// `push_expire` deletes a subscription of another VAPID key only once it
+/// has gone unused this long. During a rolling key rotation the instances
+/// on the old key and those on the new one each refresh `last_used_at` of
+/// the subscriptions they target, so neither deletes the other's; once
+/// every instance runs the new key, the old subscriptions stop being used
+/// and go after this grace.
+pub const KEY_CHANGE_GRACE: Duration = Duration::from_secs(7 * 86_400);
 
 fn b64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -241,7 +252,8 @@ impl std::fmt::Debug for Endpoint {
 }
 
 /// The strict allowlist of NT §5.3: `Err` is [`SUBSCRIPTION_INVALID`] for
-/// a malformed endpoint and [`HOST_NOT_ALLOWED`] for a scheme, port or host
+/// a malformed endpoint (including a host name that is not a valid DNS
+/// name) and [`HOST_NOT_ALLOWED`] for a scheme, port or host
 /// outside the rule. `development` is `egress.allow_private_networks`: it
 /// also lets `http` and other ports through.
 pub fn check_endpoint(
@@ -262,6 +274,11 @@ pub fn check_endpoint(
     let Some(host) = url.host() else {
         return Err(SUBSCRIPTION_INVALID);
     };
+    if let url::Host::Domain(name) = &host
+        && !valid_host(name)
+    {
+        return Err(SUBSCRIPTION_INVALID);
+    }
     let secure = url.scheme() == "https" && url.port().is_none_or(|p| p == 443);
     let relaxed = development && matches!(url.scheme(), "https" | "http");
     if !secure && !relaxed {
@@ -284,6 +301,18 @@ pub fn check_endpoint(
     let origin = url.origin().ascii_serialization();
     Ok(Endpoint { url, origin })
 }
+
+/// A DNS host name: at most 253 bytes, labels of 1 to 63 bytes (so no
+/// empty label, as in `a..b` or a trailing dot).
+fn valid_host(name: &str) -> bool {
+    name.len() <= MAX_HOST
+        && name
+            .split('.')
+            .all(|label| (1..=MAX_LABEL).contains(&label.len()))
+}
+/// Most bytes of a host name, and of one of its labels (RFC 1035).
+const MAX_HOST: usize = 253;
+const MAX_LABEL: usize = 63;
 
 /// The subscription and notification fields of one push delivery, read in
 /// Tx A. `Debug` shows the subscription id only.
@@ -370,16 +399,20 @@ pub(crate) fn removed(metrics: &Metrics, reason: &'static str, count: u64) {
     );
 }
 
-/// The push payload of NT §5.3, at most [`MAX_PUSH_PAYLOAD_BYTES`]: `body`
-/// is cut at a character boundary when the whole message would not fit.
+/// The push payload of NT §5.3, never more than [`MAX_PUSH_PAYLOAD_BYTES`]:
+/// `body` is cut at a character boundary when the whole message would not
+/// fit. The render refuses a message whose other fields, with the worst
+/// case of a collapse key, are too large; should the fields still not fit
+/// with an empty body, `tag` is dropped, and `None` means nothing fits
+/// (the delivery fails `push_payload_too_large`).
 pub fn payload(
     delivery: Uuid,
     notification: Uuid,
     topic: &str,
     content: &RenderedPush,
     tag: Option<&str>,
-) -> Vec<u8> {
-    let make = |body: &str| {
+) -> Option<Vec<u8>> {
+    let make = |body: &str, tag: Option<&str>| {
         serde_json::json!({
             "id": delivery.to_string(),
             "notification_id": notification.to_string(),
@@ -391,28 +424,35 @@ pub fn payload(
         })
         .to_string()
     };
-    let full = make(&content.body);
-    if full.len() <= MAX_PUSH_PAYLOAD_BYTES {
-        return full.into_bytes();
-    }
-    // The longest prefix that fits: zero characters always fit, since the
-    // render refuses a message whose other fields are too large.
-    let ends: Vec<usize> = content
-        .body
-        .char_indices()
-        .map(|(i, _)| i)
-        .chain(std::iter::once(content.body.len()))
-        .collect();
-    let (mut low, mut high) = (0usize, ends.len() - 1);
-    while low < high {
-        let middle = (low + high).div_ceil(2);
-        if make(&content.body[..ends[middle]]).len() <= MAX_PUSH_PAYLOAD_BYTES {
-            low = middle;
-        } else {
-            high = middle - 1;
+    let fit = |tag: Option<&str>| -> Option<String> {
+        let full = make(&content.body, tag);
+        if full.len() <= MAX_PUSH_PAYLOAD_BYTES {
+            return Some(full);
         }
-    }
-    make(&content.body[..ends[low]]).into_bytes()
+        if make("", tag).len() > MAX_PUSH_PAYLOAD_BYTES {
+            return None;
+        }
+        // The longest prefix that fits; the empty one does.
+        let ends: Vec<usize> = content
+            .body
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(content.body.len()))
+            .collect();
+        let (mut low, mut high) = (0usize, ends.len() - 1);
+        while low < high {
+            let middle = (low + high).div_ceil(2);
+            if make(&content.body[..ends[middle]], tag).len() <= MAX_PUSH_PAYLOAD_BYTES {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        Some(make(&content.body[..ends[low]], tag))
+    };
+    fit(tag)
+        .or_else(|| tag.and_then(|_| fit(None)))
+        .map(String::into_bytes)
 }
 
 /// `Topic`: the first 32 base64url characters of SHA-256 of the collapse
@@ -431,8 +471,9 @@ pub fn urgency(priority: &str) -> &'static str {
     }
 }
 
-/// `Retry-After` as seconds or an HTTP date, at most a day.
-fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+/// `Retry-After` as seconds or an HTTP date, at most `max_wait` and never
+/// more than a day.
+fn retry_after(headers: &reqwest::header::HeaderMap, max_wait: Duration) -> Option<Duration> {
     let text = headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
@@ -445,15 +486,17 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
             Duration::try_from(at.duration_since(jiff::Timestamp::now())).unwrap_or_default()
         }
     };
-    Some(wait.min(MAX_RETRY_AFTER))
+    Some(wait.min(max_wait).min(MAX_RETRY_AFTER))
 }
 
 /// The outcome of a push service response (RFC 8030, NT §5.3) on attempt
-/// `attempt` of the job.
+/// `attempt` of the job; a `Retry-After` waits at most `max_wait` (the
+/// push TTL).
 pub fn classify_response(
     status: reqwest::StatusCode,
     headers: &reqwest::header::HeaderMap,
     attempt: u32,
+    max_wait: Duration,
 ) -> SendOutcome {
     let permanent = |code: &str| SendOutcome::Permanent {
         code: code.to_owned(),
@@ -468,18 +511,18 @@ pub fn classify_response(
                 .map(str::to_owned),
         },
         404 | 410 => permanent(SUBSCRIPTION_GONE),
-        413 => permanent("push_payload_too_large"),
+        413 => permanent(PAYLOAD_TOO_LARGE),
         401 | 403 if attempt >= PUSH_AUTH_MAX_ATTEMPTS => permanent(PUSH_AUTH),
         401 | 403 => SendOutcome::Transient {
             code: PUSH_AUTH.to_owned(),
             retry_after: None,
         },
         429 => SendOutcome::RateLimited {
-            retry_after: retry_after(headers),
+            retry_after: retry_after(headers, max_wait),
         },
         500..=599 => SendOutcome::Transient {
             code: "push_unavailable".to_owned(),
-            retry_after: retry_after(headers),
+            retry_after: retry_after(headers, max_wait),
         },
         300..=399 => permanent("push_redirected"),
         _ => permanent("push_rejected"),
@@ -589,13 +632,15 @@ impl PushSender {
             return permanent(SUBSCRIPTION_INVALID);
         };
         let auth = web_push_native::Auth::clone_from_slice(&message.target.auth);
-        let plaintext = payload(
+        let Some(plaintext) = payload(
             message.delivery,
             message.notification,
             message.topic,
             message.content,
             message.target.collapse_key.as_deref(),
-        );
+        ) else {
+            return permanent(PAYLOAD_TOO_LARGE);
+        };
         let Ok(body) = web_push_native::encrypt(plaintext, &public, &auth) else {
             return permanent("push_encryption_failed");
         };
@@ -638,7 +683,9 @@ impl PushSender {
             },
             // The body is never read: push services answer with no content
             // that matters, and dropping the response bounds the read.
-            Ok(Ok(response)) => classify_response(response.status(), response.headers(), attempt),
+            Ok(Ok(response)) => {
+                classify_response(response.status(), response.headers(), attempt, self.ttl)
+            }
         };
         if let SendOutcome::Transient { code, .. } | SendOutcome::Permanent { code } = &outcome
             && code == PUSH_AUTH
@@ -661,8 +708,8 @@ impl PushSender {
 }
 
 /// `push_expire` (hourly): delete subscriptions past `expires_at`, made
-/// with another VAPID key, or failing 10 times in a row with no success in
-/// 30 days, in bounded batches.
+/// with another VAPID key and unused for [`KEY_CHANGE_GRACE`], or failing
+/// 10 times in a row with no success in 30 days, in bounded batches.
 pub(crate) async fn expire(
     db: &Database,
     metrics: &Metrics,
@@ -677,6 +724,10 @@ pub(crate) async fn expire(
     let since = now
         .checked_sub(window)
         .map_err(|_| Failure::permanent("invalid_config"))?;
+    let unused_since = jiff::SignedDuration::try_from(KEY_CHANGE_GRACE)
+        .ok()
+        .and_then(|grace| now.checked_sub(grace).ok())
+        .ok_or_else(|| Failure::permanent("invalid_config"))?;
     let mut total = 0;
     for _ in 0..MAX_BATCHES {
         let client = db.acquire(deadline).await?;
@@ -684,7 +735,14 @@ pub(crate) async fn expire(
             .query(
                 &client,
                 &sql::EXPIRE,
-                &[&now, &key_id, &MAX_CONSECUTIVE_FAILURES, &since, &BATCH],
+                &[
+                    &now,
+                    &key_id,
+                    &MAX_CONSECUTIVE_FAILURES,
+                    &since,
+                    &BATCH,
+                    &unused_since,
+                ],
             )
             .await
             .map_err(|e| classify(&e))?;
@@ -752,6 +810,35 @@ mod tests {
         }
         let long = format!("https://fcm.googleapis.com/{}", "a".repeat(MAX_ENDPOINT));
         assert_eq!(ok(&long), Err(SUBSCRIPTION_INVALID));
+    }
+
+    /// Host names follow the DNS rules (labels of 1 to 63 bytes, 253 in
+    /// all), so an over-long or empty label is `subscription_invalid`, not
+    /// a database constraint violation.
+    #[test]
+    fn endpoint_host_names_must_be_valid_dns_names() {
+        let ok = |url: &str| check_endpoint(url, &hosts(), false).map(|e| e.origin);
+        let label = |n: usize| "a".repeat(n);
+        for invalid in [
+            format!("https://{}.fcm.googleapis.com/x", label(400)),
+            format!("https://{}.fcm.googleapis.com/x", label(64)),
+            "https://a..fcm.googleapis.com/x".to_owned(),
+            "https://fcm.googleapis.com./x".to_owned(),
+            // 254 bytes in all, every label short enough.
+            format!(
+                "https://{}.fcm.googleapis.com/x",
+                [label(60), label(60), label(60), label(52)].join(".")
+            ),
+        ] {
+            assert_eq!(ok(&invalid), Err(SUBSCRIPTION_INVALID), "{invalid}");
+        }
+        // 253 bytes, labels of 63: the longest valid name.
+        let longest = format!(
+            "https://{}.fcm.googleapis.com/x",
+            [label(63), label(63), label(63), label(42)].join(".")
+        );
+        assert!(ok(&longest).is_ok(), "{longest}");
+        assert!(ok(&format!("https://{}.fcm.googleapis.com/x", label(63))).is_ok());
         // Development lifts the scheme and port rule, never the host rule.
         let dev = vec!["127.0.0.1".to_owned(), "push.test".to_owned()];
         assert_eq!(
@@ -782,7 +869,8 @@ mod tests {
             "tasks.assigned",
             &content,
             Some("k"),
-        );
+        )
+        .unwrap();
         assert!(bytes.len() <= MAX_PUSH_PAYLOAD_BYTES, "{}", bytes.len());
         assert!(bytes.len() > MAX_PUSH_PAYLOAD_BYTES - 8, "{}", bytes.len());
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -795,11 +883,55 @@ mod tests {
             ..content
         };
         let value: serde_json::Value =
-            serde_json::from_slice(&payload(Uuid::nil(), Uuid::nil(), "t", &short, None)).unwrap();
+            serde_json::from_slice(&payload(Uuid::nil(), Uuid::nil(), "t", &short, None).unwrap())
+                .unwrap();
         assert_eq!(
             (value["body"].as_str(), value["tag"].is_null()),
             (Some("hello"), true)
         );
+    }
+
+    /// The payload never exceeds the limit, even when the collapse key is
+    /// made of characters JSON escapes to six bytes each: past an empty
+    /// body the tag is dropped, and when nothing fits there is no payload.
+    #[test]
+    fn the_payload_never_exceeds_the_limit_whatever_the_tag() {
+        let content = RenderedPush {
+            title: "T".into(),
+            body: "some body".into(),
+            url: Some(format!("https://app.example.com/{}", "u".repeat(2700))),
+        };
+        let tag = "\u{1}".repeat(merezha_platform::ports::MAX_COLLAPSE_KEY);
+        let bytes = payload(Uuid::nil(), Uuid::nil(), "t", &content, Some(&tag)).unwrap();
+        assert!(bytes.len() <= MAX_PUSH_PAYLOAD_BYTES, "{}", bytes.len());
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            (value["tag"].is_null(), value["body"].as_str()),
+            (true, Some("some body"))
+        );
+        // A tag that fits is kept, with the body cut instead.
+        let cut = RenderedPush {
+            body: "b".repeat(400),
+            url: Some(format!("https://app.example.com/{}", "u".repeat(2300))),
+            ..content.clone()
+        };
+        let bytes = payload(Uuid::nil(), Uuid::nil(), "t", &cut, Some(&tag)).unwrap();
+        assert!(bytes.len() <= MAX_PUSH_PAYLOAD_BYTES, "{}", bytes.len());
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["tag"], json_tag(&tag));
+        assert!(value["body"].as_str().unwrap().len() < 400);
+        // Fields that never fit give no payload.
+        let huge = RenderedPush {
+            url: Some(format!("https://app.example.com/{}", "u".repeat(3000))),
+            ..content
+        };
+        assert_eq!(
+            payload(Uuid::nil(), Uuid::nil(), "t", &huge, Some(&tag)),
+            None
+        );
+    }
+    fn json_tag(tag: &str) -> serde_json::Value {
+        serde_json::Value::String(tag.to_owned())
     }
 
     #[test]
@@ -820,12 +952,14 @@ mod tests {
         assert_eq!(topic_header("tasks:42"), topic_header("tasks:42"));
     }
 
+    const DAY: Duration = Duration::from_secs(86_400);
+
     #[test]
     fn responses_are_classified_as_rfc_8030_says() {
         use reqwest::{StatusCode, header::HeaderMap};
         let none = HeaderMap::new();
         let class = |status: u16, attempt| {
-            classify_response(StatusCode::from_u16(status).unwrap(), &none, attempt)
+            classify_response(StatusCode::from_u16(status).unwrap(), &none, attempt, DAY)
         };
         assert!(matches!(class(201, 1), SendOutcome::Accepted { .. }));
         for gone in [404, 410] {
@@ -852,9 +986,28 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", "7".parse().unwrap());
         assert_eq!(
-            classify_response(StatusCode::TOO_MANY_REQUESTS, &headers, 1),
+            classify_response(StatusCode::TOO_MANY_REQUESTS, &headers, 1, DAY),
             SendOutcome::RateLimited {
                 retry_after: Some(Duration::from_secs(7))
+            }
+        );
+        // `Retry-After` waits at most the push TTL (then at most a day).
+        headers.insert("retry-after", "100000".parse().unwrap());
+        let ttl = Duration::from_secs(60);
+        assert_eq!(
+            classify_response(StatusCode::TOO_MANY_REQUESTS, &headers, 1, ttl),
+            SendOutcome::RateLimited {
+                retry_after: Some(ttl)
+            }
+        );
+        assert!(matches!(
+            classify_response(StatusCode::SERVICE_UNAVAILABLE, &headers, 1, ttl),
+            SendOutcome::Transient { retry_after: Some(wait), .. } if wait == ttl
+        ));
+        assert_eq!(
+            classify_response(StatusCode::TOO_MANY_REQUESTS, &headers, 1, 2 * DAY),
+            SendOutcome::RateLimited {
+                retry_after: Some(DAY)
             }
         );
     }

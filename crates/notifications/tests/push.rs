@@ -406,8 +406,8 @@ async fn a_payload_over_the_limit_is_truncated_at_send() {
 }
 
 /// NT-N6 acceptance: subscriptions made with an old VAPID key are not
-/// targeted; `push_expire` deletes them, the expired ones and the failing
-/// ones with no recent success.
+/// targeted; `push_expire` deletes them once unused for the rotation grace,
+/// the expired ones and the failing ones with no recent success.
 #[tokio::test]
 async fn subscriptions_of_an_old_vapid_key_are_not_targeted_and_expire() {
     let harness = merezha_telemetry::testing::Harness::new();
@@ -428,7 +428,10 @@ async fn subscriptions_of_an_old_vapid_key_are_not_targeted_and_expire() {
     );
     // A subscription of the previous key, one expired, one failing.
     for (name, extra) in [
-        ("old", "vapid_key_id = '00000000000000aa'"),
+        (
+            "old",
+            "vapid_key_id = '00000000000000aa', last_used_at = now() - interval '8 days'",
+        ),
         ("expired", "expires_at = now() - interval '1 minute'"),
         (
             "failing",
@@ -482,6 +485,308 @@ async fn subscriptions_of_an_old_vapid_key_are_not_targeted_and_expire() {
             "{reason}"
         );
     }
+    instance.stop().await;
+}
+
+/// A VAPID key rotation rolled out instance by instance: the instance on
+/// the old key and the one on the new key each keep the subscriptions the
+/// other made, since `push_expire` deletes another key's subscription only
+/// once it has gone unused for the 7-day grace; after the rollout the old
+/// key's subscriptions go.
+#[tokio::test]
+async fn a_rolling_key_rotation_keeps_the_subscriptions_of_both_keys() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakePushService::start().await;
+    let section = section("\"127.0.0.1\"", true, "");
+    let (old_keys, new_keys) = (push::generate().unwrap(), push::generate().unwrap());
+    let mut on_old = options(&section, &old_keys);
+    on_old.workers = false;
+    let old = Instance::start(&world, on_old).await;
+    let new = Instance::start(&world, options(&section, &new_keys)).await;
+    for instance in [&old, &new] {
+        instance.tokens.add("ada", user("usr_ada", &[], None));
+    }
+    assert_eq!(subscribe(&old, "ada", fake.subscription("k1")).await.0, 201);
+    assert_eq!(subscribe(&new, "ada", fake.subscription("k2")).await.0, 201);
+    // Made long ago, used recently: the grace counts from the last use.
+    world
+        .execute(
+            "UPDATE merezha_notify.push_subscriptions SET created_at = now() - interval '60 days'",
+        )
+        .await;
+    let endpoints = || async {
+        world
+            .text("SELECT endpoint FROM merezha_notify.push_subscriptions ORDER BY endpoint")
+            .await
+    };
+    for instance in [&old, &new] {
+        let removed = maintenance::run(&instance.core(), Task::PushExpire, soon())
+            .await
+            .unwrap();
+        assert_eq!(removed, 0);
+    }
+    assert_eq!(
+        endpoints().await,
+        [fake.endpoint("k1"), fake.endpoint("k2")]
+    );
+    // The new key's instance pushes to its own subscriptions only.
+    commit(&new, request("usr_ada", "rot:1", assigned())).await;
+    wait_settled(&new, 1).await;
+    assert_eq!(
+        fake.received()
+            .into_iter()
+            .map(|r| r.name)
+            .collect::<Vec<_>>(),
+        ["k2"]
+    );
+    // The rollout is over: the old key's subscription is no longer used,
+    // and goes once the grace has passed.
+    world
+        .execute(
+            "UPDATE merezha_notify.push_subscriptions SET last_used_at = now() - interval '6 days' \
+             WHERE endpoint LIKE '%k1'",
+        )
+        .await;
+    let core = new.core();
+    let expire = || maintenance::run(&core, Task::PushExpire, soon());
+    assert_eq!(expire().await.unwrap(), 0);
+    world
+        .execute(
+            "UPDATE merezha_notify.push_subscriptions SET last_used_at = now() - interval '8 days' \
+             WHERE endpoint LIKE '%k1'",
+        )
+        .await;
+    assert_eq!(expire().await.unwrap(), 1);
+    assert_eq!(endpoints().await, [fake.endpoint("k2")]);
+    new.stop().await;
+}
+
+/// The worker checks the subscription again at send (Tx A): one that left
+/// the notification's tenant, or now belongs to another user, is skipped
+/// `no_subscription` and never contacted.
+#[tokio::test]
+async fn send_skips_a_subscription_that_left_the_tenant_or_the_user() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakePushService::start().await;
+    let (instance, _) = start(&world, &section("\"127.0.0.1\"", true, "")).await;
+    instance
+        .tokens
+        .add("ada@a", user("usr_ada", &[], Some("org_a")));
+    instance
+        .tokens
+        .add("admin", user("usr_admin", &["notifications.admin"], None));
+    assert_eq!(
+        subscribe(&instance, "ada@a", fake.subscription("in-a"))
+            .await
+            .0,
+        201
+    );
+    // Two tenant notifications whose first attempt fails, so both can be
+    // redelivered.
+    fake.fail_next(2, 400);
+    let mut ids = Vec::new();
+    for key in ["mv:1", "mv:2"] {
+        let mut sent = request("usr_ada", key, assigned());
+        sent.tenant = Some(id("org_a"));
+        sent.members = vec![id("usr_ada")];
+        commit(&instance, sent).await;
+        wait_settled(&instance, ids.len() as i64 + 1).await;
+        let found = world
+            .text(&format!(
+                "SELECT d.id::text FROM merezha_notify.deliveries d \
+                 JOIN merezha_notify.notifications n ON n.id = d.notification_id \
+                 WHERE n.dedupe_key LIKE '%{key}'"
+            ))
+            .await;
+        ids.push(found[0].clone());
+    }
+    assert_eq!(
+        deliveries(&world).await,
+        ["push:failed:push_rejected", "push:failed:push_rejected"]
+    );
+    let redeliver = |delivery: String| {
+        let instance = &instance;
+        async move {
+            let (code, _) = instance
+                .call(
+                    "POST",
+                    &format!("/v1/notifications/deliveries/{delivery}/redeliver"),
+                    Some("admin"),
+                    None,
+                )
+                .await;
+            assert_eq!(code.as_u16(), 202);
+        }
+    };
+    let status = |delivery: String| {
+        let world = &world;
+        async move {
+            world
+                .text(&format!(
+                    "SELECT status || ':' || coalesce(status_reason, '') \
+                     FROM merezha_notify.deliveries WHERE id = '{delivery}'"
+                ))
+                .await
+                .remove(0)
+        }
+    };
+    // Same id, same user, another tenant now.
+    world
+        .execute("UPDATE merezha_notify.push_subscriptions SET tenant_id = 'org_b'")
+        .await;
+    redeliver(ids[0].clone()).await;
+    wait_settled(&instance, 2).await;
+    assert_eq!(status(ids[0].clone()).await, "skipped:no_subscription");
+    // Same id, the tenant back, another user now.
+    world
+        .execute(
+            "UPDATE merezha_notify.push_subscriptions SET tenant_id = 'org_a', user_id = 'usr_bob'",
+        )
+        .await;
+    redeliver(ids[1].clone()).await;
+    wait_settled(&instance, 2).await;
+    assert_eq!(status(ids[1].clone()).await, "skipped:no_subscription");
+    assert_eq!(
+        fake.received().len(),
+        2,
+        "only the two refused first attempts"
+    );
+    instance.stop().await;
+}
+
+/// An IP-literal endpoint never reaches the resolver, so the egress guard
+/// checks it before the request: an allowed host whose address
+/// `deny_cidrs` refuses fails `egress_blocked` and is never dialled.
+#[tokio::test]
+async fn an_ip_literal_endpoint_is_checked_by_the_egress_guard_at_send() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakePushService::start().await;
+    let (instance, _) = start(
+        &world,
+        &section("\"127.0.0.1\"", true, "").replace(
+            "egress = { allow_private_networks = true }",
+            "egress = { allow_private_networks = true, deny_cidrs = [\"127.0.0.0/8\"] }",
+        ),
+    )
+    .await;
+    instance.tokens.add("ada", user("usr_ada", &[], None));
+    assert_eq!(
+        subscribe(&instance, "ada", fake.subscription("literal"))
+            .await
+            .0,
+        201
+    );
+    commit(&instance, request("usr_ada", "ip:1", assigned())).await;
+    wait_settled(&instance, 1).await;
+    assert_eq!(deliveries(&world).await, ["push:failed:egress_blocked"]);
+    assert!(fake.received().is_empty());
+    instance.stop().await;
+}
+
+/// The subscription a `POST` just made is never the one the per-user limit
+/// evicts, even when another subscription was used later than this
+/// instance's clock says (another instance, clock skew).
+#[tokio::test]
+async fn a_new_subscription_is_never_the_one_the_limit_evicts() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakePushService::start().await;
+    let (instance, _) = start(
+        &world,
+        &section("\"127.0.0.1\"", true, "max_subscriptions_per_user = 1\n"),
+    )
+    .await;
+    instance.tokens.add("ada", user("usr_ada", &[], None));
+    assert_eq!(
+        subscribe(&instance, "ada", fake.subscription("first"))
+            .await
+            .0,
+        201
+    );
+    world
+        .execute(
+            "UPDATE merezha_notify.push_subscriptions SET last_used_at = now() + interval '1 hour'",
+        )
+        .await;
+    let (status, body) = subscribe(&instance, "ada", fake.subscription("second")).await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(
+        world
+            .text("SELECT id::text FROM merezha_notify.push_subscriptions")
+            .await,
+        [body["id"].as_str().unwrap()]
+    );
+    instance.stop().await;
+}
+
+/// The render refuses a push whose title and url would not fit the
+/// payload with the worst collapse key (64 control characters, six bytes
+/// each in JSON), so the request is refused `render_failed` rather than
+/// sent without its tag.
+#[tokio::test]
+async fn a_push_that_would_not_fit_with_the_worst_tag_is_refused_at_render() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakePushService::start().await;
+    let keys = push::generate().unwrap();
+    let mut opts = options(&section("\"127.0.0.1\"", true, ""), &keys);
+    opts.files = vec![
+        (
+            "notifications/templates/tasks.assigned/template.toml".into(),
+            "description = \"A task was assigned\"\n[preview]\ntitle = \"T\"\nbody = \"B\"\n\
+             url = \"https://app.example.com/p\"\n"
+                .into(),
+        ),
+        (
+            "notifications/templates/tasks.assigned/en/push.toml".into(),
+            "title = \"{{ title }}\"\nbody = \"{{ body }}\"\nurl = \"{{ url }}\"\n".into(),
+        ),
+    ];
+    let instance = Instance::start(&world, opts).await;
+    instance.tokens.add("ada", user("usr_ada", &[], None));
+    assert_eq!(
+        subscribe(&instance, "ada", fake.subscription("a")).await.0,
+        201
+    );
+    // With a 64-byte tag of letters this fits; with control characters it
+    // would not, even with an empty body.
+    let data = json!({
+        "title": "€".repeat(200),
+        "body": "Due Friday",
+        "url": format!("https://app.example.com/{}", "a".repeat(2000)),
+    });
+    let mut sent = request("usr_ada", "big:1", data);
+    sent.collapse_key = Some("\u{1}".repeat(64));
+    let notifier = instance.notifier("notifications");
+    let refused = instance
+        .db
+        .transaction(soon(), move |tx| {
+            Box::pin(async move { Ok(notifier.request(tx, sent).await) })
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            refused,
+            Err(merezha_platform::ports::NotifyError::RenderFailed { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.notifications")
+            .await,
+        0
+    );
+    assert!(fake.received().is_empty());
     instance.stop().await;
 }
 
@@ -549,6 +854,9 @@ async fn subscriptions_are_per_user_tenant_scoped_and_limited() {
     sent.members = vec![id("usr_ada")];
     commit(&instance, sent).await;
     wait_settled(&instance, 1).await;
+    // Expansion itself skips the tenantless subscription: one delivery,
+    // not a second one the worker would then skip.
+    assert_eq!(deliveries(&world).await, ["push:accepted:"]);
     assert_eq!(
         fake.received()
             .into_iter()

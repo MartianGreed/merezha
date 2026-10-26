@@ -44,7 +44,11 @@ const BLOCKED_V4: [(Ipv4Addr, u8); 15] = [
 ];
 /// IPv6 ranges never dialled (NT §5.6). `::/128` and `::1/128` are covered
 /// by the IPv4-compatible range `::/96`, checked by its embedded address.
-const BLOCKED_V6: [(u128, u8); 7] = [
+/// The local-use NAT64 prefix `64:ff9b:1::/48` (RFC 8215) is blocked whole:
+/// it is not globally routable, and its IPv4 address may sit anywhere in
+/// the low 80 bits.
+const BLOCKED_V6: [(u128, u8); 8] = [
+    (0x0064_ff9b_0001_0000_0000_0000_0000_0000, 48),
     (0x0100_0000_0000_0000_0000_0000_0000_0000, 64),
     (0x2001_0000_0000_0000_0000_0000_0000_0000, 23),
     (0x2001_0db8_0000_0000_0000_0000_0000_0000, 32),
@@ -65,14 +69,14 @@ fn in_v6(address: u128, (network, prefix): (u128, u8)) -> bool {
 
 /// The IPv4 address an IPv6 address carries, for the ranges NT §5.6 checks
 /// by their embedded address: IPv4-mapped `::ffff:0:0/96`, IPv4-compatible
-/// `::/96`, NAT64 `64:ff9b::/96` and `64:ff9b:1::/48`, and 6to4 `2002::/16`.
+/// `::/96`, NAT64 `64:ff9b::/96`, and 6to4 `2002::/16`. The local-use
+/// NAT64 prefix `64:ff9b:1::/48` is in [`BLOCKED_V6`] instead.
 fn embedded_v4(address: Ipv6Addr) -> Option<Ipv4Addr> {
     let bits = u128::from(address);
     let low = Ipv4Addr::from((bits & 0xffff_ffff) as u32);
     if in_v6(bits, (0xffff_0000_0000, 96))
         || in_v6(bits, (0, 96))
         || in_v6(bits, (0x0064_ff9b_0000_0000_0000_0000_0000_0000, 96))
-        || in_v6(bits, (0x0064_ff9b_0001_0000_0000_0000_0000_0000, 48))
     {
         return Some(low);
     }
@@ -102,7 +106,8 @@ pub struct EgressPolicy {
     /// `egress.allow_private_networks` (development and tests; refused with
     /// `http.public = true`): lifts the blocked ranges.
     pub allow_private_networks: bool,
-    /// `egress.deny_cidrs`: always refused, private networks allowed or not.
+    /// `egress.deny_cidrs`: always refused, private networks allowed or not,
+    /// and also matched against the IPv4 address an IPv6 address embeds.
     pub deny_cidrs: Vec<Cidr>,
     /// `MEREZHA_NOTIFY_NO_EGRESS=1` (CI): loopback only.
     pub loopback_only: bool,
@@ -121,7 +126,13 @@ impl EgressPolicy {
         if self.loopback_only && !address.is_loopback() {
             return false;
         }
-        if self.deny_cidrs.iter().any(|cidr| cidr.contains(address)) {
+        let embedded = match address {
+            IpAddr::V6(v6) => embedded_v4(v6).map(IpAddr::V4),
+            IpAddr::V4(_) => None,
+        };
+        let denied =
+            |candidate: IpAddr| self.deny_cidrs.iter().any(|cidr| cidr.contains(candidate));
+        if denied(address) || embedded.is_some_and(denied) {
             return false;
         }
         self.allow_private_networks || !blocked(address)
@@ -359,6 +370,46 @@ mod tests {
             strict.check_host(&literal("https://fcm.googleapis.com/").host().unwrap()),
             Ok(())
         );
+    }
+
+    /// `deny_cidrs` also applies to the IPv4 address an IPv6 address
+    /// embeds (NAT64, 6to4, mapped, compatible), and the local-use NAT64
+    /// prefix `64:ff9b:1::/48` is blocked whole, wherever its IPv4 sits.
+    #[test]
+    fn deny_lists_match_embedded_ipv4_and_local_use_nat64_is_blocked() {
+        let deny = EgressPolicy {
+            allow_private_networks: false,
+            deny_cidrs: vec!["8.8.8.0/24".parse().unwrap()],
+            loopback_only: false,
+        };
+        for address in [
+            "8.8.8.8",
+            "::ffff:8.8.8.8",
+            "::8.8.8.8",
+            "64:ff9b::808:808",
+            "2002:808:808::1",
+        ] {
+            assert!(!deny.allows(ip(address)), "{address} must be denied");
+        }
+        for address in [
+            "8.8.4.4",
+            "64:ff9b::808:404",
+            "2002:808:404::1",
+            "2606:4700::1111",
+        ] {
+            assert!(deny.allows(ip(address)), "{address} must be allowed");
+        }
+        for address in [
+            "64:ff9b:1::",
+            "64:ff9b:1::808:808",
+            "64:ff9b:1:abcd:a:0:508:808",
+            "64:ff9b:1:ffff:ffff:ffff:ffff:ffff",
+        ] {
+            assert!(blocked(ip(address)), "{address} must be blocked");
+            assert!(!deny.allows(ip(address)), "{address} must be refused");
+        }
+        // Just outside the /48.
+        assert!(!blocked(ip("64:ff9b:2::808:808")));
     }
 
     struct Fixed(Vec<IpAddr>);

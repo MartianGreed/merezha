@@ -41,12 +41,12 @@ pub const UPSERT: Statement = s(
      RETURNING id, created_at",
 );
 /// Delete the least recently used subscriptions of user `$1` beyond the
-/// newest `$2`.
+/// newest `$2` other than `$3` (the subscription just made, always kept).
 pub const TRIM: Statement = s(
     "notify.push.trim",
     "DELETE merezha_notify.push_subscriptions",
     "DELETE FROM merezha_notify.push_subscriptions WHERE id IN \
-     (SELECT id FROM merezha_notify.push_subscriptions WHERE user_id = $1 \
+     (SELECT id FROM merezha_notify.push_subscriptions WHERE user_id = $1 AND id <> $3 \
       ORDER BY last_used_at DESC, created_at DESC, id OFFSET $2) RETURNING id",
 );
 /// The subscriptions of user `$1` in tenant scope `$2` (NULL: those
@@ -123,18 +123,20 @@ pub const GONE: Statement = s(
 // ----- maintenance -----
 
 /// One `push_expire` batch: subscriptions past `expires_at` (`$1` = now),
-/// made with another VAPID key than `$2`, or with at least `$3`
-/// consecutive failures and no success since `$4`; at most `$5`. Each row
-/// says why it went.
+/// made with another VAPID key than `$2` and unused since `$6` (the
+/// rotation grace: during a rolling deploy each instance keeps refreshing
+/// the subscriptions of its own key, so neither key deletes the other's),
+/// or with at least `$3` consecutive failures and no success since `$4`;
+/// at most `$5`. Each row says why it went.
 pub const EXPIRE: Statement = s(
     "notify.push.expire",
     "DELETE merezha_notify.push_subscriptions",
     "DELETE FROM merezha_notify.push_subscriptions p WHERE p.id IN \
      (SELECT id FROM merezha_notify.push_subscriptions \
-      WHERE expires_at <= $1 OR vapid_key_id <> $2 \
+      WHERE expires_at <= $1 OR (vapid_key_id <> $2 AND last_used_at < $6) \
       OR (consecutive_failures >= $3 AND COALESCE(last_success_at, created_at) < $4) \
       LIMIT $5) \
-     RETURNING CASE WHEN p.vapid_key_id <> $2 THEN 'key_changed' \
+     RETURNING CASE WHEN p.vapid_key_id <> $2 AND p.last_used_at < $6 THEN 'key_changed' \
        WHEN p.expires_at <= $1 THEN 'expired' ELSE 'failures' END",
 );
 
