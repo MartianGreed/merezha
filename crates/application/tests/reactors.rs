@@ -394,7 +394,9 @@ impl Pg {
         BackgroundOptions {
             interval: Duration::from_millis(200),
             reactor_interval: Duration::from_millis(200),
-            reactor_retry: (Duration::from_millis(100), Duration::from_millis(400)),
+            // Long enough that no machine reaches a retry time between two
+            // calls of a test; tests that want a retry move `retry_at`.
+            reactor_retry: (Duration::from_secs(2), Duration::from_secs(8)),
             run_timeout: Duration::from_secs(5),
             instance_id: "test".into(),
             hooks,
@@ -1087,9 +1089,9 @@ fn a_transient_failure_retries_with_backoff_without_advancing() {
     let ReactorOutcome::Waiting(Some(wait)) = first else {
         panic!("{first:?}");
     };
-    // Equal jitter within the configured 100 ms .. 400 ms.
+    // Equal jitter: half the base to the base for the first failure.
     assert!(
-        wait >= Duration::from_millis(50) && wait <= Duration::from_millis(100),
+        wait >= Duration::from_secs(1) && wait <= Duration::from_secs(2),
         "{wait:?}"
     );
     let (checkpoint, status, halted, failures) = pg.reactor("notifier");
@@ -1103,7 +1105,8 @@ fn a_transient_failure_retries_with_backoff_without_advancing() {
         ReactorOutcome::Waiting(Some(_))
     ));
     assert_eq!(probe.reacted().len(), 1);
-    std::thread::sleep(Duration::from_millis(120));
+    // Its retry time has come.
+    pg.execute("UPDATE merezha_app.reactors SET retry_at = now()");
     react(&instance, "notifier");
     assert_eq!(pg.reactor("notifier").3, 2, "backoff grows with failures");
     probe.transient.store(false, Ordering::SeqCst);
