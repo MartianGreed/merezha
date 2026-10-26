@@ -312,9 +312,11 @@ CORS is off while `allowed_origins` is empty.
 
 Allowed methods are GET, POST, PUT, PATCH and DELETE. Allowed request
 headers are `content-type`, `authorization`, `x-request-id`, `traceparent`,
-`tracestate`, `merezha-organization` (identity's active organization) and
+`tracestate`, `merezha-organization` (identity's active organization),
 `x-csrf-token` (identity's CSRF header, so a cross-origin
-front end can send it). `x-request-id` is exposed to scripts.
+front end can send it) and `last-event-id` (so a cross-origin fetch-based
+event-stream client resumes the inbox stream). `x-request-id` is exposed to
+scripts.
 
 ### `[database]`
 
@@ -1620,7 +1622,8 @@ like a mail client.
 changes as Server-Sent Events.
 
 - **Access.** A principal of kind `user` (401 `unauthenticated` without
-  one, 403 `unauthorized` for API keys), through the session cookie
+  one, 403 `unauthorized` for any other kind, API keys included: a key
+  never streams), through the session cookie
   (`EventSource` with `withCredentials`) or `Authorization: Bearer`. The
   route takes no query string (400 `invalid_input`), so a credential never
   travels in a URL. Scope is the inbox routes': tenantless items plus those
@@ -1645,8 +1648,12 @@ changes as Server-Sent Events.
   `sse.max_streams` per instance, then 503 `overloaded` with
   `Retry-After: 5`. A stream lives `sse.max_lifetime` ±10 % and the client
   reconnects. Every `sse.reauth_interval` the stream's own credentials run
-  through the `Authenticator` again; a revoked or expired session or key,
-  another user or active tenant, or a failure to tell ends it.
+  through the `Authenticator` again; a revoked or expired session, another
+  user or active tenant (a switched organization, a removed membership),
+  or a failure to tell ends it. Each check counts as activity of the
+  session, as any request does: an open stream keeps the session's sliding
+  idle timeout (identity `sessions.idle_timeout`) from running out, and
+  only its absolute timeout or a revocation ends it.
 - **Backpressure.** At most 64 events wait for one client. A client that
   does not take an event within one `sse.heartbeat` interval is
   disconnected and resumes with `Last-Event-ID`; writers never wait on a
@@ -1655,11 +1662,20 @@ changes as Server-Sent Events.
   session outside the pool (`Database::listen`); a notification wakes only
   the local streams of the user it names, and each stream also reconciles
   every `sse.reconcile_interval`. A lost session is logged once as
-  `notification.sse_listen_lost` (warn, `code`), reopened with backoff from
-  1 s to 30 s, probed every 30 s with `Listener::check`, and on its return
-  logs `notification.sse_listen_restored`, counts
-  `merezha.inbox.listen.reconnects` and wakes every local stream.
-  Readiness never depends on it.
+  `notification.sse_listen_lost` (warn, `code`) and reopened after a
+  backoff that starts at 1 s and doubles to 30 s, each delay drawn from
+  the upper half of its step and never below 1 s. Every attempt after the
+  first waits its delay, and the backoff starts again from 1 s only after
+  a session stayed up 30 s, so a session that connects and drops again
+  keeps backing off. The session is probed every 30 s with
+  `Listener::check`. On its return it logs
+  `notification.sse_listen_restored`, counts
+  `merezha.inbox.listen.reconnects` and wakes every local stream. The same
+  wake follows a burst of 64 notifications, which may have overflowed the
+  session's queue. Such a wake reaches each user with local streams once,
+  spread evenly over 1 s, and runs at most once per second: requests made
+  during one coalesce into a single next one, so the streams of an instance
+  never all query at once. Readiness never depends on it.
 - **Drain.** `Module::draining` ends every stream before the listener
   drains, and later requests get 503 `overloaded`; clients reconnect to
   another instance with `Last-Event-ID`.
