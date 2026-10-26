@@ -344,6 +344,28 @@ pub struct Fixture {
     pub jobs: Arc<PgJobs>,
 }
 
+/// The pool size of a fixture host. A pool keeps every connection it
+/// opened until it drops, and a suite runs up to twelve tests at once
+/// against one server with the default `max_connections = 100`, so a host
+/// holds at most this, its two listeners, its detached sessions while they
+/// run, and [`CHECK_POOL`]. Requests wait up to `acquire_timeout_ms`
+/// (30 s) for a pooled connection.
+pub const POOL: usize = 4;
+/// The pool size of a [`Fixture::db`], the test's own queries.
+pub const CHECK_POOL: usize = 3;
+/// Tests that start more than two hosts at once, against one server with
+/// the default `max_connections = 100`.
+pub const HOST_SLOTS: usize = 3;
+static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(HOST_SLOTS);
+
+/// One of [`HOST_SLOTS`], held for the whole test by tests that start
+/// more than two hosts (about twenty connections each), so a suite of them
+/// stays well under `max_connections = 100` with any number of test
+/// threads.
+pub async fn host_slot() -> tokio::sync::SemaphorePermit<'static> {
+    SLOTS.acquire().await.unwrap()
+}
+
 /// Write the project into `dir`: `merezha.toml` with `[modules.content]`
 /// plus `settings` (keys of that section), and `content.toml`.
 pub fn project(dir: &Path, migrate: bool, settings: &str, model: &str) {
@@ -358,7 +380,8 @@ pub fn project_with(dir: &Path, migrate: bool, top: &str, settings: &str, model:
         dir.join("merezha.toml"),
         format!(
             "[app]\nid = \"site\"\n[database]\nurl = {{ env = \"CONTENT_DATABASE_URL\" }}\n\
-             migrate = {migrate}\npool_size = 16\nstatement_timeout_ms = 30000\n\
+             migrate = {migrate}\npool_size = {POOL}\nacquire_timeout_ms = 30000\n\
+             statement_timeout_ms = 30000\n\
              [runtime]\nmanifest = \"runtime.toml\"\n{top}\n[modules.content]\n{settings}\n"
         ),
     )
@@ -469,7 +492,9 @@ async fn start_with_options(
         jobs: Some(jobs.clone()),
         ..parts
     };
-    let db = Database::connect(&config.database).unwrap();
+    let mut checks = config.database.clone();
+    checks.pool_size = CHECK_POOL;
+    let db = Database::connect(&checks).unwrap();
     let host = Host::start_with(config, modules, parts, options)
         .await
         .expect("host starts");
@@ -834,21 +859,24 @@ pub fn id_of(reply: &Reply) -> String {
     reply.body["sys"]["id"].as_str().unwrap().to_owned()
 }
 
-/// Whether `host` reports ready within a few seconds (the jobs runtime
-/// turns ready after its first subscription and schedule sync).
+/// Whether `host` reports ready before [`soon`] (the jobs runtime turns
+/// ready after its first subscription and schedule sync). Returns as soon
+/// as it is.
 pub async fn eventually_ready(host: &Host) -> bool {
-    for _ in 0..50 {
+    let deadline = soon();
+    while std::time::Instant::now() < deadline {
         if host.readiness().check().await {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     false
 }
 
-/// Wait up to ten seconds for `sql`'s single text value to be `expected`.
+/// Wait until [`soon`] for `sql`'s single text value to be `expected`;
+/// returns as soon as it is.
 pub async fn wait_for(db: &Database, sql: &str, expected: &str) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = soon();
     loop {
         let found = strings(db, sql).await;
         if found == [expected] {
@@ -877,9 +905,9 @@ pub async fn blocked_by(db: &Database, pid: i32) -> Vec<i32> {
         .collect()
 }
 
-/// Wait up to ten seconds for a backend blocked by `pid`; returns it.
+/// Wait until [`soon`] for a backend blocked by `pid`; returns it.
 pub async fn wait_blocked_by(db: &Database, pid: i32) -> i32 {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = soon();
     loop {
         if let Some(found) = blocked_by(db, pid).await.first() {
             return *found;
@@ -887,6 +915,34 @@ pub async fn wait_blocked_by(db: &Database, pid: i32) -> i32 {
         assert!(
             std::time::Instant::now() < deadline,
             "nothing blocked by backend {pid}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Wait until [`soon`] for a backend blocked by `pid` whose statement
+/// matches the `LIKE` pattern `query`; returns it. Background work, such as
+/// the outbox relay, may queue behind the same lock first.
+pub async fn wait_blocked_running(db: &Database, pid: i32, query: &str) -> i32 {
+    let deadline = soon();
+    loop {
+        let client = db.acquire(soon()).await.unwrap();
+        let found: Option<i32> = client
+            .query_opt(
+                "SELECT pid FROM pg_stat_activity \
+                  WHERE $1 = ANY(pg_blocking_pids(pid)) AND query LIKE $2 LIMIT 1",
+                &[&pid, &query],
+            )
+            .await
+            .unwrap()
+            .map(|row| row.get(0));
+        drop(client);
+        if let Some(found) = found {
+            return found;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing running {query} blocked by backend {pid}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

@@ -1892,7 +1892,9 @@ async fn a_purge_racing_an_upload_of_the_same_bytes_never_orphans_its_blob() {
             .send()
             .await
     });
-    let uploader = wait_blocked_by(&fx.db, pid).await;
+    // The outbox relay may queue behind the same table lock: pick the
+    // upload's append.
+    let uploader = wait_blocked_running(&fx.db, pid, "%INSERT INTO merezha_jobs.outbox%").await;
     // The purge of the old asset meets the locked blob and waits.
     let client = fx.client.clone();
     let old_id = old["id"].as_str().unwrap().to_owned();
@@ -1903,7 +1905,7 @@ async fn a_purge_racing_an_upload_of_the_same_bytes_never_orphans_its_blob() {
             .send()
             .await
     });
-    wait_blocked_by(&fx.db, uploader).await;
+    wait_blocked_running(&fx.db, uploader, "%merezha_content.%").await;
     lock.commit().await.unwrap();
     drop(holder);
     assert_eq!(upload.await.unwrap().status, StatusCode::CREATED);

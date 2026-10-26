@@ -2410,6 +2410,13 @@ server's sit in a `timing` module of their test file. A plain
 `-- --skip timing::`, then the timing tests alone with
 `-- --test-threads=1 timing::`, and both steps gate.
 
+The suites fit a server with the default `max_connections = 100` at twelve
+test threads. A pool keeps every connection it opened until it drops, so
+test fixtures keep their pools small: a content fixture host has
+`pool_size = 4` and waits up to 30 s for a pooled connection, and its test
+queries through a pool of 3. Content tests that start more than two hosts
+hold one of three slots for the whole test.
+
 ## Local PostgreSQL
 
 ### Contremaitre
