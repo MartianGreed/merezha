@@ -2796,7 +2796,8 @@ management routes for drafts and revisions; C4 publishing, the
 `published` rows, deletion, the trash and its purge job; C5 the delivery
 API, preview, population and the model endpoints; C7 assets and media
 ([Content assets](#content-assets)); C9 organization types
-([Content organizations](#content-organizations)). The design is
+([Content organizations](#content-organizations)); issue #46 asset
+metadata in delivery and `delivery.public_base_url`. The design is
 [content.md](../design/content.md).
 
 ```toml
@@ -2811,6 +2812,7 @@ revisions = { retain = 100 }                           # the default
 trash = { retention = "30d", purge_cron = "23 3 * * *" }   # the defaults
 delivery = { cache_control_public = "public, max-age=60, stale-while-revalidate=300",
              cache_control_private = "private, no-cache" }      # the defaults
+# delivery.public_base_url = "https://cms.example.com"  # unset by default: paths
 ```
 
 | Key | Default | Range | Meaning |
@@ -2831,13 +2833,13 @@ delivery = { cache_control_public = "public, max-age=60, stale-while-revalidate=
 | `limits.max_response_bytes` | 16777216 | 65536 to 268435456 | Largest delivery body, and largest populated management read; past it the request fails `response_too_large` (400): ask for a smaller `limit`, fewer `fields` or less `populate`. |
 | `delivery.cache_control_public` | `"public, max-age=60, stale-while-revalidate=300"` | visible ASCII, 1 to 256 bytes, no edge spaces | `Cache-Control` of a published read of an `access = "public"` type without a principal (`invalid_value`). |
 | `delivery.cache_control_private` | `"private, no-cache"` | as above | `Cache-Control` of every other published read. |
+| `delivery.public_base_url` | unset | an absolute `https` URL with a host and an optional path, no userinfo, query or fragment, at most 2048 bytes (`invalid_url`); `http` only to `localhost`, `127.0.0.0/8` or `::1` on a private listener (`insecure_origin`) | The public origin (and prefix) of the host. Expanded asset `url`s in delivery, the management asset JSON `url` and the `Location` of created entries and uploaded assets are absolute under it, normalized without a trailing slash; unset, they are paths. Its value enters published ETags. |
 
 The tables take only these keys; `media` is C7's ([Content
-assets](#content-assets)). `delivery.public_base_url` stays
-`unknown_key`: asset URLs are paths. Problems are reported with the
+assets](#content-assets)). Problems are reported with the
 configuration, every one at once (`out_of_range`, `expected_integer`,
 `expected_duration`, `expected_string`, `invalid_cron`, `invalid_value`,
-`expected_table`, `unknown_key`), keyed `modules.content.limits.<key>`,
+`invalid_url`, `insecure_origin`, `expected_table`, `unknown_key`), keyed `modules.content.limits.<key>`,
 `modules.content.revisions.retain`, `modules.content.trash.<key>` or
 `modules.content.delivery.<key>`.
 
@@ -3132,13 +3134,28 @@ last) for a draft never published.
   field). Every reference in a delivery response whose target is not
   visible is `{"id", "type", "missing": true}`. A path's first segment
   must be among `fields` when `fields` is given (`not_selected`).
+- Every asset reference of every entry shown, populated ones and preview
+  included (asset fields, `asset` rich text embeds, inside components and
+  `blocks` too), gains `asset`: `{id, filename, content_type, size, width,
+  height, url}`, read in one statement (`content.delivery.assets`) per
+  1000 `(entry, asset)` pairs. It is `"asset": null` when the asset route
+  would not serve the asset to this reader: trashed or purged (a forced
+  delete), in a scope the entry cannot reference, or not in the entry's
+  refs of the stage read (a draft-only asset in a published response).
+  `url` is `/v1/content/assets/{id}/{filename}` for application entries
+  and `/v1/content/o/{organization}/assets/{id}/{filename}` for an
+  organization's, prefixed with `delivery.public_base_url` when set.
+  Management reads show asset references as stored.
 
 Published responses carry `ETag: W/"<8 hex of the model fingerprint>-<the
 scope's generation>-<16 hex of SHA-256 of the route, the sorted query and
 the caller's access class>"` (an organization response that populates
 on an organization's path also carries the application generation
-whenever the type can reference entries, since population and the
-`missing` checks read application rows). The access class is whether a
+whenever the type can reference entries or holds asset fields, since
+population, the `missing` checks and application assets read application
+rows; a set `delivery.public_base_url` is part of the hash). Asset
+patches, deletes and undeletes bump their scope's generation, so the
+expanded metadata never outlives its tag. The access class is whether a
 principal asked plus the set of types the caller reads there. A matching
 `If-None-Match` answers 304 after reading only
 `merezha_content.generations`; otherwise the generations are read first
@@ -3225,7 +3242,7 @@ active organization it is ([Content organizations](#content-organizations)):
 
 | Route | Permission | Success |
 | --- | --- | --- |
-| `POST /manage/assets?filename=..&title=..` (raw body, `Content-Type`) | `content.assets.write` | 201 asset, `Location` |
+| `POST /manage/assets?filename=..&title=..` (raw body, `Content-Type`) | `content.assets.write` | 201 asset, `Location` (absolute under `delivery.public_base_url`, as is the asset's `url`) |
 | `GET /manage/assets` (`content_type` exact or `image/*`, `filename_prefix`, `limit`, `cursor`) | `content.assets.read` | 200 `{items, page}`, newest first, live assets |
 | `GET /manage/assets/{id}` | `content.assets.read` | 200 asset with `usage: {draft, published, elsewhere}` (refs of its own scope by stage, and of every other scope together: what `asset_in_use` counts), trashed ones too |
 | `PATCH /manage/assets/{id}` (`application/merge-patch+json` over `{title, focal_point}`) | `content.assets.write` | 200 asset |

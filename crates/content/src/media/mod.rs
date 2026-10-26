@@ -238,10 +238,7 @@ impl AssetView {
     /// The delivery path of the asset's bytes: under
     /// `/v1/content/o/{organization}` for an organization's asset.
     pub fn url(&self) -> String {
-        match self.scope.strip_prefix("org:") {
-            Some(org) => format!("/v1/content/o/{org}/assets/{}/{}", self.id, self.filename),
-            None => format!("/v1/content/assets/{}/{}", self.id, self.filename),
-        }
+        delivery_path(&self.scope, &self.id, &self.filename)
     }
     /// The management path of the asset: under
     /// `/v1/content/o/{organization}` for an organization's asset.
@@ -252,8 +249,9 @@ impl AssetView {
         }
     }
     /// The asset JSON of section 6, in its documented order, with `usage`
-    /// when given.
-    pub fn json(&self, usage: Option<Usage>) -> String {
+    /// when given; `url` under `base` (`delivery.public_base_url`) when
+    /// set, a path otherwise.
+    pub fn json(&self, base: Option<&str>, usage: Option<Usage>) -> String {
         use crate::json::{optional, string};
         let number = |n: Option<i32>| n.map_or_else(|| "null".to_owned(), |n| n.to_string());
         let mut out = format!(
@@ -273,7 +271,7 @@ impl AssetView {
             string(&self.created_by),
             string(&self.updated_at),
             optional(self.deleted_at.as_deref()),
-            string(&self.url()),
+            string(&format!("{}{}", base.unwrap_or(""), self.url())),
         );
         if let Some(Usage {
             draft,
@@ -289,6 +287,18 @@ impl AssetView {
         }
         out.push('}');
         out
+    }
+}
+
+/// The delivery path of the bytes of asset `id` named `filename`, for a
+/// reader on `scope`'s path: `/v1/content/assets/{id}/{filename}` on the
+/// application's, `/v1/content/o/{organization}/assets/{id}/{filename}`
+/// on an organization's (which also serves the application assets that
+/// organization's published entries reference).
+pub fn delivery_path(scope: &str, id: &str, filename: &str) -> String {
+    match scope.strip_prefix("org:") {
+        Some(org) => format!("/v1/content/o/{org}/assets/{id}/{filename}"),
+        None => format!("/v1/content/assets/{id}/{filename}"),
     }
 }
 

@@ -480,11 +480,13 @@ pub(crate) fn variant_response(
     response
 }
 
-fn location(view: &VariantView) -> String {
-    format!(
+/// The `Location` of a created variant, absolute under
+/// `delivery.public_base_url` when it is set.
+fn location(manage: &Manage, view: &VariantView) -> String {
+    manage.store.state().settings().delivery.url(&format!(
         "/v1/content/manage/entries/{}/{}/{}",
         view.content_type, view.id, view.locale
-    )
+    ))
 }
 
 pub(crate) fn page_json(items: Vec<String>, next: Option<String>, limit: u32) -> String {
@@ -620,7 +622,7 @@ async fn create(
             &content_type,
             &saved.view,
             None,
-            Some(location(&saved.view)),
+            Some(location(&manage, &saved.view)),
             None,
         ))
     };
@@ -774,14 +776,19 @@ async fn put(State(manage): State<Manage>, Path(params): Params, request: Reques
                 &actor(&parts),
             )
             .await?;
-        Ok(saved_response(&content_type, &saved, false))
+        Ok(saved_response(&manage, &content_type, &saved, false))
     };
     respond(run.await)
 }
 
-fn saved_response(content_type: &ContentType, saved: &Saved, warnings: bool) -> Response {
+fn saved_response(
+    manage: &Manage,
+    content_type: &ContentType,
+    saved: &Saved,
+    warnings: bool,
+) -> Response {
     let (status, location) = if saved.created {
-        (StatusCode::CREATED, Some(location(&saved.view)))
+        (StatusCode::CREATED, Some(location(manage, &saved.view)))
     } else {
         (StatusCode::OK, None)
     };
@@ -839,7 +846,7 @@ async fn patch(State(manage): State<Manage>, Path(params): Params, request: Requ
                 &actor(&parts),
             )
             .await?;
-        Ok(saved_response(&content_type, &saved, false))
+        Ok(saved_response(&manage, &content_type, &saved, false))
     };
     respond(run.await)
 }
@@ -984,7 +991,7 @@ async fn restore(State(manage): State<Manage>, Path(params): Params, request: Re
                 &actor(&parts),
             )
             .await?;
-        Ok(saved_response(&content_type, &saved, true))
+        Ok(saved_response(&manage, &content_type, &saved, true))
     };
     respond(run.await)
 }

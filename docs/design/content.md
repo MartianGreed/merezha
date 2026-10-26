@@ -860,7 +860,8 @@ Delivery (`GET /v1/content/article/{id}?locale=fr-BE&populate=author`):
                  "fields": { "name": "Ada" } }
     },
     "seo": { "image": { "id": "0192f7a1-...", "alt": "Photo d'équipe",
-                        "asset": { "filename": "team.jpg", "content_type": "image/jpeg", "width": 1600, "height": 900, "url": "..." } } }
+                        "asset": { "id": "0192f7a1-...", "filename": "team.jpg", "content_type": "image/jpeg", "size": 248113,
+                                   "width": 1600, "height": 900, "url": "/v1/content/assets/0192f7a1-.../team.jpg" } } }
   }
 }
 ```
@@ -1089,8 +1090,8 @@ built:
   the components they embed and only reference targets among them; the
   management one needs `content.model.read` in the principal's tenant,
   or at `Application` without one.
-- Asset metadata expansion, asset serving and `delivery.public_base_url`
-  arrive with C7; until then asset fields are delivered as stored.
+- Asset metadata expansion and `delivery.public_base_url` arrived with
+  issue #46 (section 6, as built); asset serving with C7.
 - Delivery's statements are registered with the TE-T4 registry
   (`merezha_content::STATEMENTS`); its lists run through the registry's
   `Database::query_text`, which C5 adds for text built per request with
@@ -1526,6 +1527,51 @@ Management `GET /assets/{id}/file` always proxies with `attachment`.
   organization's assets, and their delivery is served there too
   (section 8, as built).
 
+### As built (issue #46, asset metadata in delivery)
+
+- Every delivery response, preview included, expands every asset
+  reference of every entry it shows, populated ones included: an `asset`
+  field (one or `many`), an `asset` rich text embed, and both inside
+  components and `blocks`. `{"id", "alt"?}` gains `asset`,
+  `{id, filename, content_type, size, width, height, url}` (`content_type`
+  as in the asset JSON; the issue's `mime`), or `"asset": null`.
+  Management reads keep references as stored.
+- The lookup runs inside the population walker (`populate.rs`), after the
+  entries are known and before they are rendered: one registered
+  statement, `content.delivery.assets`, per 1000 `(entry, asset)` pairs
+  (`IDS_PER_STATEMENT`), whatever the page size or population depth. It
+  joins the referring entries' `refs` of the stage read (`published`, or
+  `draft` in preview) with the live assets of the path's scopes.
+- `null` is what an asset the asset route would not serve to this reader
+  gets: trashed or purged (a forced delete), of a scope the entry cannot
+  reference (another organization's, or an organization's from an
+  application entry, even planted behind validation), or not recorded in
+  the entry's refs of that stage (a draft-only asset in a published
+  response). Only entries of types the caller reads under
+  `delivery::access`, in the scope their type allows, are looked up, so a
+  `missing` reference never leaks its assets, and a deleted
+  organization's path is refused (`organization_not_found`) before any
+  asset is read.
+- `url` follows the referring entry's scope, because that is whose refs
+  the asset route counts: `/v1/content/assets/{id}/{filename}` for
+  application entries (populated ones on an organization's path
+  included), `/v1/content/o/{organization}/assets/{id}/{filename}` for an
+  organization's entries, its application assets included. With
+  `delivery.public_base_url` it is that base plus the path.
+- ETags keep section 5's rule. Asset patches, deletes and undeletes
+  already bump the asset scope's generation; the expanded fields
+  (filename, type, size, dimensions) never change otherwise, since a new
+  file is a new asset. An organization type holding asset fields now adds
+  the application generation even without entry references, so a forced
+  delete of an application asset changes its tags. A set
+  `delivery.public_base_url` enters the canonical query hash (a new base
+  is a new body); unset, tags are what they were.
+- `delivery.public_base_url` also makes the management asset JSON `url`
+  and the `Location` of created entries and uploaded assets absolute.
+  Plain `http` needs a loopback host and a private listener
+  (`ContentModule::with_private_loopback`, which `merezha run` sets from
+  `http.listen`, `http.public` and `http.trusted_proxies`).
+
 ## 7. Events
 
 Every event is an outbox record appended inside the transaction of the change
@@ -1650,9 +1696,10 @@ multi-application platform keeps that rule, so the layout survives it.
   that path, counting only that organization's refs. Blob keys carry the
   `org-<32 hex>` tag, so identical bytes in two organizations are two
   blob rows and two objects. Asset events carry the organization as
-  their tenant. When asset metadata enters delivery responses (issue
-  #46), an organization response must use the organization's asset path
-  and add the application generation for application assets.
+  their tenant. Delivery responses expand asset metadata (issue #46,
+  section 6): an organization's entries carry the organization's asset
+  path for its assets and the application's alike, and an organization
+  type that holds assets adds the application generation to its tags.
 - ETags keep C5's rule: an organization response hashes its
   organization's generation, plus the application's when the type can
   reference entries; another organization's publish changes no tag.
@@ -1733,7 +1780,7 @@ multi-application platform keeps that rule, so the layout survives it.
 | `revisions.retain` | int | 100 | 2 to 10000. |
 | `trash.retention` | duration | `"30d"` | 1 day to 3650 days. |
 | `trash.purge_cron` | cron | `"23 3 * * *"` | Validated by AP's cron parser (§B.7). |
-| `delivery.public_base_url` | URL | none | `https` unless the listener is loopback. Makes asset and `Location` URLs absolute. |
+| `delivery.public_base_url` | URL | none | Absolute `https`; `http` only to a loopback host on a private listener (`insecure_origin`); no userinfo, query or fragment, at most 2048 bytes (`invalid_url`). Makes asset and `Location` URLs absolute (issue #46). |
 | `delivery.cache_control_public` | string | `"public, max-age=60, stale-while-revalidate=300"` | Header-safe characters only. |
 | `delivery.cache_control_private` | string | `"private, no-cache"` | |
 | `media` | section | absent | Media is on when `[modules.content.media]` is present; absent rejects `asset` fields in the model. |

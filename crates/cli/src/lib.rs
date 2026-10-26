@@ -170,8 +170,12 @@ fn blocks_with(
     content: merezha_content::ContentModule,
     identity: merezha_identity::IdentityModule,
 ) -> Vec<Box<dyn merezha_platform::Module>> {
-    // Organization content types need identity's organizations (CT-C9).
-    let content = content.with_organizations(identity_configured(input));
+    // Organization content types need identity's organizations (CT-C9);
+    // `delivery.public_base_url` may be plain HTTP on a private loopback
+    // listener only (issue #46).
+    let content = content
+        .with_organizations(identity_configured(input))
+        .with_private_loopback(private_loopback(input));
     vec![
         Box::new(identity),
         Box::new(content),
@@ -188,6 +192,18 @@ fn blocks_with(
 fn identity_configured(input: &merezha_platform::ConfigInput) -> bool {
     merezha_platform::ProjectConfig::load(input)
         .is_ok_and(|config| config.modules.contains_key(merezha_identity::NAME))
+}
+
+/// Whether the host listens on a private loopback address: `http.listen`
+/// is loopback, `http.public = false` and no `http.trusted_proxies`, the
+/// rule identity applies to its development settings. A configuration
+/// that does not load is not private; the kernel reports why.
+fn private_loopback(input: &merezha_platform::ConfigInput) -> bool {
+    merezha_platform::ProjectConfig::load(input).is_ok_and(|config| {
+        !config.http.public
+            && config.http.trusted_proxies.is_empty()
+            && config.http.listen.ip().is_loopback()
+    })
 }
 
 /// Read, validate and open an application configuration with the runtime as

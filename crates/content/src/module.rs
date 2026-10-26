@@ -310,6 +310,7 @@ pub struct ContentModule {
     handle: ContentHandle,
     options: ActivationOptions,
     organizations: bool,
+    private_loopback: bool,
 }
 impl ContentModule {
     pub fn new() -> Self {
@@ -321,6 +322,7 @@ impl ContentModule {
             handle: ContentHandle::default(),
             options,
             organizations: false,
+            private_loopback: false,
         }
     }
     /// Accept `scope = "organization"` types (section 8, C9): the host
@@ -331,6 +333,15 @@ impl ContentModule {
     /// `[modules.identity]` is present.
     pub fn with_organizations(mut self, organizations: bool) -> Self {
         self.organizations = organizations;
+        self
+    }
+    /// The host listens on a private loopback address (`http.public =
+    /// false`, no `http.trusted_proxies`, a loopback `http.listen`), so
+    /// `delivery.public_base_url` may be `http://` to a loopback host
+    /// (issue #46). Off by default: `https` only. `merezha run` sets it
+    /// from the project configuration.
+    pub fn with_private_loopback(mut self, private_loopback: bool) -> Self {
+        self.private_loopback = private_loopback;
         self
     }
     pub fn handle(&self) -> ContentHandle {
@@ -558,7 +569,7 @@ impl Module for ContentModule {
     }
     fn configure(&mut self, section: &ModuleSection) -> Result<(), Vec<ConfigIssue>> {
         let mut issues = section.unknown_keys(&KEYS);
-        let settings = match ContentSettings::parse(section) {
+        let settings = match ContentSettings::parse_on(section, self.private_loopback) {
             Ok(settings) => settings,
             Err(found) => {
                 issues.extend(found);
