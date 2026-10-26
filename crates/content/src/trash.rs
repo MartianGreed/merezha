@@ -72,6 +72,7 @@ impl Work {
     ) -> Result<(), Rejection> {
         let db = self.ctx.database();
         self.state.check_writable(db, tx).await?;
+        crate::organizations::guard_write(db, tx, &target.scope).await?;
         let id = id.hyphenated().to_string();
         let live: bool = db
             .query_opt(
@@ -197,6 +198,7 @@ impl Work {
     ) -> Result<(), Rejection> {
         let db = self.ctx.database();
         self.state.check_writable(db, tx).await?;
+        crate::organizations::guard_write(db, tx, &target.scope).await?;
         let id = id.hyphenated().to_string();
         let trashed: bool = db
             .query_opt(

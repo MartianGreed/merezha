@@ -61,6 +61,14 @@ macro_rules! live_variants {
     };
 }
 
+/// The advisory lock key of scope `$1` with class `$2`, the one key
+/// [`SCOPE_WRITE_LOCK`] and [`SCOPE_DELETE_LOCK`] share.
+macro_rules! scope_lock_key {
+    () => {
+        "$2::int4, hashtext($1)"
+    };
+}
+
 /// The generation of each scope a published response depends on: the
 /// whole read of the 304 path.
 pub const GENERATIONS: Statement = Statement::new(
@@ -765,6 +773,117 @@ pub(crate) const REFS_TO_ENTRIES_DELETE: Statement = Statement::new(
     "DELETE FROM merezha_content.refs \
               WHERE target_kind = 'entry' AND target_id = ANY($1::text[]::uuid[])",
 );
+/// Deleted organizations (issue #56). Every organization-scope write
+/// takes this shared transaction lock on its scope before it checks the
+/// scope is not deleted; the deletion takes it exclusively
+/// ([`SCOPE_DELETE_LOCK`]), so a write either commits before the deletion
+/// does or sees it. Both take the same key, `scope_lock_key!`: the class
+/// `$2` ([`crate::organizations::SCOPE_LOCK_CLASS`], `"cont"`) keeps
+/// content's keys apart from other two-key advisory locks; a `hashtext`
+/// collision only makes a write wait for another scope's deletion.
+pub(crate) const SCOPE_WRITE_LOCK: Statement = Statement::new(
+    "content.scopes.write_lock",
+    "SELECT pg_advisory_xact_lock_shared()",
+    concat!(
+        "SELECT pg_advisory_xact_lock_shared(",
+        scope_lock_key!(),
+        ")"
+    ),
+);
+/// The deletion's side of [`SCOPE_WRITE_LOCK`], on the same key.
+pub(crate) const SCOPE_DELETE_LOCK: Statement = Statement::new(
+    "content.scopes.delete_lock",
+    "SELECT pg_advisory_xact_lock()",
+    concat!("SELECT pg_advisory_xact_lock(", scope_lock_key!(), ")"),
+);
+/// The state of a deleted scope (`purging` or `purged`); no row while the
+/// scope is live.
+pub(crate) const SCOPE_DELETED: Statement = Statement::new(
+    "content.scopes.deleted",
+    "SELECT merezha_content.scopes_deleted",
+    "SELECT state FROM merezha_content.scopes_deleted WHERE scope = $1",
+);
+/// Mark a scope deleted; a row already there stays as it is.
+pub(crate) const SCOPE_MARK_DELETED: Statement = Statement::new(
+    "content.scopes.mark_deleted",
+    "INSERT merezha_content.scopes_deleted",
+    "INSERT INTO merezha_content.scopes_deleted (scope, source, state, deleted_at) \
+     VALUES ($1, $2, 'purging', now()) ON CONFLICT (scope) DO NOTHING RETURNING scope",
+);
+/// Whether migration 4 is applied, for `merezha content
+/// purge-organization` before it writes.
+pub(crate) const SCOPES_DELETED_EXIST: Statement = Statement::new(
+    "content.scopes.table_exists",
+    "SELECT to_regclass()",
+    "SELECT to_regclass('merezha_content.scopes_deleted') IS NOT NULL",
+);
+/// Up to `$2` entries of a deleted scope, in id order (the entries' lock
+/// order), hard-deleted with their variants, revisions, `published` rows
+/// and outgoing refs (cascades).
+pub(crate) const SCOPE_PURGE_ENTRIES: Statement = Statement::new(
+    "content.scopes.purge_entries",
+    "DELETE merezha_content.entries",
+    "DELETE FROM merezha_content.entries WHERE scope = $1 AND id IN ( \
+         SELECT id FROM merezha_content.entries WHERE scope = $1 ORDER BY id LIMIT $2 FOR UPDATE) \
+     RETURNING id::text",
+);
+/// Up to `$2` assets of a deleted scope, trashed or live.
+pub(crate) const SCOPE_PURGE_ASSETS: Statement = Statement::new(
+    "content.scopes.purge_assets",
+    "DELETE merezha_content.assets",
+    "DELETE FROM merezha_content.assets WHERE scope = $1 AND id IN ( \
+         SELECT id FROM merezha_content.assets WHERE scope = $1 ORDER BY id LIMIT $2 FOR UPDATE) \
+     RETURNING id::text",
+);
+/// Refs of any scope that point at the purged assets `$1`.
+pub(crate) const REFS_TO_ASSETS_DELETE: Statement = Statement::new(
+    "content.refs.delete_to_assets",
+    "DELETE merezha_content.refs",
+    "DELETE FROM merezha_content.refs \
+              WHERE target_kind = 'asset' AND target_id = ANY($1::text[]::uuid[])",
+);
+/// Hand up to `$2` blobs of a deleted scope, whose assets are gone, to
+/// `content.blob_cleanup`: `orphaned` since `-infinity`, so the next run
+/// takes them whatever `media.orphan_grace` (no upload can reuse them in
+/// a deleted scope). `pending` and `deleting` rows are the cleanup's
+/// already, under their leases.
+pub(crate) const SCOPE_RELEASE_BLOBS: Statement = Statement::new(
+    "content.scopes.release_blobs",
+    "UPDATE merezha_content.blobs",
+    "UPDATE merezha_content.blobs b SET state = 'orphaned', orphaned_at = '-infinity' \
+       FROM (SELECT scope, sha256 FROM merezha_content.blobs \
+              WHERE scope = $1 \
+                AND (state = 'stored' OR (state = 'orphaned' AND orphaned_at > '-infinity')) \
+              ORDER BY sha256 LIMIT $2 FOR UPDATE) due \
+      WHERE b.scope = due.scope AND b.sha256 = due.sha256",
+);
+/// Whether a deleted scope still has blob rows (released, or leased by
+/// an upload or a cleanup): the cleanup has work.
+pub(crate) const SCOPE_BLOBS_LEFT: Statement = Statement::new(
+    "content.scopes.blobs_left",
+    "SELECT merezha_content.blobs",
+    "SELECT EXISTS (SELECT 1 FROM merezha_content.blobs WHERE scope = $1)",
+);
+/// The rows of a purged scope that no entry or asset holds: its refs
+/// (none are left after the entries went; any planted stray goes too) and
+/// its generation.
+pub(crate) const SCOPE_REFS_DELETE: Statement = Statement::new(
+    "content.scopes.delete_refs",
+    "DELETE merezha_content.refs",
+    "DELETE FROM merezha_content.refs WHERE scope = $1",
+);
+pub(crate) const SCOPE_GENERATION_DELETE: Statement = Statement::new(
+    "content.scopes.delete_generation",
+    "DELETE merezha_content.generations",
+    "DELETE FROM merezha_content.generations WHERE scope = $1",
+);
+/// The end of a purge: `purged`, once.
+pub(crate) const SCOPE_PURGED: Statement = Statement::new(
+    "content.scopes.purged",
+    "UPDATE merezha_content.scopes_deleted",
+    "UPDATE merezha_content.scopes_deleted SET state = 'purged', purged_at = now() \
+      WHERE scope = $1 AND state = 'purging' RETURNING scope",
+);
 /// Text built at run time; `sql` is its shape.
 pub(crate) const TRASH_LIST: Statement = Statement::new(
     "content.trash.list",
@@ -930,6 +1049,19 @@ pub const STATEMENTS: &[Statement] = &[
     ENTRIES_PURGE,
     REFS_TO_ENTRIES_DELETE,
     TRASH_LIST,
+    SCOPE_WRITE_LOCK,
+    SCOPE_DELETE_LOCK,
+    SCOPE_DELETED,
+    SCOPE_MARK_DELETED,
+    SCOPES_DELETED_EXIST,
+    SCOPE_PURGE_ENTRIES,
+    SCOPE_PURGE_ASSETS,
+    REFS_TO_ASSETS_DELETE,
+    SCOPE_RELEASE_BLOBS,
+    SCOPE_BLOBS_LEFT,
+    SCOPE_REFS_DELETE,
+    SCOPE_GENERATION_DELETE,
+    SCOPE_PURGED,
     REBUILDS_EXIST,
     REBUILD_PENDING,
     REBUILD_CURSOR,
@@ -962,5 +1094,17 @@ mod tests {
         for statement in STATEMENTS {
             assert!(statement.name.starts_with("content."), "{}", statement.name);
         }
+    }
+
+    #[test]
+    fn the_write_and_delete_locks_take_one_key() {
+        let key = |statement: &Statement| {
+            let open = statement.sql.find('(').unwrap();
+            statement.sql[open..].to_owned()
+        };
+        assert_eq!(key(&SCOPE_WRITE_LOCK), key(&SCOPE_DELETE_LOCK));
+        assert_eq!(key(&SCOPE_WRITE_LOCK), format!("({})", scope_lock_key!()));
+        assert!(SCOPE_WRITE_LOCK.sql.contains("_shared("));
+        assert!(!SCOPE_DELETE_LOCK.sql.contains("_shared("));
     }
 }

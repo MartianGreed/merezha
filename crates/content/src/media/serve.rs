@@ -310,6 +310,9 @@ impl Assets {
             Some(org) => format!("org:{}", org.as_str()),
             None => "app".to_owned(),
         };
+        // Issue #56: nothing on a deleted organization's path, the
+        // application assets its entries used included.
+        self.store.refuse_deleted(&refs_scope).await?;
         let asset = match self.live(&refs_scope, id).await? {
             Some(asset) => asset,
             None if org.is_some() => self.live("app", id).await?.ok_or_else(not_found)?,

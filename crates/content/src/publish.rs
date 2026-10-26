@@ -330,6 +330,16 @@ pub(crate) fn in_item(index: usize, batch: bool, mut rejection: Rejection) -> Re
     rejection
 }
 
+/// The deleted-organization gate (issue #56) of each scope `items` write
+/// in, once per scope, in scope order.
+async fn guard_scopes(db: &Database, tx: &mut Tx<'_>, items: &[Item]) -> Result<(), Rejection> {
+    let scopes: BTreeSet<&str> = items.iter().map(|i| i.target.scope.as_str()).collect();
+    for scope in scopes {
+        crate::organizations::guard_write(db, tx, scope).await?;
+    }
+    Ok(())
+}
+
 impl Work {
     /// Publish `items` in this transaction; see [`Store::publish`].
     async fn publish(
@@ -341,6 +351,7 @@ impl Work {
     ) -> Result<Vec<VariantView>, Rejection> {
         let db = self.ctx.database();
         self.state.check_writable(db, tx).await?;
+        guard_scopes(db, tx, items).await?;
         lock_entries(db, tx, items).await?;
         let mut required = Vec::new();
         let mut records = Vec::new();
@@ -549,6 +560,7 @@ impl Work {
     ) -> Result<Vec<VariantView>, Rejection> {
         let db = self.ctx.database();
         self.state.check_writable(db, tx).await?;
+        guard_scopes(db, tx, items).await?;
         lock_entries(db, tx, items).await?;
         let mut records = Vec::new();
         let mut views = Vec::with_capacity(items.len());
@@ -650,6 +662,7 @@ impl Work {
     ) -> Result<(), Rejection> {
         let db = self.ctx.database();
         self.state.check_writable(db, tx).await?;
+        crate::organizations::guard_write(db, tx, &target.scope).await?;
         let id = id.hyphenated().to_string();
         lock_entry(db, tx, target, &id).await?;
         if locale == self.model.default_locale().code {

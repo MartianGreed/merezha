@@ -500,6 +500,7 @@ fn content_errors_register_with_the_kernel_codes() {
         ("populate_limit", 400),
         ("response_too_large", 400),
         ("content_type_not_found", 404),
+        ("organization_not_found", 404),
     ] {
         assert_eq!(
             registry.status_of(code).map(|s| s.as_u16()),
@@ -536,7 +537,7 @@ fn content_errors_register_with_the_kernel_codes() {
         ContentModule::new().start_timeout(),
         Some(Duration::from_secs(310))
     );
-    assert_eq!(ContentModule::new().migrations().len(), 3);
+    assert_eq!(ContentModule::new().migrations().len(), 4);
 }
 
 fn parts(config: &merezha_platform::ProjectConfig) -> HostParts {

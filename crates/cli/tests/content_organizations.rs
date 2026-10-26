@@ -45,6 +45,11 @@ fields = [{ name = "title", type = "string", required = true }]
 "#;
 
 fn project(dir: &Path, identity: bool) -> PathBuf {
+    project_with(dir, identity, "")
+}
+
+/// [`project`] with `top`, more top-level sections such as `[jobs]`.
+fn project_with(dir: &Path, identity: bool, top: &str) -> PathBuf {
     fs::write(dir.join("protocol.wasm"), support::component()).unwrap();
     fs::write(
         dir.join("runtime.toml"),
@@ -69,7 +74,7 @@ fn project(dir: &Path, identity: bool) -> PathBuf {
         format!(
             "[app]\nid = \"orgs\"\n[http]\nlisten = \"127.0.0.1:0\"\n\
              [database]\nurl = {{ env = \"{DATABASE_ENV}\" }}\nmigrate = true\n\
-             [runtime]\nmanifest = \"runtime.toml\"\n{identity}[modules.content]\n\
+             [runtime]\nmanifest = \"runtime.toml\"\n{top}\n{identity}[modules.content]\n\
              [modules.content.media]\nlocal = {{ root = {:?} }}\nspool_dir = {:?}\n",
             dir.join("media"),
             dir.join("spool"),
@@ -130,6 +135,12 @@ fn call(
 /// organization and mint its API key with the content permissions: the
 /// organization id and the key.
 fn organization(address: SocketAddr, email: &str, slug: &str) -> (String, String) {
+    let (org, key, _) = owner_of(address, email, slug);
+    (org, key)
+}
+
+/// [`organization`] with the owner's bearer session as well.
+fn owner_of(address: SocketAddr, email: &str, slug: &str) -> (String, String, String) {
     let origin = [("Origin", ORIGIN)];
     let password = "correct horse battery staple";
     let registered = call(
@@ -177,7 +188,7 @@ fn organization(address: SocketAddr, email: &str, slug: &str) -> (String, String
                                 "content.assets.read", "content.assets.write"]}),
     );
     assert_eq!(key.status, 201, "{}", key.body);
-    (org, key.body["key"].as_str().unwrap().to_owned())
+    (org, key.body["key"].as_str().unwrap().to_owned(), bearer)
 }
 
 /// Create and publish a `content_type` entry with `key`; its id.
@@ -355,4 +366,410 @@ fn organization_keys_act_in_their_own_organization_only() {
     assert_eq!(theirs.status, 404, "{}", theirs.body);
     assert_ne!(acme, globex);
     host.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #56: deleting an organization stops and purges its content.
+// ---------------------------------------------------------------------------
+
+/// A pool on the test database, for seeding and inspecting rows.
+async fn pool(test: &TestDatabase) -> merezha_postgres::Database {
+    merezha_postgres::Database::connect(&test.config()).unwrap()
+}
+
+fn soon() -> std::time::Instant {
+    std::time::Instant::now() + Duration::from_secs(30)
+}
+
+async fn texts(db: &merezha_postgres::Database, sql: &str) -> Vec<String> {
+    let client = db.acquire(soon()).await.unwrap();
+    client
+        .query(sql, &[])
+        .await
+        .unwrap_or_else(|e| panic!("{e}: {sql}"))
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect()
+}
+
+/// Wait up to `bound` for `sql`'s single text value to be `expected`.
+async fn wait_for(db: &merezha_postgres::Database, sql: &str, expected: &str, bound: Duration) {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        let found = texts(db, sql).await;
+        if found == [expected] {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{sql}: {found:?}, not {expected}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn state_of(org: &str) -> String {
+    format!(
+        "SELECT coalesce((SELECT source || ' ' || state FROM merezha_content.scopes_deleted \
+          WHERE scope = 'org:{org}'), 'none')"
+    )
+}
+
+fn count_of(table: &str, org: &str) -> String {
+    format!("SELECT count(*)::text FROM merezha_content.{table} WHERE scope = 'org:{org}'")
+}
+
+/// `merezha content purge-organization` with `args` on `config`: exit
+/// code and stdout.
+fn purge_command(config: &Path, url: &str, args: &[&str]) -> (Option<i32>, String, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_merezha"))
+        .args(["content", "purge-organization"])
+        .args(args)
+        .arg("--config")
+        .arg(config)
+        .env(DATABASE_ENV, url)
+        .env("IDENTITY_SECRET", SECRET)
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+    )
+}
+
+/// The identity id of `org` (`org_<hex>`) as its UUID.
+fn uuid_of(org: &str) -> String {
+    merezha_identity::ids::parse(merezha_identity::ids::ORGANIZATION, org)
+        .unwrap()
+        .hyphenated()
+        .to_string()
+}
+
+#[test]
+fn content_consumes_the_topic_identity_publishes() {
+    assert_eq!(
+        merezha_content::ORGANIZATION_DELETED_TOPIC,
+        merezha_identity::event::ORGANIZATION_DELETED
+    );
+}
+
+/// Issue #56, the operator purge: an organization identity deleted while
+/// content did not listen (here, its row deleted with the host stopped)
+/// still serves its public content; `merezha content purge-organization`
+/// marks and purges it and hands its blob to the cleanup, which the next
+/// host runs. A second run finds it done. A live organization is refused
+/// without `--force` and purged, with a warning, with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_operator_purges_an_organization_identity_deleted_before() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let config = project(dir.path(), true);
+    let env = [(DATABASE_ENV, test.url()), ("IDENTITY_SECRET", SECRET)];
+    let mut host = Host::spawn(&config, &env, "first");
+    let address = host.ready();
+    let (gone, gone_key) = organization(address, "ada@example.com", "acme");
+    let (live, live_key) = organization(address, "bob@example.com", "globex");
+    let notice = published(address, &gone_key, "notice", "Acme news");
+    published(address, &live_key, "notice", "Globex news");
+    let bearer = format!("Bearer {gone_key}");
+    let uploaded = call(
+        address,
+        "POST",
+        &format!("/v1/content/o/{gone}/manage/assets?filename=notes.txt"),
+        &[
+            ("Authorization", bearer.as_str()),
+            ("Content-Type", "text/plain"),
+        ],
+        &json!("notes"),
+    );
+    assert_eq!(uploaded.status, 201, "{}", uploaded.body);
+    host.stop();
+    // Deleted in identity while content did not listen.
+    let db = pool(&test).await;
+    db.acquire(soon())
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "DELETE FROM merezha_identity.organizations WHERE id = '{}'",
+            uuid_of(&gone)
+        ))
+        .await
+        .unwrap();
+    let mut host = Host::spawn(&config, &env, "stale");
+    let address = host.ready();
+    let path = format!("/v1/content/o/{gone}/notice/{notice}");
+    assert_eq!(call(address, "GET", &path, &[], &Value::Null).status, 200);
+    host.stop();
+
+    let (code, out, err) = purge_command(&config, test.url(), &[&gone]);
+    assert_eq!(code, Some(0), "{out}{err}");
+    let logged = |err: &str, event: &str| -> Vec<Value> {
+        err.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|e| e["event"] == event)
+            .collect()
+    };
+    let marked = logged(&err, "content.organization_deleted");
+    assert_eq!(marked.len(), 1, "{err}");
+    assert_eq!(
+        (
+            &marked[0]["tenant"],
+            &marked[0]["source"],
+            &marked[0]["forced"]
+        ),
+        (&json!(gone), &json!("operator"), &json!(false)),
+        "{err}"
+    );
+    let purged = logged(&err, "content.organization_purged");
+    assert_eq!(purged.len(), 1, "{err}");
+    assert_eq!(
+        (
+            &purged[0]["entries"],
+            &purged[0]["assets"],
+            &purged[0]["forced"]
+        ),
+        (&json!(1), &json!(1), &json!(false)),
+        "{err}"
+    );
+    assert_eq!(
+        out,
+        format!(
+            "organization {gone} marked deleted\npurged entries 1 assets 1 blobs 1\n\
+             status purged\nblobs released to content.blob_cleanup\n"
+        )
+    );
+    assert_eq!(texts(&db, &state_of(&gone)).await, ["operator purged"]);
+    for table in [
+        "entries",
+        "variants",
+        "published",
+        "refs",
+        "assets",
+        "generations",
+    ] {
+        assert_eq!(texts(&db, &count_of(table, &gone)).await, ["0"], "{table}");
+    }
+    assert_eq!(
+        texts(
+            &db,
+            &format!(
+                "SELECT state || ' ' || (orphaned_at = '-infinity') FROM merezha_content.blobs \
+                  WHERE scope = 'org:{gone}'"
+            )
+        )
+        .await,
+        ["orphaned true"]
+    );
+    // Again: done already.
+    let (code, out, _) = purge_command(&config, test.url(), &[&gone]);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        out,
+        format!(
+            "organization {gone} already marked deleted\npurged entries 0 assets 0 blobs 0\n\
+             status purged (already)\n"
+        )
+    );
+    // A live organization: refused, then forced.
+    let (code, out, _) = purge_command(&config, test.url(), &[&live]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(
+        out.starts_with(&format!("refused: identity still has organization {live}")),
+        "{out}"
+    );
+    assert_eq!(texts(&db, &state_of(&live)).await, ["none"]);
+    assert_eq!(texts(&db, &count_of("entries", &live)).await, ["1"]);
+    let (code, out, err) = purge_command(&config, test.url(), &["--force", &live]);
+    assert_eq!(code, Some(0), "{out}");
+    for event in [
+        "content.organization_deleted",
+        "content.organization_purged",
+    ] {
+        let found: Vec<Value> = err
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|e| e["event"] == event)
+            .collect();
+        assert_eq!(found.len(), 1, "{event}: {err}");
+        assert_eq!(found[0]["forced"], true, "{event}: {err}");
+        assert_eq!(found[0]["tenant"], json!(live), "{event}: {err}");
+    }
+    assert!(
+        out.starts_with(&format!(
+            "warning: --force: identity still has organization {live}"
+        )),
+        "{out}"
+    );
+    assert_eq!(texts(&db, &count_of("entries", &live)).await, ["0"]);
+    // An id identity never issues needs --force too; bad arguments fail.
+    let (code, out, _) = purge_command(&config, test.url(), &["acme"]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("identity cannot confirm"), "{out}");
+    let (code, _, err) = purge_command(&config, test.url(), &[]);
+    assert_eq!(code, Some(2));
+    assert!(err.contains("\"code\":\"invalid_arguments\""), "{err}");
+    // The next host refuses the organization and deletes its object.
+    let mut host = Host::spawn(&config, &env, "after");
+    let address = host.ready();
+    let refused = call(address, "GET", &path, &[], &Value::Null);
+    assert_eq!(
+        (refused.status, refused.body["error"]["code"].as_str()),
+        (404, Some("organization_not_found"))
+    );
+    wait_for(&db, &count_of("blobs", &gone), "0", Duration::from_secs(20)).await;
+    host.stop();
+}
+
+/// Tests that kill a host and wait for a lease to expire: they race
+/// deadlines, so CI runs them alone (`timing::`).
+mod timing {
+    use super::*;
+
+    /// Issue #56 through the binary: identity's `DELETE
+    /// /organizations/{org}` makes the organization's public delivery
+    /// answer 404 as soon as content's subscription commits; the purge is
+    /// killed (SIGKILL) after its first batch, and another host finishes
+    /// it once the lease expires. The other organization keeps its content.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_purge_killed_mid_way_is_finished_by_another_host() {
+        let Some(test) = TestDatabase::create() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config = project_with(
+            dir.path(),
+            true,
+            "[jobs]\npoll_interval_ms = 100\nreaper_interval_ms = 200\n\
+             [jobs.queues.content]\nlease_ms = 1000\n",
+        );
+        let env = [(DATABASE_ENV, test.url()), ("IDENTITY_SECRET", SECRET)];
+        let mut first = Host::spawn(&config, &env, "first");
+        let address = first.ready();
+        let (acme, acme_key, owner) = owner_of(address, "ada@example.com", "acme");
+        let (globex, globex_key) = organization(address, "bob@example.com", "globex");
+        let notice = published(address, &acme_key, "notice", "Acme news");
+        let kept = published(address, &globex_key, "notice", "Globex news");
+        let db = pool(&test).await;
+        // 250 more entries, so the purge takes three batches.
+        db.acquire(soon())
+            .await
+            .unwrap()
+            .batch_execute(&format!(
+                "INSERT INTO merezha_content.entries (id, scope, content_type, created_at, created_by) \
+                 SELECT gen_random_uuid(), 'org:{acme}', 'notice', now(), 'sys_test' \
+                   FROM generate_series(1, 250)"
+            ))
+            .await
+            .unwrap();
+        // Hold the 151st entry: the first batch commits, the second waits.
+        let locker = db.acquire(soon()).await.unwrap();
+        let locker_pid: i32 = locker
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        locker
+            .batch_execute(&format!(
+                "BEGIN; SELECT 1 FROM merezha_content.entries WHERE id = ( \
+                   SELECT id FROM merezha_content.entries WHERE scope = 'org:{acme}' \
+                    ORDER BY id OFFSET 150 LIMIT 1) FOR UPDATE"
+            ))
+            .await
+            .unwrap();
+        let deleted = call(
+            address,
+            "DELETE",
+            &format!("/v1/identity/organizations/{acme}"),
+            &[("Authorization", owner.as_str())],
+            &json!({"confirm_slug": "acme"}),
+        );
+        assert_eq!(deleted.status, 204, "{}", deleted.body);
+        wait_for(
+            &db,
+            &state_of(&acme),
+            "event purging",
+            Duration::from_secs(10),
+        )
+        .await;
+        let path = format!("/v1/content/o/{acme}/notice/{notice}");
+        let refused = call(address, "GET", &path, &[], &Value::Null);
+        assert_eq!(
+            (refused.status, refused.body["error"]["code"].as_str()),
+            (404, Some("organization_not_found"))
+        );
+        wait_for(
+            &db,
+            &count_of("entries", &acme),
+            "151",
+            Duration::from_secs(10),
+        )
+        .await;
+        // Kill the host mid-purge, and the backend it left waiting.
+        first.child.kill().unwrap();
+        first.child.wait().unwrap();
+        db.acquire(soon())
+            .await
+            .unwrap()
+            .execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                  WHERE $1 = ANY(pg_blocking_pids(pid))",
+                &[&locker_pid],
+            )
+            .await
+            .unwrap();
+        locker.batch_execute("ROLLBACK").await.unwrap();
+        drop(locker);
+        let mut second = Host::spawn(&config, &env, "second");
+        let address = second.ready();
+        wait_for(
+            &db,
+            &state_of(&acme),
+            "event purged",
+            Duration::from_secs(20),
+        )
+        .await;
+        assert_eq!(texts(&db, &count_of("entries", &acme)).await, ["0"]);
+        // Two leases of one purge job: the killed host's expired, the
+        // second host's succeeded.
+        let leases = texts(
+            &db,
+            "SELECT coalesce(a.outcome, 'none') FROM merezha_jobs.attempts a \
+               JOIN merezha_jobs.jobs j ON j.id = a.job_id \
+              WHERE j.kind = 'content.organization_purge' ORDER BY a.started_at",
+        )
+        .await;
+        assert_eq!(
+            leases.first().map(String::as_str),
+            Some("lease_expired"),
+            "{leases:?}"
+        );
+        assert_eq!(
+            leases.last().map(String::as_str),
+            Some("succeeded"),
+            "{leases:?}"
+        );
+        let owners = texts(
+            &db,
+            "SELECT count(DISTINCT a.lease_owner)::text FROM merezha_jobs.attempts a \
+               JOIN merezha_jobs.jobs j ON j.id = a.job_id \
+              WHERE j.kind = 'content.organization_purge'",
+        )
+        .await;
+        assert_eq!(owners, ["2"]);
+        let refused = call(address, "GET", &path, &[], &Value::Null);
+        assert_eq!(refused.status, 404);
+        // The other organization is untouched.
+        let other = call(
+            address,
+            "GET",
+            &format!("/v1/content/o/{globex}/notice/{kept}"),
+            &[],
+            &Value::Null,
+        );
+        assert_eq!(other.status, 200, "{}", other.body);
+        second.stop();
+    }
 }

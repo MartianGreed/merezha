@@ -1684,3 +1684,587 @@ async fn the_path_chooses_the_asset_scope_whatever_the_active_organization() {
         .await;
     assert_eq!(delete.code(), "asset_in_use");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #56: deleted organizations.
+// ---------------------------------------------------------------------------
+
+/// Append identity's `identity.organization_deleted` for `org`, as
+/// identity's `DELETE /organizations/{org}` does in its transaction, with
+/// the dedupe key `key` (another key is a second delivery of the event).
+async fn organization_deleted(fx: &Fixture, org: &str, key: &str) {
+    use merezha_domain::Identity;
+    use merezha_platform::ports::{
+        DedupeKey, MessageContext, NewEvent, OnDuplicate, Source, SourceOutbox,
+    };
+    let outbox = SourceOutbox::new(
+        Source::new("identity").unwrap(),
+        std::sync::Arc::new(merezha_jobs::PgOutbox),
+    );
+    let record = outbox.event(
+        Identity::new(merezha_content::ORGANIZATION_DELETED_TOPIC).unwrap(),
+        NewEvent {
+            dedupe_key: DedupeKey::new(key).unwrap(),
+            version: 1,
+            occurred_at: jiff::Timestamp::now(),
+            payload: json!({"organization_id": org, "deleted_at": jiff::Timestamp::now().to_string()}),
+            context: MessageContext {
+                correlation_id: Identity::new("delete-request").unwrap(),
+                causation_id: None,
+                tenant: Some(Identity::new(org).unwrap()),
+            },
+        },
+    );
+    fx.db
+        .transaction(soon(), move |tx| {
+            Box::pin(async move {
+                outbox.append(tx, &[record], OnDuplicate::Fail).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+}
+
+/// The `scopes_deleted` state of `org`'s scope, `none` without a row.
+fn deletion_state(org: &str) -> String {
+    format!(
+        "SELECT coalesce((SELECT state FROM merezha_content.scopes_deleted \
+          WHERE scope = 'org:{org}'), 'none')"
+    )
+}
+
+/// A digest of every row outside `org`'s scope and of the objects outside
+/// its key tag: what deleting `org` must never change.
+async fn outside_of(fx: &Fixture, dirs: &Dirs, org: &str) -> String {
+    let scope = format!("org:{org}");
+    let mut out = String::new();
+    for table in [
+        "entries",
+        "variants",
+        "published",
+        "refs",
+        "assets",
+        "blobs",
+        "generations",
+    ] {
+        out.push_str(
+            &strings(
+                &fx.db,
+                &format!(
+                    "SELECT coalesce(string_agg(t::text, '|' ORDER BY t::text), '') \
+                       FROM merezha_content.{table} t WHERE scope <> '{scope}'"
+                ),
+            )
+            .await
+            .join(""),
+        );
+        out.push('\n');
+    }
+    out.push_str(
+        &strings(
+            &fx.db,
+            &format!(
+                "SELECT coalesce(string_agg(r::text, '|' ORDER BY r::text), '') \
+                   FROM merezha_content.revisions r JOIN merezha_content.variants v \
+                     ON v.entry_id = r.entry_id AND v.locale = r.locale WHERE v.scope <> '{scope}'"
+            ),
+        )
+        .await
+        .join(""),
+    );
+    let key = merezha_content::media::blob_key(&scope, &"0".repeat(64)).unwrap();
+    let tag = key.as_str().split('/').nth(1).unwrap().to_owned();
+    for object in dirs.objects() {
+        if !object.contains(&tag) {
+            out.push('\n');
+            out.push_str(&object);
+        }
+    }
+    out
+}
+
+/// Rows of every content table still holding `org`'s scope, as
+/// `<table>=<count>` for the non-empty ones; `ids` are its former entries,
+/// whose revisions are counted too.
+async fn rows_of(fx: &Fixture, org: &str, ids: &[&str]) -> Vec<String> {
+    let scope = format!("org:{org}");
+    let ids = if ids.is_empty() {
+        "NULL".to_owned()
+    } else {
+        ids.iter()
+            .map(|id| format!("'{id}'"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    strings(
+        &fx.db,
+        &format!(
+            "SELECT t || '=' || n FROM ( \
+               SELECT 'entries' t, count(*) n FROM merezha_content.entries WHERE scope = '{scope}' \
+               UNION ALL SELECT 'variants', count(*) FROM merezha_content.variants WHERE scope = '{scope}' \
+               UNION ALL SELECT 'revisions', count(*) FROM merezha_content.revisions \
+                          WHERE entry_id::text IN ({ids}) \
+               UNION ALL SELECT 'published', count(*) FROM merezha_content.published WHERE scope = '{scope}' \
+               UNION ALL SELECT 'refs', count(*) FROM merezha_content.refs \
+                          WHERE scope = '{scope}' OR target_id::text IN ({ids}) \
+               UNION ALL SELECT 'assets', count(*) FROM merezha_content.assets WHERE scope = '{scope}' \
+               UNION ALL SELECT 'blobs', count(*) FROM merezha_content.blobs WHERE scope = '{scope}' \
+               UNION ALL SELECT 'generations', count(*) FROM merezha_content.generations \
+                          WHERE scope = '{scope}') c \
+             WHERE n > 0 ORDER BY t"
+        ),
+    )
+    .await
+}
+
+/// Whether a matrix row addresses organization B's scope when B's own
+/// credentials send it: every entry, singleton, trash and batch route (the
+/// scope comes from the principal) and everything under `/o/{B}`.
+fn of_b(row: &Row) -> bool {
+    [
+        "/manage/entries",
+        "/manage/singletons",
+        "/manage/trash",
+        "/manage/batch",
+    ]
+    .iter()
+    .any(|prefix| row.route.starts_with(prefix))
+        || row.path.contains(&format!("/o/{ORG_B}/"))
+}
+
+/// Wait up to 20 seconds for `sql`'s single text value to be `expected`
+/// (a purge and its blob cleanup run as jobs).
+async fn eventually(db: &merezha_platform::Database, sql: &str, expected: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let found = strings(db, sql).await;
+        if found == [expected] {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{sql}: {found:?}, not {expected}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Issue #56 acceptance: once the deletion's subscription commits, every
+/// route of the matrix that addresses B answers 404 while B's rows are
+/// still there (a held row lock keeps the purge from starting), every
+/// other answer is what it was; then the purge removes B's entries,
+/// variants, revisions, published rows, refs both ways, assets, blobs and
+/// generation, the blob cleanup deletes B's objects only (A stored the
+/// same bytes), nothing outside B changes, and the application asset only
+/// B's entries used is deletable without `force`.
+#[tokio::test]
+async fn a_deleted_organization_answers_404_everywhere_and_is_purged_alone() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dirs = Dirs::new();
+    let fx = start(&test, &dirs).await;
+    let page = page(&fx, "Shared").await;
+    let bytes = png(4, 3, 64);
+    let b = seed(&fx, "key_b", "B-secret", &page, &bytes, true).await;
+    let a = seed(&fx, "key_a", "A-own", &page, &png(5, 5, 32), true).await;
+    // A stores B's bytes too: one blob and one object per organization.
+    let same = upload(&fx, "key_a", "same.png", &bytes).await;
+    // A trashed asset of B, purged with the rest.
+    let binned = upload(&fx, "key_b", "binned.png", &png(6, 2, 8)).await;
+    let binned_id = binned["id"].as_str().unwrap().to_owned();
+    let trashed = fx
+        .call(
+            Method::DELETE,
+            &format!("{}/{binned_id}", assets_of("key_b")),
+        )
+        .by(Some("key_b"))
+        .send()
+        .await;
+    assert_eq!(trashed.status, StatusCode::NO_CONTENT, "{}", trashed.text);
+    assert_eq!(
+        strings(
+            &fx.db,
+            &format!(
+                "SELECT (deleted_at IS NOT NULL)::text FROM merezha_content.assets \
+                  WHERE id = '{binned_id}'"
+            )
+        )
+        .await,
+        ["true"]
+    );
+    // An application asset that only B's entries use.
+    let shared = upload(&fx, "app_key", "shared.png", &png(7, 7, 16)).await;
+    let shared_id = shared["id"].as_str().unwrap().to_owned();
+    let user = create(
+        &fx,
+        "key_b",
+        "notice",
+        json!({"title": "B uses it", "image": {"id": shared_id}}),
+    )
+    .await;
+    publish(&fx, "key_b", "notice", &user, "en", 1).await;
+    let in_use = fx
+        .call(Method::DELETE, &manage(&format!("/assets/{shared_id}")))
+        .by(Some("app_key"))
+        .send()
+        .await;
+    assert_eq!(
+        (in_use.status.as_u16(), in_use.code()),
+        (409, "asset_in_use"),
+        "{}",
+        in_use.text
+    );
+    let public = fx
+        .get(&format!("{C}/o/{ORG_B}/notice/{}", b.notice))
+        .by(None)
+        .send()
+        .await;
+    assert_eq!(public.status, StatusCode::OK, "{}", public.text);
+    let tag = public.etag();
+
+    // What B's credentials get on the routes outside B, before.
+    let rows = matrix(&b, &bytes);
+    let mut others = Vec::new();
+    for row in rows.iter().filter(|r| !of_b(r)) {
+        let reply = row.send(&fx, "key_b").await;
+        others.push((reply.status.as_u16(), reply.code().to_owned()));
+    }
+    let before = outside_of(&fx, &dirs, ORG_B).await;
+    let b_ids = [
+        b.handbook.as_str(),
+        b.notice.as_str(),
+        b.brief.as_str(),
+        b.settings.as_str(),
+        b.trashed.as_str(),
+        user.as_str(),
+    ];
+
+    // Hold the first of B's entries so the purge cannot start.
+    let locker = fx.db.acquire(soon()).await.unwrap();
+    locker
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM merezha_content.entries WHERE scope = 'org:{ORG_B}' \
+             ORDER BY id LIMIT 1 FOR UPDATE"
+        ))
+        .await
+        .unwrap();
+    organization_deleted(&fx, ORG_B, &format!("organization:{ORG_B}:deleted")).await;
+    eventually(&fx.db, &deletion_state(ORG_B), "purging").await;
+    assert!(
+        rows_of(&fx, ORG_B, &b_ids)
+            .await
+            .contains(&"entries=6".to_owned()),
+        "B's rows are still there: {:?}",
+        rows_of(&fx, ORG_B, &b_ids).await
+    );
+
+    // Every route of B answers 404 at once, for B's key and B's member.
+    for who in ["key_b", "member_b"] {
+        let mut others = others.iter();
+        for row in &rows {
+            let reply = row.send(&fx, who).await;
+            let what = format!("{who} {} {}", row.method, row.path);
+            if of_b(row) {
+                assert_eq!(
+                    (reply.status.as_u16(), reply.code()),
+                    (404, "organization_not_found"),
+                    "{what}: {}",
+                    reply.text
+                );
+            } else if who == "key_b" {
+                let (status, code) = others.next().unwrap();
+                assert_eq!(
+                    (reply.status.as_u16(), reply.code()),
+                    (*status, code.as_str()),
+                    "{what}: {}",
+                    reply.text
+                );
+            }
+            for marker in b.ids().iter().copied().chain(["B-secret", "b-secret"]) {
+                assert!(!reply.text.contains(marker), "{what} shows {marker}");
+            }
+        }
+    }
+    // Anonymous delivery too, its 304 path included.
+    for path in [
+        format!("{C}/o/{ORG_B}/notice"),
+        format!("{C}/o/{ORG_B}/notice/{}", b.notice),
+        format!("{C}/o/{ORG_B}/model"),
+        format!("{C}/o/{ORG_B}/assets/{}/{}", b.asset, b.filename),
+    ] {
+        let reply = fx
+            .get(&path)
+            .by(None)
+            .header("if-none-match", &tag)
+            .send()
+            .await;
+        assert_eq!(
+            (reply.status.as_u16(), reply.code()),
+            (404, "organization_not_found"),
+            "{path}: {}",
+            reply.text
+        );
+    }
+    // A is served as before.
+    let own = fx
+        .get(&format!("{C}/o/{ORG_A}/notice/{}", a.notice))
+        .by(None)
+        .send()
+        .await;
+    assert_eq!(own.status, StatusCode::OK, "{}", own.text);
+    assert_eq!(outside_of(&fx, &dirs, ORG_B).await, before, "only B's rows");
+
+    // Let the purge run: everything of B goes, its blobs through the
+    // blob cleanup the purge asked for.
+    locker.batch_execute("ROLLBACK").await.unwrap();
+    drop(locker);
+    eventually(&fx.db, &deletion_state(ORG_B), "purged").await;
+    eventually(
+        &fx.db,
+        &format!("SELECT count(*)::text FROM merezha_content.blobs WHERE scope = 'org:{ORG_B}'"),
+        "0",
+    )
+    .await;
+    assert_eq!(rows_of(&fx, ORG_B, &b_ids).await, Vec::<String>::new());
+    assert_eq!(
+        scalar(
+            &fx.db,
+            &format!("SELECT count(*) FROM merezha_content.assets WHERE id = '{binned_id}'")
+        )
+        .await,
+        0,
+        "the trashed asset went too"
+    );
+    let b_tag = {
+        let key =
+            merezha_content::media::blob_key(&format!("org:{ORG_B}"), &"0".repeat(64)).unwrap();
+        key.as_str().split('/').nth(1).unwrap().to_owned()
+    };
+    assert!(
+        dirs.objects().iter().all(|o| !o.contains(&b_tag)),
+        "{:?}",
+        dirs.objects()
+    );
+    // A's copy of the same bytes is still stored, object and row.
+    let sha = same["sha256"].as_str().unwrap();
+    let a_key = merezha_content::media::blob_key(&format!("org:{ORG_A}"), sha).unwrap();
+    assert!(
+        dirs.objects().contains(a_key.as_str()),
+        "{:?}",
+        dirs.objects()
+    );
+    assert_eq!(
+        strings(
+            &fx.db,
+            &format!(
+                "SELECT state FROM merezha_content.blobs WHERE scope = 'org:{ORG_A}' \
+                  AND sha256 = '{sha}'"
+            )
+        )
+        .await,
+        ["stored"]
+    );
+    assert_eq!(outside_of(&fx, &dirs, ORG_B).await, before, "only B's rows");
+    // The application asset only B used is free now.
+    let usage = fx
+        .get(&manage(&format!("/assets/{shared_id}")))
+        .by(Some("app_key"))
+        .send()
+        .await;
+    assert_eq!(
+        usage.body["usage"],
+        json!({"draft": 0, "published": 0, "elsewhere": 0}),
+        "{}",
+        usage.text
+    );
+    let freed = fx
+        .call(Method::DELETE, &manage(&format!("/assets/{shared_id}")))
+        .by(Some("app_key"))
+        .send()
+        .await;
+    assert_eq!(freed.status, StatusCode::NO_CONTENT, "{}", freed.text);
+    // B stays refused once purged; A keeps working.
+    let gone = fx
+        .get(&manage("/entries/handbook"))
+        .by(Some("key_b"))
+        .send()
+        .await;
+    assert_eq!(
+        (gone.status.as_u16(), gone.code()),
+        (404, "organization_not_found")
+    );
+    let list = fx
+        .get(&manage("/entries/handbook"))
+        .by(Some("key_a"))
+        .send()
+        .await;
+    assert_eq!(list.status, StatusCode::OK, "{}", list.text);
+    assert_eq!(list.body["items"][0]["sys"]["id"], a.handbook.as_str());
+}
+
+/// Issue #56: a second delivery of the event (or a second event for the
+/// same organization) marks nothing again and starts no second purge;
+/// one after the purge finished finds it done.
+#[tokio::test]
+async fn a_redelivered_deletion_event_marks_and_purges_once() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dirs = Dirs::new();
+    let fx = start(&test, &dirs).await;
+    let page = page(&fx, "Shared").await;
+    seed(&fx, "key_b", "B-secret", &page, &png(4, 3, 64), false).await;
+    // At least once: the same event as two jobs, back to back.
+    organization_deleted(&fx, ORG_B, "organization:b:deleted").await;
+    organization_deleted(&fx, ORG_B, "organization:b:deleted:replayed").await;
+    eventually(&fx.db, &deletion_state(ORG_B), "purged").await;
+    eventually(
+        &fx.db,
+        "SELECT count(*)::text FROM merezha_jobs.jobs \
+          WHERE kind = 'content.organization_deleted' AND state = 'succeeded'",
+        "2",
+    )
+    .await;
+    let purge_jobs = "SELECT count(*)::text FROM merezha_jobs.jobs \
+                       WHERE kind = 'content.organization_purge'";
+    assert_eq!(strings(&fx.db, purge_jobs).await, ["1"]);
+    assert_eq!(
+        strings(
+            &fx.db,
+            "SELECT source || ' ' || state FROM merezha_content.scopes_deleted"
+        )
+        .await,
+        ["event purged"]
+    );
+    // After the purge: the mark stays, the purge job is the same one.
+    organization_deleted(&fx, ORG_B, "organization:b:deleted:late").await;
+    eventually(
+        &fx.db,
+        "SELECT count(*)::text FROM merezha_jobs.jobs \
+          WHERE kind = 'content.organization_deleted' AND state = 'succeeded'",
+        "3",
+    )
+    .await;
+    assert_eq!(strings(&fx.db, purge_jobs).await, ["1"]);
+    assert_eq!(
+        scalar(
+            &fx.db,
+            &format!("SELECT count(*) FROM merezha_content.entries WHERE scope = 'org:{ORG_B}'")
+        )
+        .await,
+        0
+    );
+}
+
+/// Issue #56: the purge is resumable. One step of a run that stopped
+/// (its host died) leaves the rest, which another run finishes; every
+/// step is bounded, and a purge of a purged scope does nothing.
+#[tokio::test]
+async fn a_purge_stopped_after_one_step_is_finished_by_another_run() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dirs = Dirs::new();
+    let fx = start(&test, &dirs).await;
+    let scope = format!("org:{ORG_B}");
+    // 250 entries straight through SQL, one with a draft ref to another.
+    execute(
+        &fx.db,
+        &format!(
+            "INSERT INTO merezha_content.entries (id, scope, content_type, created_at, created_by) \
+             SELECT gen_random_uuid(), '{scope}', 'notice', now(), 'sys_test' \
+               FROM generate_series(1, 250);
+             INSERT INTO merezha_content.variants (entry_id, locale, scope, content_type, \
+                 draft_revision, draft_data, draft_updated_at, draft_updated_by) \
+             SELECT id, 'en', scope, content_type, 1, '{{\"title\": \"x\"}}', now(), 'sys_test' \
+               FROM merezha_content.entries WHERE scope = '{scope}';"
+        ),
+    )
+    .await;
+    let db = fx.db.clone();
+    let marked = scope.clone();
+    let first = fx
+        .db
+        .transaction(soon(), move |tx| {
+            Box::pin(async move {
+                merezha_content::mark_deleted(
+                    &db,
+                    tx,
+                    &marked,
+                    merezha_content::DeletedBy::Operator,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    assert!(first);
+    // A run that did one step and died.
+    let step = merezha_content::purge_step(&fx.db, soon(), &scope, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        step,
+        merezha_content::PurgeStep::Entries(merezha_content::ORGANIZATION_PURGE_BATCH as usize)
+    );
+    assert_eq!(
+        scalar(
+            &fx.db,
+            &format!("SELECT count(*) FROM merezha_content.entries WHERE scope = '{scope}'")
+        )
+        .await,
+        150
+    );
+    // Another run finishes in bounded steps.
+    let mut steps = Vec::new();
+    let report = merezha_content::purge_organization(
+        &fx.db,
+        &scope,
+        merezha_content::DeletedBy::Operator,
+        None,
+        std::time::Duration::from_secs(30),
+        |step| steps.push(step),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        steps,
+        vec![
+            merezha_content::PurgeStep::Entries(100),
+            merezha_content::PurgeStep::Entries(50),
+            merezha_content::PurgeStep::Done { now: true },
+        ]
+    );
+    assert!(!report.marked && !report.already_purged);
+    assert_eq!(report.entries, 150);
+    assert_eq!(rows_of(&fx, ORG_B, &[]).await, Vec::<String>::new());
+    // Again: nothing to do.
+    let again = merezha_content::purge_organization(
+        &fx.db,
+        &scope,
+        merezha_content::DeletedBy::Operator,
+        None,
+        std::time::Duration::from_secs(30),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert!(again.already_purged);
+    assert_eq!(
+        strings(
+            &fx.db,
+            "SELECT source || ' ' || state FROM merezha_content.scopes_deleted"
+        )
+        .await,
+        ["operator purged"]
+    );
+    // A step on a live scope touches nothing.
+    assert_eq!(
+        merezha_content::purge_step(&fx.db, soon(), &format!("org:{ORG_A}"), None)
+            .await
+            .unwrap(),
+        merezha_content::PurgeStep::NotDeleted
+    );
+}

@@ -142,6 +142,21 @@ impl Routes {
     }
 }
 
+impl Routes {
+    /// [`Routes::authorize`], then `organization_not_found` (404) on a
+    /// deleted organization's path (issue #56).
+    async fn authorized(
+        &self,
+        parts: &Parts,
+        params: &HashMap<String, String>,
+        permission: &str,
+    ) -> Result<Target, Rejection> {
+        let target = self.authorize(parts, params, permission)?;
+        self.assets.store.refuse_deleted(&target.scope).await?;
+        Ok(target)
+    }
+}
+
 /// An asset id from a path: a hyphenated UUID, anything else is absent.
 fn asset_id(text: &str) -> Result<String, Rejection> {
     Some(text)
@@ -202,7 +217,7 @@ async fn upload(
 ) -> Response {
     let run = async {
         let (parts, body) = request.into_parts();
-        let target = routes.authorize(&parts, &params, ASSETS_WRITE)?;
+        let target = routes.authorized(&parts, &params, ASSETS_WRITE).await?;
         let settings = routes.assets.settings();
         // Admission: a slot of `media.max_concurrent_uploads`, held until
         // the upload ends.
@@ -267,7 +282,7 @@ async fn list(
 ) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
-        let scope = routes.authorize(&parts, &params, ASSETS_READ)?.scope;
+        let scope = routes.authorized(&parts, &params, ASSETS_READ).await?.scope;
         let query = parameters(
             parts.uri.query(),
             &["content_type", "filename_prefix", "limit", "cursor"],
@@ -343,7 +358,7 @@ async fn read(
 ) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
-        let target = routes.authorize(&parts, &params, ASSETS_READ)?;
+        let target = routes.authorized(&parts, &params, ASSETS_READ).await?;
         parameters(parts.uri.query(), &[])?;
         let id = asset_id(params.get("id").map(String::as_str).unwrap_or(""))?;
         let (asset, usage) = routes.assets.get(&target.scope, &id).await?;
@@ -359,7 +374,7 @@ async fn patch(
 ) -> Response {
     let run = async {
         let (parts, body) = request.into_parts();
-        let target = routes.authorize(&parts, &params, ASSETS_WRITE)?;
+        let target = routes.authorized(&parts, &params, ASSETS_WRITE).await?;
         parameters(parts.uri.query(), &[])?;
         let merge = parts
             .headers
@@ -429,7 +444,7 @@ async fn delete(
 ) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
-        let target = routes.authorize(&parts, &params, ASSETS_DELETE)?;
+        let target = routes.authorized(&parts, &params, ASSETS_DELETE).await?;
         let query = parameters(parts.uri.query(), &["force", "purge"])?;
         let options = AssetDelete {
             force: flag(&query, "force")?,
@@ -458,7 +473,7 @@ async fn undelete(
 ) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
-        let target = routes.authorize(&parts, &params, ASSETS_DELETE)?;
+        let target = routes.authorized(&parts, &params, ASSETS_DELETE).await?;
         parameters(parts.uri.query(), &[])?;
         let id = asset_id(params.get("id").map(String::as_str).unwrap_or(""))?;
         let asset = routes.assets.undelete(&target.scope, &id).await?;
@@ -476,7 +491,7 @@ async fn file(
 ) -> Response {
     let run = async {
         let (parts, _) = request.into_parts();
-        let target = routes.authorize(&parts, &params, ASSETS_READ)?;
+        let target = routes.authorized(&parts, &params, ASSETS_READ).await?;
         parameters(parts.uri.query(), &[])?;
         let id = asset_id(params.get("id").map(String::as_str).unwrap_or(""))?;
         let (asset, _) = routes.assets.get(&target.scope, &id).await?;

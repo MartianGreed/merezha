@@ -47,6 +47,7 @@ async fn migration_1_applies_and_leaves_the_search_path_alone() {
             "rebuilds",
             "refs",
             "revisions",
+            "scopes_deleted",
             "variants"
         ]
     );

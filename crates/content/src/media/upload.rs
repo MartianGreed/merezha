@@ -229,6 +229,7 @@ impl Assets {
             let claim = transaction(self.db(), self.deadline(), move |tx| {
                 Box::pin(async move {
                     state.check_writable(&db, tx).await?;
+                    crate::organizations::guard_write(&db, tx, &scope).await?;
                     if let Some(row) = db
                         .query_opt(
                             &*tx,
@@ -326,6 +327,9 @@ impl Assets {
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
                 work.state.check_writable(&db, tx).await?;
+                // Issue #56: an upload that began before its organization
+                // was deleted gives up here, and its row and object go.
+                crate::organizations::guard_write(&db, tx, &scope).await?;
                 let stored = db
                     .query_opt(&*tx, &sql::BLOB_STORE, &[&scope, &sha256, &put])
                     .await

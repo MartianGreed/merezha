@@ -571,6 +571,12 @@ models, after_entry uuid, state text CHECK (state IN ('pending', 'done')),
 updated_at timestamptz NOT NULL)`, the resume cursor of the fallback
 rebuild (section 2).
 
+Migration 4 (issue #56) adds `scopes_deleted (scope text PRIMARY KEY,
+source text CHECK (source IN ('event', 'operator')), state text CHECK
+(state IN ('purging', 'purged')), deleted_at timestamptz NOT NULL,
+purged_at timestamptz)`, the deleted organizations (section 8, as built
+for #56).
+
 ### Derived indexes
 
 The model decides which indexes exist beyond the static ones. For every
@@ -1650,14 +1656,62 @@ multi-application platform keeps that rule, so the layout survives it.
 - ETags keep C5's rule: an organization response hashes its
   organization's generation, plus the application's when the type can
   reference entries; another organization's publish changes no tag.
-- Content never reads identity tables, so deleting an organization in
-  identity leaves its content in place, unreachable through management
-  (no principal has that tenant any more) but still served on its
-  public delivery path, its assets included, until issue #56 lands.
-  #56 purges an organization's content on `identity.organization_deleted`
-  and must also give operators a purge they can run themselves (for
-  organizations deleted before it, or a missed event). Until then an
-  operator removes a deleted organization's public content by hand.
+- Content never reads identity tables; it learns of a deleted
+  organization from `identity.organization_deleted` (below).
+
+### As built (issue #56, deleted organizations)
+
+- Content subscribes `content.organization_deleted` to
+  `identity.organization_deleted` beside identity. Its transaction
+  records `org:<organization_id>` in `scopes_deleted` (migration 4:
+  `scope`, `source` `event` or `operator`, `state` `purging` or `purged`,
+  `deleted_at`, `purged_at`) under the scope's exclusive transaction
+  advisory lock, and appends `content.organization_purge` keyed by the
+  scope's blob tag (`organization_purge:org-<32 hex>`), so a redelivered
+  event marks nothing again and starts no second purge.
+- Every organization-scope write takes the same lock shared, right after
+  the model version check, then checks the record in a statement of its
+  own; the deletion's exclusive lock waits for writes in flight, so none
+  commits after it. Management (`Manage::authorized`), asset routes and
+  asset delivery check the record once authorized, delivery as the first
+  statement of its read (so the 304 path refuses too): all answer
+  `organization_not_found` (404). A never-seen organization still has no
+  entries (200 with an empty list); only a deleted one is refused.
+- The purge runs bounded steps (`purge_step`, 100 rows each): entries
+  (cascading to variants, revisions, `published` and outgoing refs) with
+  the refs pointing at them from any scope, then assets with the refs to
+  them, then blobs set `orphaned` at `-infinity`, so the next
+  `content.blob_cleanup` takes them whatever `orphan_grace` (no upload can
+  reuse a deleted scope's blob) and deletes each object under C7's
+  delete-lease fence; the last step deletes the scope's stray refs and
+  generation, marks the record `purged` and, with media, appends a
+  `content.blob_cleanup` run. Steps are idempotent, so a killed run is
+  finished by the next lease; a run near its deadline appends its
+  continuation (`...:after:<job>`), like the fallback rebuild.
+- The purge appends no `content.entry_purged` or asset events: the
+  organization's webhook endpoints go with it, and consumers have
+  `identity.organization_deleted` itself.
+- `merezha content purge-organization <id> --config PATH [--force]`
+  runs the same steps in the foreground for organizations deleted before
+  this, a missed event or a dead-lettered purge, refusing (exit 1) an
+  organization identity still has or cannot confirm deleted unless
+  `--force`.
+- The record is kept: identity never reuses organization ids, and a
+  forced purge of a live organization keeps it refused. The way back is
+  deleting the row once its state is `purged` (never while `purging`).
+- The write lock and the deletion lock take one key (`scope_lock_key!`,
+  class `SCOPE_LOCK_CLASS`), checked by a unit test; a test hook
+  (feature `test-hooks`, `testing::pause_next_write`) holds a real save
+  open after its gate to show the mark waits for it.
+- Residual windows: a request that passed its check just before the mark
+  answers from what it read; presigned redirect URLs stay valid up to
+  `media.signed_url_ttl` and shared caches keep public responses for
+  `max-age` plus `stale-while-revalidate`; content's past outbox records
+  stay until `[jobs.retention]`. A purge job that will not retry logs
+  `content.organization_purge_failed` (error, alertable) and leaves the
+  data at rest, refused, until replayed or finished by the operator
+  command, which logs `content.organization_deleted` and
+  `content.organization_purged` (`forced`) like the job.
 
 ## 9. Configuration and telemetry
 
