@@ -29,6 +29,17 @@
 //!
 //! These need a check against a real Brevo account before production use
 //! (NT §12 "What could not be verified").
+//!
+//! For `POST /v3/transactionalSMS/send` (NT-N4) it has no idempotency, as
+//! Brevo documents none: every accepted request is a processed message,
+//! answered `{"messageId": <number>}`. It refuses with 400
+//! `invalid_parameter` a `recipient` that is not 8 to 15 digits (a leading
+//! `+` included: whether Brevo accepts one is not documented, so the block
+//! never sends it), a `sender` that is empty or longer than 11 characters
+//! (15 digits), empty `content`, a `type` other than `transactional` or
+//! `marketing` and a `webUrl` that is not a URL. [`FakeBrevo::sms_event`]
+//! builds a status report and [`FakeBrevo::sms_event_request`] the call to
+//! the message's `webUrl`.
 use axum::{
     body::Body,
     http::{Request, header},
@@ -47,6 +58,8 @@ use tokio::{
 
 /// How long a processed `idempotencyKey` is refused (assumption 3).
 pub const IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(30 * 60);
+/// SMS message ids are numbers of Brevo's size, this plus a counter.
+const SMS_MESSAGE_BASE: u64 = 1_511_882_900_000_000;
 /// Most bytes of a request the fake reads.
 const MAX_REQUEST: usize = 4 * 1024 * 1024;
 
@@ -212,6 +225,47 @@ impl FakeBrevo {
             "reason": if event.contains("bounce") { "550 5.1.1 unknown mailbox" } else { "" },
         })
     }
+    /// A Brevo transactional SMS status report (`msg_status` `delivered`,
+    /// `hard_bounce`, `unsubscribed`...) about `message`, with a fresh
+    /// `ts_event`.
+    pub fn sms_event(&self, status: &str, message: &Processed) -> Value {
+        let ts = {
+            let mut state = self.inner.state();
+            state.events += 1;
+            1_700_000_000 + state.events
+        };
+        let body = &message.body;
+        json!({
+            "id": 1,
+            "to": body["recipient"],
+            "sms_count": 1,
+            "credits_used": 0.045,
+            "remaining_credit": 99.5,
+            "msg_status": status,
+            "date": "2026-10-26 12:00:00",
+            "messageId": message.message_id.parse::<u64>().unwrap_or_default(),
+            "type": body["type"],
+            "tag": body["tag"],
+            "status": "OK",
+            "description": status,
+            "ts_event": ts,
+        })
+    }
+    /// The status report call Brevo would make for `message`: `POST` to the
+    /// path of its `webUrl` (no credential) with `payload`.
+    pub fn sms_event_request(message: &Processed, payload: &Value) -> Request<Body> {
+        let path = message.body["webUrl"]
+            .as_str()
+            .and_then(|u| url::Url::parse(u).ok())
+            .map(|u| u.path().to_owned())
+            .unwrap_or_default();
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap_or_else(|_| Request::new(Body::empty()))
+    }
     /// The callback request Brevo would make: `POST` `path` with
     /// `Authorization: Bearer <token>` and `payload` (an event or an array).
     pub fn event_request(path: &str, token: &str, payload: &Value) -> Request<Body> {
@@ -325,6 +379,27 @@ fn error(status: u16, code: &str) -> Reply {
     )
 }
 
+/// Why the fake refuses an SMS body, if it does.
+fn sms_refusal(body: &Value) -> Option<&'static str> {
+    let text = |key: &str| body[key].as_str().unwrap_or_default();
+    let recipient = text("recipient");
+    let sender = text("sender");
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let sender_ok = !sender.is_empty()
+        && sender.bytes().all(|b| b.is_ascii_alphanumeric())
+        && sender.len() <= if digits(sender) { 15 } else { 11 };
+    let web_url_ok = body
+        .get("webUrl")
+        .is_none_or(|u| u.as_str().is_some_and(|u| url::Url::parse(u).is_ok()));
+    let valid = (8..=15).contains(&recipient.len())
+        && digits(recipient)
+        && sender_ok
+        && !text("content").is_empty()
+        && matches!(text("type"), "transactional" | "marketing")
+        && web_url_ok;
+    (!valid).then_some("invalid_parameter")
+}
+
 fn decide(inner: &Inner, request: Recorded) -> Reply {
     let mut state = inner.state();
     state.requests.push(request.clone());
@@ -368,6 +443,9 @@ fn decide(inner: &Inner, request: Recorded) -> Reply {
     let key = request.body["headers"]["idempotencyKey"]
         .as_str()
         .map(str::to_owned);
+    if !email && let Some(code) = sms_refusal(&request.body) {
+        return error(400, code);
+    }
     if email {
         let recipients = request.body["to"].as_array().map_or(0, Vec::len);
         if recipients != 1 || !request.body["sender"].is_object() {
@@ -390,7 +468,7 @@ fn decide(inner: &Inner, request: Recorded) -> Reply {
     let message_id = if email {
         format!("<{}.fake@smtp-relay.brevo.test>", state.next_id)
     } else {
-        state.next_id.to_string()
+        (SMS_MESSAGE_BASE + state.next_id).to_string()
     };
     if let Some(key) = key.filter(|_| email) {
         state.keys.insert(key, now);
@@ -407,7 +485,7 @@ fn decide(inner: &Inner, request: Recorded) -> Reply {
     let id = if email {
         Value::String(message_id)
     } else {
-        Value::from(state.next_id)
+        Value::from(SMS_MESSAGE_BASE + state.next_id)
     };
     Reply::Json(201, Vec::new(), json!({ "messageId": id }))
 }

@@ -361,7 +361,8 @@ impl EdgeSettings {
         }
     }
     /// Routes that take no credential (`Module::credential_free_routes`),
-    /// as `(method, full path)`: for an exact match the edge never calls the
+    /// as `(method, full path)`: for a match (`{name}` segments match any
+    /// one non-empty segment, the others exactly) the edge never calls the
     /// authenticator (no session lookup, no Origin or CSRF check, no
     /// rejection of a stale cookie) and inserts `Authenticated(None)`, so
     /// the route cannot see a principal even when the request carries one.
@@ -973,11 +974,9 @@ async fn limit_body(State(state): State<EdgeState>, request: Request, next: Next
 
 async fn authenticate(State(state): State<EdgeState>, request: Request, next: Next) -> Response {
     // A credential-free route never sees the authenticator or a principal.
-    if state
-        .credential_free
-        .iter()
-        .any(|(method, path)| request.method() == method && request.uri().path() == path)
-    {
+    if state.credential_free.iter().any(|(method, path)| {
+        request.method() == method && path_matches(path, request.uri().path())
+    }) {
         let mut request = request;
         request.extensions_mut().insert(Authenticated(None));
         return next.run(request).await;

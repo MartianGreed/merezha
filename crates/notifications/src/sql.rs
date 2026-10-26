@@ -473,7 +473,7 @@ pub const EVENTS_TAKE_PENDING: Statement = s(
     "notify.event.take_pending",
     "UPDATE merezha_notify.provider_events",
     "UPDATE merezha_notify.provider_events SET pending = false \
-     WHERE delivery_id = $1 AND pending RETURNING id, event",
+     WHERE delivery_id = $1 AND pending RETURNING id, event, channel",
 );
 
 /// Every statement of this module.

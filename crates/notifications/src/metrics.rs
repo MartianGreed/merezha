@@ -1,8 +1,8 @@
 //! The notification rows of TE §1.3 this slice records (NT §9, TE-T6):
 //! requests, deliveries, attempts, attempt duration, latency, render
 //! failures, purged data, (NT-N3) provider events and provider account
-//! errors, and (NT-N6) removed push subscriptions and egress refusals.
-//! Attribute values come from closed sets
+//! errors, (NT-N4) SMS segments, and (NT-N6) removed push subscriptions
+//! and egress refusals. Attribute values come from closed sets
 //! (sources and topics are declared, channels, statuses, reasons, providers
 //! and outcomes are enums); ids, addresses and templates never become
 //! attributes.
@@ -29,6 +29,7 @@ struct Instruments {
     provider_account_errors: Counter<u64>,
     push_subscriptions_removed: Counter<u64>,
     egress_blocked: Counter<u64>,
+    sms_segments: Counter<u64>,
     /// Declared topics; any other is labelled [`UNKNOWN_TOPIC`].
     topics: BTreeSet<String>,
 }
@@ -78,6 +79,7 @@ impl Metrics {
                 &metric::NOTIFICATION_PUSH_SUBSCRIPTIONS_REMOVED,
             ),
             egress_blocked: instruments::counter(meter, &metric::NOTIFICATION_EGRESS_BLOCKED),
+            sms_segments: instruments::counter(meter, &metric::NOTIFICATION_SMS_SEGMENTS),
             topics: topics.into_iter().collect(),
         })))
     }
@@ -193,6 +195,16 @@ impl Metrics {
         if let Some(i) = &self.0 {
             i.egress_blocked
                 .add(1, &[KeyValue::new("notify.target", target)]);
+        }
+    }
+    /// The segments of an SMS the provider accepted, by `encoding`
+    /// (`gsm7`, `ucs2`).
+    pub fn sms_segments(&self, encoding: &'static str, segments: u32) {
+        if let Some(i) = &self.0 {
+            i.sms_segments.add(
+                u64::from(segments),
+                &[KeyValue::new("notify.encoding", encoding)],
+            );
         }
     }
     pub fn data_purged(&self, rows: u64) {

@@ -125,6 +125,10 @@ pub(crate) fn router(ctx: Ctx) -> Router {
         )
         .route("/suppressions/{id}", delete(remove_suppression))
         .route(
+            crate::brevo::sms_status::PATH,
+            post(crate::brevo::sms_status::callback),
+        )
+        .route(
             crate::brevo::events::PATH,
             post(crate::brevo::events::callback),
         )

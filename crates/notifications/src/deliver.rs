@@ -12,10 +12,10 @@
 //! 3. The driver sends it before `min(channel timeout, deadline - 2 s)`.
 //! 4. Tx B records the outcome.
 //!
-//! Drivers are the capture drivers and Brevo email (NT-N3), whose call
-//! deadline is `brevo.timeout`; an account problem (`provider_account`) is
-//! logged at error level and counted, a rate limit at warn. Brevo SMS
-//! (NT-N4) implements the same trait.
+//! Drivers are the capture drivers, Brevo email (NT-N3) and Brevo SMS
+//! (NT-N4), whose call deadline is `brevo.timeout`; an account problem
+//! (`provider_account`) is logged at error level and counted, a rate limit
+//! at warn. An accepted SMS counts its segments.
 //!
 //! Push (NT-N6) runs the same steps: Tx A also reads the delivery's
 //! subscription (gone, moved to another user, made with an old VAPID key,
@@ -264,6 +264,7 @@ async fn deliver(
                 )
                 .await;
             };
+            let (encoding, segments) = (content.encoding, content.segments);
             let message = SmsMessage {
                 delivery_id: id,
                 topic: locked.topic.clone(),
@@ -271,10 +272,11 @@ async fn deliver(
                 content,
                 marketing: locked.category == Category::Marketing,
             };
-            (
-                driver.send(&message, send_by(driver.timeout())).await,
-                driver.provider(),
-            )
+            let outcome = driver.send(&message, send_by(driver.timeout())).await;
+            if matches!(outcome, SendOutcome::Accepted { .. }) {
+                core.metrics.sms_segments(encoding.as_str(), segments);
+            }
+            (outcome, driver.provider())
         }
         _ => {
             core.metrics.render_failure(channel, &locked.topic);

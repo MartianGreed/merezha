@@ -33,6 +33,10 @@
 //! and still answered 200, so Brevo stops retrying. Suppressions always use
 //! the delivery's own address. No log line or span carries an address,
 //! subject, reason text or message id.
+//!
+//! The SMS status callback ([`super::sms_status`], NT-N4) runs its events
+//! through the same transaction (`apply`) and source check
+//! (`source_allowed`), with its own event set ([`StatusEvent`]).
 use crate::{http::Ctx, notifier::Core, sql};
 use axum::{
     Extension,
@@ -63,6 +67,34 @@ const MAX_REASON: usize = 200;
 const DEADLINE: Duration = Duration::from_secs(10);
 const PROVIDER: &str = "brevo";
 const CHANNEL: &str = "email";
+
+/// The status changes `(to, reason, from)` and suppressions `(reason,
+/// topic_scoped)` of one normalized provider event, for the shared
+/// callback transaction (`apply`).
+pub trait StatusEvent: Copy + Send + Sync + 'static {
+    /// The stored name (`provider_events.event`, `notify.event`).
+    fn name(self) -> &'static str;
+    /// The delivery status this event moves to, its reason and the
+    /// statuses it may move from; `None` records the event only.
+    fn status_change(self) -> Transition;
+    /// The suppression reason this event writes, and whether it is scoped
+    /// to the delivery's topic.
+    fn suppression_reason(self) -> Option<(&'static str, bool)>;
+}
+/// `(to, reason, from)` of a status change.
+pub type Transition = Option<(&'static str, Option<&'static str>, &'static [&'static str])>;
+
+impl StatusEvent for EmailEvent {
+    fn name(self) -> &'static str {
+        self.as_str()
+    }
+    fn status_change(self) -> Transition {
+        self.transition()
+    }
+    fn suppression_reason(self) -> Option<(&'static str, bool)> {
+        self.suppression()
+    }
+}
 
 /// A normalized Brevo transactional email event (NT §5.2 step 2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,9 +133,7 @@ impl EmailEvent {
     /// bounce, a complaint after reading), so `delivered` is left for them;
     /// a delivery still `queued`, `sending` or `retrying` is never moved,
     /// its worker records the outcome.
-    pub fn transition(
-        self,
-    ) -> Option<(&'static str, Option<&'static str>, &'static [&'static str])> {
+    pub fn transition(self) -> Transition {
         match self {
             EmailEvent::Delivered => Some(("delivered", None, &["accepted", "unknown"])),
             EmailEvent::HardBounce => Some((
@@ -167,8 +197,8 @@ pub fn normalize(name: &str) -> Normalized {
 
 /// One parsed event. `Debug` shows no address, message id or reason.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Parsed {
-    pub event: EmailEvent,
+pub struct Parsed<E = EmailEvent> {
+    pub event: E,
     pub delivery: Option<Uuid>,
     pub message_id: Option<String>,
     pub email: Option<String>,
@@ -176,7 +206,7 @@ pub struct Parsed {
     pub occurred_at: Option<jiff::Timestamp>,
     pub key: String,
 }
-impl std::fmt::Debug for Parsed {
+impl<E: std::fmt::Debug> std::fmt::Debug for Parsed<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Parsed")
             .field("event", &self.event)
@@ -185,14 +215,14 @@ impl std::fmt::Debug for Parsed {
     }
 }
 
-fn text(value: &Value, key: &str, max: usize) -> Option<String> {
+pub(crate) fn text(value: &Value, key: &str, max: usize) -> Option<String> {
     match value.get(key)? {
         Value::String(s) if !s.is_empty() => Some(s.chars().take(max).collect()),
         Value::Number(n) => Some(n.to_string()),
         _ => None,
     }
 }
-fn integer(value: &Value, key: &str) -> Option<i64> {
+pub(crate) fn integer(value: &Value, key: &str) -> Option<i64> {
     match value.get(key)? {
         Value::Number(n) => n.as_i64(),
         Value::String(s) => s.trim().parse().ok(),
@@ -202,11 +232,29 @@ fn integer(value: &Value, key: &str) -> Option<i64> {
 
 /// `sha256(provider|channel|message id|event|ts_event)`, hex (NT §5.2).
 pub fn event_key(message_id: &str, event: EmailEvent, ts_event: &str) -> String {
+    channel_event_key(CHANNEL, message_id, event.as_str(), ts_event)
+}
+/// `sha256(brevo|channel|message id|event|ts_event)`, hex.
+pub(crate) fn channel_event_key(
+    channel: &str,
+    message_id: &str,
+    event: &str,
+    ts_event: &str,
+) -> String {
     let digest = Sha256::digest(format!(
-        "{PROVIDER}|{CHANNEL}|{message_id}|{}|{ts_event}",
-        event.as_str()
+        "{PROVIDER}|{channel}|{message_id}|{event}|{ts_event}"
     ));
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Brevo's reason text, at most [`MAX_REASON`] characters with control
+/// characters replaced (never logged).
+pub(crate) fn reason_text(value: &Value, key: &str) -> Option<String> {
+    text(value, key, MAX_REASON).map(|r| {
+        r.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+    })
 }
 
 /// One event of a callback body, or `None` for a dropped, unknown or
@@ -225,11 +273,7 @@ pub fn parse(value: &Value) -> Option<Parsed> {
     let email = text(value, "email", 320)
         .and_then(|e| EmailAddress::new(e).ok())
         .map(|e| e.expose().to_lowercase());
-    let reason = text(value, "reason", MAX_REASON).map(|r| {
-        r.chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect::<String>()
-    });
+    let reason = reason_text(value, "reason");
     let occurred_at = integer(value, "ts_epoch")
         .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
         .or_else(|| {
@@ -261,6 +305,22 @@ pub fn parse(value: &Value) -> Option<Parsed> {
     })
 }
 
+/// Whether the client address the edge resolved may call a Brevo
+/// callback: always without `brevo.webhook_allowed_cidrs`, else only from
+/// inside one of them (a request without a resolved address is refused).
+pub(crate) fn source_allowed(
+    brevo: &crate::config::BrevoSettings,
+    client: Option<&ClientInfo>,
+) -> bool {
+    brevo.webhook_allowed_cidrs.is_empty()
+        || client.and_then(|c| c.address).is_some_and(|ip| {
+            brevo
+                .webhook_allowed_cidrs
+                .iter()
+                .any(|cidr| cidr.contains(ip))
+        })
+}
+
 /// Why a callback was refused, the `code` of
 /// `notification.provider_event_rejected`.
 fn authorize(
@@ -274,17 +334,8 @@ fn authorize(
     let Some(token) = &brevo.webhook_token else {
         return Err("not_configured");
     };
-    if !brevo.webhook_allowed_cidrs.is_empty() {
-        let address = client.and_then(|c| c.address);
-        let allowed = address.is_some_and(|ip| {
-            brevo
-                .webhook_allowed_cidrs
-                .iter()
-                .any(|cidr| cidr.contains(ip))
-        });
-        if !allowed {
-            return Err("source_not_allowed");
-        }
+    if !source_allowed(brevo, client) {
+        return Err("source_not_allowed");
     }
     let presented = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -305,14 +356,39 @@ fn authorize(
     }
 }
 
-fn rejected(code: &'static str) {
+pub(crate) fn rejected(channel: &'static str, code: &'static str) {
     merezha_telemetry::event!(
         WARN,
         "notification.provider_event_rejected",
         provider = PROVIDER,
-        channel = CHANNEL,
+        channel,
         code
     );
+}
+
+/// Count and log the stored events of one callback.
+pub(crate) fn report<E: StatusEvent>(core: &Core, channel: &'static str, applied: &[(E, bool)]) {
+    for (event, correlated) in applied {
+        core.metrics
+            .provider_event(PROVIDER, channel, event.name(), *correlated);
+        if *correlated {
+            merezha_telemetry::event!(
+                DEBUG,
+                "notification.provider_event_applied",
+                provider = PROVIDER,
+                channel,
+                event = event.name()
+            );
+        } else {
+            merezha_telemetry::event!(
+                INFO,
+                "notification.provider_event_uncorrelated",
+                provider = PROVIDER,
+                channel,
+                event = event.name()
+            );
+        }
+    }
 }
 
 /// The route handler.
@@ -328,7 +404,7 @@ pub(crate) async fn callback(
             return ErrorReply::new(Failure::permanent("not_found")).into_response();
         }
         Err(code) => {
-            rejected(code);
+            rejected(CHANNEL, code);
             return ErrorReply::new(Failure::permanent("unauthenticated")).into_response();
         }
     }
@@ -352,29 +428,9 @@ pub(crate) async fn callback(
         Ok(core) => core,
         Err(reply) => return reply.into_response(),
     };
-    match apply(&core, events).await {
+    match apply(&core, CHANNEL, true, events).await {
         Ok(applied) => {
-            for (event, correlated) in applied {
-                core.metrics
-                    .provider_event(PROVIDER, CHANNEL, event.as_str(), correlated);
-                if correlated {
-                    merezha_telemetry::event!(
-                        DEBUG,
-                        "notification.provider_event_applied",
-                        provider = PROVIDER,
-                        channel = CHANNEL,
-                        event = event.as_str()
-                    );
-                } else {
-                    merezha_telemetry::event!(
-                        INFO,
-                        "notification.provider_event_uncorrelated",
-                        provider = PROVIDER,
-                        channel = CHANNEL,
-                        event = event.as_str()
-                    );
-                }
-            }
+            report(&core, CHANNEL, &applied);
             (StatusCode::OK, axum::Json(json!({}))).into_response()
         }
         Err(failure) => ErrorReply::new(failure).into_response(),
@@ -392,16 +448,16 @@ fn new_id(core: &Core) -> Result<Uuid, Failure> {
 /// `pending`, until the worker's Tx B applies it.
 const OPEN: [&str; 3] = ["queued", "sending", "retrying"];
 
-/// Apply `event`'s status change to a locked delivery: one conditional
-/// update, a no-op unless the delivery is in a status the event may leave.
+/// Apply a status change to a locked delivery: one conditional update, a
+/// no-op unless the delivery is in a status the event may leave.
 async fn transition(
     db: &merezha_postgres::Database,
     tx: &mut merezha_postgres::Tx<'_>,
     delivery: Uuid,
-    event: EmailEvent,
+    change: Transition,
     now: jiff::Timestamp,
 ) -> Result<(), Failure> {
-    if let Some((to, why, from)) = event.transition() {
+    if let Some((to, why, from)) = change {
         let from: Vec<&str> = from.to_vec();
         db.execute(
             tx,
@@ -427,29 +483,49 @@ pub(crate) async fn apply_pending(
         .query(tx, &sql::EVENTS_TAKE_PENDING, &[&delivery])
         .await
         .map_err(|e| classify(&e))?;
-    let mut events: Vec<(i64, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    let mut events: Vec<(i64, String, String)> = rows
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
     events.sort();
-    for (_, name) in &events {
-        if let Normalized::Event(event) = normalize(name) {
-            transition(db, tx, delivery, event, now).await?;
-        }
+    for (_, name, channel) in &events {
+        transition(db, tx, delivery, stored_transition(channel, name), now).await?;
     }
     Ok(events.len())
 }
 
-/// The one transaction of a callback. Returns the newly stored events and
-/// whether each was correlated.
+/// The status change of a stored event, by its channel's event set.
+fn stored_transition(channel: &str, name: &str) -> Transition {
+    match channel {
+        super::sms_status::CHANNEL => {
+            super::sms_status::normalize(name).and_then(|e| e.transition())
+        }
+        _ => match normalize(name) {
+            Normalized::Event(event) => event.transition(),
+            _ => None,
+        },
+    }
+}
+
+/// The one transaction of a callback on `channel`. Returns the newly
+/// stored events and whether each was correlated.
 ///
-/// Every event is first resolved to its delivery (our header, then Brevo's
-/// message id) without a lock; the events are then applied in ascending
+/// Every event is first resolved to its delivery (our header or the
+/// signed path, then, when `by_message`, Brevo's message id) without a
+/// lock; the events are then applied in ascending
 /// delivery order, so two concurrent callbacks lock the same deliveries in
 /// the same order. Only a correlated event has effects: an uncorrelated one
 /// (no delivery of ours, whatever address it names) is stored and nothing
 /// else, so a forged or foreign event cannot suppress an address.
-async fn apply(core: &Core, events: Vec<Parsed>) -> Result<Vec<(EmailEvent, bool)>, Failure> {
+pub(crate) async fn apply<E: StatusEvent>(
+    core: &Core,
+    channel: &'static str,
+    by_message: bool,
+    events: Vec<Parsed<E>>,
+) -> Result<Vec<(E, bool)>, Failure> {
     let mut ids = Vec::with_capacity(events.len());
     for event in &events {
-        ids.push(if event.event.suppression().is_some() {
+        ids.push(if event.event.suppression_reason().is_some() {
             Some(new_id(core)?)
         } else {
             None
@@ -465,19 +541,20 @@ async fn apply(core: &Core, events: Vec<Parsed>) -> Result<Vec<(EmailEvent, bool
                     let mut found: Option<Uuid> = None;
                     if let Some(id) = event.delivery {
                         found = db
-                            .query_opt(tx, &sql::EVENT_RESOLVE_BY_ID, &[&id, &CHANNEL])
+                            .query_opt(tx, &sql::EVENT_RESOLVE_BY_ID, &[&id, &channel])
                             .await
                             .map_err(|e| classify(&e))?
                             .map(|r| r.get(0));
                     }
                     if found.is_none()
+                        && by_message
                         && let Some(message_id) = &event.message_id
                     {
                         found = db
                             .query_opt(
                                 tx,
                                 &sql::EVENT_RESOLVE_BY_MESSAGE,
-                                &[&PROVIDER, message_id, &CHANNEL],
+                                &[&PROVIDER, message_id, &channel],
                             )
                             .await
                             .map_err(|e| classify(&e))?
@@ -492,7 +569,7 @@ async fn apply(core: &Core, events: Vec<Parsed>) -> Result<Vec<(EmailEvent, bool
                 for (found, event, suppression_id) in resolved {
                     let delivery: Option<(Uuid, String, Option<String>, String)> = match found {
                         Some(id) => db
-                            .query_opt(tx, &sql::EVENT_DELIVERY_BY_ID, &[&id, &CHANNEL])
+                            .query_opt(tx, &sql::EVENT_DELIVERY_BY_ID, &[&id, &channel])
                             .await
                             .map_err(|e| classify(&e))?
                             .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))),
@@ -500,7 +577,7 @@ async fn apply(core: &Core, events: Vec<Parsed>) -> Result<Vec<(EmailEvent, bool
                     };
                     // A delivery its worker still owns gets the event later.
                     let pending = delivery.as_ref().is_some_and(|d| {
-                        OPEN.contains(&d.1.as_str()) && event.event.transition().is_some()
+                        OPEN.contains(&d.1.as_str()) && event.event.status_change().is_some()
                     });
                     let inserted = db
                         .query_opt(
@@ -508,8 +585,8 @@ async fn apply(core: &Core, events: Vec<Parsed>) -> Result<Vec<(EmailEvent, bool
                             &sql::PROVIDER_EVENT_INSERT,
                             &[
                                 &PROVIDER,
-                                &CHANNEL,
-                                &event.event.as_str(),
+                                &channel,
+                                &event.event.name(),
                                 &event.key,
                                 &delivery.as_ref().map(|d| d.0),
                                 &event.message_id,
@@ -530,14 +607,14 @@ async fn apply(core: &Core, events: Vec<Parsed>) -> Result<Vec<(EmailEvent, bool
                         continue;
                     };
                     if !pending {
-                        transition(&db, tx, *id, event.event, now).await?;
+                        transition(&db, tx, *id, event.event.status_change(), now).await?;
                     }
                     // The address is ours: the delivery's, never the event's.
                     if let (
                         Some((reason_text, topic_scoped)),
                         Some(suppression_id),
                         Some(address),
-                    ) = (event.event.suppression(), suppression_id, address)
+                    ) = (event.event.suppression_reason(), suppression_id, address)
                     {
                         let topic = topic_scoped.then(|| topic.clone());
                         db.execute(
@@ -545,7 +622,7 @@ async fn apply(core: &Core, events: Vec<Parsed>) -> Result<Vec<(EmailEvent, bool
                             &sql::SUPPRESSION_INSERT,
                             &[
                                 &suppression_id,
-                                &CHANNEL,
+                                &channel,
                                 &address.to_lowercase(),
                                 &topic,
                                 &reason_text,

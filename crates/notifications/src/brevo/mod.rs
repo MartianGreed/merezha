@@ -1,7 +1,9 @@
 //! Brevo transactional email (NT §5.2, slice NT-N3): the client over the
 //! kernel's outbound HTTP client, the response classifier, the email
 //! driver, the webhook registration call and, in [`events`], the email
-//! status callback.
+//! status callback. Slice NT-N4 adds transactional SMS over the same
+//! client and classifier: the driver in [`sms`] and the signed status
+//! callback in [`sms_status`].
 //!
 //! Every request goes to `brevo.base_url` with `api-key`, `accept` and
 //! `content-type: application/json`, before a per-call deadline, and is
@@ -10,6 +12,8 @@
 //! `Debug` output. From Brevo's `{ code, message }` error body only `code`
 //! is read; `message` is never stored or logged.
 pub mod events;
+pub mod sms;
+pub mod sms_status;
 
 use crate::{
     config::{BrevoSettings, Mailbox},
