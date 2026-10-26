@@ -1,12 +1,14 @@
 //! Maintenance tasks of this slice (NT §2.5), declared as cron schedules on
 //! `notify.maintenance` with the skip missed-run policy: `settle_notifications`
 //! every minute, `purge_data` every five minutes, `inbox_expire` and
-//! (NT-N6) `push_expire` hourly.
+//! (NT-N6) `push_expire` hourly, and (NT-N7) `webhook_auto_disable` every
+//! five minutes and `retention` daily, whose part so far is the webhook
+//! rows and secrets ([`crate::webhooks::tasks`]).
 //! Each run works in bounded batches within its deadline.
 use crate::{notifier::Core, sql};
 use merezha_domain::Failure;
 use merezha_postgres::classify;
-use std::{collections::BTreeMap, time::Instant};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use uuid::Uuid;
 
 /// The queue of every maintenance task.
@@ -24,13 +26,17 @@ pub enum Task {
     PurgeData,
     InboxExpire,
     PushExpire,
+    WebhookAutoDisable,
+    Retention,
 }
 impl Task {
-    pub const ALL: [Task; 4] = [
+    pub const ALL: [Task; 6] = [
         Task::SettleNotifications,
         Task::PurgeData,
         Task::InboxExpire,
         Task::PushExpire,
+        Task::WebhookAutoDisable,
+        Task::Retention,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -38,6 +44,8 @@ impl Task {
             Task::PurgeData => "purge_data",
             Task::InboxExpire => "inbox_expire",
             Task::PushExpire => "push_expire",
+            Task::WebhookAutoDisable => "webhook_auto_disable",
+            Task::Retention => "retention",
         }
     }
     /// The job kind and the schedule name: `notify.maintenance.<task>`.
@@ -50,12 +58,14 @@ impl Task {
             Task::PurgeData => "*/5 * * * *",
             Task::InboxExpire => "17 * * * *",
             Task::PushExpire => "43 * * * *",
+            Task::WebhookAutoDisable => "*/5 * * * *",
+            Task::Retention => "29 3 * * *",
         }
     }
 }
 
 /// Run `task` once; the rows it changed.
-pub async fn run(core: &Core, task: Task, deadline: Instant) -> Result<u64, Failure> {
+pub async fn run(core: &Arc<Core>, task: Task, deadline: Instant) -> Result<u64, Failure> {
     match task {
         Task::SettleNotifications => settle(core, deadline).await,
         Task::PurgeData => purge_data(core, deadline).await,
@@ -75,6 +85,10 @@ pub async fn run(core: &Core, task: Task, deadline: Instant) -> Result<u64, Fail
             }
             None => Ok(0),
         },
+        Task::WebhookAutoDisable => crate::webhooks::tasks::auto_disable(core, deadline).await,
+        // The webhook rows and secrets; delivery, attempt, provider event
+        // and capture retention join it with NT-N8's operations work.
+        Task::Retention => crate::webhooks::tasks::retention(core, deadline).await,
     }
 }
 

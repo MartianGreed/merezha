@@ -6,8 +6,8 @@
 //! caller's transaction. It calls no other port and takes no other pooled
 //! connection, so it completes on a pool whose only connection the caller's
 //! transaction holds. `emit_webhook` appends one `notify.webhook_event`
-//! record; its fan-out handler arrives with NT-N7, so until then those jobs
-//! wait in `notify.expand` unleased.
+//! record, which the fan-out of NT-N7 ([`crate::webhooks::fanout`])
+//! handles.
 use crate::{
     Checked,
     config::Settings,
@@ -39,7 +39,7 @@ use std::{
 /// Queue and kind of expansion jobs (NT §2.5).
 pub const EXPAND_QUEUE: &str = "notify.expand";
 pub const EXPAND_KIND: &str = "notify.expand";
-/// Kind of webhook fan-out jobs, handled from NT-N7.
+/// Kind of webhook fan-out jobs ([`crate::webhooks::fanout`]).
 pub const WEBHOOK_EVENT_KIND: &str = "notify.webhook_event";
 /// Event types other modules declare (NT §5.5) and the built-in test event.
 pub const MODULE_EVENT_TYPES: [&str; 4] = [
@@ -71,6 +71,8 @@ pub struct Core {
     pub sms: Option<Arc<dyn crate::drivers::SmsDriver>>,
     /// The Web Push sender, `None` without `[modules.notifications.push]`.
     pub push: Option<Arc<crate::push::PushSender>>,
+    /// The webhook sender, `None` without `[modules.notifications.webhooks]`.
+    pub webhooks: Option<Arc<crate::webhooks::WebhookSender>>,
 }
 impl std::fmt::Debug for Core {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -242,95 +244,9 @@ impl BoundNotifier {
         tx: &mut Tx<'_>,
         request: NotificationRequest,
     ) -> Result<NotificationHandle, NotifyError> {
-        let core = self.core()?;
-        let source = self.source.as_str();
-        let topic = request.topic.as_str().to_owned();
-        let notification_id = ids::notification_id(source, request.dedupe_key.as_str());
-        let checked = validate(&core.settings, &core.registry, &request)
-            .and_then(|valid| check_members(&self.source, &request).map(|()| valid));
-        let valid = match checked {
-            Ok(valid) => valid,
-            Err(error) => {
-                merezha_telemetry::event!(
-                    WARN,
-                    "notification.invalid",
-                    topic = topic.as_str(),
-                    source,
-                    notification_id = notification_id.to_string().as_str(),
-                    code = error.code()
-                );
-                core.metrics.request(source, &topic, "invalid");
-                return Err(error);
-            }
-        };
-        let payload = ExpandPayload::new(
-            source,
-            notification_id,
-            &request,
-            &valid.template,
-            &valid.channels,
-            core.now(),
-        );
-        let key = DedupeKey::new(format!("request:{notification_id}"))
-            .map_err(|_| NotifyError::Unavailable)?;
-        let record = OutboxRecord {
-            dedupe_key: key,
-            target: OutboxTarget::Job {
-                queue: Identity::new(EXPAND_QUEUE).map_err(|_| NotifyError::Unavailable)?,
-                kind: Identity::new(EXPAND_KIND).map_err(|_| NotifyError::Unavailable)?,
-            },
-            payload: payload.to_value(),
-            contains_secret: !request.secret_data.is_empty(),
-            // Nothing exists before `not_before`: expansion waits for it.
-            run_at: request.not_before,
-            priority: priority(valid.topic),
-            context: MessageContext {
-                correlation_id: request.correlation.correlation_id.clone(),
-                causation_id: request.correlation.causation_id.clone(),
-                tenant: request.tenant.clone(),
-            },
-        };
-        drop(payload);
-        let appended = core
-            .outbox
-            .append(tx, &[record], OnDuplicate::Ignore)
-            .await
-            .map_err(|failure| {
-                if failure.code == "outbox_payload_limit" {
-                    NotifyError::DataTooLarge
-                } else {
-                    NotifyError::Unavailable
-                }
-            })?;
-        let duplicate = appended.duplicates > 0;
-        let id = notification_id.to_string();
-        if duplicate {
-            merezha_telemetry::event!(
-                DEBUG,
-                "notification.duplicate",
-                topic = topic.as_str(),
-                source,
-                notification_id = id.as_str()
-            );
-        } else {
-            merezha_telemetry::event!(
-                DEBUG,
-                "notification.requested",
-                topic = topic.as_str(),
-                source,
-                notification_id = id.as_str()
-            );
-        }
-        core.metrics.request(
-            source,
-            &topic,
-            if duplicate { "duplicate" } else { "accepted" },
-        );
-        Ok(NotificationHandle {
-            notification_id,
-            duplicate,
-        })
+        request_in(&*self.core()?, &self.source, tx, request).await
     }
+
     async fn append_webhook(
         &self,
         tx: &mut Tx<'_>,
@@ -409,6 +325,105 @@ impl BoundNotifier {
             duplicate: appended.duplicates > 0,
         })
     }
+}
+
+/// `Notifier::request` for `source` in the caller's `tx`: validation, the
+/// membership rule of R4 and one `notify.expand` record. The block itself
+/// calls it with source `notifications` (the `webhook_disabled` alert).
+pub(crate) async fn request_in(
+    core: &Core,
+    source: &Source,
+    tx: &mut Tx<'_>,
+    request: NotificationRequest,
+) -> Result<NotificationHandle, NotifyError> {
+    let bound = source;
+    let source = bound.as_str();
+    let topic = request.topic.as_str().to_owned();
+    let notification_id = ids::notification_id(source, request.dedupe_key.as_str());
+    let checked = validate(&core.settings, &core.registry, &request)
+        .and_then(|valid| check_members(bound, &request).map(|()| valid));
+    let valid = match checked {
+        Ok(valid) => valid,
+        Err(error) => {
+            merezha_telemetry::event!(
+                WARN,
+                "notification.invalid",
+                topic = topic.as_str(),
+                source,
+                notification_id = notification_id.to_string().as_str(),
+                code = error.code()
+            );
+            core.metrics.request(source, &topic, "invalid");
+            return Err(error);
+        }
+    };
+    let payload = ExpandPayload::new(
+        source,
+        notification_id,
+        &request,
+        &valid.template,
+        &valid.channels,
+        core.now(),
+    );
+    let key = DedupeKey::new(format!("request:{notification_id}"))
+        .map_err(|_| NotifyError::Unavailable)?;
+    let record = OutboxRecord {
+        dedupe_key: key,
+        target: OutboxTarget::Job {
+            queue: Identity::new(EXPAND_QUEUE).map_err(|_| NotifyError::Unavailable)?,
+            kind: Identity::new(EXPAND_KIND).map_err(|_| NotifyError::Unavailable)?,
+        },
+        payload: payload.to_value(),
+        contains_secret: !request.secret_data.is_empty(),
+        // Nothing exists before `not_before`: expansion waits for it.
+        run_at: request.not_before,
+        priority: priority(valid.topic),
+        context: MessageContext {
+            correlation_id: request.correlation.correlation_id.clone(),
+            causation_id: request.correlation.causation_id.clone(),
+            tenant: request.tenant.clone(),
+        },
+    };
+    drop(payload);
+    let appended = core
+        .outbox
+        .append(tx, &[record], OnDuplicate::Ignore)
+        .await
+        .map_err(|failure| {
+            if failure.code == "outbox_payload_limit" {
+                NotifyError::DataTooLarge
+            } else {
+                NotifyError::Unavailable
+            }
+        })?;
+    let duplicate = appended.duplicates > 0;
+    let id = notification_id.to_string();
+    if duplicate {
+        merezha_telemetry::event!(
+            DEBUG,
+            "notification.duplicate",
+            topic = topic.as_str(),
+            source,
+            notification_id = id.as_str()
+        );
+    } else {
+        merezha_telemetry::event!(
+            DEBUG,
+            "notification.requested",
+            topic = topic.as_str(),
+            source,
+            notification_id = id.as_str()
+        );
+    }
+    core.metrics.request(
+        source,
+        &topic,
+        if duplicate { "duplicate" } else { "accepted" },
+    );
+    Ok(NotificationHandle {
+        notification_id,
+        duplicate,
+    })
 }
 
 /// Higher topic priorities run first in the expand and delivery queues.

@@ -1,6 +1,6 @@
 //! The egress guard (NT §5.6, invariant 10): requests to URLs a browser or a
-//! tenant supplied (push endpoints here, webhook URLs with NT-N7) go only to
-//! addresses that passed the guard, with redirects and proxies disabled.
+//! tenant supplied (push endpoints, NT-N6, and webhook URLs, NT-N7) go only
+//! to addresses that passed the guard, with redirects and proxies disabled.
 //!
 //! The guard sits in the client's DNS resolver ([`GuardedResolver`]):
 //! reqwest dials only the addresses the resolver returned, so the checked
@@ -264,11 +264,20 @@ pub fn client(
     policy: Arc<EgressPolicy>,
     lookup: Arc<dyn Lookup>,
 ) -> Result<reqwest::Client, Failure> {
+    client_with(policy, lookup, CONNECT_TIMEOUT)
+}
+
+/// [`client`] with another connect timeout (`webhooks.connect_timeout`).
+pub fn client_with(
+    policy: Arc<EgressPolicy>,
+    lookup: Arc<dyn Lookup>,
+    connect_timeout: Duration,
+) -> Result<reqwest::Client, Failure> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .dns_resolver(Arc::new(GuardedResolver::new(policy, lookup)))
-        .connect_timeout(CONNECT_TIMEOUT)
+        .connect_timeout(connect_timeout)
         .pool_max_idle_per_host(2)
         .retry(reqwest::retry::never())
         .user_agent(concat!("merezha/", env!("CARGO_PKG_VERSION")))

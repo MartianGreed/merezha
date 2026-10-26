@@ -10,12 +10,17 @@
 //!   JWT.
 //! - [`TestResolver`]: fixed addresses for host names, under the egress
 //!   guard.
+//! - [`WebhookReceiver`]: a webhook endpoint on `127.0.0.1:0` that verifies
+//!   Standard Webhooks signatures, records `webhook-id` and answers with
+//!   scripted statuses or delays (NT-N7).
 //!
 //! The named crash points live in [`crate::faults`].
 mod brevo;
 mod push;
 mod sse;
+mod webhooks;
 
 pub use brevo::{FakeBrevo, IDEMPOTENCY_WINDOW, Processed, Recorded};
 pub use push::{FakePushService, PushReceived, TestResolver};
 pub use sse::{EventReader, EventStreamParser, SseEvent};
+pub use webhooks::{WebhookReceived, WebhookReceiver};

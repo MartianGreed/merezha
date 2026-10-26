@@ -1,8 +1,9 @@
 //! The notification rows of TE §1.3 this slice records (NT §9, TE-T6):
 //! requests, deliveries, attempts, attempt duration, latency, render
 //! failures, purged data, (NT-N3) provider events and provider account
-//! errors, (NT-N4) SMS segments, and (NT-N6) removed push subscriptions
-//! and egress refusals. Attribute values come from closed sets
+//! errors, (NT-N4) SMS segments, (NT-N6) removed push subscriptions
+//! and egress refusals, and (NT-N7) webhook deliveries, attempts and
+//! disabled endpoints. Attribute values come from closed sets
 //! (sources and topics are declared, channels, statuses, reasons, providers
 //! and outcomes are enums); ids, addresses and templates never become
 //! attributes.
@@ -30,6 +31,9 @@ struct Instruments {
     push_subscriptions_removed: Counter<u64>,
     egress_blocked: Counter<u64>,
     sms_segments: Counter<u64>,
+    webhook_deliveries: Counter<u64>,
+    webhook_attempts: Counter<u64>,
+    webhook_endpoints_disabled: Counter<u64>,
     /// Declared topics; any other is labelled [`UNKNOWN_TOPIC`].
     topics: BTreeSet<String>,
 }
@@ -80,6 +84,12 @@ impl Metrics {
             ),
             egress_blocked: instruments::counter(meter, &metric::NOTIFICATION_EGRESS_BLOCKED),
             sms_segments: instruments::counter(meter, &metric::NOTIFICATION_SMS_SEGMENTS),
+            webhook_deliveries: instruments::counter(meter, &metric::WEBHOOK_DELIVERIES),
+            webhook_attempts: instruments::counter(meter, &metric::WEBHOOK_ATTEMPTS),
+            webhook_endpoints_disabled: instruments::counter(
+                meter,
+                &metric::WEBHOOK_ENDPOINTS_DISABLED,
+            ),
             topics: topics.into_iter().collect(),
         })))
     }
@@ -205,6 +215,31 @@ impl Metrics {
                 u64::from(segments),
                 &[KeyValue::new("notify.encoding", encoding)],
             );
+        }
+    }
+    /// `count` webhook deliveries settled as `outcome` (`succeeded`,
+    /// `failed`, `cancelled`).
+    pub fn webhook_delivery(&self, outcome: &'static str, count: u64) {
+        if let Some(i) = &self.0
+            && count > 0
+        {
+            i.webhook_deliveries
+                .add(count, &[KeyValue::new("notify.outcome", outcome)]);
+        }
+    }
+    /// One webhook attempt of `class` (`2xx`, `3xx`, `4xx`, `410`, `5xx`,
+    /// `timeout`, `network`, `blocked`).
+    pub fn webhook_attempt(&self, class: &'static str) {
+        if let Some(i) = &self.0 {
+            i.webhook_attempts
+                .add(1, &[KeyValue::new("notify.class", class)]);
+        }
+    }
+    /// An endpoint disabled for `reason` (`manual`, `gone`, `failing`).
+    pub fn webhook_endpoint_disabled(&self, reason: &'static str) {
+        if let Some(i) = &self.0 {
+            i.webhook_endpoints_disabled
+                .add(1, &[KeyValue::new("notify.reason", reason)]);
         }
     }
     pub fn data_purged(&self, rows: u64) {

@@ -37,10 +37,18 @@
 //! ([`brevo::sms_status`]) with the opt-out and bounce suppressions its
 //! reports write.
 //!
-//! Seams for the next slices: the SSE stream (NT-N5) listens on
-//! [`sql::INBOX_CHANNEL`], which every inbox change notifies. Webhook
-//! fan-out (NT-N7) handles the `notify.webhook_event` jobs `emit_webhook`
-//! queues and sends through [`egress::client`].
+//! Slice NT-N7 adds outgoing webhooks ([`webhooks`], migration 5): the
+//! tenant and application-level endpoint registries with their sealed
+//! signing secrets and rotation, the fan-out of the `notify.webhook_event`
+//! jobs `emit_webhook` queues, the Standard Webhooks signed delivery worker
+//! with its retry schedule through the same egress-guarded client as push,
+//! the `webhook_auto_disable` task with its `notifications.webhook_disabled`
+//! alert, the `retention` task's webhook part, audit rows of endpoint
+//! changes and, with feature `testkit`, `testkit::WebhookReceiver`.
+//!
+//! Seam for NT-N8: the module-event subscription (`notify.module_event`)
+//! maps AP's envelope onto a [`webhooks::fanout::Event`] and calls
+//! [`webhooks::fanout::fan_out`].
 pub mod brevo;
 pub mod config;
 pub mod deliver;
@@ -66,6 +74,7 @@ pub mod templates;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 pub mod topics;
+pub mod webhooks;
 
 pub use config::{HostFacts, Settings};
 pub use http::{ADMIN_PERMISSION, SEND_PERMISSION, STATUS_PERMISSION, SUPPRESSIONS_PERMISSION};
@@ -89,11 +98,11 @@ pub const SCHEMA: &str = "merezha_notify";
 /// The instrumentation scope of the block's instruments (TE §1.3).
 pub const METER_SCOPE: &str = "merezha.notifications";
 
-/// Migration 1, the core tables, migration 2, the inbox (NT §2.4), and
-/// migration 3, pending provider events (NT-N3), and migration 4, push
-/// subscriptions (NT-N6). Later slices append their own migrations and
-/// never edit these.
-pub const MIGRATIONS: [Migration; 4] = [
+/// Migration 1, the core tables, migration 2, the inbox (NT §2.4),
+/// migration 3, pending provider events (NT-N3), migration 4, push
+/// subscriptions (NT-N6), and migration 5, webhooks (NT-N7). Later slices
+/// append their own migrations and never edit these.
+pub const MIGRATIONS: [Migration; 5] = [
     Migration::new(1, "core", include_str!("../migrations/0001_core.sql")),
     Migration::new(2, "inbox", include_str!("../migrations/0002_inbox.sql")),
     Migration::new(
@@ -102,20 +111,27 @@ pub const MIGRATIONS: [Migration; 4] = [
         include_str!("../migrations/0003_provider_events.sql"),
     ),
     Migration::new(4, "push", include_str!("../migrations/0004_push.sql")),
+    Migration::new(
+        5,
+        "webhooks",
+        include_str!("../migrations/0005_webhooks.sql"),
+    ),
 ];
 
-/// The permission catalog of NT §7.1 this block checks so far.
-pub const PERMISSIONS: [&str; 5] = [
+/// The permission catalog of NT §7.1.
+pub const PERMISSIONS: [&str; 7] = [
     PREVIEW_PERMISSION,
     SEND_PERMISSION,
     STATUS_PERMISSION,
     ADMIN_PERMISSION,
     SUPPRESSIONS_PERMISSION,
+    webhooks::routes::READ_PERMISSION,
+    webhooks::routes::MANAGE_PERMISSION,
 ];
 
 /// The codes this block's routes and port return, with their statuses
 /// (R8). Canonical kernel codes are listed again with the same status.
-pub const ERRORS: [ErrorCode; 35] = [
+pub const ERRORS: [ErrorCode; 40] = [
     ErrorCode::new("invalid_input", 400),
     ErrorCode::new("invalid_cursor", 400),
     ErrorCode::new("token_invalid", 400),
@@ -125,7 +141,11 @@ pub const ERRORS: [ErrorCode; 35] = [
     ErrorCode::new("push_disabled", 404),
     ErrorCode::new("not_redeliverable", 409),
     ErrorCode::new("secret_purged", 409),
+    ErrorCode::new("webhook_endpoint_limit", 409),
+    ErrorCode::new("endpoint_disabled", 409),
     ErrorCode::new("data_purged", 410),
+    ErrorCode::new("event_body_expired", 410),
+    ErrorCode::new("revision_conflict", 412),
     ErrorCode::new("body_limit", 413),
     ErrorCode::new("stream_limit", 429),
     ErrorCode::new("validation_failed", 422),
@@ -146,6 +166,7 @@ pub const ERRORS: [ErrorCode; 35] = [
     ErrorCode::new("invalid_timezone", 422),
     ErrorCode::new("subscription_invalid", 422),
     ErrorCode::new("push_host_not_allowed", 422),
+    ErrorCode::new("webhook_url_rejected", 422),
     ErrorCode::new("unavailable", 503),
     ErrorCode::new("database_unavailable", 503),
     ErrorCode::new("database_timeout", 503),
@@ -253,12 +274,18 @@ impl Notifications {
         self.email_driver = DriverOverride(Some(driver));
         self
     }
-    /// The block with `lookup` resolving push hosts under the egress guard
-    /// (feature `testkit`), such as [`testkit::TestResolver`].
+    /// The block with `lookup` resolving push and webhook hosts under the
+    /// egress guard (feature `testkit`), such as [`testkit::TestResolver`].
     #[cfg(feature = "testkit")]
     pub fn with_push_lookup(mut self, lookup: Arc<dyn egress::Lookup>) -> Self {
         self.push_lookup = LookupOverride(Some(lookup));
         self
+    }
+    /// [`Notifications::with_push_lookup`]: one resolver serves both
+    /// guarded destinations.
+    #[cfg(feature = "testkit")]
+    pub fn with_egress_lookup(self, lookup: Arc<dyn egress::Lookup>) -> Self {
+        self.with_push_lookup(lookup)
     }
     /// The validated configuration, once [`Module::configure`] succeeded.
     pub fn checked(&self) -> Option<Arc<Checked>> {
@@ -328,6 +355,7 @@ impl Module for Notifications {
             sql::STATEMENTS,
             stream::STATEMENTS,
             push::sql::STATEMENTS,
+            webhooks::sql::STATEMENTS,
         ]
     }
     fn migrations(&self) -> &[Migration] {
@@ -443,6 +471,23 @@ impl Module for Notifications {
                 }
                 None => None,
             };
+            let webhooks = match &settings.webhooks {
+                Some(webhooks) => {
+                    let lookup = self
+                        .push_lookup
+                        .0
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(egress::SystemLookup));
+                    Some(Arc::new(webhooks::WebhookSender::new(
+                        &settings,
+                        webhooks,
+                        self.facts.no_egress,
+                        lookup,
+                        metrics.clone(),
+                    )?))
+                }
+                None => None,
+            };
             let core = notifier::Core {
                 settings: settings.clone(),
                 registry: checked.registry.clone(),
@@ -457,6 +502,7 @@ impl Module for Notifications {
                 email,
                 sms,
                 push,
+                webhooks: webhooks.clone(),
             };
             let jobs = ctx.jobs(NAME)?;
             jobs.register(
@@ -478,6 +524,20 @@ impl Module for Notifications {
                         KindOptions::default(),
                     )?;
                 }
+            }
+            if webhooks.is_some() {
+                jobs.register(
+                    notifier::WEBHOOK_EVENT_KIND,
+                    notifier::EXPAND_QUEUE,
+                    Arc::new(webhooks::fanout::Handler(self.core.clone())),
+                    KindOptions::default(),
+                )?;
+                jobs.register(
+                    webhooks::DELIVER_KIND,
+                    webhooks::DELIVER_QUEUE,
+                    Arc::new(webhooks::worker::Handler(self.core.clone())),
+                    KindOptions::default(),
+                )?;
             }
             for task in maintenance::Task::ALL {
                 let kind = task.kind();
@@ -521,14 +581,16 @@ impl Module for Notifications {
         let api = self.notifiers().notifier(
             Source::new(EXTRA_SOURCES[0]).unwrap_or_else(|_| unreachable!("`api` is a source")),
         );
+        let http_ctx = http::Ctx {
+            slot: self.core.clone(),
+            checked,
+            authorizer: ctx.authorizer().clone(),
+            api,
+            directory: ctx.directory().clone(),
+        };
         previews
-            .merge(http::router(http::Ctx {
-                slot: self.core.clone(),
-                checked,
-                authorizer: ctx.authorizer().clone(),
-                api,
-                directory: ctx.directory().clone(),
-            }))
+            .merge(http::router(http_ctx.clone()))
+            .merge(webhooks::routes::router(http_ctx))
             .merge(stream::router(stream::StreamState {
                 streams: self.streams.clone(),
                 slot: self.core.clone(),

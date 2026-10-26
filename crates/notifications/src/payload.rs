@@ -190,7 +190,7 @@ impl DeliverPayload {
 }
 
 /// Ids as their hyphenated text in JSON.
-mod uuid_text {
+pub(crate) mod uuid_text {
     use serde::{Deserialize, Deserializer, Serializer};
     use uuid::Uuid;
     pub fn serialize<S: Serializer>(id: &Uuid, serializer: S) -> Result<S::Ok, S::Error> {

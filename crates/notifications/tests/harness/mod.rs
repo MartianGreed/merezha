@@ -546,7 +546,7 @@ impl Instance {
                        AND quarantined_at IS NULL AND (run_at IS NULL OR run_at <= now())) \
                      + (SELECT count(*) FROM merezha_jobs.jobs WHERE kind IN \
                        ('notify.expand', 'notify.deliver.email', 'notify.deliver.sms', \
-                        'notify.deliver.push') \
+                        'notify.deliver.push', 'notify.webhook_event', 'notify.webhook.deliver') \
                        AND state IN ('available', 'running') AND run_at <= now())",
                     &[],
                 )

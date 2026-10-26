@@ -7,11 +7,14 @@ license.workspace = true
 
 [features]
 # Test kit (NT §8): named crash points for the duplicate-delivery tests,
-# `testkit::FakeBrevo`, `testkit::FakePushService` and `testkit::TestResolver`.
+# `testkit::FakeBrevo`, `testkit::FakePushService`, `testkit::TestResolver`
+# and `testkit::WebhookReceiver`.
 # Dev-dependencies only; release builds never enable it.
 testkit = []
 
 [dependencies]
+# Webhook secrets at rest (NT §5.5); 0.10 shares the tree with web-push-native.
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"] }
 merezha-domain = { path = "../domain" }
 merezha-platform = { path = "../platform" }
 merezha-postgres = { path = "../postgres" }

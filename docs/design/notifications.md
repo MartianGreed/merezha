@@ -310,7 +310,11 @@ CREATE TABLE push_subscriptions (
 );
 CREATE INDEX push_subscriptions_user_idx ON push_subscriptions (user_id);
 
--- Migration 5 (slice N7): webhooks
+-- Migration 5 (slice N7): webhooks. As applied, tenant ids are text (as
+-- migration 2 made them), the registry is matched as COALESCE(tenant_id, '')
+-- ('' = application level) through one expression index in place of the
+-- partial tenant index below, and the migration adds the append-only
+-- `webhook_audit` table (5.5 "Audit").
 CREATE TABLE webhook_endpoints (
   id uuid PRIMARY KEY,
   tenant_id uuid,                               -- NULL = application-level endpoint (NT6)
@@ -1100,7 +1104,9 @@ rows still on the previous key.
    record (2.5). The rule is `tenant_id IS NOT DISTINCT FROM $event_tenant`:
    a tenant event reaches only its tenant's endpoints, a tenantless event only
    application-level ones. A btree index does not serve `IS NOT DISTINCT
-   FROM`, so the handler runs one of two equivalent statements:
+   FROM`, so the handler runs one of two equivalent statements (as built in
+   N7: one statement on `COALESCE(tenant_id, '') = $1`, `''` for a
+   tenantless event, served by an expression index):
 
 ```sql
 SELECT id FROM webhook_endpoints        -- $1 = event tenant, $2 = event type
@@ -1140,7 +1146,8 @@ semaphore map. The timeout is 10 s and the connect timeout 5 s.
 **Auto-disable.** The first failure after a success sets `failing_since`, and
 any success clears it. `webhook_auto_disable` disables an endpoint when
 `failing_since` is older than `webhooks.auto_disable_after` (5 days) and at
-least 10 attempts failed in that window. Disabling cancels the queued
+least 10 attempts failed in that window (finished at or after
+`failing_since`). Disabling cancels the queued
 deliveries and notifies `webhooks.alert_roles` in the endpoint's tenant, or
 `webhooks.application_alert_roles` for an application-level endpoint, with
 `notifications.webhook_disabled`. An empty `application_alert_roles` (the
@@ -1150,7 +1157,11 @@ Re-enabling clears `failing_since`.
 Cancelled deliveries are sent again only through redeliver.
 
 **Audit.** Endpoint create, update, rotate, enable, disable and delete are
-written to the audit stream, without the secret.
+written to the audit stream, without the secret. As built (N7) the stream is
+the block's own `merezha_notify.webhook_audit` table, written in the
+transaction of the change (actor subject, or `sys_notifications` for the
+block's own disables) and kept 400 days by the `retention` task: no shared
+audit port exists for blocks other than identity.
 
 ### 5.6 Egress guard (SSRF)
 
@@ -1726,7 +1737,11 @@ followed; when `TestResolver` returns one public and one private address, only
 the public one is dialled. *Tests:* a duplicated fan-out job still gives one
 delivery per endpoint; a receiver outage follows the schedule on an injected
 clock; `after_provider_call` resends with the same `webhook-id`; the 24-hour
-step is honoured with `backoff_max_ms = 86400000`.
+step is honoured with `backoff_max_ms = 86400000`. *As built:* the
+`webhook_disabled` alert, which N8 lists, ships here because the
+acceptance needs it; N8 keeps the `notify.module_event` subscription, which
+maps AP's envelope onto `webhooks::fanout::Event` and calls `fan_out`. The
+`retention` task holds only the webhook rows and secrets so far.
 
 **N8: integrations, operations.** *Scope:* the identity topics of
 R2, which can merge right after N3; the AP subscriptions to content events;

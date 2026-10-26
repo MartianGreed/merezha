@@ -1330,8 +1330,8 @@ email: the email driver, the email status callback and `merezha
 notifications brevo register-webhook` ([Brevo email](#brevo-email)). Slice
 NT-N4 adds Brevo SMS: the SMS driver and its signed status callback
 ([Brevo SMS](#brevo-sms)). Slice NT-N5 adds the inbox stream ([Inbox
-stream](#inbox-stream)) and NT-N6 Web Push ([Web Push](#web-push)).
-Webhook fan-out (NT-N7) comes later.
+stream](#inbox-stream)), NT-N6 Web Push ([Web Push](#web-push)) and
+NT-N7 outgoing webhooks ([Outgoing webhooks](#outgoing-webhooks)).
 
 ```toml
 [modules.notifications]
@@ -1364,7 +1364,9 @@ mail to `skipped`), and exit code 0; or `status` `invalid` with
   `inbox_items`, stores user and tenant ids as text and adds the deliveries'
   recipient `name`. Migration 3 (`provider_events`, NT-N3) adds pending
   provider events. Migration 4 (`push`, NT-N6) adds
-  `push_subscriptions`. The checksums are pinned by a test; later slices
+  `push_subscriptions`. Migration 5 (`webhooks`, NT-N7) adds
+  `webhook_endpoints`, `webhook_events`, `webhook_deliveries`,
+  `webhook_attempts` and `webhook_audit`. The checksums are pinned by a test; later slices
   add migrations.
 - At start the block registers `notify.expand` (queue `notify.expand`),
   the delivery kinds of its capture drivers and the maintenance kinds and
@@ -1410,8 +1412,11 @@ whose only connection the caller holds. The notification id is
 `UUIDv5(source, dedupe_key)`, so the same key twice names one notification
 (`duplicate: true` while the outbox row is retained). `emit_webhook`
 appends a `notify.webhook_event` record for a declared event type
-(`[modules.notifications.webhooks]` present, else `webhooks_disabled`); its
-fan-out handler arrives with NT-N7, so these jobs wait unleased until then.
+(`[modules.notifications.webhooks]` present, else `webhooks_disabled`),
+which the webhook fan-out handles ([Outgoing webhooks](#outgoing-webhooks)).
+The whole record, envelope and metadata, is at most
+`webhooks.max_payload_bytes` and the outbox's 64 KiB payload limit
+(`data_too_large`).
 Metrics label only declared topics; any other `notify.topic` is
 `unknown`.
 
@@ -1475,6 +1480,8 @@ Maintenance, each a cron schedule on queue `notify.maintenance` (UTC):
 | `settle_notifications` | every minute | sets `settled_at` on notifications whose deliveries all settled, 1,000 per batch |
 | `purge_data` | every 5 minutes | nulls `data` (and the deliveries' recipient names) of notifications settled more than `retention.data_after_settled` ago; counts `merezha.notification.data_purged` |
 | `inbox_expire` | hourly | deletes items past `expires_at` or archived more than `inbox.archived_retention` ago, 100 users per transaction in ascending order, raising each user's `purged_through` |
+| `webhook_auto_disable` | every 5 minutes | with `[modules.notifications.webhooks]`: disables the endpoints failing for `webhooks.auto_disable_after` with at least 10 failed attempts since, and alerts ([Outgoing webhooks](#outgoing-webhooks)) |
+| `retention` | daily (03:29) | the webhook rows so far: nulls event bodies older than `retention.webhook_deliveries`, deletes events older than `retention.deliveries` with no open delivery (their deliveries and attempts with them), deletes audit rows older than 400 days, drops previous secrets whose rotation window closed, and with `secret_key_previous` set seals again under `secret_key` the secrets only the previous key opens; 500 rows per batch |
 | `push_expire` | hourly (minute 43) | with `[modules.notifications.push]`: deletes subscriptions past `expires_at`, made with another VAPID key and unused for 7 days, or with 10 consecutive failures and no success in 30 days, 1,000 per batch; counts `merezha.notification.push_subscriptions_removed` (`expired`, `key_changed`, `failures`) |
 
 ### Brevo email
@@ -1892,6 +1899,129 @@ Routes under `/v1/notifications/`:
   `MEREZHA_NOTIFY_NO_EGRESS=1` only loopback addresses are dialled.
 - Endpoints, `p256dh`, `auth`, payloads and the VAPID key never appear in
   logs, spans, metrics or `Debug` output.
+
+### Outgoing webhooks
+
+`[modules.notifications.webhooks]` turns signed outgoing webhooks on (NT
+§5.5). The `notify.webhook` queue must keep the 24-hour retry step and
+three request timeouts per lease (startup refuses otherwise):
+
+```toml
+[modules.notifications.webhooks]
+# max_endpoints_per_tenant = 20
+# max_payload_bytes = 262144
+# timeout = "10s"
+# connect_timeout = "5s"
+# concurrency_per_endpoint = 4
+# auto_disable_after = "5d"
+# allow_http = false               # development only; refused with http.public
+alert_roles = ["owner", "admin"]   # tenant roles told about a disabled endpoint
+application_alert_roles = []       # empty: no alert for application-level endpoints
+event_types = { "tasks.task_completed" = { description = "A task was completed" } }
+
+[jobs.queues."notify.webhook"]
+concurrency = 16
+max_attempts = 10
+backoff_base_ms = 1000
+backoff_max_ms = 86400000
+```
+
+Routes under `/v1/notifications/`. Every `tenants/{tenant_id}/webhooks…`
+route checks its permission at `Tenant(tenant_id)` scope; the same routes
+under `webhooks…` are the application-level registry (NT6), checked at
+`Application` scope. An endpoint of another registry answers 404, as a
+missing one does; a missing grant is 403 `unauthorized`. Without the section
+every route answers 422 `webhooks_disabled`.
+
+| Method and path | Permission | Answer |
+| --- | --- | --- |
+| `GET webhook-event-types` | any authenticated principal | `[{type, description}]`: the application's `event_types`, the content module's `content.entry_published`, `content.entry_unpublished`, `content.entry_deleted`, and `webhook.test` |
+| `GET …webhooks` | `notifications.webhooks.read` | `[Endpoint]`, oldest first, never the secret |
+| `POST …webhooks` | `notifications.webhooks.manage` | `{url, description?, event_types?}`: 201 `Endpoint + {secret}`. 422 `webhook_url_rejected` (`details: [{path: "/url", code}]`, `code` one of `scheme`, `userinfo`, `fragment`, `blocked_address`, `unresolvable`, `too_long`, `invalid_url`), `unknown_event_type` (`/event_types/<i>`), `validation_failed` (`/description`, `/event_types`); 409 `webhook_endpoint_limit` past `max_endpoints_per_tenant` |
+| `GET` / `PATCH` / `DELETE …webhooks/{id}` | read / manage / manage | PATCH `{url?, description?, event_types?, revision}` (`description: null` clears it): 200 `Endpoint`; 412 `revision_conflict` on a stale revision. DELETE 204, the endpoint's deliveries and attempts with it |
+| `POST …webhooks/{id}/rotate-secret` | manage | `{keep_previous_hours?}` (0 to 72, default 24; 0 keeps no previous secret): 200 `{secret, previous_expires_at}` |
+| `POST …webhooks/{id}/enable`, `…/disable` | manage | 200 `Endpoint`. Disable (`manual`) cancels the queued deliveries; enable clears `failing_since` |
+| `POST …webhooks/{id}/test` | manage | 202 `{delivery_id}`: a `webhook.test` event (`data: {endpoint_id}`) for this endpoint alone, whatever its filter; 409 `endpoint_disabled` |
+| `GET …webhooks/{id}/deliveries?status=&cursor=` | read | `{items: [{id, event_type, status, attempt_count, last_http_status, created_at, attempts: [{attempt, outcome, http_status, duration_ms, started_at}]}], next_cursor}`, newest first, 50 per page; 400 `invalid_cursor` |
+| `POST …webhooks/{id}/deliveries/{delivery_id}/redeliver` | manage | a settled delivery (`succeeded`, `failed`, `cancelled`) as a new generation: 202 `{generation}`; 409 `not_redeliverable` (still open), `endpoint_disabled`; 410 `event_body_expired` |
+
+`Endpoint` is `{id, url, description, event_types, status, disabled_reason,
+failing_since, last_success_at, revision, created_at}`. A filter is an exact
+type of the catalog or `prefix.*`; an empty filter matches every type.
+
+- **URLs.** Registration (and PATCH) accepts `https`, or `http` with
+  `allow_http`; no userinfo or fragment; at most 2,048 characters; a host
+  that is not a blocked IP literal (`127.0.0.1`, `[::ffff:127.0.0.1]` and
+  `0x7f000001` are all the same blocked address) and that resolves within
+  5 s to at least one address the egress guard allows. That check only
+  gives early feedback: the one that counts is the guarded resolver at
+  send time. Requests go through the egress guard Web Push uses (see
+  [Web Push](#web-push), with `webhooks.connect_timeout`): the client dials
+  only the addresses the resolver allowed, IP literals are checked before
+  the request, and `MEREZHA_NOTIFY_NO_EGRESS=1` dials loopback only.
+- **Secrets.** `whsec_` plus base64 of 32 random bytes, shown only in the
+  create and rotate answers. At rest the secret is AES-256-GCM ciphertext
+  under `k_wh = HKDF-SHA256(secret_key, "merezha-notify/webhook-secret/v1")`
+  with a random nonce and the endpoint id as associated data; opening tries
+  `secret_key`, then `secret_key_previous`. To rotate `secret_key`, deploy
+  the new key with the old one as `secret_key_previous` and keep it until a
+  daily `retention` run has resealed the secrets. A secret neither key
+  opens fails its deliveries `secret_unreadable`. Secrets never appear in
+  logs, spans, metrics, errors, `Debug` output or other answers.
+- **Fan-out.** `notify.webhook_event` (queue `notify.expand`) stores the
+  event once (`UUIDv5(source, source_event_id)`) with its envelope frozen,
+  `{"type":…,"timestamp":"<RFC 3339>","data":…}`, and, in the same
+  transaction, one delivery (`UUIDv5(event id, endpoint id)`) per matching
+  active endpoint of the event's registry with its job record
+  (`notify.webhook.deliver`, key `webhook:{delivery_id}:g{generation}`). A
+  tenant event reaches only that tenant's endpoints, a tenantless event only
+  the application-level ones. A second run of the same job writes nothing.
+- **Requests.** `POST <url>` with `content-type: application/json`,
+  `user-agent: Merezha-Webhooks/1`, `webhook-id: msg_<delivery id hex>`
+  (stable across retries and redeliveries: receivers deduplicate on it),
+  `webhook-timestamp` (this attempt's Unix seconds) and `webhook-signature:
+  v1,<base64(HMAC-SHA256(secret, "{id}.{timestamp}.{body}"))>` over the
+  frozen body (Standard Webhooks). During a rotation window a second `v1,`
+  signature made with the previous secret follows, separated by a space.
+  Receivers should accept any listed signature and a 5-minute timestamp
+  tolerance. Each instance sends at most `concurrency_per_endpoint`
+  requests per endpoint at once; the request deadline is
+  `min(timeout, job deadline - 2 s)`.
+- **Outcomes.** Any 2xx succeeds and clears `failing_since`. The first
+  1 KiB of the response body is kept as the attempt's `response_snippet`
+  (lossy UTF-8, control characters removed), then the connection is
+  dropped. A 410 fails the delivery `gone` and disables the endpoint
+  (`disabled_reason = gone`), cancelling its queued deliveries. Every other
+  answer, a 3xx included (redirects are never followed), a timeout, a
+  network error or a destination the egress guard refuses (attempt
+  `blocked`, `merezha.notification.egress_blocked{notify.target=webhook}`
+  and `notification.egress_blocked`), is a failure: it sets
+  `failing_since` if unset and retries at +5 s, +5 min, +30 min, +2 h,
+  +5 h, +10 h, +14 h, +20 h and +24 h (±10 %, never past 24 h). After the
+  tenth attempt of a generation, or when the job's `max_attempts` run out,
+  the delivery is `failed`. A crash between the request and its record
+  resends with the same `webhook-id`.
+- **Auto-disable.** `webhook_auto_disable` disables an endpoint whose
+  `failing_since` is older than `auto_disable_after` and that failed at
+  least 10 attempts since (`disabled_reason = failing`), cancels its queued
+  deliveries, and in the same transaction requests
+  `notifications.webhook_disabled` (email and inbox, data `{endpoint_id}`,
+  dedupe key `whdisable:{endpoint_id}:{unix seconds}`) for the members of
+  the endpoint's tenant holding an `alert_roles` role, or the holders of an
+  `application_alert_roles` role for an application-level endpoint. An
+  empty list sends no alert. Every disable logs
+  `notification.webhook_endpoint_disabled` and counts
+  `merezha.webhook.endpoints_disabled{notify.reason}`. Cancelled deliveries
+  are sent again only through redeliver.
+- **Audit.** Create, update, rotate, enable, disable (manual, `gone`,
+  `failing`) and delete write a row to `merezha_notify.webhook_audit`
+  (endpoint, tenant, action, reason, actor subject, revision, time), never
+  the secret or the URL. The block's own disables name `sys_notifications`.
+- **Telemetry.** `merezha.webhook.attempts{notify.class}`,
+  `merezha.webhook.deliveries{notify.outcome}` and
+  `merezha.webhook.endpoints_disabled{notify.reason}`. The job span carries
+  `notify.webhook_delivery_id`, `notify.endpoint_id` and
+  `http.response.status_code`; URLs never reach telemetry.
 
 ### Templates
 
