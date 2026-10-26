@@ -130,7 +130,7 @@ impl PostgresStore {
         let reactors = if reactors.is_empty() {
             Vec::new()
         } else {
-            self.reactors_overview(reactors, deadline)?
+            self.reactors_overview(reactors, false, deadline)?
                 .1
                 .into_iter()
                 .map(|(entry, _)| ReactorStatus {
@@ -179,6 +179,9 @@ impl PostgresStore {
     }
 }
 
+/// `GET reactors` counts each reactor's rejections up to this many.
+pub const REJECTIONS_COUNTED: u64 = 10_000;
+
 /// Configured reactors' admin entries with the accepted time of each one's
 /// first unprocessed event, and the head they were read at.
 pub(crate) type ReactorRows = (u64, Vec<(ReactorEntry, Option<i64>)>);
@@ -188,12 +191,21 @@ pub(crate) type ReactorRows = (u64, Vec<(ReactorEntry, Option<i64>)>);
 /// paused, resumed or retried before it is re-added.
 impl PostgresStore {
     /// Configured reactors' rows and the head, in one snapshot, each with
-    /// the accepted time of its first unprocessed event.
+    /// the accepted time of its first unprocessed event. With
+    /// `count_rejections`, each entry's `rejected` counts its rejections up
+    /// to [`REJECTIONS_COUNTED`]; otherwise it is 0, so the lag sampler and
+    /// the status document never scan the rejections.
     pub(crate) fn reactors_overview(
         &self,
         reactors: &[&Reactor],
+        count_rejections: bool,
         deadline: Instant,
     ) -> Result<ReactorRows, Failure> {
+        let cap = if count_rejections {
+            REJECTIONS_COUNTED as i64
+        } else {
+            0
+        };
         let names: Vec<String> = reactors
             .iter()
             .map(|r| r.name.as_str().to_owned())
@@ -213,7 +225,7 @@ impl PostgresStore {
                         .map_err(|e| read_error(&e))?
                         .get(0);
                     let rows = handle
-                        .query(tx, &sql::REACTORS_OVERVIEW, &[&names])
+                        .query(tx, &sql::REACTORS_OVERVIEW, &[&names, &cap])
                         .await
                         .map_err(|e| read_error(&e))?;
                     Ok((head, rows))
@@ -234,7 +246,7 @@ impl PostgresStore {
                     failure_code: row.get(4),
                     failures: u32::try_from(row.get::<_, i32>(5)).map_err(|_| invalid())?,
                     retry_at: row.get(6),
-                    rejected: unsigned(row.get(7))?,
+                    rejected: row.get::<_, Option<i64>>(7).map_or(Ok(0), unsigned)?,
                 },
                 row.get(8),
             ));
@@ -394,10 +406,12 @@ impl PostgresStore {
                         SkipTo::Head if head <= current => return Ok((current, false)),
                         SkipTo::Head => (head, "skip_to_head"),
                     };
+                    // The row covers the whole skipped range.
+                    let first = current + 1;
                     db.execute(
                         tx,
                         &sql::INSERT_SKIP,
-                        &[&text, &target, &reason, &None::<String>, &principal],
+                        &[&text, &target, &reason, &None::<String>, &principal, &first],
                     )
                     .await
                     .map_err(|e| read_error(&e))?;

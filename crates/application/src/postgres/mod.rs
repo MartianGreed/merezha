@@ -34,14 +34,18 @@ pub(crate) use runner::at_deadline;
 pub(crate) fn request_bounds(deadline: Instant) -> runner::Bounds {
     runner::Bounds::request(deadline)
 }
+pub use admin::REJECTIONS_COUNTED;
 #[doc(hidden)]
 pub use reactor::ReactorOutcome;
 pub use reactor::{
     COMMAND_KIND, COMMAND_QUEUE, CommandJob, EffectBody, EffectRequest, Effects, SOURCE,
 };
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use runner::FailOnce;
 pub use runner::{BackgroundOptions, CatchUp, INTERVAL, MAX_CONCURRENT, RUN_TIMEOUT};
 #[doc(hidden)]
-pub use runner::{FailOnce, Pause, RunHooks};
+pub use runner::{Pause, RunHooks};
 pub use scheduler::{EVENTS_CHANNEL, Scheduler};
 pub use verify::{MAX_VIOLATIONS, Subject, VerifyReport, Violation, verify};
 

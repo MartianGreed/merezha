@@ -2178,7 +2178,9 @@ in order: every accepted effect through the module's notifier
 `application`/`application.command` job record), bound to the source
 `application` and keyed `reaction:{reactor}:{event_id}:{index}`; the
 rejected effects; and the new checkpoint, compared with the row revision.
-Directory membership checks run before it opens. Without the notifications
+Directory membership checks run before it opens. `application` recipients
+are refused on tenant events (`invalid_recipient`): application roles span
+every tenant. Without the notifications
 block the capture fallback logs `notification.captured` and delivers
 nothing. When any reactor allows `command` effects, the module registers
 the `application.command` handler on queue `application`
@@ -2192,7 +2194,9 @@ configured) dead-letter. Routes that declare neither `permission` nor
 
 Logs: `reactor.halted` (error, once per halt), `reactor.skipped` (info),
 `reactor.effect_rejected` (warn, with the effect type as `reason` and the
-code). Metrics: `merezha.reactor.batch.duration` (`accepted`, `failed`,
+code), `reactor.isolating` (warn: a batch of several events failed
+transiently three times in a row and is retried one event at a time from
+`position`). Metrics: `merezha.reactor.batch.duration` (`accepted`, `failed`,
 `halted`), `merezha.reactor.effects` (`accepted`, `rejected` per effect
 type), `merezha.reactor.skipped`, `merezha.reactor.halted`,
 `merezha.reactor.lag.events`, `merezha.reactor.lag.age`,
@@ -2202,11 +2206,11 @@ type), `merezha.reactor.skipped`, `merezha.reactor.halted`,
 
 | Route under `/v1/application/` | Permission | Answer |
 | --- | --- | --- |
-| `GET reactors` | `application.admin.read` | `{"head","reactors":[{"name","checkpoint","lag","status","halted_position","failure_code","failures","retry_at","rejected"}]}` for the configured reactors; `lag` is `head - checkpoint` |
+| `GET reactors` | `application.admin.read` | `{"head","reactors":[{"name","checkpoint","lag","status","halted_position","failure_code","failures","retry_at","rejected"}]}` for the configured reactors; `lag` is `head - checkpoint`; `rejected` is counted up to 10,000 (the status document and the lag sampler never count) |
 | `GET reactors/{name}/rejections?limit=&after=` | `application.admin.read` | `{"rejections":[{"position","index","effect","code","rejected_at"}],"next"?}`, oldest first, `limit` 1 to 200 (default 50), `after` the previous page's `next` (`{position}.{index}`); `400 invalid_input` for another parameter |
 | `POST reactors/{name}/pause` and `/resume` | `application.admin.write` | `{"name","status"}`; a paused reactor runs no batch, and a batch that was running when it paused does not commit; resume makes it due now |
 | `POST reactors/{name}/retry` | `application.admin.write` | `{"name","status"}`; the next attempt runs now |
-| `POST reactors/{name}/skip` | `application.admin.write` | body `{"position":P}` with `P = checkpoint + 1` (else `409 invalid_skip`) or `{"to":"head"}`; a `reactor_skips` row with the principal (`admin` or `skip_to_head`), the reactor active again (a paused one stays paused); `{"name","checkpoint"}` |
+| `POST reactors/{name}/skip` | `application.admin.write` | body `{"position":P}` with `P = checkpoint + 1` (else `409 invalid_skip`) or `{"to":"head"}`; a `reactor_skips` row with the principal (`admin` or `skip_to_head`) covering `first_position` to `position`, the reactor active again (a paused one stays paused); `{"name","checkpoint"}` |
 
 These routes work on any reactor row, configured or not, so an operator can
 skip a removed reactor to the head before re-adding it; a name without a row
@@ -3422,3 +3426,7 @@ itself.
   the `task-notifier` example is contract-tested natively and builds as a
   component, and the end-to-end example application (`merezha new`, stage 3)
   wires it with an `ArchiveTask` route.
+- `merezha_app.reactor_rejections` and `reactor_skips` have no retention yet;
+  `GET reactors` counts rejections up to 10,000. A reactor batch asks the
+  Directory one `(user, tenant)` pair after another, and the capture notifier
+  logs `notification.captured` before the checkpoint transaction commits.

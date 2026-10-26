@@ -380,13 +380,13 @@ pub const INSERT_REJECTIONS: Statement = Statement::new(
       FROM unnest($2::bigint[], $3::smallint[], $4::text[], $5::text[]) AS u (position, index, effect, code) \
     ON CONFLICT DO NOTHING",
 );
-/// A skipped event: `on_error = "skip"` in the checkpoint transaction, or
-/// an operator's skip (`$5` the principal).
+/// Skipped events `$6` to `$2`: `on_error = "skip"` in the checkpoint
+/// transaction, or an operator's skip (`$5` the principal).
 pub const INSERT_SKIP: Statement = Statement::new(
     "app.reactor_skips.insert",
     "INSERT merezha_app.reactor_skips",
-    "INSERT INTO merezha_app.reactor_skips (name, position, reason, failure_code, principal) \
-    VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+    "INSERT INTO merezha_app.reactor_skips (name, position, reason, failure_code, principal, first_position) \
+    VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
 );
 /// Checkpoint transaction, last step: advance past the batch and clear
 /// every failure mark; a halted reactor that succeeds is active again.
@@ -441,15 +441,17 @@ pub const SKIP_REACTOR: Statement = Statement::new(
     WHERE name = $1 AND $2 <= (SELECT position FROM merezha_app.head WHERE id = 1) \
     RETURNING checkpoint",
 );
-/// The admin listing of configured reactors (`$1`), in one snapshot with
-/// the head: each row, its rejection count and the accepted time of its
-/// first unprocessed event.
+/// The configured reactors (`$1`), in one snapshot with the head: each
+/// row and the accepted time of its first unprocessed event; with `$2 > 0`
+/// also its rejections, counted up to `$2` (only `GET reactors` counts:
+/// the lag sampler and the status document pass 0).
 pub const REACTORS_OVERVIEW: Statement = Statement::new(
     "app.reactors.overview",
     "SELECT merezha_app.reactors",
     "SELECT r.name, r.checkpoint, r.status, r.halted_position, r.failure_code, r.failures, \
         to_char(r.retry_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), \
-        (SELECT count(*) FROM merezha_app.reactor_rejections j WHERE j.name = r.name), \
+        CASE WHEN $2::bigint > 0 THEN (SELECT count(*) FROM (SELECT 1 FROM merezha_app.reactor_rejections j \
+            WHERE j.name = r.name LIMIT $2::bigint) capped) END, \
         e.accepted_unix_ms \
     FROM unnest($1::text[]) AS c (name) \
     JOIN merezha_app.reactors r ON r.name = c.name \

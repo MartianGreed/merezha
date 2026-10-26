@@ -202,8 +202,11 @@ impl Decider for TaskDecider {
                 }
                 TaskEvent::Renamed(TaskRenamed { task_id, title })
             }
-            (Task::Open { .. }, TaskCommand::CompleteTask(_)) => {
-                TaskEvent::Completed(TaskCompleted { task_id })
+            (Task::Open { owner, .. }, TaskCommand::CompleteTask(_)) => {
+                TaskEvent::Completed(TaskCompleted {
+                    task_id,
+                    owner: owner.clone(),
+                })
             }
         };
         Ok(vec![event])

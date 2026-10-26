@@ -1163,6 +1163,18 @@ pub const EVENTS: &[Event] = &[
             CODE,
         ],
     ),
+    // A batch of several events failed transiently `ISOLATE_AFTER` times in
+    // a row: the reactor retries it one event at a time (AP-C3).
+    ev(
+        "reactor.isolating",
+        WARN,
+        &[
+            REACTOR,
+            f("position", key::EVENT_POSITION),
+            f("reason", key::REASON),
+            CODE,
+        ],
+    ),
     // Jobs and outbox.
     ev("job.leased", DEBUG, &[JOB_ID, QUEUE, KIND, ATTEMPT]),
     ev("job.completed", DEBUG, &[JOB_ID, QUEUE, KIND, ATTEMPT]),

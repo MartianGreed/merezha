@@ -197,8 +197,6 @@ pub const KERNEL_CODES: &[ErrorCode] = &[
     ErrorCode::new("projection_behind", 503),
     ErrorCode::new("run_timeout", 503),
     ErrorCode::new("cancelled", 503),
-    // `RunHooks::reactor_fail`, a test hook's forced rollback.
-    ErrorCode::new("test_rollback", 503),
     ErrorCode::new("migration_lock_timeout", 503),
     ErrorCode::new("migration_timeout", 503),
     ErrorCode::new("listener_failed", 503),

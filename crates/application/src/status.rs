@@ -106,7 +106,7 @@ pub struct ReactorEntry {
     pub failures: u32,
     /// RFC 3339, UTC; the next attempt after a failure.
     pub retry_at: Option<String>,
-    /// How many effects were rejected so far.
+    /// How many effects were rejected so far, counted up to 10,000.
     pub rejected: u64,
 }
 /// `GET /v1/application/reactors/{name}/rejections`.

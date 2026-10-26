@@ -7,20 +7,19 @@
 //!
 //! | Index | Effect | What |
 //! | --- | --- | --- |
-//! | 0 | `notify` | topic `tasks.completed` on `inbox` and `email` to the user who completed the task (the event's principal), with `{"task_id"}`; omitted for an event without a user principal |
+//! | 0 | `notify` | topic `tasks.completed` on `inbox` and `email` to the task's owner (`TaskCompleted` schema version 2), with `{"task_id"}`; omitted for an unowned task |
 //! | next | `command` | `ArchiveTask` on the task's stream, `{}`, seven days later |
 //!
-//! Who completes a task is its owner or an admin (`task-domain`), and a
-//! reactor sees events only, never projection state (AP3), so the user
-//! notified is the one who completed it. Guests never name the dedupe key,
+//! A reactor sees events only, never projection state (AP3), so the owner
+//! comes from the event itself: `task-domain` records it in `TaskCompleted`
+//! whoever completed the task, the owner or an admin. Guests never name the dedupe key,
 //! the tenant or the source event: the host derives them, so a tenant
 //! task's effects stay in its tenant. Other events get no effects; a
 //! `TaskCompleted` that does not decode fails `invalid_event`, which halts
 //! the reactor at that event.
 
 use merezha_domain::{
-    Channel, Effect, Failure, Identity, Operation, PrincipalKind, Reaction, Recipient, Reply,
-    StoredEvent,
+    Channel, Effect, Failure, Identity, Operation, Reaction, Recipient, Reply, StoredEvent,
 };
 use serde_json::{Map, Value, json};
 use task_events::TaskEvent;
@@ -46,9 +45,7 @@ pub fn effects(event: &StoredEvent) -> Result<Vec<Effect>, Failure> {
         return Err(Failure::permanent("invalid_event"));
     };
     let mut effects = Vec::with_capacity(2);
-    if let Some(principal) = event.metadata.principal()
-        && principal.kind == PrincipalKind::User
-    {
+    if let Some(owner) = completed.owner {
         let mut data = Map::new();
         data.insert(
             "task_id".into(),
@@ -56,9 +53,7 @@ pub fn effects(event: &StoredEvent) -> Result<Vec<Effect>, Failure> {
         );
         effects.push(Effect::Notify {
             topic: Identity::new(TOPIC)?,
-            recipients: vec![Recipient::User {
-                id: principal.subject.clone(),
-            }],
+            recipients: vec![Recipient::User { id: owner }],
             channels: Some(vec![Channel::Inbox, Channel::Email]),
             data,
             delay_ms: None,

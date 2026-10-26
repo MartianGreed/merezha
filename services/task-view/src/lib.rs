@@ -96,7 +96,7 @@ impl Board {
                 row.title = title;
                 row.version = version;
             }
-            TaskEvent::Completed(TaskCompleted { task_id }) => {
+            TaskEvent::Completed(TaskCompleted { task_id, .. }) => {
                 let row = self.open_row(&task_id).ok_or_else(gap)?;
                 row.status = Status::Completed;
                 row.version = version;

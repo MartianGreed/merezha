@@ -25,7 +25,8 @@ fn stored(
         position,
         event: Event {
             tag: id(tag),
-            schema_version: 1,
+            // An owned completion is schema version 2 (`task-events`).
+            schema_version: if payload.get("owner").is_some() { 2 } else { 1 },
             payload,
         },
         metadata: Metadata {
@@ -53,14 +54,15 @@ fn react(events: Vec<StoredEvent>) -> Result<Reply, Failure> {
 }
 
 #[test]
-fn a_completed_task_notifies_who_completed_it_and_schedules_its_archiving() {
+fn a_completed_task_notifies_its_owner_and_schedules_its_archiving() {
     let reply = react(vec![
+        // An admin completed Ada's task: Ada is told, not the admin.
         stored(
             41,
             "org_1:Task/t-1",
             "TaskCompleted",
-            json!({"task_id": "org_1:Task/t-1"}),
-            Some("usr_ada"),
+            json!({"task_id": "org_1:Task/t-1", "owner": "usr_ada"}),
+            Some("usr_root"),
         ),
         stored(
             42,
@@ -69,7 +71,7 @@ fn a_completed_task_notifies_who_completed_it_and_schedules_its_archiving() {
             json!({"task_id": "Task/t-2", "title": "New"}),
             Some("usr_ada"),
         ),
-        // Version 1 history: no principal, so nobody to notify. A local
+        // An unowned task (version 1 history): nobody to notify. A local
         // id may hold `/`.
         stored(
             43,
@@ -107,22 +109,13 @@ fn a_completed_task_notifies_who_completed_it_and_schedules_its_archiving() {
 }
 
 #[test]
-fn a_system_principal_is_not_notified() {
-    let mut event = stored(
+fn an_unowned_task_completed_by_a_user_notifies_nobody() {
+    let event = stored(
         1,
         "Task/t-1",
         "TaskCompleted",
         json!({"task_id": "Task/t-1"}),
-        None,
-    );
-    event.metadata.principal = Some(
-        Principal::new(
-            id("sys_reactor_task-notifier"),
-            PrincipalKind::System,
-            None,
-            vec![],
-        )
-        .unwrap(),
+        Some("usr_bob"),
     );
     let Reply::Reacted { reactions } = react(vec![event]).unwrap() else {
         panic!("reacted");
@@ -143,6 +136,19 @@ fn an_undecodable_completion_fails_and_other_operations_are_refused() {
             json!({"task_id": "Task/t-1", "extra": true}),
             None
         )]),
+        Err(Failure::permanent("invalid_event"))
+    );
+    // An owner under schema version 1 contradicts the schema.
+    let mut downgraded = stored(
+        1,
+        "Task/t-1",
+        "TaskCompleted",
+        json!({"task_id": "Task/t-1", "owner": "usr_ada"}),
+        None,
+    );
+    downgraded.event.schema_version = 1;
+    assert_eq!(
+        react(vec![downgraded]),
         Err(Failure::permanent("invalid_event"))
     );
     let validate = Request::with_version(

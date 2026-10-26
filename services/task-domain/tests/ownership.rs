@@ -130,13 +130,20 @@ fn only_the_owner_or_an_admin_changes_an_owned_task() {
         rename,
     )
     .unwrap();
-    decide(
+    // An admin completes it; the event names the owner, not the admin, so
+    // a reactor can notify the owner (schema version 2).
+    let completed = decide(
         &mut history,
         Some(user("usr_root", &["admin"])),
         "CompleteTask",
         json!({}),
     )
     .unwrap();
+    assert_eq!(completed[0].schema_version, 2);
+    assert_eq!(
+        completed[0].payload,
+        json!({"task_id":"task-1","owner":"usr_ada"})
+    );
     // A completed owned task still refuses others first.
     assert_eq!(
         decide(
@@ -172,7 +179,9 @@ fn unowned_tasks_stay_open_to_every_caller() {
         json!({"title":"New"}),
     )
     .unwrap();
-    decide(&mut history, None, "CompleteTask", json!({})).unwrap();
+    let completed = decide(&mut history, None, "CompleteTask", json!({})).unwrap();
+    assert_eq!(completed[0].schema_version, 1);
+    assert_eq!(completed[0].payload, json!({"task_id":"task-1"}));
 }
 
 #[test]

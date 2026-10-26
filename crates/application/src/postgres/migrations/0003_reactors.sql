@@ -14,10 +14,13 @@ CREATE TABLE merezha_app.reactors (
     CHECK ((status = 'halted') = (halted_position IS NOT NULL)));
 
 -- Events a reactor advanced past without reacting: an operator's skip of
--- the stuck event or to the head, or `on_error = "skip"`.
+-- the stuck event or to the head, or `on_error = "skip"`. A row covers
+-- positions `first_position` to `position`; a single event's skip has
+-- both equal.
 CREATE TABLE merezha_app.reactor_skips (
     name text NOT NULL REFERENCES merezha_app.reactors (name),
     position bigint NOT NULL,
+    first_position bigint NOT NULL CHECK (first_position BETWEEN 1 AND position),
     reason text NOT NULL CHECK (reason IN ('admin', 'on_error_skip', 'skip_to_head')),
     failure_code text NULL, principal text NULL, skipped_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (name, position));

@@ -143,10 +143,13 @@ pub struct RunHooks {
     /// the next batch.
     pub rebuild_batch: Option<Arc<Pause>>,
     /// A one-shot failure of a reactor's checkpoint transaction after its
-    /// writes and before `COMMIT`, which rolls everything back.
+    /// writes and before `COMMIT`, which rolls everything back (feature
+    /// `test-support`).
+    #[cfg(feature = "test-support")]
     pub reactor_fail: Option<Arc<FailOnce>>,
 }
 /// See [`RunHooks::reactor_fail`].
+#[cfg(feature = "test-support")]
 #[derive(Debug, Default)]
 #[doc(hidden)]
 pub struct FailOnce {
@@ -154,9 +157,10 @@ pub struct FailOnce {
     fired: AtomicBool,
     reactor: Mutex<String>,
 }
+#[cfg(feature = "test-support")]
 impl FailOnce {
     /// Fail the next checkpoint transaction of `reactor` with transient
-    /// `test_rollback`.
+    /// `cancelled`, as a lost commit.
     pub fn arm(&self, reactor: &str) {
         *self.reactor.lock().unwrap_or_else(|e| e.into_inner()) = reactor.to_owned();
         self.fired.store(false, Ordering::SeqCst);
@@ -171,7 +175,7 @@ impl FailOnce {
             && self.armed.swap(false, Ordering::SeqCst)
         {
             self.fired.store(true, Ordering::SeqCst);
-            return Err(Failure::transient("test_rollback"));
+            return Err(Failure::transient("cancelled"));
         }
         Ok(())
     }

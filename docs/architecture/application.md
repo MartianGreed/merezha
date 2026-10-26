@@ -601,7 +601,8 @@ halts the reactor whatever `on_error` says. A *rejected* effect is recorded
 in `merezha_app.reactor_rejections`, logged as `reactor.effect_rejected`,
 and its siblings are written: `effect_not_allowed`, `command_not_allowed`,
 `address_not_allowed`, `invalid_recipient` (a `tenant` recipient naming
-another tenant), `tenant_required` (a `tenant` recipient on an event without
+another tenant, or an `application` recipient on a tenant event, since
+application roles span every tenant), `tenant_required` (a `tenant` recipient on an event without
 tenant), `invalid_delay` (over 30 days), and every refusal of the
 notifications block (`unknown_topic`, `recipient_not_in_tenant`, ...).
 
@@ -626,6 +627,7 @@ lanes, under the advisory lock `r:{name}`, so one host at a time runs it.
 | Failure | What happens |
 | --- | --- |
 | Transient (guest `timeout` or `overloaded`, storage, the Directory, the notifier's `unavailable`) | the checkpoint stays; `failures + 1` and a retry after an equal-jitter backoff (`[application.reactors] retry_base_ms` to `retry_max_ms`) |
+| The guest's transient failure on a batch of several events, three times in a row | the same range again, one event at a time (`reactor.isolating`): the events before the failing one commit, and it becomes `checkpoint + 1`, which `skip` accepts |
 | Permanent guest failure or malformed reply on a batch of several events | the same range again, one event at a time, isolating the poison event |
 | Malformed reply on one event, or a permanent failure with `on_error = "halt"` | `halted` at that position (`reactor.halted`); retried at its retry time, so a fixed guest resumes it; an operator can `retry` now or `skip` |
 | Permanent guest failure on one event with `on_error = "skip"` | a `reactor_skips` row (`on_error_skip`) and the checkpoint past it, in one transaction |

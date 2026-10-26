@@ -261,8 +261,16 @@ impl JobHandler for CommandEffects {
             .await
             .map_err(|_| JobFailure::transient("internal", None))?;
             // The classification drives retry: conflict and transient
-            // retry, permanent dead-letters.
-            result.map(|_| ()).map_err(JobFailure::from)
+            // retry, permanent dead-letters. `idempotency_mismatch` is a
+            // conflict for a caller, but here the job's own key names
+            // another command: retrying cannot succeed (AP §C.5).
+            result.map(|_| ()).map_err(|failure| {
+                if failure.code == "idempotency_mismatch" {
+                    JobFailure::permanent(&failure.code)
+                } else {
+                    JobFailure::from(failure)
+                }
+            })
         })
     }
 }

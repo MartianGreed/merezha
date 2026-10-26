@@ -418,7 +418,7 @@ impl Application {
                         Vec::new()
                     } else {
                         store
-                            .reactors_overview(&reactors, deadline)?
+                            .reactors_overview(&reactors, false, deadline)?
                             .1
                             .into_iter()
                             .map(|(entry, oldest)| {
@@ -1300,10 +1300,13 @@ impl Admission {
         self.pg()?.delete_revision(&name, revision, self.deadline)
     }
     /// `GET reactors`: every configured reactor with its checkpoint, lag
-    /// (`head - checkpoint`), status, failure and rejection count.
+    /// (`head - checkpoint`), status, failure and rejection count, counted
+    /// up to 10,000 (`postgres::REJECTIONS_COUNTED`).
     pub fn reactors(self) -> Result<crate::status::ReactorsOverview, Failure> {
         let reactors: Vec<_> = self.inner.config.reactors.iter().flatten().collect();
-        let (head, rows) = self.pg()?.reactors_overview(&reactors, self.deadline)?;
+        let (head, rows) = self
+            .pg()?
+            .reactors_overview(&reactors, true, self.deadline)?;
         Ok(crate::status::ReactorsOverview {
             head,
             reactors: rows.into_iter().map(|(entry, _)| entry).collect(),

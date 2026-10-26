@@ -124,6 +124,9 @@ struct Probe {
     transient: AtomicBool,
     /// Answer `malformed` events with a reaction for another event.
     malformed: AtomicBool,
+    /// Fail with transient `timeout` on events whose payload has
+    /// `"stall": true`.
+    stall: AtomicBool,
     delay_ms: std::sync::atomic::AtomicU64,
 }
 impl Probe {
@@ -205,6 +208,9 @@ impl Fake {
         let flagged = |key: &str| events.iter().any(|e| e.event.payload[key] == json!(true));
         if probe.poison.load(Ordering::SeqCst) && flagged("poison") {
             return Err(Failure::permanent("poisoned"));
+        }
+        if probe.stall.load(Ordering::SeqCst) && flagged("stall") {
+            return Err(Failure::transient("timeout"));
         }
         let malformed = probe.malformed.load(Ordering::SeqCst) && flagged("malformed");
         let reactions = events
@@ -638,6 +644,8 @@ fn effects_stay_inside_the_events_tenant() {
             {"effect": "notify", "topic": "tasks.completed", "recipients": [{"tenant": {"id": "org_2"}}]},
             {"effect": "notify", "topic": "tasks.completed", "recipients": [{"tenant": {"id": "org_1", "roles": ["admin"]}}]},
             archive("t-1", 0),
+            // Application roles span every tenant.
+            {"effect": "notify", "topic": "tasks.completed", "recipients": [{"application": {"roles": ["member"]}}]},
         ]),
     );
     instance
@@ -647,6 +655,7 @@ fn effects_stay_inside_the_events_tenant() {
             json!([
                 {"effect": "webhook", "event_type": "tasks.task_completed", "data": {"task_id": "t-9"}},
                 {"effect": "notify", "topic": "tasks.completed", "recipients": [{"tenant": {"id": "org_1"}}]},
+                {"effect": "notify", "topic": "tasks.completed", "recipients": [{"application": {"roles": ["support"]}}]},
             ]),
         ))
         .unwrap();
@@ -656,6 +665,7 @@ fn effects_stay_inside_the_events_tenant() {
         [
             "1.0 notify recipient_not_in_tenant",
             "1.1 notify invalid_recipient",
+            "1.4 notify invalid_recipient",
             "2.1 notify tenant_required",
         ]
     );
@@ -665,6 +675,7 @@ fn effects_stay_inside_the_events_tenant() {
             "reaction:notifier:event/1:2 notify org_1",
             "reaction:notifier:event/1:3 command org_1",
             "reaction:notifier:event/2:0 webhook -",
+            "reaction:notifier:event/2:2 notify -",
         ]
     );
     // The command effect, as the application.command handler runs it.
@@ -1396,6 +1407,145 @@ fn pause_resume_and_status() {
     assert_eq!(
         pg.count("SELECT count(*) FROM merezha_app.reactor_skips"),
         0
+    );
+}
+
+/// Review finding 1: an event that keeps failing transiently does not
+/// stall the reactor. After three transient failures of a batch of several
+/// events, the reactor retries one event at a time (`reactor.isolating`):
+/// the ten healthy events before it commit, their reactions written once,
+/// and the failing event is the stuck one `skip {position}` accepts.
+#[test]
+fn an_event_that_keeps_failing_transiently_is_isolated_and_the_events_before_it_commit() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    probe.stall.store(true, Ordering::SeqCst);
+    let instance = pg
+        .open(notifier(), &probe, Pg::background(RunHooks::default()))
+        .unwrap();
+    for i in 1..=16 {
+        let mut payload = json!({"effects": [notify("usr_ada")]});
+        if i == 11 {
+            payload["stall"] = json!(true);
+        }
+        instance
+            .app
+            .command(emit(&format!("t-{i}"), "TaskCompleted", payload))
+            .unwrap();
+    }
+    for failures in 1..=3 {
+        assert!(matches!(
+            react(&instance, "notifier"),
+            ReactorOutcome::Waiting(Some(_))
+        ));
+        assert_eq!(pg.reactor("notifier"), (0, "active".into(), None, failures));
+        pg.execute("UPDATE merezha_app.reactors SET retry_at = NULL");
+    }
+    let calls = probe.reacts.lock().unwrap().clone();
+    assert_eq!(calls.len(), 3);
+    assert!(calls.iter().all(|batch| batch.len() == 16));
+    // Isolating: one event at a time from here on.
+    react(&instance, "notifier");
+    let calls = probe.reacts.lock().unwrap().clone();
+    assert_eq!(
+        calls[3..].to_vec(),
+        (1..=11).map(|p| vec![p]).collect::<Vec<_>>()
+    );
+    assert_eq!(pg.reactor("notifier"), (10, "active".into(), None, 1));
+    assert_eq!(pg.count("SELECT count(*) FROM reactor_test.effects"), 10);
+    assert_eq!(
+        pg.count(
+            "SELECT count(DISTINCT dedupe_key) FROM reactor_test.effects \
+             WHERE dedupe_key LIKE 'reaction:notifier:event/%:0'"
+        ),
+        10
+    );
+    // The stuck event is now the one an operator can skip.
+    instance
+        .app
+        .admit()
+        .unwrap()
+        .skip_reactor("notifier", SkipTo::Position(11), Some("usr_ops"))
+        .unwrap();
+    react(&instance, "notifier");
+    assert_eq!(pg.reactor("notifier"), (16, "active".into(), None, 0));
+    assert_eq!(pg.count("SELECT count(*) FROM reactor_test.effects"), 15);
+}
+
+/// Review finding 4: a pause that lands while the guest call is in flight
+/// wins. The batch's checkpoint transaction sees the paused row and writes
+/// nothing; the reactor stays paused at 0.
+#[test]
+fn a_pause_during_a_batch_keeps_the_reactor_paused_and_commits_nothing() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    probe.delay_ms.store(500, Ordering::SeqCst);
+    let instance = pg
+        .open(notifier(), &probe, Pg::background(RunHooks::default()))
+        .unwrap();
+    instance
+        .app
+        .command(completed("t-1", json!([notify("usr_ada")])))
+        .unwrap();
+    let app = instance.app.clone();
+    let outcome = std::thread::scope(|scope| {
+        let run = scope.spawn(move || app.react_now("notifier").unwrap());
+        until(Duration::from_secs(5), "the guest call", || {
+            probe.in_flight.load(Ordering::SeqCst) == 1
+        });
+        instance
+            .app
+            .admit()
+            .unwrap()
+            .set_reactor_active("notifier", false)
+            .unwrap();
+        run.join().unwrap()
+    });
+    assert_eq!(outcome, ReactorOutcome::Waiting(None));
+    assert_eq!(pg.reactor("notifier"), (0, "paused".into(), None, 0));
+    assert_eq!(pg.effects(), Vec::<String>::new());
+    assert_eq!(probe.reacted(), [1]);
+}
+
+/// Review findings 5 and 6: `GET reactors` counts rejections only up to
+/// 10,000, and a skip to the head records the whole skipped range.
+#[test]
+fn rejections_are_counted_up_to_a_cap_and_skips_record_their_range() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let instance = pg
+        .open(notifier(), &probe, Pg::background(RunHooks::default()))
+        .unwrap();
+    let admin = || instance.app.admit().unwrap();
+    admin().set_reactor_active("notifier", false).unwrap();
+    for i in 0..3 {
+        instance
+            .app
+            .command(completed(&format!("t-{i}"), json!([notify("usr_ada")])))
+            .unwrap();
+    }
+    let skipped = admin()
+        .skip_reactor("notifier", SkipTo::Head, Some("usr_ops"))
+        .unwrap();
+    assert_eq!(skipped.checkpoint, 3);
+    let range: String = pg.rows(
+        "SELECT first_position || '..' || position || ' ' || reason || ' ' || principal \
+         FROM merezha_app.reactor_skips WHERE name = 'notifier'",
+    )[0]
+    .get(0);
+    assert_eq!(range, "1..3 skip_to_head usr_ops");
+    pg.execute(
+        "INSERT INTO merezha_app.reactor_rejections (name, position, index, effect, code) \
+         SELECT 'notifier', p, 0, 'notify', 'unknown_topic' FROM generate_series(1, 10050) AS p",
+    );
+    assert_eq!(
+        admin().reactors().unwrap().reactors[0].rejected,
+        merezha_application::postgres::REJECTIONS_COUNTED
+    );
+    // The status document never counts them.
+    assert_eq!(
+        serde_json::to_value(instance.app.status().unwrap().reactors).unwrap(),
+        json!([{"name": "notifier", "status": "paused", "lag_events": 0}])
     );
 }
 

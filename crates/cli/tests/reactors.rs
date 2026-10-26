@@ -666,6 +666,19 @@ async fn command_effects_run_once_as_the_reactor_on_the_events_tenant() {
         1,
         "one append; every duplicate replayed the receipt"
     );
+    // The same job key with another payload is another command: the
+    // receipt's fingerprint differs, and retrying cannot help, so it
+    // dead-letters (permanent).
+    let mut changed = job.clone();
+    changed.payload = json!({"note": "changed"});
+    let refused = handler
+        .handle(context(), serde_json::to_value(&changed).unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (refused.code.as_str(), refused.is_retryable()),
+        ("idempotency_mismatch", false)
+    );
     // A malformed or unknown job dead-letters (permanent).
     let refused = handler
         .handle(context(), json!({"nope": 1}))

@@ -48,6 +48,9 @@ use std::{
 };
 use tokio::sync::Notify;
 
+/// After this many consecutive transient guest failures of a batch of
+/// several events, the batch is retried one event at a time.
+pub const ISOLATE_AFTER: u32 = 3;
 /// The queue command effects run on (`[jobs.queues.application]`).
 pub const COMMAND_QUEUE: &str = "application";
 /// The job kind of a command effect, handled by the host's
@@ -418,7 +421,7 @@ impl Session<'_> {
         let (start, revision) = (signed(expected.checkpoint)?, expected.row_revision);
         let end = signed(end)?;
         let hooks = self.store.shared().options.hooks();
-        let (pause, fail) = (hooks.pause, hooks.reactor_fail);
+        let pause = hooks.pause.clone();
         let hard = self.bounds.hard;
         let (store, bounds) = (self.store, self.bounds);
         let db = store.db.clone();
@@ -482,7 +485,14 @@ impl Session<'_> {
                             db.execute(
                                 tx,
                                 &sql::INSERT_SKIP,
-                                &[&name, &position, &"on_error_skip", code, &None::<String>],
+                                &[
+                                    &name,
+                                    &position,
+                                    &"on_error_skip",
+                                    code,
+                                    &None::<String>,
+                                    &position,
+                                ],
                             )
                             .await
                             .map_err(|e| read_error(&e))?;
@@ -491,9 +501,7 @@ impl Session<'_> {
                             .await
                             .map_err(|e| read_error(&e))?;
                         pause_in(&db, tx, pause, &name).await?;
-                        if let Some(fail) = fail {
-                            fail.check(&name)?;
-                        }
+                        forced_rollback(&hooks, &name)?;
                         #[cfg(test)]
                         super::tests::crash_cut("reactor_before_commit");
                         Ok((written, rejected.split_off(before)))
@@ -538,6 +546,19 @@ impl Session<'_> {
         })?;
         Ok(())
     }
+}
+
+/// The test hook `RunHooks::reactor_fail` (feature `test-support`).
+#[cfg(feature = "test-support")]
+fn forced_rollback(hooks: &super::RunHooks, reactor: &str) -> Result<(), Failure> {
+    match &hooks.reactor_fail {
+        Some(fail) => fail.check(reactor),
+        None => Ok(()),
+    }
+}
+#[cfg(not(feature = "test-support"))]
+fn forced_rollback(_: &super::RunHooks, _: &str) -> Result<(), Failure> {
+    Ok(())
 }
 
 fn classification(class: Classification) -> &'static str {
@@ -627,7 +648,8 @@ fn reactions(
 /// The rejected tier on the host's side (AP §C.2), before any port: the
 /// effect type the reactor allows, its command tags, address recipients
 /// only with `allow_addresses`, a `tenant` recipient only for the event's
-/// own tenant, and the delay bound.
+/// own tenant, `application` recipients only on events without tenant, and
+/// the delay bound.
 fn admissible(
     reactor: &Reactor,
     effect: &Effect,
@@ -657,6 +679,11 @@ fn admissible(
                         Some(tenant) if tenant != id => return Err("invalid_recipient"),
                         Some(_) => {}
                     },
+                    // Application roles span every tenant: a tenant event
+                    // never notifies them.
+                    Recipient::Application { .. } if tenant.is_some() => {
+                        return Err("invalid_recipient");
+                    }
                     _ => {}
                 }
             }
@@ -822,6 +849,11 @@ fn memberships(
 
 /// How a batch failed.
 enum Failed {
+    /// The guest's own transient failure (`timeout`, `overloaded`, a
+    /// transient trap): retried with backoff like [`Failed::Transient`],
+    /// and after [`ISOLATE_AFTER`] consecutive ones on several events, one
+    /// event at a time.
+    GuestTransient(RunFailure),
     /// Retry the same range later, with backoff (`timeout`, `overloaded`,
     /// storage, the Directory, `unavailable`).
     Transient(RunFailure),
@@ -1018,12 +1050,39 @@ pub(crate) fn react(
                     }
                 }
             }
+            Err(Failed::GuestTransient(failure))
+                if read > 1 && row.failures.saturating_add(1) >= ISOLATE_AFTER =>
+            {
+                // An event that keeps failing transiently must not stall
+                // the events before it: from now on one event at a time,
+                // so the healthy prefix commits and the failing event is
+                // the stuck one an operator can `skip`.
+                run.finish_failed(&failure, false);
+                let code = failure.log_code().to_owned();
+                let wait = fail(
+                    &session,
+                    reactor,
+                    &row,
+                    Failed::GuestTransient(failure),
+                    options,
+                )?;
+                lane.narrow.store(end, Ordering::SeqCst);
+                merezha_telemetry::event!(
+                    WARN,
+                    "reactor.isolating",
+                    reactor = reactor.name.as_str(),
+                    position = row.checkpoint + 1,
+                    reason = "transient_failures",
+                    code = code.as_str()
+                );
+                return Ok(ReactorOutcome::Waiting(Some(wait)));
+            }
             Err(failed) => {
                 let halting = matches!(failed, Failed::Guest { .. });
                 match &failed {
-                    Failed::Transient(f) | Failed::Guest { run: f, .. } => {
-                        run.finish_failed(f, halting)
-                    }
+                    Failed::Transient(f)
+                    | Failed::GuestTransient(f)
+                    | Failed::Guest { run: f, .. } => run.finish_failed(f, halting),
                 }
                 let wait = fail(&session, reactor, &row, failed, options)?;
                 if halting {
@@ -1053,7 +1112,7 @@ fn fail(
     );
     let position = row.checkpoint + 1;
     match failed {
-        Failed::Transient(run) => {
+        Failed::Transient(run) | Failed::GuestTransient(run) => {
             session.record_failure(&run.failure, row.checkpoint, delay, None)?;
         }
         Failed::Guest { run, malformed } => {
@@ -1118,7 +1177,7 @@ fn batch_of(
                     ),
                     run,
                 },
-                _ => Failed::Transient(run),
+                _ => Failed::GuestTransient(run),
             }
         })?;
     let reactions =

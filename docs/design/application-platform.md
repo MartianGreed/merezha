@@ -1451,7 +1451,8 @@ The reply is checked in two tiers (R4):
 - **Rejected** (recorded in `reactor_rejections`, the reactor advances): a well-formed effect whose
   type is not in the reactor's `effects`, a command tag outside `commands`, an `address` recipient
   without `allow_addresses`, a `tenant` recipient other than the event's tenant, a `tenant`
-  recipient on an event without tenant (`tenant_required`), or any `NotifyError` from NT,
+  recipient on an event without tenant (`tenant_required`), an `application` recipient on a
+  tenant event (`invalid_recipient`), or any `NotifyError` from NT,
   including `recipient_not_in_tenant`.
 
 ## C.3 SDK changes
@@ -1679,8 +1680,11 @@ since two reactors can react to one event. The context is the event's correlatio
 
 **Tenant safety of effects.** On a tenant event, `user` recipients must be members (step 4 fills
 `members` from `Directory::is_member`, and NT refuses any user outside it), a `tenant` recipient
-must name that tenant, and webhooks reach only its
-endpoints. `application` recipients resolve through `Directory::application_members`. Command
+must name that tenant, webhooks reach only its endpoints, and `application` recipients are
+rejected (`invalid_recipient`): application roles span every tenant, and expansion pages
+`Directory::application_members` across the whole application, so a tenant's event could otherwise
+notify other tenants' users. On an event without tenant they resolve through
+`Directory::application_members`. Command
 effects run as `{subject: "sys_reactor_{name}", kind: system, tenant: event tenant, roles: []}`
 (R13), holding only the reactor's `permissions`, so tenant routes compose the same tenant. Events
 without tenant accept `user`, `application` and allowed `address` recipients (NT §3.3),
@@ -2217,7 +2221,8 @@ presence and subject to the key scope. *Closed in C2 by the second option (below
   it only under the loopback allow-all policy, as for edge callers.
 - Rejection codes the host assigns: `effect_not_allowed`,
   `command_not_allowed`, `address_not_allowed`, `invalid_recipient` (a
-  `tenant` recipient naming another tenant), `tenant_required` (a `tenant`
+  `tenant` recipient naming another tenant, or an `application` recipient
+  on a tenant event), `tenant_required` (a `tenant`
   recipient on an event without tenant) and `invalid_delay` (over 30 days,
   rejected rather than malformed); the notifications block's codes pass
   through (`unknown_topic`, `recipient_not_in_tenant`, ...). A port's
@@ -2248,12 +2253,40 @@ presence and subject to the key scope. *Closed in C2 by the second option (below
 - Test 2's kill -9 cuts are `reactor_before_commit` (inside the checkpoint
   transaction, after its writes) and `reactor_after_commit`, run in the
   crate's crash-cut child process; the relay side of "relayed once" is AP-B1
-  test 3. A forced rollback uses the test hook `RunHooks::reactor_fail`.
-- `task-notifier` notifies the user who completed the task (the event's
-  principal): `TaskCompleted` carries no owner and reactors cannot read
-  projection state (AP3), and only the owner or an admin can complete a
-  task. `ArchiveTask` is not a `task-domain` command yet; the stage 3
-  example application adds the route and the command.
+  test 3. A forced rollback uses the test hook `RunHooks::reactor_fail`
+  (feature `test-support`).
+- `task-notifier` notifies the task's owner from `TaskCompleted.owner`
+  (review fixes below). `ArchiveTask` is not a `task-domain` command yet;
+  the stage 3 example application adds the route and the command.
+- Review fixes (security review of #65, PASS-WITH-FINDINGS):
+  - *Design gap, fixed:* the failure table isolates only permanent
+    failures, so one event failing transiently forever (a guest timeout or
+    overload) stalled its reactor with the status `active` and no log, and
+    `skip {position}` could not name it. After `ISOLATE_AFTER` (3)
+    consecutive transient guest failures of a batch of several events, the
+    reactor retries it one event at a time (log `reactor.isolating`, a TE
+    catalog row): the healthy prefix commits and the failing event becomes
+    `checkpoint + 1`, which an operator can `skip`. Storage, Directory and
+    notifier outages are not event-specific and keep retrying the batch.
+  - `application` recipients on a tenant event are rejected
+    `invalid_recipient` (tenant safety, above).
+  - The `application.command` handler maps `idempotency_mismatch` (a
+    conflict) to permanent: the job's own key names another command, so
+    retrying cannot succeed.
+  - `GET reactors` counts rejections up to 10,000 (`REJECTIONS_COUNTED`);
+    the lag sampler and the status document no longer count them.
+  - `reactor_skips.first_position` records the start of the skipped range
+    (a skip to the head covers `checkpoint + 1` to the head).
+  - The forced-rollback hook `RunHooks::reactor_fail` is compiled only with
+    `test-support` and fails `cancelled`, so no test-only code reaches the
+    error registry.
+  - `TaskCompleted` carries the task's `owner` (schema version 2 when set,
+    as `TaskCreated`), so `task-notifier` notifies the owner as §C.3 says,
+    also when an admin completed the task. This replaces the earlier
+    "notify the completer" deviation.
+  - Follow-ups, not changed: the capture notifier logs
+    `notification.captured` inside the checkpoint transaction, before it
+    commits; the batch's `is_member` calls run one after another.
 - Not in this slice (NT-N8's other parts): the identity topics, content
   subscriptions, `max_per_target_per_hour`, the `webhook_disabled` alert,
   the operations guide and the end-to-end example application.
