@@ -2,8 +2,9 @@
 //! published entries under `/v1/content/{type}`, and under
 //! `/v1/content/o/{organization}/{type}` for organization types, read by
 //! each type's declared `access`; preview of drafts with `stage=draft` and
-//! `content.preview`; `fields`, `populate`, by-slug lookups; weak ETags
-//! from the scope generations with 304 answered from `generations` alone;
+//! `content.preview`; `fields`, `populate`, by-slug lookups; asset
+//! metadata in place of every asset reference (issue #46,
+//! [`crate::populate`]); weak ETags from the scope generations with 304 answered from `generations` alone;
 //! cache headers that keep private responses out of shared caches; and
 //! the model endpoints, `GET /v1/content/model` (types restricted to those
 //! the caller reads) and `GET /v1/content/manage/model`
@@ -15,8 +16,8 @@ use crate::{
     json::{optional, string},
     model::{Access, ContentModel, ContentType, Kind, Scope},
     populate::{
-        Doc, Expanded, Paths, Population, RESPONSE_TOO_LARGE, Read, parse_paths, reachable_types,
-        referenced_types,
+        AssetExpansion, Doc, Expanded, Paths, Population, RESPONSE_TOO_LARGE, Read, holds_assets,
+        parse_paths, reachable_types, referenced_types,
     },
     publish::{chain, locale_chain},
     query::{self, Built, Params, Source, Split, detail, encode_cursor, hex16, type_literal},
@@ -257,14 +258,21 @@ fn access_class(principal: bool, readable: &BTreeMap<String, String>) -> String 
 /// The scopes whose generations a published read of `content_type` in
 /// `scope` depends on: its own, and on an organization's path the
 /// application scope too whenever the type can reference entries, since
-/// populated entries and the `missing` checks read application rows.
+/// populated entries and the `missing` checks read application rows, or
+/// assets, since the expanded metadata of an application asset changes
+/// with the application's generation (issue #46).
 pub(crate) fn tag_scopes(
     model: &ContentModel,
     content_type: &ContentType,
     scope: &str,
 ) -> Vec<String> {
     let mut scopes = vec![scope.to_owned()];
-    if scope != "app" && !referenced_types(model, content_type).is_empty() {
+    let reads_app = !referenced_types(model, content_type).is_empty()
+        || content_type
+            .fields
+            .iter()
+            .any(|f| holds_assets(model, &f.kind, 0));
+    if scope != "app" && reads_app {
         scopes.push("app".to_owned());
     }
     scopes
@@ -365,6 +373,13 @@ impl Delivery {
             preview(policy, principal, &content_type, org.as_ref())?;
         }
         let limits = self.store.state().settings().limits;
+        let base_url = self
+            .store
+            .state()
+            .settings()
+            .delivery
+            .public_base_url
+            .clone();
         let listing = address == Address::Type && content_type.kind == Kind::Collection;
         const EXTRA: [&str; 4] = ["locale", "fallback", "populate", "stage"];
         let (mut split, single) = if listing {
@@ -398,12 +413,16 @@ impl Delivery {
             max_entries: limits.max_populated_entries as usize,
             max_bytes: limits.max_response_bytes,
             mark_all: true,
+            assets: Some(AssetExpansion {
+                base: base_url.clone(),
+                selection: plan.fields.clone(),
+            }),
         };
         // The ETag of a published read, without its generations.
         let mut sorted = pairs.clone();
         sorted.sort();
         let class = access_class(principal.is_some(), &readable);
-        let canonical = format!(
+        let mut canonical = format!(
             "{}\n{}\n{scope}\n{}\n{}\n{class}",
             content_type.name,
             content_type.kind.as_str(),
@@ -414,6 +433,12 @@ impl Delivery {
                 .collect::<Vec<_>>()
                 .join("\u{1e}"),
         );
+        // Asset URLs are absolute under `delivery.public_base_url`, so a
+        // new base is a new body (issue #46); unset, tags stay as before.
+        if let Some(base) = &base_url {
+            canonical.push('\n');
+            canonical.push_str(base);
+        }
         // An organization response that populates application entries
         // depends on both generations.
         let generations = tag_scopes(&model, &content_type, &scope);
@@ -1117,6 +1142,7 @@ pub(crate) async fn populate_draft(
         max_entries: limits.max_populated_entries as usize,
         max_bytes: limits.max_response_bytes,
         mark_all: false,
+        assets: None,
     };
     let root = Doc {
         id: view.id.clone(),

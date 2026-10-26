@@ -423,6 +423,23 @@ pub async fn start_metered(
     start_with_options(dir, test, Arc::new(FixturePolicy), options, false).await
 }
 
+/// [`start_metered`] with organization types accepted, as beside
+/// identity (C9).
+pub async fn start_metered_organizations(
+    test: &TestDatabase,
+    settings: &str,
+    model: &str,
+    harness: &merezha_telemetry::testing::Harness,
+) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    project(dir.path(), true, settings, model);
+    let options = HostOptions {
+        meters: harness.telemetry().meters(),
+        ..HostOptions::default()
+    };
+    start_with_options(dir, test, Arc::new(FixturePolicy), options, true).await
+}
+
 async fn start_with_options(
     dir: tempfile::TempDir,
     test: &TestDatabase,

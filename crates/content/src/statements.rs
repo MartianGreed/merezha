@@ -267,6 +267,30 @@ pub const VISIBLE_DRAFT: Statement = Statement::new(
     ),
 );
 
+/// The asset metadata of a delivery response (issue #46), one batch of
+/// `(entry, locale, asset)` triples (`$1`, `$2`, `$3`, the same length):
+/// each live asset the refs of that entry's variant in that locale record
+/// in stage `$4` (`published`, or `draft` for preview), recorded in one of
+/// the scopes `$5` (the path's and the application's) and of that ref's
+/// scope or the application's, with the triple and the ref's scope. Only
+/// what the asset route would serve to a reader of the entry: a ref of
+/// its own variant and stage, never a trashed asset, never another
+/// organization's, never an organization's from an application entry.
+pub const DELIVERY_ASSETS: Statement = Statement::new(
+    "content.delivery.assets",
+    "SELECT merezha_content.assets",
+    "SELECT DISTINCT w.entry, w.locale, r.scope, a.id::text, a.scope, a.filename, \
+            a.content_type, a.size, a.width, a.height \
+       FROM unnest($1::text[], $2::text[], $3::text[]) AS w (entry, locale, asset) \
+       JOIN merezha_content.refs r \
+         ON r.from_entry = w.entry::uuid AND r.from_locale = w.locale AND r.stage = $4 \
+        AND r.target_kind = 'asset' AND r.target_id = w.asset::uuid \
+       JOIN merezha_content.assets a ON a.id = r.target_id \
+      WHERE r.scope = ANY($5::text[]) \
+        AND (a.scope = r.scope OR a.scope = 'app') \
+        AND a.deleted_at IS NULL",
+);
+
 /// `EXPLAIN (COSTS OFF)` of a delivery list, for index tests and
 /// operators (`ContentState::explain_delivery`).
 pub const EXPLAIN_LIST: Statement = Statement::new(
@@ -978,6 +1002,7 @@ pub const STATEMENTS: &[Statement] = &[
     POPULATE_DRAFT,
     VISIBLE_PUBLISHED,
     VISIBLE_DRAFT,
+    DELIVERY_ASSETS,
     EXPLAIN_LIST,
     MODELS_EXIST,
     MODEL_ACTIVE,

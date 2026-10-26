@@ -124,7 +124,9 @@ pub use parse::{
     CONTENT_PERMISSIONS, MAX_DESCRIPTION, MAX_MODEL_BYTES, MAX_PATTERN_BYTES, ModelOptions,
     PATTERN_SIZE_LIMIT, PermissionCatalog,
 };
-pub use populate::{IDS_PER_STATEMENT, POPULATE_LIMIT, RESPONSE_TOO_LARGE};
+pub use populate::{
+    ASSET_LIMIT, IDS_PER_STATEMENT, MAX_ASSET_REFERENCES, POPULATE_LIMIT, RESPONSE_TOO_LARGE,
+};
 pub use publish::{Expect, Item, PUBLISHED, UNPUBLISHED};
 pub use query::{MAX_CURSOR_BYTES, MAX_FILTER_VALUES, MAX_QUERY_BYTES};
 pub use rebuild::{PendingRebuild, REBUILD_BATCH, REBUILD_JOB, pending_rebuild};
@@ -132,7 +134,8 @@ pub use rich_text::{MAX_HREF_BYTES, MAX_MARK_DEFS, MAX_SPAN_MARKS, MAX_SPANS};
 pub use schema::{MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4, MIGRATIONS};
 pub use settings::{
     ContentSettings, DEFAULT_CACHE_CONTROL_PRIVATE, DEFAULT_CACHE_CONTROL_PUBLIC,
-    DEFAULT_PURGE_CRON, DEFAULT_TRASH_RETENTION, Delivery, Limits, MAX_CACHE_CONTROL, Trash,
+    DEFAULT_PURGE_CRON, DEFAULT_TRASH_RETENTION, Delivery, Limits, MAX_CACHE_CONTROL,
+    MAX_PUBLIC_BASE_URL, Trash, public_base_url,
 };
 pub use slug::slugify;
 pub use statements::{DIFF_READ_ONLY, STATEMENTS};
@@ -187,6 +190,7 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("entry_referenced", 409),
     ErrorCode::new("default_variant_required", 409),
     ErrorCode::new("populate_limit", 400),
+    ErrorCode::new("asset_limit", 400),
     ErrorCode::new("response_too_large", 400),
     ErrorCode::new(ORGANIZATION_NOT_FOUND, 404),
 ];

@@ -143,6 +143,14 @@ impl Routes {
 }
 
 impl Routes {
+    /// `[modules.content.delivery]`, for absolute URLs.
+    fn delivery(&self) -> &crate::settings::Delivery {
+        &self.assets.state().settings().delivery
+    }
+    /// `delivery.public_base_url`, when set.
+    fn base(&self) -> Option<&str> {
+        self.delivery().public_base_url.as_deref()
+    }
     /// [`Routes::authorize`], then `organization_not_found` (404) on a
     /// deleted organization's path (issue #56).
     async fn authorized(
@@ -200,10 +208,16 @@ fn valid_title(title: &str) -> bool {
     title.chars().count() <= MAX_TITLE_CHARS && !title.chars().any(char::is_control)
 }
 
-fn asset_response(status: StatusCode, asset: &AssetView, usage: Option<super::Usage>) -> Response {
-    let mut response = json(status, asset.json(usage));
+fn asset_response(
+    status: StatusCode,
+    asset: &AssetView,
+    usage: Option<super::Usage>,
+    delivery: &crate::settings::Delivery,
+) -> Response {
+    let base = delivery.public_base_url.as_deref();
+    let mut response = json(status, asset.json(base, usage));
     if status == StatusCode::CREATED
-        && let Ok(location) = HeaderValue::from_str(&asset.manage_url())
+        && let Ok(location) = HeaderValue::from_str(&delivery.url(&asset.manage_url()))
     {
         response.headers_mut().insert(header::LOCATION, location);
     }
@@ -270,7 +284,12 @@ async fn upload(
                 &actor(&parts),
             )
             .await?;
-        Ok(asset_response(StatusCode::CREATED, &asset, None))
+        Ok(asset_response(
+            StatusCode::CREATED,
+            &asset,
+            None,
+            routes.delivery(),
+        ))
     };
     respond(run.await)
 }
@@ -345,7 +364,8 @@ async fn list(
         } else {
             None
         };
-        let items = items.iter().map(|a| a.json(None)).collect();
+        let base = routes.base();
+        let items = items.iter().map(|a| a.json(base, None)).collect();
         Ok(json(StatusCode::OK, page_json(items, next, limit)))
     };
     respond(run.await)
@@ -362,7 +382,12 @@ async fn read(
         parameters(parts.uri.query(), &[])?;
         let id = asset_id(params.get("id").map(String::as_str).unwrap_or(""))?;
         let (asset, usage) = routes.assets.get(&target.scope, &id).await?;
-        Ok(asset_response(StatusCode::OK, &asset, Some(usage)))
+        Ok(asset_response(
+            StatusCode::OK,
+            &asset,
+            Some(usage),
+            routes.delivery(),
+        ))
     };
     respond(run.await)
 }
@@ -424,7 +449,12 @@ async fn patch(
             .assets
             .patch(&target, &id, title, focal, &actor(&parts))
             .await?;
-        Ok(asset_response(StatusCode::OK, &asset, None))
+        Ok(asset_response(
+            StatusCode::OK,
+            &asset,
+            None,
+            routes.delivery(),
+        ))
     };
     respond(run.await)
 }
@@ -477,7 +507,12 @@ async fn undelete(
         parameters(parts.uri.query(), &[])?;
         let id = asset_id(params.get("id").map(String::as_str).unwrap_or(""))?;
         let asset = routes.assets.undelete(&target.scope, &id).await?;
-        Ok(asset_response(StatusCode::OK, &asset, None))
+        Ok(asset_response(
+            StatusCode::OK,
+            &asset,
+            None,
+            routes.delivery(),
+        ))
     };
     respond(run.await)
 }

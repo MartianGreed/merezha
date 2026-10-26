@@ -405,7 +405,7 @@ fn population_limits_and_delivery_cache_headers_are_validated_with_every_problem
         "[modules.content]\n\
          limits = { max_populate_depth = 4, max_populated_entries = 0, max_response_bytes = 1024 }\n\
          delivery = { cache_control_public = \"public\\nx\", cache_control_private = 3, \
-                      public_base_url = \"https://example.com\" }\n",
+                      public_base_url = \"https://user@example.com\" }\n",
         &[("content.toml", V1)],
     );
     let mut issues = configure_issues(dir.path()).unwrap_err();
@@ -425,8 +425,8 @@ fn population_limits_and_delivery_cache_headers_are_validated_with_every_problem
                 "modules.content.delivery.cache_control_public",
                 "invalid_value"
             ),
-            // Asset URLs arrive with C7.
-            ("modules.content.delivery.public_base_url", "unknown_key"),
+            // Issue #46: no userinfo.
+            ("modules.content.delivery.public_base_url", "invalid_url"),
             ("modules.content.limits.max_populate_depth", "out_of_range"),
             (
                 "modules.content.limits.max_populated_entries",
@@ -476,6 +476,145 @@ fn population_limits_and_delivery_cache_headers_are_validated_with_every_problem
     assert_eq!(defaults.delivery.cache_control_private, "private, no-cache");
 }
 
+/// `[modules.content]` with `delivery.public_base_url = <value>` (a TOML
+/// value), configured on a host whose listener is private loopback or
+/// not: the base kept, or the problem.
+fn base_url_on(value: &str, private_loopback: bool) -> Result<Option<String>, String> {
+    let dir = tempfile::tempdir().unwrap();
+    project(
+        dir.path(),
+        false,
+        &format!("[modules.content]\ndelivery = {{ public_base_url = {value} }}\n"),
+        &[("content.toml", V1)],
+    );
+    let module = ContentModule::new().with_private_loopback(private_loopback);
+    let handle = module.handle();
+    match configure(
+        &input(dir.path(), "postgres://localhost/x"),
+        vec![Box::new(module)],
+    ) {
+        Ok(_) => Ok(handle
+            .state()
+            .unwrap()
+            .settings()
+            .delivery
+            .public_base_url
+            .clone()),
+        Err(errors) => {
+            assert_eq!(errors.0.len(), 1, "{:?}", errors.0);
+            assert_eq!(errors.0[0].key, "modules.content.delivery.public_base_url");
+            Err(errors.0[0].code.to_owned())
+        }
+    }
+}
+
+#[test]
+fn public_base_url_is_an_absolute_https_url_and_http_only_on_a_private_loopback_listener() {
+    // Accepted and normalized: no trailing slash, a path kept.
+    for (value, expected) in [
+        ("\"https://cms.example.com\"", "https://cms.example.com"),
+        ("\"https://cms.example.com/\"", "https://cms.example.com"),
+        (
+            "\"https://CMS.example.com:8443/site/\"",
+            "https://cms.example.com:8443/site",
+        ),
+        ("\"https://[2001:db8::1]\"", "https://[2001:db8::1]"),
+        ("\"https://203.0.113.7:65535\"", "https://203.0.113.7:65535"),
+        (
+            "\"https://xn--bcher-kva.example\"",
+            "https://xn--bcher-kva.example",
+        ),
+        (
+            "\"https://cms-1.example.com:1\"",
+            "https://cms-1.example.com:1",
+        ),
+    ] {
+        for private in [false, true] {
+            assert_eq!(
+                base_url_on(value, private),
+                Ok(Some(expected.to_owned())),
+                "{value}"
+            );
+        }
+    }
+    // Plain HTTP: to a loopback host on a private loopback listener only.
+    for value in [
+        "\"http://localhost:8080\"",
+        "\"http://127.0.0.1:8080\"",
+        "\"http://[::1]:8080\"",
+    ] {
+        assert_eq!(
+            base_url_on(value, false),
+            Err("insecure_origin".to_owned()),
+            "{value}"
+        );
+        assert!(
+            matches!(base_url_on(value, true), Ok(Some(url)) if url.starts_with("http://")),
+            "{value}"
+        );
+    }
+    assert_eq!(
+        base_url_on("\"http://cms.example.com\"", true),
+        Err("insecure_origin".to_owned())
+    );
+    // Not an absolute HTTP(S) URL with a host, or with userinfo, a query
+    // or a fragment.
+    for value in [
+        "\"/v1/content\"",
+        "\"cms.example.com\"",
+        "\"\"",
+        "\"ftp://cms.example.com\"",
+        "\"https://user:secret@cms.example.com\"",
+        "\"https://user@cms.example.com\"",
+        "\"https://cms.example.com/?a=1\"",
+        "\"https://cms.example.com/#top\"",
+        "\"https://\"",
+        "\"data:text/plain,x\"",
+        // A password without a user name.
+        "\"https://:secret@cms.example.com\"",
+        // Not a DNS name: a wildcard, an underscore, empty labels, a
+        // label edged with a hyphen or longer than 63 bytes.
+        "\"https://*.example.com\"",
+        "\"https://exa_mple.com\"",
+        "\"https://.\"",
+        "\"https://cms..example.com\"",
+        "\"https://cms.example.com.\"",
+        "\"https://-cms.example.com\"",
+        "\"https://cms-.example.com\"",
+        format!("\"https://{}.example.com\"", "a".repeat(64)).as_str(),
+        // Port 0.
+        "\"https://cms.example.com:0\"",
+        // Whitespace around or inside, never trimmed; control characters.
+        "\" https://cms.example.com\"",
+        "\"https://cms.example.com \"",
+        "\"https://cms.example.com/\\tsite\"",
+        "\"https://cms.example.com/\\nsite\"",
+        "\"https://cms.exa mple.com\"",
+        // A backslash, which parsers read as a slash: the host would be
+        // `evil.com` and the rest its path.
+        "'https://evil.com\\@cms.example.com'",
+        "'https://cms.example.com\\site'",
+        // Non-ASCII: give an international name as punycode.
+        "\"https://bücher.example\"",
+    ] {
+        assert_eq!(
+            base_url_on(value, true),
+            Err("invalid_url".to_owned()),
+            "{value}"
+        );
+    }
+    let long = format!("\"https://cms.example.com/{}\"", "a".repeat(2048));
+    assert_eq!(base_url_on(&long, true), Err("invalid_url".to_owned()));
+    assert_eq!(base_url_on("3", true), Err("expected_string".to_owned()));
+    // Unset: relative URLs.
+    assert_eq!(
+        merezha_content::ContentSettings::default()
+            .delivery
+            .public_base_url,
+        None
+    );
+}
+
 #[test]
 fn content_errors_register_with_the_kernel_codes() {
     let mut registry = ErrorRegistry::kernel();
@@ -498,6 +637,7 @@ fn content_errors_register_with_the_kernel_codes() {
         ("index_build_failed", 422),
         ("validation_failed", 422),
         ("populate_limit", 400),
+        ("asset_limit", 400),
         ("response_too_large", 400),
         ("content_type_not_found", 404),
         ("organization_not_found", 404),

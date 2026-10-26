@@ -2,8 +2,9 @@
 //! `limits.*` for request, entry, page, filter, sort, batch and query
 //! bounds, `revisions.retain`, and the trash's `retention` and
 //! `purge_cron` (C4), population bounds and delivery cache headers
-//! (C5), and `media` (C7, [`crate::media::MediaSettings`]). Keys of later
-//! slices stay `unknown_key` until the slice that gives them behaviour.
+//! (C5), `media` (C7, [`crate::media::MediaSettings`]) and
+//! `delivery.public_base_url` (issue #46). Keys of later slices stay
+//! `unknown_key` until the slice that gives them behaviour.
 use merezha_platform::{
     ModuleSection,
     config::{ConfigIssue, parse_duration},
@@ -88,22 +89,103 @@ pub const DEFAULT_CACHE_CONTROL_PRIVATE: &str = "private, no-cache";
 /// Longest accepted `delivery.cache_control_*` value, in bytes.
 pub const MAX_CACHE_CONTROL: usize = 256;
 
+/// Longest accepted `delivery.public_base_url`, in bytes.
+pub const MAX_PUBLIC_BASE_URL: usize = 2048;
+
 /// `[modules.content.delivery]`: the `Cache-Control` values of published
-/// delivery responses (section 5, caching).
+/// delivery responses (section 5, caching) and the base of absolute URLs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Delivery {
     /// For `access = "public"` types read without a principal.
     pub cache_control_public: String,
     /// For every other published response.
     pub cache_control_private: String,
+    /// `delivery.public_base_url` without its trailing slash: asset URLs
+    /// and `Location` headers are absolute under it; paths without it.
+    pub public_base_url: Option<String>,
 }
 impl Default for Delivery {
     fn default() -> Self {
         Self {
             cache_control_public: DEFAULT_CACHE_CONTROL_PUBLIC.to_owned(),
             cache_control_private: DEFAULT_CACHE_CONTROL_PRIVATE.to_owned(),
+            public_base_url: None,
         }
     }
+}
+impl Delivery {
+    /// `path` (absolute, starting with `/`) under `public_base_url`, or
+    /// `path` itself when the key is unset.
+    pub fn url(&self, path: &str) -> String {
+        match &self.public_base_url {
+            Some(base) => format!("{base}{path}"),
+            None => path.to_owned(),
+        }
+    }
+}
+
+/// `delivery.public_base_url`: an absolute `https` URL, or `http` to a
+/// loopback host (`localhost`, `127.0.0.0/8`, `::1`) when the listener is
+/// private loopback (`http.public = false`, no `http.trusted_proxies`,
+/// a loopback `http.listen`). The text is visible ASCII only (no
+/// whitespace, around it or inside, and no backslash, which URL parsers
+/// read as `/`); the host is an IP address or a DNS name of letters,
+/// digits and inner hyphens (punycode for an international name, no
+/// `*`, `_` or empty label); a port is 1 to 65535; no userinfo, query or
+/// fragment; at most [`MAX_PUBLIC_BASE_URL`] bytes. A path is kept, so a
+/// host mounted under a prefix gets it. Returned normalized, without a
+/// trailing slash. Fails `invalid_url`, or `insecure_origin` for `http`
+/// elsewhere.
+pub fn public_base_url(text: &str, private_loopback: bool) -> Result<String, &'static str> {
+    if text.is_empty()
+        || text.len() > MAX_PUBLIC_BASE_URL
+        || !text.bytes().all(|b| b.is_ascii_graphic() && b != b'\\')
+    {
+        return Err("invalid_url");
+    }
+    let url = url::Url::parse(text).map_err(|_| "invalid_url")?;
+    let Some(host) = url.host() else {
+        return Err("invalid_url");
+    };
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.port() == Some(0)
+    {
+        return Err("invalid_url");
+    }
+    let loopback = match host {
+        url::Host::Domain(domain) if !dns_name(domain) => return Err("invalid_url"),
+        url::Host::Domain(domain) => domain == "localhost",
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback && private_loopback => {}
+        "http" => return Err("insecure_origin"),
+        _ => return Err("invalid_url"),
+    }
+    let normalized = url.as_str().trim_end_matches('/');
+    if normalized.len() > MAX_PUBLIC_BASE_URL {
+        return Err("invalid_url");
+    }
+    Ok(normalized.to_owned())
+}
+
+/// A DNS host name: at most 253 bytes of labels of 1 to 63 letters,
+/// digits and hyphens, none starting or ending with a hyphen.
+fn dns_name(name: &str) -> bool {
+    name.len() <= 253
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
 }
 
 /// The settings of the content block.
@@ -132,7 +214,11 @@ impl Default for ContentSettings {
 /// The top-level keys `[modules.content]` accepts.
 pub(crate) const KEYS: [&str; 6] = ["model", "limits", "revisions", "trash", "delivery", "media"];
 const TRASH_KEYS: [&str; 2] = ["retention", "purge_cron"];
-const DELIVERY_KEYS: [&str; 2] = ["cache_control_public", "cache_control_private"];
+const DELIVERY_KEYS: [&str; 3] = [
+    "cache_control_public",
+    "cache_control_private",
+    "public_base_url",
+];
 const LIMIT_KEYS: [&str; 11] = [
     "max_request_bytes",
     "max_entry_bytes",
@@ -149,9 +235,19 @@ const LIMIT_KEYS: [&str; 11] = [
 const REVISION_KEYS: [&str; 1] = ["retain"];
 
 impl ContentSettings {
-    /// Read `limits` and `revisions` from the section, reporting every
-    /// problem at once.
+    /// Read the section for a host whose listener is not private loopback
+    /// ([`ContentSettings::parse_on`] with `false`).
     pub fn parse(section: &ModuleSection) -> Result<Self, Vec<ConfigIssue>> {
+        Self::parse_on(section, false)
+    }
+
+    /// Read the section, reporting every problem at once.
+    /// `private_loopback` says whether the host's listener is private
+    /// loopback, the only place `delivery.public_base_url` may be `http`.
+    pub fn parse_on(
+        section: &ModuleSection,
+        private_loopback: bool,
+    ) -> Result<Self, Vec<ConfigIssue>> {
         let mut issues = Vec::new();
         let mut settings = Self::default();
         let defaults = Limits::default();
@@ -265,7 +361,19 @@ impl ContentSettings {
         }
         if let Some(table) = subtable(section, "delivery", &DELIVERY_KEYS, &mut issues) {
             let origin = section.origin("delivery");
-            for key in DELIVERY_KEYS {
+            if let Some(value) = table.get("public_base_url") {
+                let dotted = format!("{}.public_base_url", section.key("delivery"));
+                match value.as_str() {
+                    Some(text) => match public_base_url(text, private_loopback) {
+                        Ok(url) => settings.delivery.public_base_url = Some(url),
+                        Err(code) => issues.push(ConfigIssue::new(dotted, code, origin.clone())),
+                    },
+                    None => {
+                        issues.push(ConfigIssue::new(dotted, "expected_string", origin.clone()))
+                    }
+                }
+            }
+            for key in ["cache_control_public", "cache_control_private"] {
                 let Some(value) = table.get(key) else {
                     continue;
                 };
