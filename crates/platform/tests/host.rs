@@ -401,6 +401,45 @@ async fn cors_answers_preflight_for_allowed_origins_only() {
     assert!(!headers.contains_key("access-control-allow-origin"));
 }
 
+/// A cross-origin fetch client resuming an event stream sends
+/// `Last-Event-ID` with its bearer token: the preflight allows both.
+#[tokio::test]
+async fn cors_preflight_allows_last_event_id_for_resuming_streams() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let config = config(
+        &test,
+        true,
+        "[http.cors]\nallowed_origins = [\"https://app.example\"]\n",
+    );
+    let host = Host::start(config, vec![Box::new(Notes::default())], parts())
+        .await
+        .unwrap();
+    let router = host.router();
+    let request = Request::options("/v1/notes/count")
+        .header("origin", "https://app.example")
+        .header("access-control-request-method", "GET")
+        .header(
+            "access-control-request-headers",
+            "authorization,last-event-id",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let (_, _, headers) = call(&router, request).await;
+    assert_eq!(
+        headers["access-control-allow-origin"],
+        "https://app.example"
+    );
+    let allowed = headers["access-control-allow-headers"]
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    let allowed: Vec<&str> = allowed.split(',').map(str::trim).collect();
+    assert!(allowed.contains(&"authorization"), "{allowed:?}");
+    assert!(allowed.contains(&"last-event-id"), "{allowed:?}");
+}
+
 #[tokio::test]
 async fn verify_mode_refuses_readiness_until_migrations_are_current() {
     let Some(test) = TestDatabase::create() else {

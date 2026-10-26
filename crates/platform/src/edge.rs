@@ -47,6 +47,9 @@ pub const CSRF_TOKEN: HeaderName = HeaderName::from_static("x-csrf-token");
 /// The header that selects the active organization for one request
 /// (identity section 4).
 pub const ORGANIZATION: HeaderName = HeaderName::from_static("merezha-organization");
+/// The resume point of an event stream; CORS allows it so a cross-origin
+/// fetch-based client can resume the inbox stream.
+pub const LAST_EVENT_ID: HeaderName = HeaderName::from_static("last-event-id");
 const FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 const FORWARDED_HOST: HeaderName = HeaderName::from_static("x-forwarded-host");
@@ -488,6 +491,7 @@ fn cors(config: &CorsConfig) -> Option<tower_http::cors::CorsLayer> {
                 TRACESTATE,
                 CSRF_TOKEN,
                 ORGANIZATION,
+                LAST_EVENT_ID,
             ])
             .expose_headers([REQUEST_ID])
             .allow_credentials(config.allow_credentials)
