@@ -109,6 +109,16 @@ impl SecretBox {
     pub fn key_id(&self) -> KeyId {
         self.current.id
     }
+    /// The ids of the current and the previous key (8 zero bytes without
+    /// one): what an unreadable row was tried with.
+    pub fn key_pair(&self) -> [u8; 16] {
+        let mut pair = [0u8; 16];
+        pair[..8].copy_from_slice(&self.current.id);
+        if let Some(previous) = &self.previous {
+            pair[8..].copy_from_slice(&previous.id);
+        }
+        pair
+    }
     /// Whether a previous key is configured, so rows may still be sealed
     /// under it.
     pub fn has_previous(&self) -> bool {

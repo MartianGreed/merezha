@@ -229,7 +229,8 @@ pub const ENDPOINT_ROTATE: Statement = s(
        previous_secret_nonce = CASE WHEN $4::boolean THEN secret_nonce END, \
        previous_expires_at = CASE WHEN $4::boolean THEN $5::timestamptz END, \
        previous_key_id = CASE WHEN $4::boolean THEN key_id END, \
-       secret_ct = $2, secret_nonce = $3, key_id = $7, updated_at = $6, \
+       secret_ct = $2, secret_nonce = $3, key_id = $7, unreadable_under = NULL, \
+       updated_at = $6, \
        revision = revision + 1 WHERE id = $1 RETURNING revision",
 );
 pub const ENDPOINT_ENABLE: Statement = s(
@@ -343,25 +344,37 @@ pub const PREVIOUS_EXPIRE: Statement = s(
     "notify.webhook.previous_expire",
     "UPDATE merezha_notify.webhook_endpoints",
     "UPDATE merezha_notify.webhook_endpoints SET previous_secret_ct = NULL, \
-     previous_secret_nonce = NULL, previous_expires_at = NULL WHERE id IN \
+     previous_secret_nonce = NULL, previous_key_id = NULL, previous_expires_at = NULL WHERE id IN \
      (SELECT id FROM merezha_notify.webhook_endpoints WHERE previous_expires_at <= $1 LIMIT $2)",
 );
 /// After id `$1`, the endpoints with a secret sealed under another key
-/// than `$2`, at most `$3`.
+/// than `$2`, at most `$3`, except those found unreadable under the key
+/// pair `$4`.
 pub const STALE_SECRETS: Statement = s(
     "notify.webhook.stale_secrets",
     "SELECT merezha_notify.webhook_endpoints",
     "SELECT id, secret_ct, secret_nonce, key_id, previous_secret_ct, previous_secret_nonce, \
      previous_key_id FROM merezha_notify.webhook_endpoints \
-     WHERE id > $1 AND (key_id <> $2 OR previous_key_id <> $2) ORDER BY id LIMIT $3",
+     WHERE id > $1 AND (key_id <> $2 OR previous_key_id <> $2) \
+     AND unreadable_under IS DISTINCT FROM $4 ORDER BY id LIMIT $3",
 );
 /// How many endpoints still hold a secret sealed under another key than
-/// `$1`.
-pub const STALE_COUNT: Statement = s(
-    "notify.webhook.stale_count",
+/// `$1` (readable ones), and how many were found unreadable under it.
+pub const SECRET_COUNTS: Statement = s(
+    "notify.webhook.secret_counts",
     "SELECT merezha_notify.webhook_endpoints",
-    "SELECT count(*) FROM merezha_notify.webhook_endpoints \
-     WHERE key_id <> $1 OR previous_key_id <> $1",
+    "SELECT count(*) FILTER (WHERE (key_id <> $1 OR previous_key_id <> $1) \
+       AND (unreadable_under IS NULL OR substring(unreadable_under FROM 1 FOR 8) <> $1)), \
+     count(*) FILTER (WHERE substring(unreadable_under FROM 1 FOR 8) = $1) \
+     FROM merezha_notify.webhook_endpoints",
+);
+/// Mark endpoint `$1` unreadable under key pair `$2`, unless its secret
+/// changed since it was read (`$3`).
+pub const MARK_UNREADABLE: Statement = s(
+    "notify.webhook.mark_unreadable",
+    "UPDATE merezha_notify.webhook_endpoints",
+    "UPDATE merezha_notify.webhook_endpoints SET unreadable_under = $2 \
+     WHERE id = $1 AND secret_ct = $3",
 );
 /// Store secrets re-sealed under key `$7`, unless the endpoint's secret
 /// changed since it was read (`$6`).
@@ -370,8 +383,8 @@ pub const SECRETS_RESEAL: Statement = s(
     "UPDATE merezha_notify.webhook_endpoints",
     "UPDATE merezha_notify.webhook_endpoints SET secret_ct = $2, secret_nonce = $3, \
      previous_secret_ct = $4, previous_secret_nonce = $5, key_id = $7::bytea, \
-     previous_key_id = CASE WHEN $4::bytea IS NULL THEN NULL ELSE $7::bytea END \
-     WHERE id = $1 AND secret_ct = $6",
+     previous_key_id = CASE WHEN $4::bytea IS NULL THEN NULL ELSE $7::bytea END, \
+     unreadable_under = NULL WHERE id = $1 AND secret_ct = $6",
 );
 
 /// Every statement of the outgoing webhooks.
@@ -412,7 +425,8 @@ pub const STATEMENTS: &[Statement] = &[
     RETENTION_AUDIT,
     PREVIOUS_EXPIRE,
     STALE_SECRETS,
-    STALE_COUNT,
+    SECRET_COUNTS,
+    MARK_UNREADABLE,
     SECRETS_RESEAL,
     TEST_RATE,
 ];

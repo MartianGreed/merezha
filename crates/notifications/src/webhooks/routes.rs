@@ -1135,6 +1135,7 @@ async fn redeliver(
                     endpoint_id: id,
                     generation,
                     busy: 0,
+                    busy_since: None,
                 };
                 let record = fanout::job_record(&job, &correlation, tenant.as_deref())?;
                 outbox.append(tx, &[record], OnDuplicate::Ignore).await?;

@@ -1751,7 +1751,10 @@ delivery to a new job of the same generation (1 s doubling to 30 s, ±50 %),
 spending no attempt, because AP has no way to reschedule a job without
 counting an attempt; a job whose last attempt would retry settles its
 delivery `failed` with the code, and redeliver also accepts an open
-delivery untouched for an hour.
+delivery untouched for an hour. After the re-review a hand-off chain is bounded (20
+hand-offs or 5 minutes, then a `failed` / `endpoint_busy` attempt on the
+schedule), its keys are deterministic, retention steps run independently,
+and secrets neither key opens are marked and counted apart.
 
 **N8: integrations, operations.** *Scope:* the identity topics of
 R2, which can merge right after N3; the AP subscriptions to content events;

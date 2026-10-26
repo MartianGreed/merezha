@@ -150,6 +150,7 @@ pub(crate) async fn insert_deliveries(
             endpoint_id: row.get(1),
             generation: 0,
             busy: 0,
+            busy_since: None,
         };
         created.push(job.webhook_delivery_id);
         records.push(job_record(&job, correlation, tenant)?);

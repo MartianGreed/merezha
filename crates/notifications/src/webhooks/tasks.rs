@@ -198,33 +198,54 @@ async fn batches(
 pub async fn retention(core: &Arc<Core>, deadline: Instant) -> Result<u64, Failure> {
     let now = core.now();
     let retention = &core.settings.retention;
+    // Each step runs whatever the earlier ones did, so a failing step never
+    // keeps the reseal and its gauges from running; the first failure is
+    // the task's outcome, every one is logged.
+    let mut first_failure = None;
     let mut total = 0;
-    total += batches(
-        core,
-        &sql::RETENTION_BODIES,
-        before(now, retention.webhook_deliveries)?,
-        deadline,
-    )
-    .await?;
-    total += batches(
-        core,
-        &sql::RETENTION_EVENTS,
-        before(now, retention.deliveries)?,
-        deadline,
-    )
-    .await?;
-    total += batches(
-        core,
-        &sql::RETENTION_AUDIT,
-        before(now, AUDIT_RETENTION)?,
-        deadline,
-    )
-    .await?;
-    total += batches(core, &sql::PREVIOUS_EXPIRE, now, deadline).await?;
-    total += reseal(core, deadline, ResealBounds::default())
-        .await?
-        .resealed;
-    Ok(total)
+    let mut step = |name: &'static str, result: Result<u64, Failure>| match result {
+        Ok(rows) => total += rows,
+        Err(failure) => {
+            merezha_telemetry::event!(
+                WARN,
+                "notification.maintenance_step_failed",
+                task = "retention",
+                reason = name,
+                code = failure.code.as_str()
+            );
+            first_failure.get_or_insert(failure);
+        }
+    };
+    let at = |by: Duration| before(now, by);
+    let bodies = match at(retention.webhook_deliveries) {
+        Ok(at) => batches(core, &sql::RETENTION_BODIES, at, deadline).await,
+        Err(failure) => Err(failure),
+    };
+    step("webhook_bodies", bodies);
+    let events = match at(retention.deliveries) {
+        Ok(at) => batches(core, &sql::RETENTION_EVENTS, at, deadline).await,
+        Err(failure) => Err(failure),
+    };
+    step("webhook_events", events);
+    let audit = match at(AUDIT_RETENTION) {
+        Ok(at) => batches(core, &sql::RETENTION_AUDIT, at, deadline).await,
+        Err(failure) => Err(failure),
+    };
+    step("webhook_audit", audit);
+    step(
+        "previous_secrets",
+        batches(core, &sql::PREVIOUS_EXPIRE, now, deadline).await,
+    );
+    step(
+        "reseal",
+        reseal(core, deadline, ResealBounds::default())
+            .await
+            .map(|r| r.resealed),
+    );
+    match first_failure {
+        Some(failure) => Err(failure),
+        None => Ok(total),
+    }
 }
 
 /// How much one [`reseal`] run may do: `batches` pages of `batch` rows.
@@ -249,16 +270,21 @@ pub struct Resealed {
     pub resealed: u64,
     /// Endpoints still holding a secret under another key afterwards: the
     /// value of `merezha.webhook.secrets.previous_key`. `secret_key_previous`
-    /// may be removed once it is 0.
+    /// may be removed once it is 0. Unreadable endpoints are not counted.
     pub remaining: u64,
+    /// Endpoints whose secret neither key opens: the value of
+    /// `merezha.webhook.secrets.unreadable`.
+    pub unreadable: u64,
 }
 
 /// While `secret_key_previous` is set, seal again under `secret_key` the
 /// secrets of the endpoints whose `key_id` or `previous_key_id` names
 /// another key, at most `bounds` per run; each run picks up the rows the
 /// last one left, since resealed rows no longer match. A secret neither
-/// key opens is left as it is (its deliveries fail `secret_unreadable`)
-/// and stays counted. Then counts what remains and records the gauge.
+/// key opens is marked unreadable under the current key pair and skipped
+/// from then on (its deliveries fail `secret_unreadable`; rotating the
+/// endpoint's secret or deleting the endpoint clears it). Then counts what
+/// remains and the unreadable rows, and records both gauges.
 pub async fn reseal(
     core: &Core,
     deadline: Instant,
@@ -269,6 +295,7 @@ pub async fn reseal(
         core.settings.secret_key_previous.as_ref(),
     );
     let current = secrets.key_id().to_vec();
+    let pair = secrets.key_pair().to_vec();
     let mut resealed = 0;
     if secrets.has_previous() {
         let mut after = Uuid::nil();
@@ -279,7 +306,7 @@ pub async fn reseal(
                 .query(
                     &client,
                     &sql::STALE_SECRETS,
-                    &[&after, &current, &bounds.batch],
+                    &[&after, &current, &bounds.batch, &pair],
                 )
                 .await
                 .map_err(|e| classify(&e))?;
@@ -292,6 +319,12 @@ pub async fn reseal(
                 let previous_nonce: Option<Vec<u8>> = row.get(5);
                 let previous_key: Option<Vec<u8>> = row.get(6);
                 let Ok((secret, _)) = secrets.open(id, &ct, &nonce, Some(&key)) else {
+                    // Neither key opens it: skipped by later runs until the
+                    // keys change or the secret is rotated.
+                    core.database
+                        .execute(&client, &sql::MARK_UNREADABLE, &[&id, &pair, &ct])
+                        .await
+                        .map_err(|e| classify(&e))?;
                     continue;
                 };
                 let sealed = secrets.seal(id, &secret, core.random.as_ref())?;
@@ -331,18 +364,21 @@ pub async fn reseal(
             }
         }
     }
-    let remaining: i64 = {
+    let (remaining, unreadable): (i64, i64) = {
         let client = core.database.acquire(deadline).await?;
-        core.database
-            .query_one(&client, &sql::STALE_COUNT, &[&current])
+        let row = core
+            .database
+            .query_one(&client, &sql::SECRET_COUNTS, &[&current])
             .await
-            .map_err(|e| classify(&e))?
-            .get(0)
+            .map_err(|e| classify(&e))?;
+        (row.get(0), row.get(1))
     };
     let remaining = u64::try_from(remaining).unwrap_or(0);
-    core.metrics.webhook_secrets_previous_key(remaining);
+    let unreadable = u64::try_from(unreadable).unwrap_or(0);
+    core.metrics.webhook_secrets(remaining, unreadable);
     Ok(Resealed {
         resealed,
         remaining,
+        unreadable,
     })
 }

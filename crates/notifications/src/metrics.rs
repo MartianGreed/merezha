@@ -44,6 +44,8 @@ struct Instruments {
     /// What the last `retention` run counted; the gauge reads it.
     previous_key_secrets: Arc<AtomicU64>,
     _previous_key_gauge: ObservableGauge<u64>,
+    unreadable_secrets: Arc<AtomicU64>,
+    _unreadable_gauge: ObservableGauge<u64>,
     /// Declared topics; any other is labelled [`UNKNOWN_TOPIC`].
     topics: BTreeSet<String>,
 }
@@ -82,6 +84,13 @@ impl Metrics {
             &metric::WEBHOOK_SECRETS_PREVIOUS_KEY,
             move |observer| observer.observe(read.load(Ordering::Relaxed), &[]),
         );
+        let unreadable_secrets = Arc::new(AtomicU64::new(0));
+        let read = unreadable_secrets.clone();
+        let unreadable_gauge = instruments::u64_gauge(
+            meter,
+            &metric::WEBHOOK_SECRETS_UNREADABLE,
+            move |observer| observer.observe(read.load(Ordering::Relaxed), &[]),
+        );
         Self(Some(Arc::new(Instruments {
             requests: instruments::counter(meter, &metric::NOTIFICATION_REQUESTS),
             deliveries: instruments::counter(meter, &metric::NOTIFICATION_DELIVERIES),
@@ -109,6 +118,8 @@ impl Metrics {
             ),
             previous_key_secrets,
             _previous_key_gauge: previous_key_gauge,
+            unreadable_secrets,
+            _unreadable_gauge: unreadable_gauge,
             topics: topics.into_iter().collect(),
         })))
     }
@@ -262,10 +273,13 @@ impl Metrics {
         }
     }
     /// Endpoints whose secret is still sealed under another key than
-    /// `secret_key`, as `retention` counted them.
-    pub fn webhook_secrets_previous_key(&self, count: u64) {
+    /// `secret_key`, and those neither key opens, as `retention` counted
+    /// them.
+    pub fn webhook_secrets(&self, previous_key: u64, unreadable: u64) {
         if let Some(i) = &self.0 {
-            i.previous_key_secrets.store(count, Ordering::Relaxed);
+            i.previous_key_secrets
+                .store(previous_key, Ordering::Relaxed);
+            i.unreadable_secrets.store(unreadable, Ordering::Relaxed);
         }
     }
     pub fn data_purged(&self, rows: u64) {

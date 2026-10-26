@@ -42,6 +42,12 @@ const RECORD_MARGIN: Duration = Duration::from_secs(2);
 /// doubling per hand-off up to [`BUSY_MAX_DELAY`], with ±50 % jitter.
 pub const BUSY_DELAY: Duration = Duration::from_secs(1);
 pub const BUSY_MAX_DELAY: Duration = Duration::from_secs(30);
+/// A chain of hand-offs ends after this many, or once its first hand-off is
+/// [`BUSY_WINDOW`] old: the busy endpoint then costs the delivery a
+/// `failed` / `endpoint_busy` attempt on the schedule, so its backoff and
+/// final `failed` apply.
+pub const MAX_HANDOFFS: u32 = 20;
+pub const BUSY_WINDOW: Duration = Duration::from_secs(5 * 60);
 /// The code of a delivery whose last job attempt found its endpoint busy.
 pub const ENDPOINT_BUSY: &str = "endpoint_busy";
 /// The actor of the audit rows the block writes itself.
@@ -155,7 +161,7 @@ async fn settle_exhausted(core: &Core, job: &DeliverJob, code: &str) -> Outcome 
 /// delay: its endpoint has no free slot on this instance. No attempt is
 /// recorded and this job ends, so neither the schedule nor the job's
 /// attempts are spent and no queue worker waits.
-async fn reschedule(core: &Core, ctx: &JobContext, job: &DeliverJob) -> Outcome {
+async fn reschedule(core: &Core, ctx: &JobContext, job: &DeliverJob, since: i64) -> Outcome {
     let doublings = job.busy.min(5);
     let base = (BUSY_DELAY * 2u32.pow(doublings)).min(BUSY_MAX_DELAY);
     let mut bytes = [0u8; 8];
@@ -166,16 +172,18 @@ async fn reschedule(core: &Core, ctx: &JobContext, job: &DeliverJob) -> Outcome 
     let delay = base.mul_f64(0.5 + share);
     let next = DeliverJob {
         busy: job.busy.saturating_add(1),
+        busy_since: Some(since),
         ..job.clone()
     };
-    let suffix = u64::from_le_bytes(bytes);
     let at = core
         .now()
         .checked_add(jiff::SignedDuration::try_from(delay).unwrap_or_default())
         .ok();
     let record = super::fanout::job_record(&next, &ctx.correlation_id, None).map(|mut record| {
+        // Deterministic, so a hand-off replayed after a lost completion
+        // dedupes instead of starting a second chain.
         if let Ok(key) = merezha_platform::ports::DedupeKey::new(format!(
-            "webhook:{}:g{}:b{}:{suffix:016x}",
+            "webhook:{}:g{}:b{}",
             job.webhook_delivery_id, job.generation, next.busy
         )) {
             record.dedupe_key = key;
@@ -214,9 +222,15 @@ async fn deliver(core: &Core, ctx: &JobContext, job: &DeliverJob) -> Outcome {
     };
     let deadline = ctx.deadline.into_std();
     // Never wait for a slot: a queue worker stays free for other endpoints.
-    let Some(_permit) = sender.limiter.try_acquire(job.endpoint_id) else {
-        return reschedule(core, ctx, job).await;
-    };
+    let permit = sender.limiter.try_acquire(job.endpoint_id);
+    if permit.is_none() {
+        let now = core.now().as_second();
+        let since = job.busy_since.unwrap_or(now);
+        let window = i64::try_from(BUSY_WINDOW.as_secs()).unwrap_or(i64::MAX);
+        if job.busy < MAX_HANDOFFS && now.saturating_sub(since) < window {
+            return reschedule(core, ctx, job, since).await;
+        }
+    }
     let id = job.webhook_delivery_id;
     let locked = match prepare(core, &sender, deadline, job).await {
         Ok(Prepared::Send(locked)) => locked,
@@ -224,6 +238,15 @@ async fn deliver(core: &Core, ctx: &JobContext, job: &DeliverJob) -> Outcome {
         Err(failure) => return Outcome::retry(&failure.code),
     };
     tracing::Span::current().record("notify.attempt", locked.attempt);
+    if permit.is_none() {
+        // The hand-off budget is spent: the busy endpoint costs an attempt.
+        let busy = Sent {
+            class: Class::Busy,
+            status: None,
+            snippet: None,
+        };
+        return record(core, &sender, ctx, job, &locked, &busy, Duration::ZERO).await;
+    }
     core.faults.hit(faults::AFTER_ATTEMPT_COMMITTED).await;
     let now = core.now();
     let current = sender.secrets.open(
@@ -564,6 +587,7 @@ async fn record(
     let (attempt_outcome, status, code) = (step.attempt, step.status, step.code.clone());
     let next_at = step.next.map(|after| plus(now, after));
     let success = sent.class == Class::Success;
+    let busy = sent.class == Class::Busy;
     let gone = sent.class == Class::Gone;
     let deadline = Instant::now() + Duration::from_secs(10);
     let written = db
@@ -606,14 +630,18 @@ async fn record(
                 )
                 .await
                 .map_err(|e| classify(&e))?;
-                let health = if success {
-                    &sql::ENDPOINT_SUCCEEDED
-                } else {
-                    &sql::ENDPOINT_FAILED
+                // A busy endpoint is this instance's limit, not the
+                // receiver failing: it leaves `failing_since` alone.
+                let health = match (success, busy) {
+                    (true, _) => Some(&sql::ENDPOINT_SUCCEEDED),
+                    (false, false) => Some(&sql::ENDPOINT_FAILED),
+                    (false, true) => None,
                 };
-                db.execute(tx, health, &[&endpoint, &now])
-                    .await
-                    .map_err(|e| classify(&e))?;
+                if let Some(health) = health {
+                    db.execute(tx, health, &[&endpoint, &now])
+                        .await
+                        .map_err(|e| classify(&e))?;
+                }
                 let cancelled = if gone {
                     disable(&db, tx, endpoint, "gone", now, None, SYSTEM_ACTOR).await?
                 } else {
@@ -629,7 +657,9 @@ async fn record(
         Ok(Some(cancelled)) => cancelled,
     };
     let metrics = &sender.metrics;
-    metrics.webhook_attempt(sent.class.as_str());
+    if !busy {
+        metrics.webhook_attempt(sent.class.as_str());
+    }
     if matches!(status, "succeeded" | "failed") {
         metrics.webhook_delivery(status, 1);
     }

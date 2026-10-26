@@ -1481,7 +1481,7 @@ Maintenance, each a cron schedule on queue `notify.maintenance` (UTC):
 | `purge_data` | every 5 minutes | nulls `data` (and the deliveries' recipient names) of notifications settled more than `retention.data_after_settled` ago; counts `merezha.notification.data_purged` |
 | `inbox_expire` | hourly | deletes items past `expires_at` or archived more than `inbox.archived_retention` ago, 100 users per transaction in ascending order, raising each user's `purged_through` |
 | `webhook_auto_disable` | every 5 minutes | with `[modules.notifications.webhooks]`: disables the endpoints failing for `webhooks.auto_disable_after` with at least 10 failed attempts since, and alerts ([Outgoing webhooks](#outgoing-webhooks)) |
-| `retention` | daily (03:29) | the webhook rows so far: nulls event bodies older than `retention.webhook_deliveries`, deletes events older than `retention.deliveries` with no open delivery (their deliveries and attempts with them), deletes audit rows older than 400 days, drops previous secrets whose rotation window closed, and with `secret_key_previous` set seals again under `secret_key` the secrets still under another key (by their key id), then records `merezha.webhook.secrets.previous_key`; 500 rows per batch |
+| `retention` | daily (03:29) | the webhook rows so far: nulls event bodies older than `retention.webhook_deliveries`, deletes events older than `retention.deliveries` with no open delivery (their deliveries and attempts with them), deletes audit rows older than 400 days, drops previous secrets whose rotation window closed, and with `secret_key_previous` set seals again under `secret_key` the secrets still under another key (by their key id), then records `merezha.webhook.secrets.previous_key` and `merezha.webhook.secrets.unreadable`; 500 rows per batch. Each step runs whatever the earlier ones did: a failing step is logged `notification.maintenance_step_failed` (`task`, `reason` = the step, `code`) and becomes the run's outcome after the others ran |
 | `push_expire` | hourly (minute 43) | with `[modules.notifications.push]`: deletes subscriptions past `expires_at`, made with another VAPID key and unused for 7 days, or with 10 consecutive failures and no success in 30 days, 1,000 per batch; counts `merezha.notification.push_subscriptions_removed` (`expired`, `key_changed`, `failures`) |
 
 ### Brevo email
@@ -1975,8 +1975,15 @@ type of the catalog or `prefix.*`; an empty filter matches every type.
   `merezha.webhook.secrets.previous_key` holds how many endpoints still
   have a secret under another key: remove `secret_key_previous` only once
   it is 0 (trigger the `notify.maintenance.retention` schedule through the
-  jobs admin API to run it sooner). Decrypted secrets are wiped from memory
-  when dropped. Secrets never appear in logs, spans, metrics, errors,
+  jobs admin API to run it sooner). A secret neither key opens is marked
+  with the pair of keys it was tried with, skipped by later runs and left
+  out of that gauge; `merezha.webhook.secrets.unreadable` counts these.
+  Its deliveries fail `secret_unreadable`. To recover, configure the key
+  it was sealed under as `secret_key_previous` again (the mark no longer
+  matches the new key pair, so it is retried), or rotate the endpoint's
+  secret (`rotate-secret` with `keep_previous_hours = 0`; the receiver
+  takes the new secret), or delete the endpoint. Decrypted secrets are
+  wiped from memory when dropped. Secrets never appear in logs, spans, metrics, errors,
   `Debug` output or other answers.
 - **Fan-out.** `notify.webhook_event` (queue `notify.expand`) stores the
   event once (`UUIDv5(source, source_event_id)`) with its envelope frozen,
@@ -1999,7 +2006,13 @@ type of the catalog or `prefix.*`; an empty filter matches every type.
   it hands the delivery to a new job of the same generation 1 s later,
   doubling per hand-off up to 30 s (±50 % jitter), records no attempt and
   ends, so neither the schedule nor the job's attempts are spent and one
-  slow receiver cannot hold the queue's workers. The request deadline is
+  slow receiver cannot hold the queue's workers. The hand-off's key is
+  `webhook:{id}:g{generation}:b{n}`, so one replayed after a lost
+  completion starts no second chain. A chain is bounded: after 20
+  hand-offs, or 5 minutes after its first, a still-busy endpoint costs the
+  delivery a `failed` / `endpoint_busy` attempt on the schedule below (it
+  does not set `failing_since`), so the delivery backs off and eventually
+  fails like any other. The request deadline is
   `min(timeout, job deadline - 2 s)`.
 - **Outcomes.** Any 2xx succeeds and clears `failing_since`. The first
   1 KiB of the response body is kept as the attempt's `response_snippet`
@@ -2040,8 +2053,9 @@ type of the catalog or `prefix.*`; an empty filter matches every type.
   the secret or the URL. The block's own disables name `sys_notifications`.
 - **Telemetry.** `merezha.webhook.attempts{notify.class}`,
   `merezha.webhook.deliveries{notify.outcome}`,
-  `merezha.webhook.endpoints_disabled{notify.reason}` and the gauge
-  `merezha.webhook.secrets.previous_key`. The job span carries
+  `merezha.webhook.endpoints_disabled{notify.reason}` and the gauges
+  `merezha.webhook.secrets.previous_key` and
+  `merezha.webhook.secrets.unreadable`. The job span carries
   `notify.webhook_delivery_id`, `notify.endpoint_id` and
   `http.response.status_code`; URLs never reach telemetry.
 - **Accepted risk: an internal DNS oracle.** A principal allowed to manage

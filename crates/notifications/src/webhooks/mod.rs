@@ -127,6 +127,9 @@ pub struct DeliverJob {
     /// the delivery on (0 for the first job of a generation).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub busy: u32,
+    /// Unix seconds of the chain's first hand-off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_since: Option<i64>,
 }
 fn is_zero(n: &u32) -> bool {
     *n == 0
@@ -154,6 +157,10 @@ pub enum Class {
     Timeout,
     Network,
     Blocked,
+    /// No request: the endpoint's slots stayed busy past the hand-off
+    /// budget. Not one of TE's classes: it is not counted as an attempt
+    /// class.
+    Busy,
 }
 impl Class {
     pub fn of_status(status: u16) -> Self {
@@ -175,6 +182,7 @@ impl Class {
             Class::Timeout => "timeout",
             Class::Network => "network",
             Class::Blocked => "blocked",
+            Class::Busy => "busy",
         }
     }
     /// The attempt's `error_code` (none on success).
@@ -188,6 +196,7 @@ impl Class {
             Class::Timeout => Some("timeout"),
             Class::Network => Some("network"),
             Class::Blocked => Some(egress::EGRESS_BLOCKED),
+            Class::Busy => Some("endpoint_busy"),
         }
     }
 }
@@ -289,6 +298,12 @@ impl WebhookSender {
             settings: webhooks.clone(),
             metrics,
         })
+    }
+    /// Take one of `endpoint`'s slots, as a request would (feature
+    /// `testkit`): while held, jobs for the endpoint find it busy.
+    #[cfg(feature = "testkit")]
+    pub fn occupy(&self, endpoint: Uuid) -> Option<OwnedSemaphorePermit> {
+        self.limiter.try_acquire(endpoint)
     }
     /// The registration check of `url` (NT §5.5).
     pub async fn check_url(&self, url: &str) -> Result<url::Url, &'static str> {

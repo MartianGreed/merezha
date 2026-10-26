@@ -1506,7 +1506,6 @@ async fn resealing_resumes_across_runs_and_counts_what_remains() {
         secrets.push(endpoint["secret"].as_str().unwrap().to_owned());
     }
     instance.stop().await;
-    const NEW_KEY: &str = "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=";
     let rotated = section(true, "").replace(
         "secret_key = { env = \"NOTIFY_KEY\" }\n",
         "secret_key = { env = \"NEW_KEY\" }\nsecret_key_previous = { env = \"NOTIFY_KEY\" }\n",
@@ -1566,6 +1565,295 @@ async fn resealing_resumes_across_runs_and_counts_what_remains() {
     verified.sort();
     assert_eq!(verified, (0..7).collect::<Vec<_>>());
     instance.stop().await;
+}
+
+/// A second `secret_key`, for rotation tests.
+const NEW_KEY: &str = "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=";
+
+/// `section(true, "")` with `secret_key` rotated: `NEW_KEY` current, the
+/// harness key previous (or gone with `keep_previous = false`).
+fn rotated_section(keep_previous: bool) -> String {
+    let previous = if keep_previous {
+        "secret_key_previous = { env = \"NOTIFY_KEY\" }\n"
+    } else {
+        ""
+    };
+    section(true, "").replace(
+        "secret_key = { env = \"NOTIFY_KEY\" }\n",
+        &format!("secret_key = {{ env = \"NEW_KEY\" }}\n{previous}"),
+    )
+}
+
+/// The review's reproduction: once a rotation window closed, `retention`
+/// drops the previous secret with its key id and succeeds.
+#[tokio::test]
+async fn retention_drops_a_closed_rotation_window() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let instance = start(&world, &section(true, "")).await;
+    let (_, endpoint) = create(
+        &instance,
+        "ada",
+        "/tenants/org_a",
+        json!({ "url": receiver.url("a") }),
+    )
+    .await;
+    let id = endpoint["id"].as_str().unwrap().to_owned();
+    let (status, _) = instance
+        .call(
+            "POST",
+            &format!("/v1/notifications/tenants/org_a/webhooks/{id}/rotate-secret"),
+            Some("ada"),
+            Some(json!({ "keep_previous_hours": 1 })),
+        )
+        .await;
+    assert_eq!(status, 200);
+    world
+        .execute(
+            "UPDATE merezha_notify.webhook_endpoints \
+             SET previous_expires_at = now() - interval '1 minute'",
+        )
+        .await;
+    maintenance::run(&instance.core(), Task::Retention, soon())
+        .await
+        .unwrap();
+    assert_eq!(
+        world
+            .scalar(
+                "SELECT count(*) FROM merezha_notify.webhook_endpoints WHERE previous_secret_ct IS NULL \
+                 AND previous_secret_nonce IS NULL AND previous_key_id IS NULL \
+                 AND previous_expires_at IS NULL"
+            )
+            .await,
+        1
+    );
+    instance.stop().await;
+}
+
+/// A failing retention step neither stops the later ones nor the reseal
+/// and its gauges; it is logged and is the task's outcome.
+#[tokio::test]
+async fn a_failing_retention_step_still_lets_the_reseal_and_gauges_run() {
+    let harness = merezha_telemetry::testing::Harness::new();
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let instance = start(&world, &section(true, "")).await;
+    create(
+        &instance,
+        "ada",
+        "/tenants/org_a",
+        json!({ "url": receiver.url("a") }),
+    )
+    .await;
+    emit(
+        &instance,
+        "application",
+        Some("org_a"),
+        "tasks.task_completed",
+        "old",
+    )
+    .await;
+    instance.settle().await;
+    instance.stop().await;
+    world
+        .execute(
+            "UPDATE merezha_notify.webhook_events SET created_at = now() - interval '40 days'; \
+             CREATE FUNCTION merezha_notify.refuse() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'refused'; END $$; \
+             CREATE TRIGGER refuse BEFORE UPDATE ON merezha_notify.webhook_events \
+             FOR EACH ROW EXECUTE FUNCTION merezha_notify.refuse()",
+        )
+        .await;
+    let instance = start_with(&world, &rotated_section(true), |o| {
+        o.env.push(("NEW_KEY".into(), NEW_KEY.into()));
+        o.meters = Some(harness.telemetry().meters());
+    })
+    .await;
+    let before = world
+        .text("SELECT encode(key_id, 'hex') FROM merezha_notify.webhook_endpoints")
+        .await;
+    let outcome = maintenance::run(&instance.core(), Task::Retention, soon()).await;
+    assert!(outcome.is_err(), "{outcome:?}");
+    let after = world
+        .text("SELECT encode(key_id, 'hex') FROM merezha_notify.webhook_endpoints")
+        .await;
+    assert_ne!(before, after, "the reseal ran");
+    let gauge = |name: &str| harness.metric(name).value(&[]);
+    assert_eq!(gauge("merezha.webhook.secrets.previous_key"), Some(0.0));
+    assert_eq!(gauge("merezha.webhook.secrets.unreadable"), Some(0.0));
+    let failed: Vec<_> = harness
+        .recorded()
+        .into_iter()
+        .filter(|r| r.name.as_deref() == Some("notification.maintenance_step_failed"))
+        .collect();
+    assert_eq!(failed.len(), 1);
+    harness.assert_catalogued();
+    instance.stop().await;
+}
+
+/// Secrets neither key opens are marked and skipped: with small bounds and
+/// the unreadable rows first in id order, every run still progresses, the
+/// previous-key gauge reaches 0 and the unreadable ones are counted apart.
+#[tokio::test]
+async fn unreadable_secrets_are_set_aside_and_counted_apart() {
+    let harness = merezha_telemetry::testing::Harness::new();
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let instance = start(&world, &section(true, "")).await;
+    for n in 0..5 {
+        create(
+            &instance,
+            "ada",
+            "/tenants/org_a",
+            json!({ "url": receiver.url(&format!("u{n}")) }),
+        )
+        .await;
+    }
+    instance.stop().await;
+    // The three oldest endpoints hold a secret no key opens.
+    world
+        .execute(
+            "UPDATE merezha_notify.webhook_endpoints SET secret_ct = decode(repeat('ab', 48), 'hex') \
+             WHERE id IN (SELECT id FROM merezha_notify.webhook_endpoints ORDER BY id LIMIT 3)",
+        )
+        .await;
+    let instance = start_with(&world, &rotated_section(true), |o| {
+        o.env.push(("NEW_KEY".into(), NEW_KEY.into()));
+        o.meters = Some(harness.telemetry().meters());
+    })
+    .await;
+    let core = instance.core();
+    let bounds = webhooks::tasks::ResealBounds {
+        batch: 2,
+        batches: 1,
+    };
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        let run = webhooks::tasks::reseal(&core, soon(), bounds)
+            .await
+            .unwrap();
+        runs.push((run.resealed, run.remaining, run.unreadable));
+    }
+    assert_eq!(runs, [(0, 3, 2), (1, 1, 3), (1, 0, 3)]);
+    let gauge = |name: &str| harness.metric(name).value(&[]);
+    assert_eq!(gauge("merezha.webhook.secrets.previous_key"), Some(0.0));
+    assert_eq!(gauge("merezha.webhook.secrets.unreadable"), Some(3.0));
+    // Rotating an unreadable endpoint's secret clears its mark.
+    let id = world
+        .text(
+            "SELECT id::text FROM merezha_notify.webhook_endpoints \
+             WHERE unreadable_under IS NOT NULL ORDER BY id LIMIT 1",
+        )
+        .await
+        .remove(0);
+    let (status, _) = instance
+        .call(
+            "POST",
+            &format!("/v1/notifications/tenants/org_a/webhooks/{id}/rotate-secret"),
+            Some("ada"),
+            Some(json!({ "keep_previous_hours": 0 })),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let last = webhooks::tasks::reseal(&core, soon(), bounds)
+        .await
+        .unwrap();
+    assert_eq!((last.remaining, last.unreadable), (0, 2));
+    instance.stop().await;
+}
+
+/// A hand-off replayed after a lost completion dedupes: one follow-up job.
+#[tokio::test]
+async fn a_replayed_hand_off_starts_no_second_chain() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let mut opts = Options::new(&section(true, ""), people());
+    opts.workers = false;
+    let instance = Instance::start(&world, opts).await;
+    instance
+        .tokens
+        .add("ada", member("usr_ada", "org_a", &[READ, MANAGE]));
+    let (_, endpoint) = create(
+        &instance,
+        "ada",
+        "/tenants/org_a",
+        json!({ "url": receiver.url("a") }),
+    )
+    .await;
+    let endpoint = uuid::Uuid::parse_str(endpoint["id"].as_str().unwrap()).unwrap();
+    let core = instance.core();
+    let event = fanout::Event {
+        id: uuid::Uuid::from_u128(11),
+        source: "application".into(),
+        source_event_id: "replay".into(),
+        tenant: Some("org_a".into()),
+        event_type: "tasks.task_completed".into(),
+        occurred_at: jiff::Timestamp::now(),
+        data: json!({}),
+    };
+    fanout::fan_out(&core, event, id("corr"), soon()).await;
+    let delivery = webhooks::delivery_id(uuid::Uuid::from_u128(11), endpoint);
+    let sender = core.webhooks.clone().unwrap();
+    let mut held = Vec::new();
+    while let Some(permit) = sender.occupy(endpoint) {
+        held.push(permit);
+    }
+    let slot = Arc::new(std::sync::OnceLock::new());
+    let _ = slot.set(core.clone());
+    let handler = webhooks::worker::Handler(slot);
+    let job = webhooks::DeliverJob {
+        webhook_delivery_id: delivery,
+        endpoint_id: endpoint,
+        generation: 0,
+        busy: 0,
+        busy_since: None,
+    };
+    for _ in 0..2 {
+        let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+        let ctx = merezha_platform::ports::JobContext {
+            id: 1,
+            kind: id("notify.webhook.deliver"),
+            attempt: 1,
+            max_attempts: 10,
+            idempotency_key: "k".into(),
+            deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+            cancel: cancelled,
+            correlation_id: id("corr"),
+            causation_id: None,
+            tenant: Some(id("org_a")),
+        };
+        use merezha_platform::ports::JobHandler;
+        handler.handle(ctx, job.to_value()).await.unwrap();
+    }
+    assert_eq!(
+        world
+            .scalar(&format!(
+                "SELECT count(*) FROM merezha_jobs.outbox WHERE dedupe_key = 'webhook:{delivery}:g0:b1'"
+            ))
+            .await,
+        1
+    );
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_jobs.outbox WHERE dedupe_key LIKE 'webhook:%:b%'")
+            .await,
+        1
+    );
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.webhook_attempts")
+            .await,
+        0
+    );
+    drop(held);
 }
 
 /// Crashes and retry delays race lease deadlines (issue #37): CI runs them
@@ -1642,6 +1930,82 @@ mod timing {
                 "two requests overlapped on a one-slot endpoint"
             );
         }
+        instance.stop().await;
+    }
+
+    /// A chain of hand-offs is bounded: past `BUSY_WINDOW` on the block's
+    /// clock (injected), the busy endpoint costs the delivery a
+    /// `failed` / `endpoint_busy` attempt on the schedule, which moves to
+    /// its next step; `failing_since` is left alone.
+    #[tokio::test]
+    async fn a_busy_chain_past_its_window_costs_an_attempt_on_the_schedule() {
+        let Some(world) = World::new().await else {
+            return;
+        };
+        let receiver = WebhookReceiver::start().await;
+        let clock = Arc::new(Shifted::default());
+        let config = section(true, "").replace(
+            "allow_http = true\n",
+            "allow_http = true\nconcurrency_per_endpoint = 1\n",
+        );
+        let instance = start_with(&world, &config, |o| {
+            o.clock = Some(clock.clone());
+        })
+        .await;
+        let (_, endpoint) = create(
+            &instance,
+            "ada",
+            "/tenants/org_a",
+            json!({ "url": receiver.url("a") }),
+        )
+        .await;
+        let endpoint = uuid::Uuid::parse_str(endpoint["id"].as_str().unwrap()).unwrap();
+        let sender = instance.core().webhooks.clone().unwrap();
+        let held = sender.occupy(endpoint).unwrap();
+        emit(
+            &instance,
+            "application",
+            Some("org_a"),
+            "tasks.task_completed",
+            "w1",
+        )
+        .await;
+        // The first job hands off.
+        instance
+            .until(
+                "SELECT count(*) FROM merezha_jobs.outbox WHERE dedupe_key LIKE 'webhook:%:b1'",
+                1,
+            )
+            .await;
+        assert_eq!(
+            world
+                .scalar("SELECT count(*) FROM merezha_notify.webhook_attempts")
+                .await,
+            0
+        );
+        clock.advance(webhooks::worker::BUSY_WINDOW + Duration::from_secs(1));
+        instance
+            .until(
+                "SELECT count(*) FROM merezha_notify.webhook_attempts WHERE error_code = 'endpoint_busy'",
+                1,
+            )
+            .await;
+        assert_eq!(deliveries(&world).await, ["retrying:endpoint_busy"]);
+        assert_eq!(
+            world
+                .scalar("SELECT count(*) FROM merezha_notify.webhook_endpoints WHERE failing_since IS NULL")
+                .await,
+            1
+        );
+        drop(held);
+        run_now(&world).await;
+        instance
+            .until(
+                "SELECT count(*) FROM merezha_notify.webhook_deliveries WHERE status = 'succeeded'",
+                1,
+            )
+            .await;
+        assert_eq!(attempts(&world).await, ["failed:", "succeeded:204"]);
         instance.stop().await;
     }
 
