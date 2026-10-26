@@ -61,6 +61,14 @@ macro_rules! live_variants {
     };
 }
 
+/// The advisory lock key of scope `$1` with class `$2`, the one key
+/// [`SCOPE_WRITE_LOCK`] and [`SCOPE_DELETE_LOCK`] share.
+macro_rules! scope_lock_key {
+    () => {
+        "$2::int4, hashtext($1)"
+    };
+}
+
 /// The generation of each scope a published response depends on: the
 /// whole read of the 304 path.
 pub const GENERATIONS: Statement = Statement::new(
@@ -769,19 +777,24 @@ pub(crate) const REFS_TO_ENTRIES_DELETE: Statement = Statement::new(
 /// takes this shared transaction lock on its scope before it checks the
 /// scope is not deleted; the deletion takes it exclusively
 /// ([`SCOPE_DELETE_LOCK`]), so a write either commits before the deletion
-/// does or sees it. The class `1668247156` (`"cont"`) keeps content's keys
-/// apart from other two-key advisory locks; a `hashtext` collision only
-/// makes a write wait for another scope's deletion.
+/// does or sees it. Both take the same key, `scope_lock_key!`: the class
+/// `$2` ([`crate::organizations::SCOPE_LOCK_CLASS`], `"cont"`) keeps
+/// content's keys apart from other two-key advisory locks; a `hashtext`
+/// collision only makes a write wait for another scope's deletion.
 pub(crate) const SCOPE_WRITE_LOCK: Statement = Statement::new(
     "content.scopes.write_lock",
     "SELECT pg_advisory_xact_lock_shared()",
-    "SELECT pg_advisory_xact_lock_shared(1668247156, hashtext($1))",
+    concat!(
+        "SELECT pg_advisory_xact_lock_shared(",
+        scope_lock_key!(),
+        ")"
+    ),
 );
-/// The deletion's side of [`SCOPE_WRITE_LOCK`].
+/// The deletion's side of [`SCOPE_WRITE_LOCK`], on the same key.
 pub(crate) const SCOPE_DELETE_LOCK: Statement = Statement::new(
     "content.scopes.delete_lock",
     "SELECT pg_advisory_xact_lock()",
-    "SELECT pg_advisory_xact_lock(1668247156, hashtext($1))",
+    concat!("SELECT pg_advisory_xact_lock(", scope_lock_key!(), ")"),
 );
 /// The state of a deleted scope (`purging` or `purged`); no row while the
 /// scope is live.
@@ -1081,5 +1094,17 @@ mod tests {
         for statement in STATEMENTS {
             assert!(statement.name.starts_with("content."), "{}", statement.name);
         }
+    }
+
+    #[test]
+    fn the_write_and_delete_locks_take_one_key() {
+        let key = |statement: &Statement| {
+            let open = statement.sql.find('(').unwrap();
+            statement.sql[open..].to_owned()
+        };
+        assert_eq!(key(&SCOPE_WRITE_LOCK), key(&SCOPE_DELETE_LOCK));
+        assert_eq!(key(&SCOPE_WRITE_LOCK), format!("({})", scope_lock_key!()));
+        assert!(SCOPE_WRITE_LOCK.sql.contains("_shared("));
+        assert!(!SCOPE_DELETE_LOCK.sql.contains("_shared("));
     }
 }

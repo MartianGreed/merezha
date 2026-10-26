@@ -55,6 +55,9 @@ pub const ORGANIZATION_PURGE: &str = "content.organization_purge";
 pub const ORGANIZATION_PURGE_BATCH: i64 = 100;
 /// The 404 of every route of a deleted organization's scope.
 pub const ORGANIZATION_NOT_FOUND: &str = "organization_not_found";
+/// The class of the scopes' two-key advisory locks (`"cont"`), the `$2`
+/// of the write and delete lock statements.
+pub const SCOPE_LOCK_CLASS: i32 = 0x636f_6e74;
 /// The longest organization id a scope holds (`org:` plus 1 to 128
 /// characters of `[A-Za-z0-9._:/-]`, the `entries.scope` check).
 pub const MAX_ORGANIZATION_ID: usize = 128;
@@ -113,12 +116,77 @@ pub(crate) async fn guard_write(
     if !is_organization(scope) {
         return Ok(());
     }
-    db.execute(&*tx, &statements::SCOPE_WRITE_LOCK, &[&scope])
-        .await
-        .map_err(|e| sql(&e))?;
+    db.execute(
+        &*tx,
+        &statements::SCOPE_WRITE_LOCK,
+        &[&scope, &SCOPE_LOCK_CLASS],
+    )
+    .await
+    .map_err(|e| sql(&e))?;
     // A statement of its own: its snapshot sees a deletion that committed
     // while the lock waited.
-    refuse_in(db, tx, scope).await
+    refuse_in(db, tx, scope).await?;
+    #[cfg(feature = "test-hooks")]
+    testing::after_guard(scope).await;
+    Ok(())
+}
+
+/// Test hooks (feature `test-hooks`, enabled only by this crate's own
+/// tests): hold a real write open right after its deleted-organization
+/// gate, with the scope's shared lock taken.
+#[cfg(feature = "test-hooks")]
+pub mod testing {
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    /// One armed pause: the next write of its scope stops after the gate.
+    #[derive(Clone)]
+    pub struct Pause {
+        scope: String,
+        reached: Arc<Notify>,
+        resume: Arc<Notify>,
+    }
+    impl Pause {
+        /// Wait until a write of the scope holds the gate.
+        pub async fn reached(&self) {
+            self.reached.notified().await;
+        }
+        /// Let that write go on.
+        pub fn resume(&self) {
+            self.resume.notify_one();
+        }
+    }
+
+    static ARMED: Mutex<Option<Pause>> = Mutex::new(None);
+
+    /// Pause the next write of `scope` right after its gate passed.
+    pub fn pause_next_write(scope: &str) -> Pause {
+        let pause = Pause {
+            scope: scope.to_owned(),
+            reached: Arc::new(Notify::new()),
+            resume: Arc::new(Notify::new()),
+        };
+        *ARMED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pause.clone());
+        pause
+    }
+
+    pub(crate) async fn after_guard(scope: &str) {
+        let pause = {
+            let mut armed = ARMED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match armed.as_ref() {
+                Some(pause) if pause.scope == scope => armed.take(),
+                _ => None,
+            }
+        };
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+    }
 }
 
 /// `organization_not_found` when `scope` is deleted, inside `tx` (the
@@ -180,9 +248,13 @@ pub async fn mark_deleted(
     if !is_organization(scope) {
         return Err(Failure::permanent("invalid_organization"));
     }
-    db.execute(&*tx, &statements::SCOPE_DELETE_LOCK, &[&scope])
-        .await
-        .map_err(|e| merezha_postgres::classify(&e))?;
+    db.execute(
+        &*tx,
+        &statements::SCOPE_DELETE_LOCK,
+        &[&scope, &SCOPE_LOCK_CLASS],
+    )
+    .await
+    .map_err(|e| merezha_postgres::classify(&e))?;
     let marked = db
         .query_opt(
             &*tx,
@@ -481,7 +553,8 @@ impl JobHandler for OrganizationDeleted {
                     INFO,
                     "content.organization_deleted",
                     tenant = tenant.as_str(),
-                    source = DeletedBy::Event.as_str()
+                    source = DeletedBy::Event.as_str(),
+                    forced = false
                 );
             }
             Ok(())
@@ -543,14 +616,19 @@ impl JobHandler for OrganizationPurge {
                     return Ok(());
                 }
                 first = false;
-                match purge_step(
+                let step = purge_step(
                     self.store.database(),
                     self.store.deadline(),
                     &scope,
                     cleanup.as_ref(),
                 )
-                .await?
-                {
+                .await
+                .map_err(JobFailure::from);
+                let step = match step {
+                    Ok(step) => step,
+                    Err(failure) => return Err(last_failure(&ctx, tenant.as_ref(), failure)),
+                };
+                match step {
                     PurgeStep::Entries(n) => report.entries += n,
                     PurgeStep::Assets(n) => report.assets += n,
                     PurgeStep::Blobs(n) => report.blobs += n,
@@ -562,19 +640,40 @@ impl JobHandler for OrganizationPurge {
                                 tenant = tenant.as_str(),
                                 entries = report.entries,
                                 assets = report.assets,
-                                blobs = report.blobs
+                                blobs = report.blobs,
+                                forced = false
                             );
                         }
                         return Ok(());
                     }
                     // Never appended without the mark; nothing to purge.
                     PurgeStep::NotDeleted => {
-                        return Err(JobFailure::permanent("organization_not_deleted"));
+                        return Err(last_failure(
+                            &ctx,
+                            tenant.as_ref(),
+                            JobFailure::permanent("organization_not_deleted"),
+                        ));
                     }
                 }
             }
         })
     }
+}
+
+/// `failure`, logged `content.organization_purge_failed` (error) when the
+/// job will not run again by itself: permanent, or its last attempt. The
+/// alert for a purge that leaves the organization's data at rest.
+fn last_failure(ctx: &JobContext, tenant: Option<&Identity>, failure: JobFailure) -> JobFailure {
+    if !failure.is_retryable() || ctx.attempt >= ctx.max_attempts {
+        merezha_telemetry::event!(
+            ERROR,
+            "content.organization_purge_failed",
+            tenant = tenant.map_or("", |t| t.as_str()),
+            code = failure.code.as_str(),
+            attempt = ctx.attempt
+        );
+    }
+    failure
 }
 
 #[cfg(test)]

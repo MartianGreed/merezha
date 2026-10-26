@@ -1792,6 +1792,7 @@ dependencies = [
  "jiff",
  "merezha-application",
  "merezha-blob",
+ "merezha-content",
  "merezha-domain",
  "merezha-jobs",
  "merezha-platform",

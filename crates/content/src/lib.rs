@@ -112,10 +112,13 @@ pub use module::{
     ContentHandle, ContentModule, ContentState, DEFAULT_MODEL_PATH, LoadError, NAME, PUBLISHES,
     load_model, lock_model_version, resolve_model_path,
 };
+#[cfg(feature = "test-hooks")]
+pub use organizations::testing;
 pub use organizations::{
     DeletedBy, MAX_ORGANIZATION_ID, ORGANIZATION_DELETED, ORGANIZATION_DELETED_TOPIC,
     ORGANIZATION_NOT_FOUND, ORGANIZATION_PURGE, ORGANIZATION_PURGE_BATCH, PurgeReport, PurgeStep,
-    deletion_ready, mark_deleted, organization_scope, purge_organization, purge_step,
+    SCOPE_LOCK_CLASS, deletion_ready, mark_deleted, organization_scope, purge_organization,
+    purge_step,
 };
 pub use parse::{
     CONTENT_PERMISSIONS, MAX_DESCRIPTION, MAX_MODEL_BYTES, MAX_PATTERN_BYTES, ModelOptions,

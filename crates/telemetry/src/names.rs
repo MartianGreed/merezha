@@ -1581,7 +1581,11 @@ pub const EVENTS: &[Event] = &[
     ev(
         "content.organization_deleted",
         INFO,
-        &[f("tenant", key::TENANT_ID), local("source")],
+        &[
+            f("tenant", key::TENANT_ID),
+            local("source"),
+            local("forced"),
+        ],
     ),
     ev(
         "content.organization_purged",
@@ -1591,7 +1595,16 @@ pub const EVENTS: &[Event] = &[
             local("entries"),
             local("assets"),
             local("blobs"),
+            local("forced"),
         ],
+    ),
+    // A purge job that will not run again by itself (its last attempt, or
+    // a permanent failure): the organization's data stays at rest until
+    // it is replayed or `merezha content purge-organization` finishes it.
+    ev(
+        "content.organization_purge_failed",
+        ERROR,
+        &[f("tenant", key::TENANT_ID), CODE, local("attempt")],
     ),
     ev(
         "content.schedule_failed",

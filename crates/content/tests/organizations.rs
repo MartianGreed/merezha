@@ -1871,6 +1871,29 @@ async fn a_deleted_organization_answers_404_everywhere_and_is_purged_alone() {
     let a = seed(&fx, "key_a", "A-own", &page, &png(5, 5, 32), true).await;
     // A stores B's bytes too: one blob and one object per organization.
     let same = upload(&fx, "key_a", "same.png", &bytes).await;
+    // A trashed asset of B, purged with the rest.
+    let binned = upload(&fx, "key_b", "binned.png", &png(6, 2, 8)).await;
+    let binned_id = binned["id"].as_str().unwrap().to_owned();
+    let trashed = fx
+        .call(
+            Method::DELETE,
+            &format!("{}/{binned_id}", assets_of("key_b")),
+        )
+        .by(Some("key_b"))
+        .send()
+        .await;
+    assert_eq!(trashed.status, StatusCode::NO_CONTENT, "{}", trashed.text);
+    assert_eq!(
+        strings(
+            &fx.db,
+            &format!(
+                "SELECT (deleted_at IS NOT NULL)::text FROM merezha_content.assets \
+                  WHERE id = '{binned_id}'"
+            )
+        )
+        .await,
+        ["true"]
+    );
     // An application asset that only B's entries use.
     let shared = upload(&fx, "app_key", "shared.png", &png(7, 7, 16)).await;
     let shared_id = shared["id"].as_str().unwrap().to_owned();
@@ -2005,6 +2028,15 @@ async fn a_deleted_organization_answers_404_everywhere_and_is_purged_alone() {
     )
     .await;
     assert_eq!(rows_of(&fx, ORG_B, &b_ids).await, Vec::<String>::new());
+    assert_eq!(
+        scalar(
+            &fx.db,
+            &format!("SELECT count(*) FROM merezha_content.assets WHERE id = '{binned_id}'")
+        )
+        .await,
+        0,
+        "the trashed asset went too"
+    );
     let b_tag = {
         let key =
             merezha_content::media::blob_key(&format!("org:{ORG_B}"), &"0".repeat(64)).unwrap();
@@ -2116,67 +2148,6 @@ async fn a_redelivered_deletion_event_marks_and_purges_once() {
     )
     .await;
     assert_eq!(strings(&fx.db, purge_jobs).await, ["1"]);
-    assert_eq!(
-        scalar(
-            &fx.db,
-            &format!("SELECT count(*) FROM merezha_content.entries WHERE scope = 'org:{ORG_B}'")
-        )
-        .await,
-        0
-    );
-}
-
-/// Issue #56: a write of the organization that holds the scope's shared
-/// lock commits before the deletion marks the scope (the mark waits for
-/// it), and the purge then removes what it wrote; a write after the mark
-/// is refused.
-#[tokio::test]
-async fn the_mark_waits_for_writes_in_flight_and_refuses_later_ones() {
-    let Some(test) = TestDatabase::create() else {
-        return;
-    };
-    let dirs = Dirs::new();
-    let fx = start(&test, &dirs).await;
-    let early = create(&fx, "key_b", "notice", json!({"title": "Early"})).await;
-    // A write in flight: the shared lock every organization write takes.
-    let writer = fx.db.acquire(soon()).await.unwrap();
-    let pid: i32 = writer
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .unwrap()
-        .get(0);
-    writer
-        .batch_execute(&format!(
-            "BEGIN; SELECT pg_advisory_xact_lock_shared(1668247156, hashtext('org:{ORG_B}')); \
-             INSERT INTO merezha_content.entries (id, scope, content_type, created_at, created_by) \
-             VALUES (gen_random_uuid(), 'org:{ORG_B}', 'notice', now(), 'sys_test')"
-        ))
-        .await
-        .unwrap();
-    organization_deleted(&fx, ORG_B, "organization:b:deleted").await;
-    wait_blocked_by(&fx.db, pid).await;
-    assert_eq!(strings(&fx.db, &deletion_state(ORG_B)).await, ["none"]);
-    // Still live for a request meanwhile: the mark has not committed.
-    let read = fx
-        .get(&variant("notice", &early, "en"))
-        .by(Some("key_b"))
-        .send()
-        .await;
-    assert_eq!(read.status, StatusCode::OK, "{}", read.text);
-    writer.batch_execute("COMMIT").await.unwrap();
-    eventually(&fx.db, &deletion_state(ORG_B), "purged").await;
-    let late = fx
-        .post(&manage("/entries/notice"))
-        .by(Some("key_b"))
-        .json(&json!({"fields": {"title": "Late"}}))
-        .send()
-        .await;
-    assert_eq!(
-        (late.status.as_u16(), late.code()),
-        (404, "organization_not_found"),
-        "{}",
-        late.text
-    );
     assert_eq!(
         scalar(
             &fx.db,

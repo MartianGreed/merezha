@@ -812,7 +812,8 @@ Block events (AP's former `jobs.*` events are `job.*`):
 | `content.rebuild_batch` / `content.rebuild_completed` (the background `published` rebuild, CT-C4) | info | `version`, `entries`, `done` / `version`, `entries` |
 | `content.schedule_failed` | warn | `entry_id`, `action`, `code` |
 | `content.blob_cleanup` / `content.spool_cleared` | info | `driver`, `count` |
-| `content.organization_deleted` / `content.organization_purged` (issue #56, deleted organizations) | info | `tenant`, `source` (`event`, `operator`) / `tenant`, `entries`, `assets`, `blobs` |
+| `content.organization_deleted` / `content.organization_purged` (issue #56, deleted organizations; also logged by `merezha content purge-organization`) | info | `tenant`, `source` (`event`, `operator`), `forced` / `tenant`, `entries`, `assets`, `blobs`, `forced` |
+| `content.organization_purge_failed` (a purge job that will not run again by itself: permanent failure or last attempt; alert on it) | error | `tenant`, `code`, `attempt` |
 | `content.purge_failed` (`merezha content purge-organization` cannot run) | error | `code`, `usage` |
 
 Severity policy:

@@ -2733,14 +2733,36 @@ The subscription's transaction records the scope in
 - The record stays after the purge (organization ids are never reused),
   so the organization never answers again. The purge appends no content
   events; consumers learn of it from `identity.organization_deleted`.
-  Logs: `content.organization_deleted` (tenant, source) when the scope is
-  marked, `content.organization_purged` (tenant, entries, assets, blobs)
-  when the job finishes it.
+  Logs: `content.organization_deleted` (tenant, source, forced) when the
+  scope is marked, `content.organization_purged` (tenant, entries,
+  assets, blobs, forced) when the purge finishes it, from the job and
+  from the operator command alike.
 
-A purge job that dead-letters (only a persistent database failure does)
-is replayed through the jobs admin API, or finished with the operator
-command, which also covers organizations deleted before content
-subscribed, or a missed event:
+What the mark does not reach at once:
+
+- A management or delivery request that passed its check just before
+  the mark commits still answers from the rows it read. A write in that
+  window cannot commit after the mark (it waits on the lock, then is
+  refused or purged).
+- With `media.serve = "redirect"`, a presigned URL handed out before the
+  mark stays valid for up to `media.signed_url_ttl`, until the purge's
+  blob cleanup deletes the object.
+- Shared caches and CDNs keep a public response for its `max-age` plus
+  `stale-while-revalidate` (`delivery.cache_control_public`,
+  `media.asset_cache_control`): purge them for the organization's path
+  if that matters.
+- Content's past events (`content.*` outbox records and their jobs, which
+  carry ids, never field values) stay in `merezha_jobs` until
+  `[jobs.retention]` removes them; the kernel's application event store
+  is not touched.
+
+A purge job that will not run again by itself (a permanent failure, or
+its last attempt) logs `content.organization_purge_failed` at error with
+the tenant and the code, besides the jobs runtime's `job.dead_lettered`:
+alert on it. Until the job is replayed through the jobs admin API, or the
+operator command below finishes it, the organization's data stays at rest
+(still refused on every route). The operator command also covers
+organizations deleted before content subscribed, or a missed event:
 
 `merezha content purge-organization ORGANIZATION --config merezha.toml
 [--force] [--set SECTION.KEY=VALUE]...` marks the organization's scope
@@ -2758,7 +2780,16 @@ configuration or the database fail (`content.purge_failed` on stderr
 with the code). With `[modules.content.media]` configured, it appends a
 `content.blob_cleanup` run that the next running host takes, which
 deletes the released objects (`blobs released to content.blob_cleanup`).
-Safe beside a running purge job; rerun it after an interruption.
+Safe beside a running purge job; rerun it after an interruption. Besides
+stdout it logs `content.organization_deleted` and
+`content.organization_purged` on stderr with `source: "operator"` and
+`forced: true` when `--force` overrode identity.
+
+The way back from a forced purge: the purged content is gone, but the
+organization can be served again (empty) by deleting its row from
+`merezha_content.scopes_deleted`, only once its `state` is `purged`.
+Deleting a `purging` row would let writes resume while a purge job is
+still deleting the scope's rows.
 
 ## Dependencies
 

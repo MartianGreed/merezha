@@ -212,6 +212,34 @@ fn report_purge_failure(code: &str, usage: bool) {
     });
 }
 
+/// `content.organization_deleted` (when this run marked the scope) and
+/// `content.organization_purged`, source `operator`, on stderr through the
+/// bootstrap dispatcher, `forced` when `--force` overrode identity.
+fn log_purge(organization: &str, report: &merezha_content::PurgeReport, forced: bool) {
+    tracing::dispatcher::with_default(&merezha_telemetry::pipeline::bootstrap(), || {
+        if report.marked {
+            merezha_telemetry::event!(
+                INFO,
+                "content.organization_deleted",
+                tenant = organization,
+                source = merezha_content::DeletedBy::Operator.as_str(),
+                forced
+            );
+        }
+        if !report.already_purged {
+            merezha_telemetry::event!(
+                INFO,
+                "content.organization_purged",
+                tenant = organization,
+                entries = report.entries,
+                assets = report.assets,
+                blobs = report.blobs,
+                forced
+            );
+        }
+    });
+}
+
 /// The command's own arguments: the organization and `--force`, the rest
 /// as `merezha run` takes them.
 fn purge_arguments(
@@ -347,6 +375,8 @@ pub async fn purge(
             return Err(2);
         }
         let mut out = String::new();
+        // `--force` overrode identity's answer.
+        let mut force_used = false;
         match in_identity(&database, organization, deadline)
             .await
             .map_err(unavailable)?
@@ -369,6 +399,7 @@ pub async fn purge(
                 return Ok((out, 1));
             }
             InIdentity::Live => {
+                force_used = true;
                 let _ = writeln!(
                     out,
                     "warning: --force: identity still has organization {organization}; its \
@@ -377,6 +408,7 @@ pub async fn purge(
                 );
             }
             InIdentity::Unknown(why) => {
+                force_used = true;
                 let _ = writeln!(
                     out,
                     "warning: --force: identity cannot confirm organization {organization} is \
@@ -404,6 +436,7 @@ pub async fn purge(
         )
         .await
         .map_err(unavailable)?;
+        log_purge(organization, &report, force_used);
         let _ = writeln!(
             out,
             "organization {organization} {}",

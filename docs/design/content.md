@@ -1697,7 +1697,21 @@ multi-application platform keeps that rule, so the layout survives it.
   organization identity still has or cannot confirm deleted unless
   `--force`.
 - The record is kept: identity never reuses organization ids, and a
-  forced purge of a live organization keeps it refused.
+  forced purge of a live organization keeps it refused. The way back is
+  deleting the row once its state is `purged` (never while `purging`).
+- The write lock and the deletion lock take one key (`scope_lock_key!`,
+  class `SCOPE_LOCK_CLASS`), checked by a unit test; a test hook
+  (feature `test-hooks`, `testing::pause_next_write`) holds a real save
+  open after its gate to show the mark waits for it.
+- Residual windows: a request that passed its check just before the mark
+  answers from what it read; presigned redirect URLs stay valid up to
+  `media.signed_url_ttl` and shared caches keep public responses for
+  `max-age` plus `stale-while-revalidate`; content's past outbox records
+  stay until `[jobs.retention]`. A purge job that will not retry logs
+  `content.organization_purge_failed` (error, alertable) and leaves the
+  data at rest, refused, until replayed or finished by the operator
+  command, which logs `content.organization_deleted` and
+  `content.organization_purged` (`forced`) like the job.
 
 ## 9. Configuration and telemetry
 

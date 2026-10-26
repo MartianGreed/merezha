@@ -506,6 +506,34 @@ async fn the_operator_purges_an_organization_identity_deleted_before() {
 
     let (code, out, err) = purge_command(&config, test.url(), &[&gone]);
     assert_eq!(code, Some(0), "{out}{err}");
+    let logged = |err: &str, event: &str| -> Vec<Value> {
+        err.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|e| e["event"] == event)
+            .collect()
+    };
+    let marked = logged(&err, "content.organization_deleted");
+    assert_eq!(marked.len(), 1, "{err}");
+    assert_eq!(
+        (
+            &marked[0]["tenant"],
+            &marked[0]["source"],
+            &marked[0]["forced"]
+        ),
+        (&json!(gone), &json!("operator"), &json!(false)),
+        "{err}"
+    );
+    let purged = logged(&err, "content.organization_purged");
+    assert_eq!(purged.len(), 1, "{err}");
+    assert_eq!(
+        (
+            &purged[0]["entries"],
+            &purged[0]["assets"],
+            &purged[0]["forced"]
+        ),
+        (&json!(1), &json!(1), &json!(false)),
+        "{err}"
+    );
     assert_eq!(
         out,
         format!(
@@ -554,8 +582,21 @@ async fn the_operator_purges_an_organization_identity_deleted_before() {
     );
     assert_eq!(texts(&db, &state_of(&live)).await, ["none"]);
     assert_eq!(texts(&db, &count_of("entries", &live)).await, ["1"]);
-    let (code, out, _) = purge_command(&config, test.url(), &["--force", &live]);
+    let (code, out, err) = purge_command(&config, test.url(), &["--force", &live]);
     assert_eq!(code, Some(0), "{out}");
+    for event in [
+        "content.organization_deleted",
+        "content.organization_purged",
+    ] {
+        let found: Vec<Value> = err
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|e| e["event"] == event)
+            .collect();
+        assert_eq!(found.len(), 1, "{event}: {err}");
+        assert_eq!(found[0]["forced"], true, "{event}: {err}");
+        assert_eq!(found[0]["tenant"], json!(live), "{event}: {err}");
+    }
     assert!(
         out.starts_with(&format!(
             "warning: --force: identity still has organization {live}"

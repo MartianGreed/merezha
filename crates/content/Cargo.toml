@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Test hooks (`testing`): only this crate's own dev-dependency enables
+# them; release builds never do.
+test-hooks = []
+
 [dependencies]
 merezha-blob = { path = "../blob" }
 merezha-domain = { path = "../domain" }
@@ -30,6 +35,8 @@ toml.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# The integration tests pause real writes (`testing::pause_next_write`).
+merezha-content = { path = ".", features = ["test-hooks"] }
 merezha-application = { path = "../application" }
 merezha-jobs = { path = "../jobs" }
 merezha-telemetry = { path = "../telemetry", features = ["testing"] }
