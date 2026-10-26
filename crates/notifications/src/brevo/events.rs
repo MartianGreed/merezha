@@ -12,7 +12,11 @@
 //! [`MAX_EVENTS`] events in at most [`MAX_BODY`] bytes, is applied in one
 //! transaction: each event is normalized, correlated by `X-Mailin-custom`
 //! (`mzd:<delivery_id>`) and then by message id, deduplicated on
-//! `sha256(provider|channel|message id|event|ts_event)` and applied once:
+//! `sha256(provider|channel|message id|event|ts_event)` (the delivery and
+//! the address stand in for a missing message id) and applied once.
+//! Deliveries are resolved first and locked in ascending id order. An
+//! event about a delivery still `queued`, `sending` or `retrying` is
+//! stored `pending` and applied by the worker's Tx B ([`apply_pending`]):
 //!
 //! | Event | Effect |
 //! | --- | --- |
@@ -24,9 +28,11 @@
 //! | `request`, `soft_bounce`, `deferred` | recorded only |
 //!
 //! Opens and clicks are dropped unstored (NT3). Uncorrelated events are
-//! stored with `delivery_id` NULL and still answered 200, so Brevo stops
-//! retrying; their suppressions use the event's own address. No log line
-//! or span carries an address, subject, reason text or message id.
+//! stored with `delivery_id` NULL and no effect at all (no status change,
+//! no suppression: a forged or foreign event names any address it likes),
+//! and still answered 200, so Brevo stops retrying. Suppressions always use
+//! the delivery's own address. No log line or span carries an address,
+//! subject, reason text or message id.
 use crate::{http::Ctx, notifier::Core, sql};
 use axum::{
     Extension,
@@ -235,10 +241,15 @@ pub fn parse(value: &Value) -> Option<Parsed> {
         .or_else(|| text(value, "ts_epoch", 32))
         .or_else(|| text(value, "ts", 32))
         .unwrap_or_default();
-    let key_id = message_id
-        .clone()
-        .or_else(|| delivery.map(|d| d.to_string()))
-        .unwrap_or_default();
+    // Without Brevo's message id, the delivery and the address tell two
+    // events of the same name and time apart.
+    let key_id = message_id.clone().unwrap_or_else(|| {
+        format!(
+            "-|{}|{}",
+            delivery.map(|d| d.to_string()).unwrap_or_default(),
+            email.as_deref().unwrap_or_default()
+        )
+    });
     Some(Parsed {
         event,
         delivery,
@@ -336,12 +347,7 @@ pub(crate) async fn callback(
     if items.len() > MAX_EVENTS {
         return ErrorReply::new(Failure::permanent("body_limit")).into_response();
     }
-    let mut events: Vec<Parsed> = items.iter().filter_map(parse).collect();
-    // One lock order for concurrent callbacks; stable, so a delivery's
-    // events keep their order.
-    events.sort_by(|a, b| {
-        (a.delivery, a.message_id.as_deref()).cmp(&(b.delivery, b.message_id.as_deref()))
-    });
+    let events: Vec<Parsed> = items.iter().filter_map(parse).collect();
     let core = match ctx.core() {
         Ok(core) => core,
         Err(reply) => return reply.into_response(),
@@ -382,8 +388,64 @@ fn new_id(core: &Core) -> Result<Uuid, Failure> {
     Ok(uuid::Builder::from_random_bytes(bytes).into_uuid())
 }
 
+/// The statuses a worker still owns: an event about such a delivery waits,
+/// `pending`, until the worker's Tx B applies it.
+const OPEN: [&str; 3] = ["queued", "sending", "retrying"];
+
+/// Apply `event`'s status change to a locked delivery: one conditional
+/// update, a no-op unless the delivery is in a status the event may leave.
+async fn transition(
+    db: &merezha_postgres::Database,
+    tx: &mut merezha_postgres::Tx<'_>,
+    delivery: Uuid,
+    event: EmailEvent,
+    now: jiff::Timestamp,
+) -> Result<(), Failure> {
+    if let Some((to, why, from)) = event.transition() {
+        let from: Vec<&str> = from.to_vec();
+        db.execute(
+            tx,
+            &sql::DELIVERY_EVENT_SET,
+            &[&delivery, &to, &why, &now, &from],
+        )
+        .await
+        .map_err(|e| classify(&e))?;
+    }
+    Ok(())
+}
+
+/// The events stored `pending` for `delivery`, applied in arrival order
+/// and cleared. The delivery worker calls it in Tx B, after the outcome is
+/// recorded, with the delivery locked.
+pub(crate) async fn apply_pending(
+    db: &merezha_postgres::Database,
+    tx: &mut merezha_postgres::Tx<'_>,
+    delivery: Uuid,
+    now: jiff::Timestamp,
+) -> Result<usize, Failure> {
+    let rows = db
+        .query(tx, &sql::EVENTS_TAKE_PENDING, &[&delivery])
+        .await
+        .map_err(|e| classify(&e))?;
+    let mut events: Vec<(i64, String)> = rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+    events.sort();
+    for (_, name) in &events {
+        if let Normalized::Event(event) = normalize(name) {
+            transition(db, tx, delivery, event, now).await?;
+        }
+    }
+    Ok(events.len())
+}
+
 /// The one transaction of a callback. Returns the newly stored events and
 /// whether each was correlated.
+///
+/// Every event is first resolved to its delivery (our header, then Brevo's
+/// message id) without a lock; the events are then applied in ascending
+/// delivery order, so two concurrent callbacks lock the same deliveries in
+/// the same order. Only a correlated event has effects: an uncorrelated one
+/// (no delivery of ours, whatever address it names) is stored and nothing
+/// else, so a forged or foreign event cannot suppress an address.
 async fn apply(core: &Core, events: Vec<Parsed>) -> Result<Vec<(EmailEvent, bool)>, Failure> {
     let mut ids = Vec::with_capacity(events.len());
     for event in &events {
@@ -398,30 +460,48 @@ async fn apply(core: &Core, events: Vec<Parsed>) -> Result<Vec<(EmailEvent, bool
     db.clone()
         .transaction(Instant::now() + DEADLINE, move |tx| {
             Box::pin(async move {
-                let mut applied = Vec::new();
+                let mut resolved = Vec::with_capacity(events.len());
                 for (event, suppression_id) in events.into_iter().zip(ids) {
-                    // Correlate: our header first, then Brevo's message id.
-                    let mut row = None;
+                    let mut found: Option<Uuid> = None;
                     if let Some(id) = event.delivery {
-                        row = db
-                            .query_opt(tx, &sql::EVENT_DELIVERY_BY_ID, &[&id, &CHANNEL])
+                        found = db
+                            .query_opt(tx, &sql::EVENT_RESOLVE_BY_ID, &[&id, &CHANNEL])
                             .await
-                            .map_err(|e| classify(&e))?;
+                            .map_err(|e| classify(&e))?
+                            .map(|r| r.get(0));
                     }
-                    if row.is_none()
+                    if found.is_none()
                         && let Some(message_id) = &event.message_id
                     {
-                        row = db
+                        found = db
                             .query_opt(
                                 tx,
-                                &sql::EVENT_DELIVERY_BY_MESSAGE,
+                                &sql::EVENT_RESOLVE_BY_MESSAGE,
                                 &[&PROVIDER, message_id, &CHANNEL],
                             )
                             .await
-                            .map_err(|e| classify(&e))?;
+                            .map_err(|e| classify(&e))?
+                            .map(|r| r.get(0));
                     }
-                    let delivery: Option<(Uuid, String, Option<String>, String)> =
-                        row.map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)));
+                    resolved.push((found, event, suppression_id));
+                }
+                // Ascending delivery ids, uncorrelated last; stable, so a
+                // delivery's events keep their order.
+                resolved.sort_by_key(|(id, _, _)| (id.is_none(), *id));
+                let mut applied = Vec::new();
+                for (found, event, suppression_id) in resolved {
+                    let delivery: Option<(Uuid, String, Option<String>, String)> = match found {
+                        Some(id) => db
+                            .query_opt(tx, &sql::EVENT_DELIVERY_BY_ID, &[&id, &CHANNEL])
+                            .await
+                            .map_err(|e| classify(&e))?
+                            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))),
+                        None => None,
+                    };
+                    // A delivery its worker still owns gets the event later.
+                    let pending = delivery.as_ref().is_some_and(|d| {
+                        OPEN.contains(&d.1.as_str()) && event.event.transition().is_some()
+                    });
                     let inserted = db
                         .query_opt(
                             tx,
@@ -436,57 +516,47 @@ async fn apply(core: &Core, events: Vec<Parsed>) -> Result<Vec<(EmailEvent, bool
                                 &event.reason,
                                 &event.occurred_at,
                                 &now,
+                                &pending,
                             ],
                         )
                         .await
                         .map_err(|e| classify(&e))?;
                     if inserted.is_none() {
-                        // Already applied: Brevo retried or batched it twice.
+                        // Already stored: Brevo retried or batched it twice.
                         continue;
                     }
-                    if let (Some((id, status, _, _)), Some((to, why, from))) =
-                        (&delivery, event.event.transition())
-                        && from.contains(&status.as_str())
-                    {
-                        let from: Vec<&str> = from.to_vec();
-                        db.execute(tx, &sql::DELIVERY_EVENT_SET, &[id, &to, &why, &now, &from])
-                            .await
-                            .map_err(|e| classify(&e))?;
+                    let Some((id, _, address, topic)) = &delivery else {
+                        applied.push((event.event, false));
+                        continue;
+                    };
+                    if !pending {
+                        transition(&db, tx, *id, event.event, now).await?;
                     }
-                    if let (Some((reason_text, topic_scoped)), Some(suppression_id)) =
-                        (event.event.suppression(), suppression_id)
+                    // The address is ours: the delivery's, never the event's.
+                    if let (
+                        Some((reason_text, topic_scoped)),
+                        Some(suppression_id),
+                        Some(address),
+                    ) = (event.event.suppression(), suppression_id, address)
                     {
-                        let address = delivery
-                            .as_ref()
-                            .and_then(|d| d.2.as_ref().map(|a| a.to_lowercase()))
-                            .or_else(|| event.email.clone());
-                        let topic = if topic_scoped {
-                            delivery.as_ref().map(|d| d.3.clone())
-                        } else {
-                            None
-                        };
-                        // A topic-scoped suppression needs the topic.
-                        if let Some(address) = address
-                            && (!topic_scoped || topic.is_some())
-                        {
-                            db.execute(
-                                tx,
-                                &sql::SUPPRESSION_INSERT,
-                                &[
-                                    &suppression_id,
-                                    &CHANNEL,
-                                    &address,
-                                    &topic,
-                                    &reason_text,
-                                    &delivery.as_ref().map(|d| d.0),
-                                    &now,
-                                ],
-                            )
-                            .await
-                            .map_err(|e| classify(&e))?;
-                        }
+                        let topic = topic_scoped.then(|| topic.clone());
+                        db.execute(
+                            tx,
+                            &sql::SUPPRESSION_INSERT,
+                            &[
+                                &suppression_id,
+                                &CHANNEL,
+                                &address.to_lowercase(),
+                                &topic,
+                                &reason_text,
+                                &Some(*id),
+                                &now,
+                            ],
+                        )
+                        .await
+                        .map_err(|e| classify(&e))?;
                     }
-                    applied.push((event.event, delivery.is_some()));
+                    applied.push((event.event, true));
                 }
                 Ok(applied)
             })
@@ -549,6 +619,20 @@ mod tests {
             !debug.contains("example") && !debug.contains("m1@relay"),
             "{debug}"
         );
+        // Without a message id the delivery and the address key the event.
+        let bare = |email: &str, custom: Option<Uuid>| {
+            let mut event = json!({"event": "hard_bounce", "email": email, "ts_event": 5});
+            if let Some(id) = custom {
+                event["X-Mailin-custom"] = json!(format!("mzd:{id}"));
+            }
+            parse(&event).unwrap().key
+        };
+        assert_ne!(bare("a@example.org", None), bare("b@example.org", None));
+        assert_ne!(
+            bare("a@example.org", Some(Uuid::from_u128(1))),
+            bare("a@example.org", Some(Uuid::from_u128(2)))
+        );
+        assert_eq!(bare("a@example.org", None), bare("A@example.org", None));
         // A foreign custom header does not correlate.
         let foreign = parse(&json!({"event": "delivered", "X-Mailin-custom": "order-17"})).unwrap();
         assert_eq!(foreign.delivery, None);

@@ -1304,7 +1304,7 @@ topics with an unsubscribe link, and `X-Sib-Sandbox: drop` with
 | 2xx | `accepted` | `accepted` |
 | 400 `duplicate_parameter` | `duplicate` | `accepted` without a message id |
 | 400 `duplicate_request` | `transient` | `retrying`, at least 60 s later |
-| 401, 402, 403, or code `unauthorized`, `not_enough_credits`, `permission_denied`, `account_under_validation` | `transient` (`provider_account`) | `retrying`, at least 5 min later; error log `notification.provider_account_error` and `merezha.notification.provider_account_errors` |
+| 401, 402, 403, or code `unauthorized`, `not_enough_credits`, `permission_denied`, `account_under_validation` | `transient` (`provider_account`) | `retrying`, at least 5 min later (at most the `notify.email` `backoff_max_ms`, which must be at least 5 min, else startup fails `backoff_max_too_short`). The answer consumes no attempt: the next try is a new job of the same generation (outbox key `deliver:{id}:g{n}:a{attempt}`), until the notification's `expires_at`, or 24 h after the run's first refusal, then `failed` / `provider_account_unresolved`. One error log `notification.provider_account_error` per run of refusals; `merezha.notification.provider_account_errors` counts each |
 | 408, 425, 429 | `rate_limited` | `retrying` after `max(Retry-After, x-sib-ratelimit-reset)` (at most 1 h, and at most the queue's `backoff_max_ms`); warn log `notification.provider_rate_limited` |
 | other 4xx | `permanent` | `failed` / `provider_rejected_<code>` for `invalid_parameter`, `missing_parameter`, `out_of_range`, `document_not_found`, `not_acceptable`, else `provider_rejected` |
 | 5xx | `transient` (`provider_unavailable`) | `retrying`, after `Retry-After` when sent |
@@ -1315,7 +1315,12 @@ Only Brevo's error `code` is read; its `message` is never stored or logged.
 On the last attempt a retryable answer becomes `failed` /
 `retries_exhausted` and the job is dead-lettered. A crash after the call
 leaves a `started` attempt: the rerun marks it `ambiguous` and resends with
-the same key, which Brevo answers `duplicate_parameter`. The block assumes
+the same key, which Brevo answers `duplicate_parameter`. A resend must
+start within 25 minutes of the generation's first ambiguous attempt, the
+30-minute key window less a margin: a retry or rerun that would start
+later sets the delivery `unknown` / `idempotency_window` and never resends
+(a provider event can still settle it; `redeliver` starts a new generation
+and key). The block assumes
 that answer is a 400, that only a processed request takes the key and that
 the key holds 30 minutes, as `testkit::FakeBrevo` models; this needs a check
 against a real Brevo account (NT §12).
@@ -1328,25 +1333,35 @@ address the edge resolved through `http.trusted_proxies` against
 `Authorization: Bearer` with `brevo.webhook_token` in constant time;
 either failure answers 401 `unauthenticated`, stores nothing and logs
 `notification.provider_event_rejected` (code `source_not_allowed`,
-`missing_token` or `bad_token`). Without a Brevo email driver the route is
+`missing_token` or `bad_token`); with CIDRs set, a request whose client
+address the edge could not resolve is refused too. Without a Brevo email driver the route is
 404. The body (an event or an array of at most 2,000, at most 1 MiB, else
 413 `body_limit`) is applied in one transaction:
 
 - events are normalized (`request`, `delivered`, `deferred`, `soft_bounce`,
   `hard_bounce`, `invalid_email`, `blocked`, `spam`, `unsubscribed`,
   `error`); opens and clicks are dropped unstored (NT3);
-- each is correlated by `X-Mailin-custom`, then by message id, and stored
-  in `provider_events` once per `sha256(brevo|email|message id|event|ts_event)`;
+- each is correlated by `X-Mailin-custom`, then by message id (resolved
+  first, then locked in ascending delivery order), and stored in
+  `provider_events` once per `sha256(brevo|email|message id|event|ts_event)`,
+  the delivery and the address standing in for a missing message id;
 - `delivered` moves `accepted` or `unknown` to `delivered`; `hard_bounce`
   and `invalid_email` move `accepted`, `unknown` or `delivered` to `bounced`
   and add a `hard_bounce` or `invalid` suppression of the address; `spam`
   moves `accepted` or `delivered` to `complained` and adds a
   `spam_complaint` suppression; `blocked` and `error` move `accepted` or
   `unknown` to `failed`; `unsubscribed` adds an `unsubscribed` suppression
-  for the delivery's topic; the rest is recorded only. A delivery still
-  `queued`, `sending` or `retrying` keeps its status;
-- an uncorrelated event is stored with no delivery (its suppression uses
-  the event's address) and still answered 200 `{}`, so Brevo stops retrying.
+  for the delivery's topic; the rest is recorded only. Suppressions use the
+  delivery's own address. An event about a delivery still `queued`,
+  `sending` or `retrying` is stored `pending` (migration 3) and the worker
+  applies its status change in the transaction that records the outcome;
+- an uncorrelated event is stored with no delivery and no effect at all (no
+  status, no suppression: an event can name any address) and still
+  answered 200 `{}`, so Brevo stops retrying.
+
+`provider_events.reason` holds Brevo's reason text (at most 200
+characters), personal data such as a bounced address, until the row's
+retention; it is never logged.
 
 Hard bounce and spam suppressions cover every non-security topic, `invalid`
 every topic, so the next non-security email to a bounced address is
@@ -1357,18 +1372,21 @@ message id.
 **Webhook registration.**
 
 ```sh
-merezha notifications brevo register-webhook --config merezha.toml [--url URL]
+merezha notifications brevo register-webhook --config merezha.toml [--url URL [--allow-host]]
 ```
 
 loads and validates the project like `check`, then calls Brevo's `POST
 /v3/webhooks` with `type: "transactional"`, the events `delivered`,
 `hardBounce`, `softBounce`, `blocked`, `spam`, `invalid`, `deferred`,
 `unsubscribed` and `auth: {type: "bearer", token: <brevo.webhook_token>}`,
-to `URL` (https, or http to loopback) or `public_base_url` +
-`/v1/notifications/providers/brevo/email`. It prints
-`{"status":"registered","id":N,"url":"…"}` (exit 0) or
+to `public_base_url` + `/v1/notifications/providers/brevo/email`, or to
+`URL` (https, or http to loopback), which must have that path and
+`public_base_url`'s host and port; `--allow-host` accepts another host with
+the `host_override` warning (in `warnings` and on stderr). It prints
+`{"status":"registered","id":N,"url":"…","warnings":[…]}` (exit 0) or
 `{"status":"failed","code":"…"}` (exit 1: `brevo_not_configured`,
-`missing_public_base_url`, `invalid_url`, `provider_account`,
+`missing_public_base_url`, `invalid_url`, `callback_path_mismatch`,
+`callback_host_mismatch`, `provider_account`,
 `provider_rejected[_<code>]`, `provider_unavailable` or a transport code);
 an invalid project prints the `check` report (exit 2). The key and the
 token are never printed. Switch Brevo's open and click tracking off in the
@@ -1472,7 +1490,8 @@ non-https `brevo.base_url` or `preview` without `preview_in_public`
 (`refused_when_public`), a missing `public_base_url` with Brevo SMS or with
 Brevo email and a non-security email topic, a `notify.email`,
 `notify.sms` or `notify.webhook` `lease_ms` under three provider timeouts
-(`lease_too_short`), a `notify.webhook` `backoff_max_ms` under 24 h
+(`lease_too_short`), a `notify.webhook` `backoff_max_ms` under 24 h or,
+with the Brevo email driver, a `notify.email` `backoff_max_ms` under 5 min
 (`backoff_max_too_short`), and with `MEREZHA_NOTIFY_NO_EGRESS=1` a
 non-loopback `brevo.base_url` (`egress_not_loopback`).
 

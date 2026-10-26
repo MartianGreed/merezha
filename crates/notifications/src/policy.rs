@@ -31,6 +31,11 @@ pub mod reason {
     pub const RETRIES_EXHAUSTED: &str = "retries_exhausted";
     pub const EXPIRED: &str = "expired";
     pub const INVALID_ADDRESS: &str = "invalid_address";
+    /// A resend would fall past the margin of Brevo's idempotency window
+    /// after an attempt it may have processed (NT-N3): never resent.
+    pub const IDEMPOTENCY_WINDOW: &str = "idempotency_window";
+    /// Brevo refused the account until the deadline (NT-N3).
+    pub const PROVIDER_ACCOUNT_UNRESOLVED: &str = "provider_account_unresolved";
 }
 
 /// Whether `channel` is on for a user target of `topic` (NT §6): security

@@ -29,7 +29,7 @@ const PROVIDER_DELAYS: &str = "max_attempts = 10\nbackoff_base_ms = 10\nbackoff_
 /// The block on `fake`, with fast retries unless `queue` says otherwise.
 fn section(fake: &FakeBrevo, queue: &str, brevo: &str, top: &str) -> String {
     let queue = if queue.is_empty() {
-        "max_attempts = 10\nbackoff_base_ms = 10\nbackoff_max_ms = 50\n"
+        "max_attempts = 10\nbackoff_base_ms = 10\nbackoff_max_ms = 300000\n"
     } else {
         queue
     };
@@ -324,7 +324,7 @@ async fn a_provider_outage_exhausts_into_a_dead_letter_and_redelivery_sends_afte
         &world,
         options(&section(
             &fake,
-            "max_attempts = 3\nbackoff_base_ms = 10\nbackoff_max_ms = 50\n",
+            "max_attempts = 3\nbackoff_base_ms = 10\nbackoff_max_ms = 300000\n",
             "",
             "",
         )),
@@ -424,6 +424,11 @@ async fn the_callback_refuses_a_wrong_bearer_or_source_and_stores_nothing() {
         (from(brevo_ip, Some("session-token")), "session"),
         (from(brevo_ip, None), "missing"),
         (from("203.0.113.9", Some(TOKEN)), "source"),
+        // No client address at all: refused while CIDRs are configured.
+        (
+            FakeBrevo::event_request(CALLBACK, TOKEN, &event),
+            "no address",
+        ),
     ] {
         let (status, body) = instance.raw(request).await;
         assert_eq!(
@@ -443,7 +448,7 @@ async fn the_callback_refuses_a_wrong_bearer_or_source_and_stores_nothing() {
         .into_iter()
         .filter(|r| r.name.as_deref() == Some("notification.provider_event_rejected"))
         .count();
-    assert_eq!(rejected, 4);
+    assert_eq!(rejected, 5);
     let (status, _) = instance.raw(from(brevo_ip, Some(TOKEN))).await;
     assert_eq!(status.as_u16(), 200);
     assert_eq!(
@@ -744,6 +749,345 @@ async fn logs_and_spans_hold_no_address_subject_or_body() {
     instance.stop().await;
 }
 
+/// The id of the delivery to `address`.
+async fn delivery_id(world: &World, address: &str) -> String {
+    world
+        .text(&format!(
+            "SELECT id::text FROM merezha_notify.deliveries WHERE address = '{address}'"
+        ))
+        .await
+        .remove(0)
+}
+/// Make every waiting delivery job due now, until `sql` answers `want`:
+/// the provider-asked delays are minutes long.
+async fn hurry_until(world: &World, sql: &str, want: i64) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        world
+            .execute(
+                "UPDATE merezha_jobs.jobs SET run_at = now() \
+                 WHERE state = 'available' AND run_at > now()",
+            )
+            .await;
+        let got = world.scalar(sql).await;
+        if got == want {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{sql} stayed {got}, not {want}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Review M1: an event no delivery of ours correlates has no effect, so a
+/// forged `invalid_email` naming any address cannot block its mail, not
+/// even security mail; it is still stored and answered 200.
+#[tokio::test]
+async fn an_uncorrelated_event_suppresses_nothing() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakeBrevo::start(API_KEY).await.unwrap();
+    let instance = Instance::start(&world, options(&section(&fake, "", "", ""))).await;
+    let forged = [
+        json!({"event": "invalid_email", "email": "victim@example.org", "ts_event": 1}),
+        json!({"event": "spam", "email": "victim@example.org", "ts_event": 2,
+            "X-Mailin-custom": format!("mzd:{}", uuid::Uuid::from_u128(42))}),
+        json!({"event": "hard_bounce", "email": "victim@example.org", "ts_event": 3,
+            "message-id": "<never-sent@relay>"}),
+    ];
+    assert_eq!(callback(&instance, &json!(forged)).await, (200, json!({})));
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.provider_events WHERE delivery_id IS NULL")
+            .await,
+        3
+    );
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.suppressions")
+            .await,
+        0
+    );
+    commit(
+        &instance,
+        request(
+            "identity.password_changed",
+            email("victim@example.org", None),
+            "identity.password_changed:m1",
+        ),
+    )
+    .await;
+    commit(
+        &instance,
+        request("tasks.assigned", email("victim@example.org", None), "m:2"),
+    )
+    .await;
+    wait_status(&instance, "accepted", 2).await;
+    instance.stop().await;
+}
+
+/// Review M2: after an attempt Brevo may have processed, a resend must
+/// start inside the margin of the idempotency window (25 of Brevo's 30
+/// minutes); a `Retry-After: 3600` would fall later, so the delivery is
+/// `unknown` and never resent, as an ambiguous SMS.
+#[tokio::test]
+async fn a_resend_past_the_idempotency_window_is_never_made() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakeBrevo::start(API_KEY).await.unwrap();
+    fake.close_after_accept();
+    // The resend after the dropped answer waits at least a second.
+    let queue = "max_attempts = 10\nbackoff_base_ms = 2000\nbackoff_max_ms = 3600000\n";
+    let instance = Instance::start(&world, options(&section(&fake, queue, "", ""))).await;
+    commit(
+        &instance,
+        request("tasks.assigned", email("lena@example.org", None), "w:1"),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.processed().is_empty() {
+        assert!(Instant::now() < deadline, "never sent");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    fake.rate_limit(&[("Retry-After", "3600")]);
+    wait_status(&instance, "unknown", 1).await;
+    assert_eq!(
+        delivery(&world, "lena@example.org").await,
+        "unknown:idempotency_window"
+    );
+    assert_eq!(attempts(&world).await, ["ambiguous", "rate_limited"]);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!((sends(&fake).len(), fake.processed().len()), (2, 1));
+    assert_eq!(
+        world
+            .scalar(
+                "SELECT count(*) FROM merezha_jobs.jobs WHERE kind = 'notify.deliver.email' \
+                 AND state NOT IN ('succeeded')"
+            )
+            .await,
+        0,
+        "nothing left to resend"
+    );
+    // A provider event can still settle it.
+    let message = fake.processed().remove(0);
+    assert_eq!(
+        callback(&instance, &fake.event("delivered", &message))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(delivery(&world, "lena@example.org").await, "delivered:");
+    instance.stop().await;
+}
+
+/// Review M3: `provider_account` answers consume no attempt. A 70-minute
+/// run of 401s (twelve, five minutes apart on the block's clock) on a
+/// queue of two attempts keeps the security mail retrying, logs one error
+/// for the run and counts every refusal; once the key is fixed it is sent.
+#[tokio::test]
+async fn a_long_provider_account_streak_consumes_no_attempts_and_delivers_once_fixed() {
+    let harness = merezha_telemetry::testing::Harness::new();
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakeBrevo::start(API_KEY).await.unwrap();
+    fake.fail_next(12, 401);
+    let clock = Arc::new(Shifted::default());
+    let mut options = options(&section(
+        &fake,
+        "max_attempts = 2\nbackoff_base_ms = 10\nbackoff_max_ms = 3600000\n",
+        "",
+        "",
+    ));
+    options.meters = Some(harness.telemetry().meters());
+    options.clock = Some(clock.clone());
+    let instance = Instance::start(&world, options).await;
+    commit(
+        &instance,
+        request(
+            "identity.password_changed",
+            email("mo@example.org", None),
+            "identity.password_changed:s1",
+        ),
+    )
+    .await;
+    for done in 1..=12 {
+        instance
+            .until(
+                "SELECT count(*) FROM merezha_notify.delivery_attempts WHERE outcome <> 'started'",
+                done,
+            )
+            .await;
+        assert_eq!(
+            delivery(&world, "mo@example.org").await,
+            "retrying:provider_account",
+            "refusal {done}"
+        );
+        clock.advance(Duration::from_secs(6 * 60));
+        hurry_until(
+            &world,
+            "SELECT count(*) FROM merezha_notify.delivery_attempts",
+            done + 1,
+        )
+        .await;
+    }
+    wait_status(&instance, "accepted", 1).await;
+    let outcomes = attempts(&world).await;
+    assert_eq!(outcomes.len(), 13);
+    assert!(
+        outcomes[..12].iter().all(|o| o == "transient"),
+        "{outcomes:?}"
+    );
+    assert_eq!(outcomes[12], "accepted");
+    assert_eq!(
+        world
+            .scalar(
+                "SELECT count(*) FROM merezha_jobs.jobs WHERE kind = 'notify.deliver.email' \
+                 AND state = 'dead'"
+            )
+            .await,
+        0,
+        "no attempt budget ran out"
+    );
+    let errors = harness
+        .recorded()
+        .into_iter()
+        .filter(|r| r.name.as_deref() == Some("notification.provider_account_error"))
+        .count();
+    assert_eq!(errors, 1, "one error per run of refusals");
+    assert_eq!(
+        harness
+            .metric("merezha.notification.provider_account_errors")
+            .value(&[("notify.provider", "brevo")]),
+        Some(12.0)
+    );
+    harness.assert_catalogued();
+    instance.stop().await;
+}
+
+/// Review M3: a run of `provider_account` answers ends at the
+/// notification's `expires_at` as `failed` / `provider_account_unresolved`.
+#[tokio::test]
+async fn a_provider_account_streak_fails_unresolved_at_the_deadline() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakeBrevo::start(API_KEY).await.unwrap();
+    fake.fail_next(5, 401);
+    let clock = Arc::new(Shifted::default());
+    let mut options = options(&section(&fake, PROVIDER_DELAYS, "", ""));
+    options.clock = Some(clock.clone());
+    let instance = Instance::start(&world, options).await;
+    let mut expiring = request("tasks.assigned", email("nia@example.org", None), "x:1");
+    expiring.expires_at = Some(jiff::Timestamp::now() + jiff::SignedDuration::from_mins(10));
+    commit(&instance, expiring).await;
+    wait_status(&instance, "retrying", 1).await;
+    clock.advance(Duration::from_secs(6 * 60));
+    hurry_until(
+        &world,
+        "SELECT count(*) FROM merezha_notify.deliveries WHERE status = 'failed'",
+        1,
+    )
+    .await;
+    assert_eq!(
+        delivery(&world, "nia@example.org").await,
+        "failed:provider_account_unresolved"
+    );
+    instance
+        .until(
+            "SELECT count(*) FROM merezha_jobs.jobs WHERE kind = 'notify.deliver.email' \
+             AND state = 'dead'",
+            1,
+        )
+        .await;
+    assert_eq!(fake.processed().len(), 0);
+    instance.stop().await;
+}
+
+/// Review L5: without Brevo's message id, the delivery and the address
+/// keep two bounces of the same time apart: both apply.
+#[tokio::test]
+async fn bounces_without_a_message_id_are_told_apart() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakeBrevo::start(API_KEY).await.unwrap();
+    let instance = Instance::start(&world, options(&section(&fake, "", "", ""))).await;
+    for (address, key) in [("oli@example.org", "d:1"), ("pia@example.org", "d:2")] {
+        commit(
+            &instance,
+            request("tasks.assigned", email(address, None), key),
+        )
+        .await;
+    }
+    wait_status(&instance, "accepted", 2).await;
+    let bounces: Vec<Value> = fake
+        .processed()
+        .iter()
+        .map(|message| {
+            let mut event = fake.event("hard_bounce", message);
+            let object = event.as_object_mut().unwrap();
+            object.remove("message-id");
+            object.insert("ts_event".into(), json!(1_700_000_500));
+            object.insert("ts_epoch".into(), json!(1_700_000_500_000_i64));
+            event
+        })
+        .collect();
+    assert_eq!(callback(&instance, &json!(bounces)).await.0, 200);
+    assert_eq!(
+        world
+            .text(
+                "SELECT address FROM merezha_notify.suppressions \
+                 WHERE reason = 'hard_bounce' ORDER BY address"
+            )
+            .await,
+        ["oli@example.org", "pia@example.org"]
+    );
+    for address in ["oli@example.org", "pia@example.org"] {
+        assert_eq!(delivery(&world, address).await, "bounced:hard_bounce");
+    }
+    instance.stop().await;
+}
+
+/// Review M5: a callback of more than `MAX_EVENTS` events is refused with
+/// 413 and stores nothing; `MAX_EVENTS` events are taken.
+#[tokio::test]
+async fn a_callback_over_the_event_limit_is_refused_whole() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakeBrevo::start(API_KEY).await.unwrap();
+    let instance = Instance::start(&world, options(&section(&fake, "", "", ""))).await;
+    let batch = |n: usize| {
+        Value::Array(
+            (0..n)
+                .map(|i| json!({"event": "deferred", "message-id": format!("<m{i}@relay>"), "ts_event": i}))
+                .collect(),
+        )
+    };
+    let max = merezha_notifications::brevo::events::MAX_EVENTS;
+    let (status, body) = callback(&instance, &batch(max + 1)).await;
+    assert_eq!(
+        (status, body["error"]["code"].clone()),
+        (413, json!("body_limit"))
+    );
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.provider_events")
+            .await,
+        0
+    );
+    assert_eq!(callback(&instance, &batch(max)).await.0, 200);
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.provider_events")
+            .await,
+        max as i64
+    );
+    instance.stop().await;
+}
+
 /// Crashes and rate-limit delays race lease and retry deadlines (issue
 /// #37): CI runs them alone (`cargo test -- --test-threads=1 timing::`).
 mod timing {
@@ -752,7 +1096,7 @@ mod timing {
     /// Leases (three Brevo timeouts) expire after 6 s and a crashed run is
     /// aborted after 3 s.
     const CRASHING: &str = "concurrency = 2\nlease_ms = 6000\ntimeout_ms = 3000\n\
-        backoff_base_ms = 10\nbackoff_max_ms = 50\n";
+        backoff_base_ms = 10\nbackoff_max_ms = 300000\n";
 
     async fn crashed(point: Option<&'static str>, close: bool) -> (World, FakeBrevo, Instance) {
         let world = World::new().await.expect("database");
@@ -868,6 +1212,95 @@ mod timing {
         assert!(gap >= Duration::from_secs(7), "{gap:?}");
         assert!(started.elapsed() < Duration::from_secs(25));
         assert_eq!(attempts(&world).await, ["rate_limited", "accepted"]);
+        instance.stop().await;
+    }
+
+    /// Review M2 on the rerun path: a crash after the provider call, and
+    /// the block's clock 26 minutes later when the lease expires: the
+    /// rerun does not resend, the delivery is `unknown`.
+    #[tokio::test]
+    async fn a_rerun_past_the_idempotency_window_does_not_resend() {
+        let Some(world) = World::new().await else {
+            return;
+        };
+        let fake = FakeBrevo::start(API_KEY).await.unwrap();
+        let clock = Arc::new(Shifted::default());
+        let mut options = options(&section(&fake, CRASHING, "", ""));
+        options.heartbeat = false;
+        options.clock = Some(clock.clone());
+        options.faults.crash_once(faults::AFTER_PROVIDER_CALL);
+        let instance = Instance::start(&world, options).await;
+        commit(
+            &instance,
+            request("tasks.assigned", email("quin@example.org", None), "q:1"),
+        )
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fake.processed().is_empty() {
+            assert!(Instant::now() < deadline, "never sent");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        clock.advance(Duration::from_secs(26 * 60));
+        wait_status(&instance, "unknown", 1).await;
+        assert_eq!(
+            delivery(&world, "quin@example.org").await,
+            "unknown:idempotency_window"
+        );
+        assert_eq!(attempts(&world).await, ["ambiguous"]);
+        assert_eq!((sends(&fake).len(), fake.processed().len()), (1, 1));
+        instance.stop().await;
+    }
+
+    /// Review L4: an event about a delivery its worker still owns is kept
+    /// pending, not consumed, and Tx B applies it once the outcome is
+    /// recorded.
+    #[tokio::test]
+    async fn an_event_during_the_send_is_applied_after_the_outcome() {
+        let Some(world) = World::new().await else {
+            return;
+        };
+        let fake = FakeBrevo::start(API_KEY).await.unwrap();
+        let options = options(&section(&fake, "", "", ""));
+        options
+            .faults
+            .pause_once(faults::AFTER_PROVIDER_CALL, Duration::from_secs(3));
+        let instance = Instance::start(&world, options).await;
+        commit(
+            &instance,
+            request("tasks.assigned", email("rae@example.org", None), "p:1"),
+        )
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fake.processed().is_empty() {
+            assert!(Instant::now() < deadline, "never sent");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let message = fake.processed().remove(0);
+        assert_eq!(
+            callback(&instance, &fake.event("delivered", &message))
+                .await
+                .0,
+            200
+        );
+        assert_eq!(delivery(&world, "rae@example.org").await, "sending:");
+        let id = delivery_id(&world, "rae@example.org").await;
+        assert_eq!(
+            world
+                .scalar(&format!(
+                    "SELECT count(*) FROM merezha_notify.provider_events \
+                     WHERE delivery_id = '{id}' AND pending"
+                ))
+                .await,
+            1
+        );
+        wait_status(&instance, "delivered", 1).await;
+        assert_eq!(
+            world
+                .scalar("SELECT count(*) FROM merezha_notify.provider_events WHERE pending")
+                .await,
+            0
+        );
+        assert_eq!(attempts(&world).await, ["accepted"]);
         instance.stop().await;
     }
 }

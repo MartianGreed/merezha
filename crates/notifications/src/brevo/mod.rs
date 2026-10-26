@@ -144,7 +144,13 @@ impl BrevoClient {
             .http
             .client()
             .post(format!("{}{path}", self.base_url))
-            .header("api-key", self.api_key.expose())
+            .header(
+                "api-key",
+                api_key_header(&self.api_key).map_err(|failure| OutboundFailure {
+                    failure,
+                    maybe_sent: false,
+                })?,
+            )
             .header("accept", "application/json")
             .header("content-type", "application/json")
             .body(body.to_string())
@@ -217,18 +223,38 @@ impl BrevoClient {
 /// The failure code of a registration without a Brevo email driver.
 pub const NOT_CONFIGURED: &str = "brevo_not_configured";
 
+/// The callback's full path, which a registered webhook URL must have.
+pub const CALLBACK_PATH: &str = "/v1/notifications/providers/brevo/email";
+
+/// What `register-webhook` created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Registered {
+    /// Brevo's webhook id.
+    pub id: i64,
+    pub url: String,
+    /// `host_override` when `--allow-host` let a host other than
+    /// `public_base_url`'s through.
+    pub warnings: Vec<&'static str>,
+}
+
 /// `merezha notifications brevo register-webhook`: create the account-level
 /// webhook of `settings` (a Brevo email driver with its token) to `url`,
-/// or by default to `public_base_url` + `/v1/notifications` + the callback
-/// path. Returns Brevo's webhook id and the URL. Fails permanent
-/// `brevo_not_configured`, `missing_public_base_url` or `invalid_url`, or
-/// with [`BrevoClient::register_webhook`]'s codes.
+/// or by default to `public_base_url` + [`CALLBACK_PATH`].
+///
+/// A given `url` must have the callback path, no query, and the host and
+/// port of `public_base_url`, so the bearer token is never handed to
+/// another server by a typo; `allow_host` lets another host through with
+/// the `host_override` warning. Fails permanent `brevo_not_configured`,
+/// `missing_public_base_url`, `invalid_url`, `callback_path_mismatch` or
+/// `callback_host_mismatch`, or with [`BrevoClient::register_webhook`]'s
+/// codes.
 pub async fn register_webhook(
     settings: &crate::Settings,
     url: Option<&str>,
+    allow_host: bool,
     http: &OutboundHttp,
     deadline: Instant,
-) -> Result<(i64, String), Failure> {
+) -> Result<Registered, Failure> {
     let (Some(brevo), crate::config::Driver::Brevo) = (&settings.brevo, settings.email.driver)
     else {
         return Err(Failure::permanent(NOT_CONFIGURED));
@@ -238,15 +264,51 @@ pub async fn register_webhook(
     };
     let url = match (url, &settings.public_base_url) {
         (Some(url), _) => url.to_owned(),
-        (None, Some(base)) => format!("{base}/v1/notifications{}", events::PATH),
+        (None, Some(base)) => format!("{base}{CALLBACK_PATH}"),
         (None, None) => return Err(Failure::permanent("missing_public_base_url")),
     };
-    if !callback_url_allowed(&url) {
-        return Err(Failure::permanent("invalid_url"));
-    }
+    let warnings = check_callback_url(&url, settings.public_base_url.as_deref(), allow_host)?;
     let client = BrevoClient::new(brevo, http)?;
     let id = client.register_webhook(&url, token, deadline).await?;
-    Ok((id, url))
+    Ok(Registered { id, url, warnings })
+}
+
+/// The checks of [`register_webhook`] on its URL.
+pub fn check_callback_url(
+    url: &str,
+    public_base_url: Option<&str>,
+    allow_host: bool,
+) -> Result<Vec<&'static str>, Failure> {
+    if !callback_url_allowed(url) {
+        return Err(Failure::permanent("invalid_url"));
+    }
+    let parsed = url::Url::parse(url).map_err(|_| Failure::permanent("invalid_url"))?;
+    if parsed.path() != CALLBACK_PATH || parsed.query().is_some() {
+        return Err(Failure::permanent("callback_path_mismatch"));
+    }
+    let origin = |u: &url::Url| {
+        (
+            u.host_str().map(str::to_ascii_lowercase),
+            u.port_or_known_default(),
+        )
+    };
+    let same_host = public_base_url
+        .and_then(|base| url::Url::parse(base).ok())
+        .is_some_and(|base| origin(&base) == origin(&parsed));
+    match (same_host, allow_host) {
+        (true, _) => Ok(Vec::new()),
+        (false, true) => Ok(vec!["host_override"]),
+        (false, false) => Err(Failure::permanent("callback_host_mismatch")),
+    }
+}
+
+/// The `api-key` header value, marked sensitive so the HTTP stack never
+/// shows it in a `Debug` output or caches it for header compression.
+pub fn api_key_header(key: &Secret) -> Result<axum::http::HeaderValue, Failure> {
+    let mut value = axum::http::HeaderValue::from_str(key.expose())
+        .map_err(|_| Failure::permanent("invalid_config"))?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 /// Whether `text` may be the callback URL Brevo calls: `https`, or `http`
@@ -628,6 +690,50 @@ mod tests {
     }
 
     #[test]
+    fn a_callback_url_needs_the_path_and_the_public_host_unless_overridden() {
+        let base = Some("https://api.acme.test");
+        let ok = "https://api.acme.test/v1/notifications/providers/brevo/email";
+        assert_eq!(check_callback_url(ok, base, false), Ok(Vec::new()));
+        let code = |url: &str, base: Option<&str>, allow: bool| {
+            check_callback_url(url, base, allow).map_err(|f| f.code)
+        };
+        assert_eq!(
+            code("https://api.acme.test/v1/notifications/other", base, true),
+            Err("callback_path_mismatch".into())
+        );
+        assert_eq!(
+            code(&format!("{ok}?x=1"), base, true),
+            Err("callback_path_mismatch".into())
+        );
+        let elsewhere = "https://evil.test/v1/notifications/providers/brevo/email";
+        assert_eq!(
+            code(elsewhere, base, false),
+            Err("callback_host_mismatch".into())
+        );
+        assert_eq!(
+            code(
+                "https://api.acme.test:8443/v1/notifications/providers/brevo/email",
+                base,
+                false
+            ),
+            Err("callback_host_mismatch".into())
+        );
+        assert_eq!(
+            code(elsewhere, None, false),
+            Err("callback_host_mismatch".into())
+        );
+        assert_eq!(code(elsewhere, base, true), Ok(vec!["host_override"]));
+        assert_eq!(
+            code(
+                "http://evil.test/v1/notifications/providers/brevo/email",
+                base,
+                true
+            ),
+            Err("invalid_url".into())
+        );
+    }
+
+    #[test]
     fn the_client_debug_redacts_the_key() {
         let settings = BrevoSettings {
             api_key: Some(Secret::new("xkeysib-very-secret")),
@@ -641,6 +747,9 @@ mod tests {
         let client = BrevoClient::new(&settings, &OutboundHttp::new().unwrap()).unwrap();
         let debug = format!("{client:?}");
         assert!(!debug.contains("very-secret"), "{debug}");
+        let header = api_key_header(settings.api_key.as_ref().unwrap()).unwrap();
+        assert!(header.is_sensitive());
+        assert!(!format!("{header:?}").contains("very-secret"));
         assert_eq!(client.host, "api.brevo.com");
     }
 }

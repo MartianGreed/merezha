@@ -72,11 +72,17 @@ pub const SCHEMA: &str = "merezha_notify";
 /// The instrumentation scope of the block's instruments (TE §1.3).
 pub const METER_SCOPE: &str = "merezha.notifications";
 
-/// Migration 1, the core tables, and migration 2, the inbox (NT §2.4).
-/// Later slices append their own migrations and never edit these.
-pub const MIGRATIONS: [Migration; 2] = [
+/// Migration 1, the core tables, migration 2, the inbox (NT §2.4), and
+/// migration 3, pending provider events (NT-N3). Later slices append their
+/// own migrations and never edit these.
+pub const MIGRATIONS: [Migration; 3] = [
     Migration::new(1, "core", include_str!("../migrations/0001_core.sql")),
     Migration::new(2, "inbox", include_str!("../migrations/0002_inbox.sql")),
+    Migration::new(
+        3,
+        "provider_events",
+        include_str!("../migrations/0003_provider_events.sql"),
+    ),
 ];
 
 /// The permission catalog of NT §7.1 this block checks so far.

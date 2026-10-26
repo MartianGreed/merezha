@@ -17,8 +17,9 @@
 //! logged at error level and counted, a rate limit at warn. Brevo SMS
 //! (NT-N4) implements the same trait.
 use crate::{
+    brevo::events,
     drivers::{EmailMessage, SendOutcome, SmsMessage},
-    faults,
+    expand, faults,
     handler::Outcome,
     ids,
     keys::Unsubscribe,
@@ -29,8 +30,11 @@ use crate::{
     templates::{RenderContext, Rendered},
     topics::Category,
 };
-use merezha_domain::Failure;
-use merezha_platform::ports::{Channel, EmailAddress, JobContext, PhoneNumber};
+use merezha_domain::{Failure, Identity};
+use merezha_platform::ports::{
+    Channel, DedupeKey, EmailAddress, JobContext, MessageContext, OnDuplicate, OutboxRecord,
+    OutboxTarget, PhoneNumber,
+};
 use merezha_postgres::classify;
 use serde_json::{Map, Value};
 use std::time::{Duration, Instant};
@@ -59,6 +63,15 @@ struct Locked {
     expires_at: Option<jiff::Timestamp>,
     requested_at: jiff::Timestamp,
     timezone: Option<String>,
+    /// When Tx A started this attempt.
+    started_at: jiff::Timestamp,
+    /// The first attempt of this generation Brevo may have processed (an
+    /// `ambiguous` one): the start of its idempotency window (email).
+    first_uncertain: Option<jiff::Timestamp>,
+    /// The start of the current run of `provider_account` answers.
+    account_streak_since: Option<jiff::Timestamp>,
+    correlation_id: Option<String>,
+    tenant: Option<String>,
 }
 
 enum Prepared {
@@ -230,7 +243,18 @@ async fn deliver(
     };
     let took = started.elapsed();
     core.faults.hit(faults::AFTER_PROVIDER_CALL).await;
-    let result = record(core, channel, ctx, id, &locked, &outcome, provider, took).await;
+    let result = record(
+        core,
+        channel,
+        ctx,
+        id,
+        &locked,
+        &outcome,
+        provider,
+        took,
+        payload.secret_data.as_ref(),
+    )
+    .await;
     core.faults.hit(faults::AFTER_TX_B).await;
     result
 }
@@ -362,6 +386,7 @@ async fn prepare(
                     )
                     .await
                     .map_err(|e| classify(&e))?;
+                    events::apply_pending(&db, tx, id, now).await?;
                     return Ok((
                         Prepared::Finished(Outcome::Done),
                         Some((status, why, topic)),
@@ -409,12 +434,45 @@ async fn prepare(
                             )
                             .await
                             .map_err(|e| classify(&e))?;
+                            events::apply_pending(&db, tx, id, now).await?;
                             return Ok((
                                 Prepared::Finished(Outcome::Done),
                                 Some(("unknown", "ambiguous", topic)),
                             ));
                         }
                     }
+                }
+                let history = db
+                    .query_one(tx, &sql::ATTEMPT_HISTORY, &[&id, &generation])
+                    .await
+                    .map_err(|e| classify(&e))?;
+                let first_uncertain: Option<jiff::Timestamp> = history.get(0);
+                let account_streak_since: Option<jiff::Timestamp> = history.get(1);
+                // Past the margin of Brevo's idempotency window a resend
+                // could deliver twice: the outcome stays unknown (NT §5.1).
+                if channel == Channel::Email
+                    && first_uncertain.is_some_and(|first| beyond_window(first, now))
+                {
+                    db.execute(
+                        tx,
+                        &sql::DELIVERY_SET,
+                        &[
+                            &id,
+                            &generation,
+                            &"unknown",
+                            &reason::IDEMPOTENCY_WINDOW,
+                            &now,
+                            &None::<jiff::Timestamp>,
+                            &None::<i32>,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| classify(&e))?;
+                    events::apply_pending(&db, tx, id, now).await?;
+                    return Ok((
+                        Prepared::Finished(Outcome::Done),
+                        Some(("unknown", reason::IDEMPOTENCY_WINDOW, topic)),
+                    ));
                 }
                 db.execute(tx, &sql::ATTEMPT_START, &[&id, &next, &generation, &now])
                     .await
@@ -451,6 +509,11 @@ async fn prepare(
                         expires_at,
                         requested_at: row.get(15),
                         timezone,
+                        started_at: now,
+                        first_uncertain,
+                        account_streak_since,
+                        correlation_id: row.get(17),
+                        tenant: row.get(18),
                     })),
                     None,
                 ))
@@ -556,6 +619,7 @@ async fn finish(
                     )
                     .await
                     .map_err(|e| classify(&e))?;
+                    events::apply_pending(&db, tx, id, now).await?;
                 }
                 Ok(changed)
             })
@@ -573,6 +637,28 @@ async fn finish(
     }
 }
 
+/// Whether a resend at `at` falls past the margin of the idempotency
+/// window opened by an attempt Brevo may have processed at `first`.
+fn beyond_window(first: jiff::Timestamp, at: jiff::Timestamp) -> bool {
+    jiff::SignedDuration::try_from(IDEMPOTENCY_MARGIN)
+        .ok()
+        .and_then(|margin| first.checked_add(margin).ok())
+        .is_some_and(|limit| at > limit)
+}
+/// A resend after an ambiguous email attempt must start within this much of
+/// it: Brevo holds an `idempotencyKey` 30 minutes, minus a 5-minute margin.
+pub const IDEMPOTENCY_MARGIN: Duration = Duration::from_secs(25 * 60);
+/// How long a run of `provider_account` answers may last when the
+/// notification has no `expires_at`.
+pub const ACCOUNT_STREAK_LIMIT: Duration = Duration::from_secs(24 * 3600);
+
+fn plus(at: jiff::Timestamp, by: Duration) -> jiff::Timestamp {
+    jiff::SignedDuration::try_from(by)
+        .ok()
+        .and_then(|d| at.checked_add(d).ok())
+        .unwrap_or(jiff::Timestamp::MAX)
+}
+
 /// Tx B: the provider's outcome.
 #[allow(clippy::too_many_arguments)]
 async fn record(
@@ -584,24 +670,30 @@ async fn record(
     outcome: &SendOutcome,
     provider: crate::drivers::Provider,
     took: Duration,
+    secret: Option<&Map<String, Value>>,
 ) -> Outcome {
     let now = core.now();
     let exhausted = ctx.attempt >= ctx.max_attempts;
+    // The idempotency window opened by the first attempt Brevo may have
+    // processed: an earlier ambiguous one, or this one.
+    let first_uncertain = locked
+        .first_uncertain
+        .or_else(|| matches!(outcome, SendOutcome::Ambiguous { .. }).then_some(locked.started_at));
     let retry = |code: &str, after: Option<Duration>, attempt_outcome: &'static str| {
-        let late = locked.expires_at.is_some_and(|at| {
-            let wait =
-                jiff::SignedDuration::try_from(after.unwrap_or_default()).unwrap_or_default();
-            now.checked_add(wait).is_ok_and(|next| next > at)
-        });
+        let next = plus(now, after.unwrap_or_default());
+        let late = locked.expires_at.is_some_and(|at| next > at);
         if late {
-            Step {
-                attempt: attempt_outcome,
-                code: Some(code.to_owned()),
-                status: "expired",
-                reason: reason::EXPIRED.to_owned(),
+            Step::settled(attempt_outcome, code, "expired", reason::EXPIRED, after)
+        } else if channel == Channel::Email
+            && first_uncertain.is_some_and(|first| beyond_window(first, next))
+        {
+            Step::settled(
+                attempt_outcome,
+                code,
+                "unknown",
+                reason::IDEMPOTENCY_WINDOW,
                 after,
-                job: Outcome::Done,
-            }
+            )
         } else if exhausted {
             Step {
                 attempt: attempt_outcome,
@@ -610,6 +702,7 @@ async fn record(
                 reason: reason::RETRIES_EXHAUSTED.to_owned(),
                 after,
                 job: Outcome::Permanent(reason::RETRIES_EXHAUSTED.to_owned()),
+                continue_at: None,
             }
         } else {
             Step {
@@ -622,6 +715,7 @@ async fn record(
                     after,
                     code: code.to_owned(),
                 },
+                continue_at: None,
             }
         }
     };
@@ -635,6 +729,7 @@ async fn record(
             reason: code.clone(),
             after: None,
             job: Outcome::Permanent(code.clone()),
+            continue_at: None,
         },
         // NT1: an ambiguous SMS is never resent.
         SendOutcome::Ambiguous { code } if channel == Channel::Sms => Step {
@@ -644,7 +739,56 @@ async fn record(
             reason: "ambiguous".into(),
             after: None,
             job: Outcome::Done,
+            continue_at: None,
         },
+        // An account problem consumes no attempt: the delivery waits for an
+        // operator until its deadline (NT §5.2).
+        SendOutcome::Transient { code, retry_after } if code == crate::brevo::PROVIDER_ACCOUNT => {
+            let after = retry_after
+                .unwrap_or(crate::brevo::ACCOUNT_DELAY)
+                .max(crate::brevo::ACCOUNT_DELAY)
+                .min(
+                    core.settings
+                        .provider_retry_cap
+                        .max(crate::brevo::ACCOUNT_DELAY),
+                );
+            let next = plus(now, after);
+            let since = locked.account_streak_since.unwrap_or(locked.started_at);
+            let deadline = locked
+                .expires_at
+                .unwrap_or_else(|| plus(since, ACCOUNT_STREAK_LIMIT));
+            if next > deadline {
+                Step {
+                    attempt: "transient",
+                    code: Some(code.clone()),
+                    status: "failed",
+                    reason: reason::PROVIDER_ACCOUNT_UNRESOLVED.to_owned(),
+                    after: None,
+                    job: Outcome::Permanent(reason::PROVIDER_ACCOUNT_UNRESOLVED.to_owned()),
+                    continue_at: None,
+                }
+            } else if channel == Channel::Email
+                && first_uncertain.is_some_and(|first| beyond_window(first, next))
+            {
+                Step::settled(
+                    "transient",
+                    code,
+                    "unknown",
+                    reason::IDEMPOTENCY_WINDOW,
+                    Some(after),
+                )
+            } else {
+                Step {
+                    attempt: "transient",
+                    code: Some(code.clone()),
+                    status: "retrying",
+                    reason: code.clone(),
+                    after: Some(after),
+                    job: Outcome::Done,
+                    continue_at: Some(next),
+                }
+            }
+        }
         // Email resends with the same idempotency key.
         SendOutcome::Ambiguous { code } => retry(code, None, "ambiguous"),
         SendOutcome::Transient { code, retry_after } => retry(code, *retry_after, "transient"),
@@ -656,7 +800,53 @@ async fn record(
         SendOutcome::Accepted { message_id, .. } => message_id.clone(),
         _ => None,
     };
+    // The next attempt of an account problem is a new job of the same
+    // generation, so it starts with a fresh attempt budget.
+    let continuation = match (step.continue_at, expand::delivery_queue(channel)) {
+        (Some(at), Some((queue, kind))) => {
+            let correlation_id = locked
+                .correlation_id
+                .as_deref()
+                .and_then(|c| Identity::new(c).ok())
+                .map_or_else(
+                    || Identity::new(locked.notification.simple().to_string()),
+                    Ok,
+                );
+            let record = (|| {
+                Ok::<_, Failure>(OutboxRecord {
+                    dedupe_key: DedupeKey::new(format!(
+                        "deliver:{id}:g{}:a{}",
+                        locked.generation, locked.attempt
+                    ))?,
+                    target: OutboxTarget::Job {
+                        queue: Identity::new(queue)?,
+                        kind: Identity::new(kind)?,
+                    },
+                    payload: DeliverPayload {
+                        delivery_id: id,
+                        generation: locked.generation,
+                        secret_data: secret.cloned(),
+                    }
+                    .to_value(),
+                    contains_secret: secret.is_some(),
+                    run_at: Some(at),
+                    priority: 0,
+                    context: MessageContext {
+                        correlation_id: correlation_id?,
+                        causation_id: None,
+                        tenant: locked.tenant.as_deref().and_then(|t| Identity::new(t).ok()),
+                    },
+                })
+            })();
+            match record {
+                Ok(record) => Some(record),
+                Err(failure) => return Outcome::retry(&failure.code),
+            }
+        }
+        _ => None,
+    };
     let db = core.database.clone();
+    let outbox = core.outbox.clone();
     let (attempt, generation) = (locked.attempt, locked.generation);
     let provider_name = provider.as_str();
     let after_ms = step
@@ -666,11 +856,7 @@ async fn record(
     let reason_text = step.reason.clone();
     let code = step.code.clone();
     let attempt_outcome = step.attempt;
-    let run_at = step.after.and_then(|after| {
-        jiff::SignedDuration::try_from(after)
-            .ok()
-            .and_then(|d| now.checked_add(d).ok())
-    });
+    let run_at = step.after.map(|after| plus(now, after));
     let deadline = Instant::now() + CHANNEL_TIMEOUT;
     let written = db
         .clone()
@@ -717,6 +903,17 @@ async fn record(
                     )
                     .await
                     .map_err(|e| classify(&e))?;
+                    if let Some(record) = continuation {
+                        outbox
+                            .append(tx, &[record], OnDuplicate::Ignore)
+                            .await
+                            .map_err(|e| Failure::new(&e.code, e.classification))?;
+                    }
+                    // Events that arrived while the worker owned the
+                    // delivery apply now that its outcome is recorded.
+                    if !matches!(status, "queued" | "sending" | "retrying") {
+                        events::apply_pending(&db, tx, id, now).await?;
+                    }
                 }
                 Ok(changed)
             })
@@ -732,15 +929,18 @@ async fn record(
     core.metrics
         .attempt(channel, provider_name, attempt_outcome, took);
     match outcome {
-        // Mail stays queued while an operator fixes the key or the credits.
+        // Mail stays queued while an operator fixes the key or the
+        // credits; one error per run of refusals, every refusal counted.
         SendOutcome::Transient { code, .. } if code == crate::brevo::PROVIDER_ACCOUNT => {
-            merezha_telemetry::event!(
-                ERROR,
-                "notification.provider_account_error",
-                provider = provider_name,
-                channel = channel.as_str(),
-                code = code.as_str()
-            );
+            if locked.account_streak_since.is_none() {
+                merezha_telemetry::event!(
+                    ERROR,
+                    "notification.provider_account_error",
+                    provider = provider_name,
+                    channel = channel.as_str(),
+                    code = code.as_str()
+                );
+            }
             core.metrics.provider_account_error(provider_name, channel);
         }
         SendOutcome::RateLimited { .. } => merezha_telemetry::event!(
@@ -799,6 +999,8 @@ struct Step {
     reason: String,
     after: Option<Duration>,
     job: Outcome,
+    /// The next attempt is a new job of the same generation at this time.
+    continue_at: Option<jiff::Timestamp>,
 }
 impl Step {
     fn accepted(attempt: &'static str) -> Self {
@@ -809,6 +1011,25 @@ impl Step {
             reason: String::new(),
             after: None,
             job: Outcome::Done,
+            continue_at: None,
+        }
+    }
+    /// Settled without another attempt (`expired`, `unknown`).
+    fn settled(
+        attempt: &'static str,
+        code: &str,
+        status: &'static str,
+        why: &str,
+        after: Option<Duration>,
+    ) -> Self {
+        Self {
+            attempt,
+            code: Some(code.to_owned()),
+            status,
+            reason: why.to_owned(),
+            after,
+            job: Outcome::Done,
+            continue_at: None,
         }
     }
 }

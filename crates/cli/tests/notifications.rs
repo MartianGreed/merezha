@@ -242,6 +242,7 @@ fn brevo_register_webhook_creates_the_bearer_webhook() {
     let report: Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(report["status"], "registered");
     assert_eq!(report["id"], 1);
+    assert_eq!(report["warnings"], serde_json::json!([]));
     assert_eq!(
         report["url"],
         "https://api.acme.test/v1/notifications/providers/brevo/email"
@@ -276,11 +277,41 @@ fn brevo_register_webhook_creates_the_bearer_webhook() {
     assert_eq!(output.status.code(), Some(1));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["code"], "invalid_url");
+    // Another path, or another host than `public_base_url`'s, is refused;
+    // `--allow-host` lets the host through with a warning.
+    for (url, code) in [
+        (
+            "https://api.acme.test/v1/notifications/oops",
+            "callback_path_mismatch",
+        ),
+        (
+            "https://hooks.other.test/v1/notifications/providers/brevo/email",
+            "callback_host_mismatch",
+        ),
+    ] {
+        let output = run(key, &["--url", url]);
+        assert_eq!(output.status.code(), Some(1), "{url}");
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["code"], code, "{url}");
+    }
+    let other = "https://hooks.other.test/v1/notifications/providers/brevo/email";
+    let output = run(key, &["--url", other, "--allow-host"]);
+    assert_eq!(output.status.code(), Some(0));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        (report["url"].clone(), report["warnings"].clone()),
+        (
+            serde_json::json!(other),
+            serde_json::json!(["host_override"])
+        )
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("host_override"));
+    assert_eq!(fake.requests_to("/v3/webhooks").len(), 2);
     // A wrong key is an account error, reported by code only.
     let output = run("xkeysib-wrong", &[]);
     assert_eq!(output.status.code(), Some(1));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["code"], "provider_account");
-    assert_eq!(fake.requests_to("/v3/webhooks").len(), 2);
+    assert_eq!(fake.requests_to("/v3/webhooks").len(), 3);
     drop(fake);
 }

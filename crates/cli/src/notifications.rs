@@ -8,15 +8,20 @@
 //! warnings name settings and template files, never values.
 //!
 //! `merezha notifications brevo register-webhook --config merezha.toml
-//! [--url URL]` (NT §5.2, NT-N3) validates the project the same way, then
+//! [--url URL [--allow-host]]` (NT §5.2, NT-N3) validates the project the
+//! same way, then
 //! creates Brevo's account-level transactional webhook with `POST
 //! /v3/webhooks`: the email events of the callback, `auth: { type: bearer,
 //! token: brevo.webhook_token }`, to `URL` or, by default,
-//! `public_base_url` + `/v1/notifications/providers/brevo/email`. It prints
-//! `{"status":"registered","id":N,"url":"…"}` and exits 0, or
+//! `public_base_url` + `/v1/notifications/providers/brevo/email`. A given
+//! `URL` must have that path and `public_base_url`'s host and port;
+//! `--allow-host` lets another host through with the `host_override`
+//! warning (in `warnings` and on stderr). It prints
+//! `{"status":"registered","id":N,"url":"…","warnings":[…]}` and exits 0, or
 //! `{"status":"failed","code":"…"}` and exits 1 (`brevo_not_configured`
 //! without a Brevo email driver, `missing_public_base_url`, `invalid_url`,
-//! `provider_account`, `provider_rejected[_<code>]`, or a transport code).
+//! `callback_path_mismatch`, `callback_host_mismatch`, `provider_account`,
+//! `provider_rejected[_<code>]`, or a transport code).
 //! The API key and the token are never printed.
 use merezha_notifications::{HostFacts, Notifications};
 use merezha_platform::{ConfigInput, Module, host};
@@ -25,7 +30,7 @@ use std::process::ExitCode;
 
 pub const USAGE: &str = "merezha notifications check --config PATH [--listen ADDRESS] \
      [--set SECTION.KEY=VALUE]... | merezha notifications brevo register-webhook --config PATH \
-     [--url URL] [--set SECTION.KEY=VALUE]...";
+     [--url URL [--allow-host]] [--set SECTION.KEY=VALUE]...";
 
 /// How long `brevo register-webhook` waits for Brevo.
 const REGISTER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -90,6 +95,7 @@ pub fn main(mut args: impl Iterator<Item = String>) -> ExitCode {
         _ => return invalid(),
     };
     let mut url = None;
+    let mut allow_host = false;
     let mut rest = Vec::new();
     while let Some(argument) = args.next() {
         if register && argument == "--url" && url.is_none() {
@@ -97,6 +103,8 @@ pub fn main(mut args: impl Iterator<Item = String>) -> ExitCode {
                 Some(value) => url = Some(value),
                 None => return invalid(),
             }
+        } else if register && argument == "--allow-host" {
+            allow_host = true;
         } else {
             rest.push(argument);
         }
@@ -112,7 +120,7 @@ pub fn main(mut args: impl Iterator<Item = String>) -> ExitCode {
         overrides: arguments.overrides,
     };
     let (report, code) = if register {
-        register_webhook(&input, url.as_deref())
+        register_webhook(&input, url.as_deref(), allow_host)
     } else {
         check(&input)
     };
@@ -122,7 +130,11 @@ pub fn main(mut args: impl Iterator<Item = String>) -> ExitCode {
 
 /// The report and exit code of `brevo register-webhook`, for embedding
 /// and tests.
-pub fn register_webhook(input: &ConfigInput, url: Option<&str>) -> (Value, ExitCode) {
+pub fn register_webhook(
+    input: &ConfigInput,
+    url: Option<&str>,
+    allow_host: bool,
+) -> (Value, ExitCode) {
     let failed = |code: &str| (json!({"status": "failed", "code": code}), ExitCode::from(1));
     let module = Notifications::new(HostFacts::load(input));
     let handle = module.handle();
@@ -152,16 +164,27 @@ pub fn register_webhook(input: &ConfigInput, url: Option<&str>) -> (Value, ExitC
         merezha_notifications::brevo::register_webhook(
             &checked.settings,
             url,
+            allow_host,
             &http,
             std::time::Instant::now() + REGISTER_DEADLINE,
         )
         .await
     });
     match result {
-        Ok((id, url)) => (
-            json!({"status": "registered", "id": id, "url": url}),
-            ExitCode::SUCCESS,
-        ),
+        Ok(registered) => {
+            for warning in &registered.warnings {
+                eprintln!("{}", json!({"warning": warning, "url": registered.url}));
+            }
+            (
+                json!({
+                    "status": "registered",
+                    "id": registered.id,
+                    "url": registered.url,
+                    "warnings": registered.warnings,
+                }),
+                ExitCode::SUCCESS,
+            )
+        }
         Err(failure) => failed(&failure.code),
     }
 }
