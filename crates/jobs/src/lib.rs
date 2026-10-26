@@ -1183,6 +1183,9 @@ impl Module for PgJobs {
     fn migrations(&self) -> &[Migration] {
         Self::migrations()
     }
+    fn statements(&self) -> &[&'static [merezha_postgres::Statement]] {
+        &[STATEMENTS]
+    }
     fn errors(&self) -> &[ErrorCode] {
         ERRORS
     }

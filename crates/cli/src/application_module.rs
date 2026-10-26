@@ -36,6 +36,10 @@ use std::{
 /// module start bound (10 s).
 const CONNECT_BUDGET: Duration = Duration::from_secs(8);
 
+/// The statements [`ApplicationModule`] runs: the application store's.
+pub const STATEMENTS: &[&[merezha_postgres::Statement]] =
+    &[merezha_application::postgres::STATEMENTS];
+
 pub struct ApplicationModule {
     config: Config,
     /// How often the lag gauges are sampled while metrics are exported.
@@ -141,6 +145,9 @@ impl Module for ApplicationModule {
     }
     fn migrations(&self) -> &[Migration] {
         MIGRATIONS
+    }
+    fn statements(&self) -> &[&'static [merezha_postgres::Statement]] {
+        STATEMENTS
     }
     fn start(&self, ctx: AppContext) -> BoxFuture<'_, Result<(), Failure>> {
         Box::pin(async move {

@@ -363,6 +363,9 @@ impl Module for IdentityModule {
         )?);
         Ok(())
     }
+    fn statements(&self) -> &[&'static [merezha_postgres::Statement]] {
+        &[crate::sql::STATEMENTS]
+    }
     fn migrations(&self) -> &[Migration] {
         MIGRATIONS
     }

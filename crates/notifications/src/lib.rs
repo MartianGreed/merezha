@@ -322,6 +322,14 @@ impl Module for Notifications {
         let _ = self.checked.set(Arc::new(checked));
         Ok(())
     }
+    fn statements(&self) -> &[&'static [merezha_postgres::Statement]] {
+        &[
+            drivers::STATEMENTS,
+            sql::STATEMENTS,
+            stream::STATEMENTS,
+            push::sql::STATEMENTS,
+        ]
+    }
     fn migrations(&self) -> &[Migration] {
         &MIGRATIONS
     }

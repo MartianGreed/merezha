@@ -631,6 +631,9 @@ impl Module for ContentModule {
             Err(issues)
         }
     }
+    fn statements(&self) -> &[&'static [merezha_postgres::Statement]] {
+        &[crate::STATEMENTS, crate::media::STATEMENTS]
+    }
     fn migrations(&self) -> &[Migration] {
         MIGRATIONS
     }

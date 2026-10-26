@@ -24,3 +24,7 @@ merezha-telemetry = { path = "../telemetry", features = ["testing"] }
 opentelemetry = { workspace = true, features = ["trace"] }
 opentelemetry_sdk.workspace = true
 tempfile.workspace = true
+# The workspace statement scan parses sources (tests/statement_scan.rs);
+# `span-locations` gives its findings their line numbers.
+syn = { version = "3.0.9", default-features = false, features = ["full", "parsing", "visit"] }
+proc-macro2 = { version = "1.0.107", default-features = false, features = ["span-locations"] }
