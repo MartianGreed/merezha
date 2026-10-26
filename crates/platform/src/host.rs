@@ -735,7 +735,8 @@ impl Host {
     /// readiness turns `not_ready` at once while liveness stays 200, the
     /// listener keeps serving for `http.drain_delay_ms` so load balancers
     /// stop routing, then stops accepting and drains in-flight requests for
-    /// at most the drain timeout; modules shut down in reverse order (the
+    /// at most the drain timeout (each module's [`Module::draining`] runs
+    /// first, ending its event streams); modules shut down in reverse order (the
     /// jobs runtime first) and the pool closes. Emits `shutdown.started`,
     /// `listener.draining`, `listener.stopped` and `shutdown.completed`.
     async fn drain(
@@ -760,6 +761,11 @@ impl Host {
                 );
                 merezha_telemetry::event!(INFO, "listener.draining");
                 tokio::time::sleep(delay).await;
+                // Long-lived responses end first, so the drain below
+                // finishes with the requests in flight.
+                for module in &self.modules {
+                    module.draining();
+                }
                 server.stop();
                 let drain = self.timeouts.drain;
                 match tokio::time::timeout(drain, &mut server.task).await {

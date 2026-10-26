@@ -39,6 +39,9 @@ const NOTES: [Migration; 2] = [
 struct Notes {
     started: Arc<AtomicUsize>,
     stopped: Arc<AtomicUsize>,
+    /// `Module::draining` calls, and whether one came before `shutdown`.
+    drained: Arc<AtomicUsize>,
+    drained_first: Arc<AtomicBool>,
     unready: Arc<AtomicBool>,
     fail_start: bool,
     migrations: Option<&'static [Migration]>,
@@ -120,8 +123,14 @@ impl Module for Notes {
             }
         })
     }
+    fn draining(&self) {
+        self.drained.fetch_add(1, Ordering::SeqCst);
+    }
     fn shutdown(&self, _deadline: Instant) -> BoxFuture<'_, ()> {
         Box::pin(async move {
+            if self.drained.load(Ordering::SeqCst) > 0 {
+                self.drained_first.store(true, Ordering::SeqCst);
+            }
             self.stopped.fetch_add(1, Ordering::SeqCst);
         })
     }
@@ -568,6 +577,10 @@ async fn shutdown_drains_in_flight_requests_then_stops_modules() {
         .unwrap()
         .unwrap();
     assert_eq!(notes.stopped.load(Ordering::SeqCst), 1);
+    // Modules hear of the drain once, before they are shut down (NT-N5:
+    // the inbox stream ends its responses there).
+    assert_eq!(notes.drained.load(Ordering::SeqCst), 1);
+    assert!(notes.drained_first.load(Ordering::SeqCst));
     assert!(
         tokio::net::TcpStream::connect(address).await.is_err(),
         "the listener closed"
