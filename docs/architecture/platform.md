@@ -1763,7 +1763,11 @@ Routes under `/v1/notifications/`:
   once they have gone unused for 7 days (`last_used_at`). During a rolling
   deploy the instances on the old and on the new key each keep using their
   own subscriptions, so neither deletes the other's; after the rollout the
-  old key's subscriptions stop being used and go a week later.
+  old key's subscriptions stop being used and go a week later. Until the
+  rollout completes, a push job picked up by an instance on the other key
+  is `skipped` / `no_subscription`: that push is not sent, though the
+  subscription stays. The inbox keeps the durable copy of the notification.
+  Issue #66 tracks sending these pushes instead.
 - **Delivery.** Expansion creates one push delivery per live subscription
   made with the current VAPID key (`push_subscription_id`, target key
   `pushsub:<id>`). The `notify.deliver.push` worker (queue `notify.push`)
