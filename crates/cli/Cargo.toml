@@ -17,7 +17,7 @@ merezha-platform = { path = "../platform" }
 merezha-jobs = { path = "../jobs" }
 merezha-notifications = { path = "../notifications" }
 merezha-content = { path = "../content" }
-merezha-identity = { path = "../identity" }
+merezha-identity = { path = "../identity", features = ["passkeys"] }
 merezha-postgres = { path = "../postgres" }
 merezha-telemetry = { path = "../telemetry", features = ["pipeline"] }
 anyhow.workspace = true

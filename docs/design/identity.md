@@ -920,8 +920,8 @@ Behavior notes:
 | Method and path | Auth | Request | Success | Errors |
 | --- | --- | --- | --- | --- |
 | `GET /oauth/providers` | none | | `200 {items:[{id, kind, display_name}]}` | |
-| `POST /oauth/{provider}/start` | none (sign-in) or session (link) | `{intent: "sign_in" \| "link", return_to?}` | `200 {authorization_url}` and sets `__Host-merezha_oauth` | `not_found`, `rate_limited`, `provider_unavailable` |
-| `GET /oauth/{provider}/callback` | binding cookie | provider query `code`, `state`, `iss?` or `error` | `303` to `return_to` or `links.sign_in_redirect`, sets session cookie | `303` to `links.oauth_error#error=<code>` |
+| `POST /oauth/{provider}/start` | none (sign-in) or recent (link) | `{intent: "sign_in" \| "link", return_to?}` | `200 {authorization_url}` and sets `__Host-merezha_oauth` | `not_found`, `rate_limited`, `provider_unavailable` |
+| `GET /oauth/{provider}/callback` | binding cookie | provider query `code`, `state`, `iss?` or `error` | `303` to `return_to` or `links.sign_in_redirect`, sets session cookie | `303` to `links.oauth_error#error=<code>`; `oauth_callback.ip` throttles failures |
 | `GET /me/oauth-identities` | session | | `200 {items:[{id, provider, email, created_at, last_used_at}]}` | |
 | `DELETE /me/oauth-identities/{id}` | recent | | `204` | `last_credential`, `not_found` |
 | `POST /passkeys/registrations/options` | recent | | `200 {ceremony_id, public_key}` | `passkey_limit`, `reauthentication_required` |
@@ -937,7 +937,8 @@ Behavior notes:
 The OAuth callback is a browser navigation, so it answers with redirects, not
 JSON. Error codes in the fragment: `oauth_denied`, `oauth_failed`,
 `invalid_state`, `account_exists`, `identity_already_linked`,
-`registration_closed`, `email_unverified`, `account_disabled`.
+`registration_closed`, `email_unverified`, `account_disabled`, and
+`provider_unavailable` (PR 3 as built, section 10).
 
 `POST /passkeys/authentications/options` without `email` starts a
 discoverable (usernameless, conditional UI) ceremony. With `email`, it
@@ -1225,7 +1226,17 @@ repeating them while staying exact across host instances:
 Generic OIDC defaults to untrusted email because an identity provider
 controlled by someone else can assert any address. The "nOAuth" incidents
 with Azure AD's mutable `email` claim are the known case. An operator who
-runs the IdP can set `trust_email = true`.
+runs the IdP can set `trust_email = true`. Turning `trust_email` on later
+verifies nothing retroactively: accounts the provider created while
+untrusted stay unverified until they verify through the normal flows (the
+verification link, a magic link, a reset, an invitation, or a later
+trusted assertion of their exact address, rule 1).
+
+Subjects are scoped by their issuer: every identity stores the issuer it
+was linked under (the OIDC issuer, GitHub's API base), and an identity
+whose stored issuer differs from the provider's current one never signs in
+(`oauth_failed`), so changing a provider's `issuer` never re-maps subjects
+onto accounts.
 
 ### Authorization code flow
 
@@ -1238,12 +1249,20 @@ runs the IdP can set `trust_email = true`.
 2. The redirect URI is exact and per provider:
    `{api_base_url}/v1/identity/oauth/{provider}/callback`. A distinct callback
    per provider is the RFC 9700 mix-up defense. When the provider returns
-   `iss` (RFC 9207), it must equal the configured issuer.
+   `iss` (RFC 9207), it must equal the configured issuer; when its
+   discovery document advertises
+   `authorization_response_iss_parameter_supported`, `iss` is required.
 3. The callback consumes the flow by `state` digest (`DELETE ... RETURNING`),
-   requires the binding cookie to match, and clears it. A missing or
-   mismatched binding fails `invalid_state`. This blocks login CSRF and
-   callback injection, where an attacker finishes a flow in the victim's
-   browser with the attacker's code.
+   requires the binding cookie to match, and clears it once no other flow of
+   that binding is pending (two tabs share one binding, and both complete).
+   A missing or mismatched binding fails `invalid_state` and leaves the
+   browser's cookie alone. This blocks login CSRF and callback injection,
+   where an attacker finishes a flow in the victim's browser with the
+   attacker's code. Failed callbacks naming a live flow are charged to
+   `oauth_callback.ip`, checked before any work; a callback naming no live
+   flow is counted, not audited, and charged to its own looser
+   `oauth_callback_unknown.ip`, so junk never locks out the same IP's
+   legitimate callbacks.
 4. Code exchange and ID token validation use `openidconnect`: signature
    against the provider JWKS (refetched once on an unknown `kid`), allowed
    algorithms `RS256`, `ES256` and `EdDSA` only, `iss`, `aud`, `azp`,
@@ -1255,8 +1274,9 @@ runs the IdP can set `trust_email = true`.
    `openidconnect::AsyncHttpClient`: redirects disabled (an SSRF and
    token-leak precaution recommended by the `oauth2` crate docs), 10 s
    deadline, 1 MiB response cap, no retries. Discovery documents and JWKS are
-   cached for 1 hour. A provider that cannot be reached returns
-   `provider_unavailable` and does not affect readiness.
+   cached for 1 hour; concurrent callers share one fetch, and a failed
+   discovery is remembered for 30 s. A provider that cannot be reached
+   returns `provider_unavailable` and does not affect readiness.
 
 ### Account linking rules
 
@@ -1267,8 +1287,12 @@ trusted, signed_in_user, existing_user_by_email, config)`:
    another signed-in user: `identity_already_linked`). Update the stored
    email assertion.
 2. Link intent, signed-in user from the flow row: attach the identity. The
-   flow carries `session_id`, and that session must still exist. One identity
-   per provider per user.
+   flow carries `session_id`, and that session must still be alive at the
+   callback (share-locked, so a revocation is not lost). Starting a link
+   needs a recent session, and the callback re-checks that it still is
+   (`reauthentication_required` otherwise; the provider round trip does not
+   stretch the window). One identity per provider per user. A link onto
+   an existing account sends `identity.sign_in_method_added`.
 3. Sign-in intent, no linked identity, and a trusted verified email that
    matches an existing user:
    - The existing user's email is verified and `link_by_verified_email =
@@ -1475,6 +1499,8 @@ IPv6 addresses are keyed by their /64.
 | `reauth.session` | session | 5 per 15 min | on failure |
 | `passkey.ip` | IP | 60 per 10 min | on arrival, options routes |
 | `oauth.ip` | IP | 30 per 10 min | on arrival, start route |
+| `oauth_callback.ip` | IP | 30 per 10 min | on failure of a callback naming a live flow (checked first) |
+| `oauth_callback_unknown.ip` | IP | 300 per 10 min | on failure of a callback naming no live flow; past it such callbacks answer `rate_limited`, never the IP's legitimate ones |
 | `invitation.organization` | organization | 100 per day | on arrival |
 | `api_key.invalid.ip` | IP | 60 per min | on failure |
 
@@ -1574,7 +1600,8 @@ identity defines none. Spans are TE's `identity {operation}`.
 | Database read by an attacker | Only digests and Argon2id hashes. Raw tokens exist only in flagged outbox and job payloads until relay or terminal state (R3). |
 | Double consumption under races | `DELETE ... RETURNING` on tokens, flows, ceremonies. Unique constraints for users and identities. |
 | WebAuthn ceremony replay | State stored server-side, consumed once, bound to user and session, 5-minute TTL. |
-| Cloned authenticator | Counter regression check for nonzero counters. |
+| Cloned authenticator | Counter regression check for nonzero counters. The check runs against the counter read before verification, so two assertions verified concurrently can both pass; the stored counter keeps the maximum. |
+| A credential added by a session that is revoked meanwhile | Passkey registration and OAuth linking re-check their session, share-locked, under the user lock before storing anything; a credential removed mid sign-in signs nobody in. A new method sends `identity.sign_in_method_added`. |
 | WebAuthn origin spoofing | RP id and origins from configuration. webauthn-rs checks origin and RP id hash. |
 | Privilege escalation through roles, keys or service accounts | Escalation check on every grant path at the target scope, owner-only owner assignment, `platform_admin` CLI-only and unreachable from keys, key power intersected live with the owner's, scope rules in foreign keys, custom roles bound to their organization. |
 | Cross-tenant access (IDOR) | Organization in every scoped check, tenant match required unless an application grant matches, tenant keys pinned, 404 for foreign ids. |
@@ -1618,6 +1645,7 @@ Identity owns this topic list, and NT predeclares every topic in it (R2):
 | `identity.email_change_notice` | email change requested | `Address` (the current address, captured at request time) | none |
 | `identity.invitation` | invitation created | `Address` | `link` |
 | `identity.new_sign_in` | session created, when `notify_new_sign_in = true` (default false) | `User` | none |
+| `identity.sign_in_method_added` | an OAuth identity linked to, or a passkey registered on, an existing account (PR 3) | `User` | none |
 
 Token mail goes to `Address`, the exact address the token was issued for
 (with `user` set when an account exists). Notices go to `User` through the
@@ -2180,6 +2208,88 @@ Test plan:
   redirect response (not followed); ceremony expired between options and
   verify; user deleted mid-flow (flow cascade-deleted, callback
   `invalid_state`).
+
+PR 3 as built (2026-10-25):
+
+- Migration 3 is the SQL above plus bounds (`oauth_identities.email_normalized`
+  at most 254 bytes, `pkce_verifier` 43 to 128 bytes, `nonce` and
+  `return_to` bounded, at most 8 `transports`), checks that a link flow and
+  a registration or reauthentication ceremony carry their session, and the
+  indexes `oauth_flows_user_idx`, `oauth_flows_session_idx`,
+  `webauthn_ceremonies_user_idx` and `webauthn_ceremonies_session_idx` the
+  cascades and the claim read.
+- Providers live in `crate::oauth`; `oauth::adapter` is the only module
+  that touches `openidconnect`, `oauth2` and `chrono` (R14). Google's
+  issuer and GitHub's endpoints can be replaced in code only
+  (`IdentityModule::override_provider_endpoints`, for GitHub Enterprise
+  Server and the tests' mock providers), never by request input or
+  configuration. An OIDC `issuer` may be `http://` on a loopback host only
+  on a private loopback listener (a development identity provider).
+  GitHub sends no `iss`; one it sends is ignored, since GitHub has no
+  issuer to compare.
+- The callback's fragment codes add `provider_unavailable` for a provider
+  unreachable at the code exchange. The start route answers
+  `503 provider_unavailable` for any discovery failure (unreachable,
+  redirect, error status, document over 1 MiB, mismatched `issuer`).
+- Discovery fetches the key set with the document; an unknown `kid`
+  refetches it at most once a minute per provider and instance, so a
+  stream of tokens with foreign keys cannot make identity hammer the
+  provider. `azp`, which `openidconnect` leaves to the client, is checked
+  here: when present it must name this client. Tokens with audiences
+  besides this client never reach that check, since `openidconnect`
+  refuses them.
+- Linking: rule 1 and rule 2 mark an unverified account verified, without
+  the claim, when a trusted provider asserts its exact address (the
+  identity was linked by someone holding a session on the account, which
+  the pre-hijacking rule already required). Rule 1 on an unverified
+  account answers `email_unverified` while verification is required.
+  Rule 4 with an untrusted address and verification required creates the
+  account unverified with the identity, sets the registration binding
+  cookie and mails `identity.verify_email` in the same transaction, and
+  lands on `email_unverified`; the link clicked in that browser verifies
+  without a claim, so the identity stays. A sign-in through a trusted
+  provider onto an unverified account (rule 3) runs the claim, which now
+  also deletes passkeys, OAuth identities, pending OAuth link flows and
+  WebAuthn ceremonies, in every flow that claims (verification without the
+  binding, magic link, reset, invitation, OAuth).
+- "Another credential remains" counts what can sign in under the running
+  configuration: a password with password sign-in on, a passkey with
+  passkeys on, an identity of a configured provider, or a verified address
+  with magic links on (section 1).
+- Security review of PR #55: starting a link needs a recent session and a
+  link or a passkey registration sends `identity.sign_in_method_added`;
+  passkey registration re-checks its session (share-locked) under the user
+  lock, and a passkey removed mid sign-in refuses it
+  (`invalid_credentials`); failed callbacks are throttled
+  (`oauth_callback.ip`, and `oauth_callback_unknown.ip` for states naming
+  no flow) and unknown states not audited; the link callback re-checks
+  the reauthentication window; the binding cookie
+  is cleared only by its own browser's callback once no flow of it is
+  pending; rule 4 reuses a presented registration binding; failed
+  discovery is remembered 30 s; identities store their issuer
+  (`oauth_identities.issuer`, `oauth_flows_binding_idx`); `iss` is
+  required when advertised; decoy credential ids are 16, 32 or 64 bytes.
+- Ceremony ids are random UUIDv4 rendered `cer_<hex>`, not time ordered.
+  `passkey.ip` is charged on the three options routes; a failed passkey
+  reauthentication charges `reauth.session` like a wrong password.
+  Reauthentication options for a user without passkeys answer
+  `404 not_found`. Email-first answers drop `transports` and `extensions`
+  so real and decoy answers have one shape; decoy ids come from a
+  `passkey-decoy` key derived from `secret_key`. A lost compare-and-swap
+  on a passkey's `revision` merges into a fresh read (counters only grow)
+  and retries once; every passkey writer holds the user lock.
+- Passkeys alone do not satisfy `no_sign_in_method` (ID7: they are
+  registered from a signed-in session). New error codes:
+  `invalid_ceremony`, `last_credential`, `identity_already_linked`,
+  `passkey_exists`, `passkey_limit`, `passkey_rejected`, `passkeys_config`,
+  `provider_unavailable`.
+- Crates as listed in section 9, plus `chrono` 0.4.45 and `reqwest` as
+  direct dependencies of the adapter, and `openssl` as a dev-dependency for
+  the mock provider's test-only signing keys, generated at test start.
+  `deny.toml` adds a scoped ignore of RUSTSEC-2026-0387 (`crypto-bigint`
+  0.5 through `elliptic-curve` 0.13 in `openidconnect`), unreachable for
+  the same reason as RUSTSEC-2023-0071: identity only verifies signatures
+  with public keys.
 
 ## 11. Decisions
 

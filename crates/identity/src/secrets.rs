@@ -1,9 +1,10 @@
 //! Secret values and the keys derived from `secret_key` (section 7).
 //!
 //! Session tokens and one-time tokens are 32 bytes from the platform
-//! CSPRNG, stored only as SHA-256 digests. `secret_key` derives three
+//! CSPRNG, stored only as SHA-256 digests. `secret_key` derives four
 //! purpose keys with HKDF-SHA256: `csrf`, `ratelimit` (rate-limit bucket
-//! keys) and `audit-subject` (HMAC of emails for unknown accounts). Secret
+//! keys), `audit-subject` (HMAC of emails for unknown accounts) and
+//! `passkey-decoy` (the decoy credential ids of unknown addresses). Secret
 //! types print `[redacted]`, have no `Serialize` and zeroize on drop.
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{KeyInit, Mac};
@@ -118,17 +119,22 @@ pub struct Keys {
     pub csrf_previous: Option<Key>,
     pub ratelimit: Key,
     pub audit_subject: Key,
+    /// HMAC key of the decoy credential ids passkey options return for
+    /// unknown addresses (section 4).
+    pub passkey_decoy: Key,
 }
 impl Keys {
     pub const CSRF_LABEL: &'static [u8] = b"merezha/identity/csrf";
     pub const RATELIMIT_LABEL: &'static [u8] = b"merezha/identity/ratelimit";
     pub const AUDIT_LABEL: &'static [u8] = b"merezha/identity/audit-subject";
+    pub const PASSKEY_DECOY_LABEL: &'static [u8] = b"merezha/identity/passkey-decoy";
     pub fn derive(secret: &[u8], previous: Option<&[u8]>) -> Self {
         Self {
             csrf: hkdf(secret, Self::CSRF_LABEL),
             csrf_previous: previous.map(|p| hkdf(p, Self::CSRF_LABEL)),
             ratelimit: hkdf(secret, Self::RATELIMIT_LABEL),
             audit_subject: hkdf(secret, Self::AUDIT_LABEL),
+            passkey_decoy: hkdf(secret, Self::PASSKEY_DECOY_LABEL),
         }
     }
     /// `base64url(HMAC-SHA256(csrf_key, "merezha.csrf.v1" || session_id))`.
@@ -156,6 +162,28 @@ impl Keys {
     /// HMAC of a normalized email, for audit rows about unknown accounts.
     pub fn subject(&self, email_normalized: &str) -> [u8; 32] {
         self.audit_subject.mac(&[email_normalized.as_bytes()])
+    }
+    /// One or two decoy credential ids of `email_normalized`, stable
+    /// across requests, shaped like real ones (section 4): 16, 32 or 64
+    /// bytes, the lengths common authenticators use.
+    pub fn passkey_decoys(&self, email_normalized: &str) -> Vec<Vec<u8>> {
+        let seed = self.passkey_decoy.mac(&[b"0", email_normalized.as_bytes()]);
+        let count = 1 + usize::from(seed[0] & 1);
+        (0..count)
+            .map(|i| {
+                let len = [16, 32, 64][usize::from(seed[1 + i]) % 3];
+                let mut id = self
+                    .passkey_decoy
+                    .mac(&[&[b'1' + i as u8], email_normalized.as_bytes()])
+                    .to_vec();
+                id.extend(
+                    self.passkey_decoy
+                        .mac(&[&[b'a' + i as u8], email_normalized.as_bytes()]),
+                );
+                id.truncate(len);
+                id
+            })
+            .collect()
     }
 }
 
@@ -200,7 +228,29 @@ mod tests {
         let keys = Keys::derive(&[7; 32], None);
         assert_ne!(keys.csrf.0, keys.ratelimit.0);
         assert_ne!(keys.ratelimit.0, keys.audit_subject.0);
-        assert_eq!(format!("{keys:?}").matches("[redacted]").count(), 3);
+        assert_eq!(format!("{keys:?}").matches("[redacted]").count(), 4);
+        assert_ne!(keys.audit_subject.0, keys.passkey_decoy.0);
+        assert_eq!(
+            keys.passkey_decoys("ada@example.com"),
+            keys.passkey_decoys("ada@example.com")
+        );
+        assert_ne!(
+            keys.passkey_decoys("ada@example.com")[0],
+            keys.passkey_decoys("bob@example.com")[0]
+        );
+        // Decoys take the common real lengths, and vary by address.
+        let mut lengths = std::collections::BTreeSet::new();
+        let mut counts = std::collections::BTreeSet::new();
+        for n in 0..64 {
+            let decoys = keys.passkey_decoys(&format!("user{n}@example.com"));
+            counts.insert(decoys.len());
+            for id in decoys {
+                assert!([16, 32, 64].contains(&id.len()));
+                lengths.insert(id.len());
+            }
+        }
+        assert_eq!(lengths.len(), 3);
+        assert_eq!(counts, [1, 2].into_iter().collect());
     }
 
     #[test]

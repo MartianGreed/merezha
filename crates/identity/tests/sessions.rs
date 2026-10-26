@@ -229,6 +229,7 @@ async fn csrf_tokens_survive_a_secret_rotation() {
         clock: world.clock.clone(),
         mail: world.mail.clone(),
         section: rotated,
+        endpoints: Default::default(),
     };
     let node = after.instance().await;
     let mut b = ada.clone();

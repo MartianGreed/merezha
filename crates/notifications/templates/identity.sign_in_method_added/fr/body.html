@@ -1,0 +1,7 @@
+{% extends "_layouts/email.html" %}
+{% block unsubscribe %}Se désabonner{% endblock %}
+{% block content %}
+<p>Bonjour{% if recipient.name %} {{ recipient.name }}{% endif %},</p>
+<p>Un nouveau moyen de connexion{% if method == "passkey" %} (une clé d’accès){% elif provider is defined %} ({{ provider }}){% endif %} a été ajouté à votre compte {{ app.name }}.</p>
+<p>Si c’était vous, il n’y a rien à faire. Sinon, supprimez-le dans les réglages de votre compte et réinitialisez votre mot de passe maintenant.</p>
+{% endblock %}

@@ -42,6 +42,8 @@ pub struct Reply {
     pub cookie: CookieAction,
     /// The registration binding cookie (section 2, pre-hijacking).
     pub binding: Option<Binding>,
+    /// The OAuth flow binding cookie (section 6).
+    pub oauth_binding: Option<Binding>,
 }
 /// What to do with the binding cookie a registration or a verification
 /// resend sets in the browser that asked.
@@ -68,6 +70,7 @@ impl Reply {
             body: Some(body),
             cookie: CookieAction::Keep,
             binding: None,
+            oauth_binding: None,
         }
     }
     pub(crate) fn accepted(status: &str) -> Self {
@@ -79,6 +82,7 @@ impl Reply {
             body: None,
             cookie,
             binding: None,
+            oauth_binding: None,
         }
     }
 }
@@ -120,6 +124,7 @@ impl Core {
             body: Some(body),
             cookie,
             binding: None,
+            oauth_binding: None,
         }
     }
     /// The browser's binding cookie when it presents a well-formed one,
@@ -272,7 +277,7 @@ impl Core {
         Ok(())
     }
     /// A user notice through the `Directory` (`User` recipient).
-    async fn notice(
+    pub(crate) async fn notice(
         &self,
         tx: &mut Tx<'_>,
         topic: &'static str,

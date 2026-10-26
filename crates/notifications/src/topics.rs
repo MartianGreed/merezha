@@ -95,7 +95,7 @@ pub fn channel(name: &str) -> Option<Channel> {
 
 /// The predeclared topics: every identity topic of R2 and
 /// `notifications.webhook_disabled`.
-pub const BUILTIN: [(&str, Category, &[Channel], Priority, &str); 10] = [
+pub const BUILTIN: [(&str, Category, &[Channel], Priority, &str); 11] = [
     (
         "identity.verify_email",
         Category::Security,
@@ -158,6 +158,13 @@ pub const BUILTIN: [(&str, Category, &[Channel], Priority, &str); 10] = [
         &[Channel::Email, Channel::Inbox],
         Priority::Normal,
         "A new sign-in to your account",
+    ),
+    (
+        "identity.sign_in_method_added",
+        Category::Security,
+        &[Channel::Email, Channel::Inbox],
+        Priority::Normal,
+        "A new sign-in method was added to your account",
     ),
     (
         "notifications.webhook_disabled",

@@ -56,8 +56,10 @@ pub mod topic {
     pub const EMAIL_CHANGE_NOTICE: &str = "identity.email_change_notice";
     pub const INVITATION: &str = "identity.invitation";
     pub const NEW_SIGN_IN: &str = "identity.new_sign_in";
+    /// An OAuth identity was linked or a passkey registered (security).
+    pub const SIGN_IN_METHOD_ADDED: &str = "identity.sign_in_method_added";
     /// Every topic, NT predeclares them (R2).
-    pub const ALL: [&str; 9] = [
+    pub const ALL: [&str; 10] = [
         VERIFY_EMAIL,
         PASSWORD_RESET,
         MAGIC_LINK,
@@ -67,6 +69,7 @@ pub mod topic {
         EMAIL_CHANGE_NOTICE,
         INVITATION,
         NEW_SIGN_IN,
+        SIGN_IN_METHOD_ADDED,
     ];
 }
 
@@ -210,6 +213,10 @@ pub enum Method {
     EmailToken,
     /// An invitation accepted anonymously (its token proves the inbox).
     Invitation,
+    /// An OAuth or OIDC provider (section 6).
+    OAuth,
+    /// A WebAuthn passkey with user verification (section 6).
+    Passkey,
 }
 impl Method {
     pub fn as_str(self) -> &'static str {
@@ -218,6 +225,8 @@ impl Method {
             Method::MagicLink => "magic_link",
             Method::EmailToken => "email_token",
             Method::Invitation => "invitation",
+            Method::OAuth => "oauth",
+            Method::Passkey => "passkey",
         }
     }
 }
@@ -253,6 +262,10 @@ pub struct UserRow {
     pub status: String,
     pub created_at: Timestamp,
     pub phc: Option<String>,
+    /// Registered passkeys.
+    pub passkeys: i64,
+    /// Providers of the linked OAuth identities.
+    pub oauth: Vec<String>,
 }
 impl std::fmt::Debug for UserRow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -281,7 +294,7 @@ impl UserRow {
             "display_name": self.display_name,
             "locale": self.locale,
             "created_at": self.created_at.to_string(),
-            "credentials": {"password": self.phc.is_some(), "passkeys": 0, "oauth": []},
+            "credentials": {"password": self.phc.is_some(), "passkeys": self.passkeys, "oauth": self.oauth},
         })
     }
 }
@@ -296,6 +309,8 @@ pub(crate) fn user_row(row: &tokio_postgres::Row) -> UserRow {
         status: row.get(6),
         created_at: row.get(7),
         phc: row.get(8),
+        passkeys: row.get(9),
+        oauth: row.get(10),
     }
 }
 
@@ -421,7 +436,7 @@ pub struct Audit {
 /// The only keys audit `details` may carry: methods, transports, reason
 /// codes, policy names, counts, scopes, role keys, permission names,
 /// resource kinds and statuses. Free text, tokens and emails never.
-pub const AUDIT_DETAIL_KEYS: [&str; 13] = [
+pub const AUDIT_DETAIL_KEYS: [&str; 14] = [
     "method",
     "transport",
     "reason",
@@ -435,6 +450,7 @@ pub const AUDIT_DETAIL_KEYS: [&str; 13] = [
     "resource_kind",
     "status",
     "keep_owner",
+    "provider",
 ];
 impl Audit {
     pub fn new(action: &'static str, actor: Actor) -> Self {
@@ -541,6 +557,11 @@ pub struct Core {
     pub break_glass_slots: Arc<tokio::sync::Semaphore>,
     /// Resource kinds assignments may target (`unknown_resource_kind`).
     pub resource_kinds: std::collections::BTreeSet<String>,
+    /// The configured OAuth providers (section 6).
+    pub oauth: crate::oauth::Providers,
+    /// The WebAuthn relying party, when passkeys are configured.
+    #[cfg(feature = "passkeys")]
+    pub webauthn: Option<Arc<webauthn_rs::Webauthn>>,
 }
 impl std::fmt::Debug for Core {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1021,8 +1042,9 @@ impl Core {
     }
 
     /// The pre-hijacking rule (section 2): the real owner of an unverified
-    /// account's address proved control of it. Strip every credential,
-    /// session and token of the account and audit
+    /// account's address proved control of it. Strip every credential
+    /// (password, passkeys, OAuth identities), session, token and API key of
+    /// the account and audit
     /// `user.unverified_account_claimed`; the caller then marks the address
     /// verified and continues the flow. The caller holds the user lock.
     pub async fn claim_unverified(
@@ -1049,11 +1071,35 @@ impl Core {
             .execute(&*tx, &crate::sql::TOKENS_OF_USER_DELETE, &[&user.id])
             .await
             .map_err(sql)?;
-        // Its API keys go too; PR 3 adds passkeys and OAuth identities.
+        // Its API keys, passkeys, OAuth identities, pending OAuth link flows
+        // and WebAuthn ceremonies go too: whoever registered the address
+        // keeps nothing on the account.
         self.db()
             .execute(&*tx, &crate::sql::KEYS_DELETE_OF_USER, &[&user.id])
             .await
             .map_err(sql)?;
+        self.db()
+            .execute(&*tx, &crate::sql::PASSKEYS_DELETE_OF_USER, &[&user.id])
+            .await
+            .map_err(sql)?;
+        self.db()
+            .execute(
+                &*tx,
+                &crate::sql::OAUTH_IDENTITIES_DELETE_OF_USER,
+                &[&user.id],
+            )
+            .await
+            .map_err(sql)?;
+        self.db()
+            .execute(&*tx, &crate::sql::OAUTH_FLOWS_DELETE_OF_USER, &[&user.id])
+            .await
+            .map_err(sql)?;
+        self.db()
+            .execute(&*tx, &crate::sql::CEREMONIES_DELETE_OF_USER, &[&user.id])
+            .await
+            .map_err(sql)?;
+        user.passkeys = 0;
+        user.oauth.clear();
         self.db()
             .execute(&*tx, &crate::sql::USER_BUMP, &[&user.id, &now])
             .await
@@ -1319,6 +1365,49 @@ impl Core {
             created.row.active_organization = Some(org);
         }
         Ok(Some(created))
+    }
+    /// The session row by id, share-locked against a concurrent
+    /// revocation (`sql::SESSION_HOLD`).
+    pub async fn hold_session(
+        &self,
+        tx: &mut Tx<'_>,
+        id: Uuid,
+    ) -> Result<Option<SessionRow>, Failure> {
+        Ok(self
+            .db()
+            .query_opt(&*tx, &crate::sql::SESSION_HOLD, &[&id])
+            .await
+            .map_err(sql)?
+            .map(|r| session_row(&r, 0)))
+    }
+    /// A `identity.sign_in_method_added` notice to `user`: `method` is
+    /// `oauth` (with the provider's display name) or `passkey`.
+    pub async fn method_added(
+        &self,
+        tx: &mut Tx<'_>,
+        user: &UserRow,
+        method: &'static str,
+        provider: Option<&str>,
+        client: &Client,
+    ) -> Result<(), Failure> {
+        let mut data = Core::data(Some(user), None);
+        data.insert("method".into(), Value::String(method.into()));
+        if let Some(provider) = provider {
+            data.insert("provider".into(), Value::String(provider.into()));
+        }
+        self.notify(
+            tx,
+            topic::SIGN_IN_METHOD_ADDED,
+            Recipient::User {
+                id: user.identity(),
+            },
+            data,
+            None,
+            self.new_id()?,
+            None,
+            client,
+        )
+        .await
     }
     /// The session row by id.
     pub async fn session(&self, tx: &mut Tx<'_>, id: Uuid) -> Result<Option<SessionRow>, Failure> {

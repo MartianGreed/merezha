@@ -968,6 +968,7 @@ async fn magic_link_sign_up_follows_the_registration_mode() {
         clock: world.clock.clone(),
         mail: world.mail.clone(),
         section: text,
+        endpoints: Default::default(),
     };
     let node = closed.instance().await;
     let refused = b

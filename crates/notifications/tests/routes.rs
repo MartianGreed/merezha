@@ -164,7 +164,7 @@ async fn preview_needs_the_permission_at_application_scope() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let list = json_of(&body);
-    assert_eq!(list.as_array().unwrap().len(), 10);
+    assert_eq!(list.as_array().unwrap().len(), 11);
     let changed = list
         .as_array()
         .unwrap()

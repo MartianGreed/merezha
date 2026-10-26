@@ -1,8 +1,8 @@
-//! GCRA, the generic cell rate algorithm (section 7), and the PR 1 policy
+//! GCRA, the generic cell rate algorithm (section 7), and the policy
 //! table. One theoretical arrival time (`tat`) per bucket: with emission
 //! interval `T = period / limit` and burst `B = limit`, a request at `now`
 //! is allowed when `max(tat, now) + T <= now + B·T`, and then sets
-//! `tat = max(tat, now) + T`. The PostgreSQL statement in `ratelimit.rs`
+//! `tat = max(tat, now) + T`. The PostgreSQL statement `sql::RATE_CHARGE`
 //! evaluates exactly [`admit`].
 use std::time::Duration;
 
@@ -119,9 +119,34 @@ pub const API_KEY_INVALID_IP: Policy = Policy {
     default: Rate::new(60, minutes(1)),
 };
 
-/// Every policy PR 1 and PR 2 enforce. The passkey and OAuth policies
-/// arrive with PR 3.
-pub const POLICIES: [Policy; 11] = [
+pub const PASSKEY_IP: Policy = Policy {
+    name: "passkey.ip",
+    charge: Charge::Arrival,
+    default: Rate::new(60, minutes(10)),
+};
+pub const OAUTH_IP: Policy = Policy {
+    name: "oauth.ip",
+    charge: Charge::Arrival,
+    default: Rate::new(30, minutes(10)),
+};
+/// Failed OAuth callbacks per IP that named a live flow (unbound, refused
+/// codes, provider errors): checked before the callback does any work,
+/// charged when it fails.
+pub const OAUTH_CALLBACK_IP: Policy = Policy {
+    name: "oauth_callback.ip",
+    charge: Charge::Failure,
+    default: Rate::new(30, minutes(10)),
+};
+/// OAuth callbacks per IP naming no live flow (unknown, replayed or forged
+/// `state`): their own, looser bucket, so junk never locks out the same
+/// IP's legitimate callbacks; past it junk is answered `rate_limited`.
+pub const OAUTH_CALLBACK_UNKNOWN_IP: Policy = Policy {
+    name: "oauth_callback_unknown.ip",
+    charge: Charge::Failure,
+    default: Rate::new(300, minutes(10)),
+};
+/// Every policy of section 7.
+pub const POLICIES: [Policy; 15] = [
     SIGN_IN_IP,
     SIGN_IN_ACCOUNT_IP,
     SIGN_IN_ACCOUNT,
@@ -133,6 +158,10 @@ pub const POLICIES: [Policy; 11] = [
     REAUTH_SESSION,
     INVITATION_ORGANIZATION,
     API_KEY_INVALID_IP,
+    PASSKEY_IP,
+    OAUTH_IP,
+    OAUTH_CALLBACK_IP,
+    OAUTH_CALLBACK_UNKNOWN_IP,
 ];
 
 /// The configuration table name of a policy: dots become underscores.
@@ -176,6 +205,8 @@ mod tests {
         assert_eq!(table_name(&SIGN_IN_IP), "sign_in_ip");
         assert_eq!(table_name(&EMAIL_ADDRESS_IP), "email_address_ip");
         assert_eq!(table_name(&API_KEY_INVALID_IP), "api_key_invalid_ip");
+        assert_eq!(table_name(&PASSKEY_IP), "passkey_ip");
+        assert_eq!(table_name(&OAUTH_IP), "oauth_ip");
         assert_eq!(SIGN_IN_ACCOUNT.charge, Charge::Failure);
         assert_eq!(
             EMAIL_ADDRESS.default,

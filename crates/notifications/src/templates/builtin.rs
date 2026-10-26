@@ -249,6 +249,42 @@ pub(super) const FILES: &[(&str, &str)] = &[
         include_str!("../../templates/identity.password_reset/template.toml"),
     ),
     (
+        "identity.sign_in_method_added/en/body.html",
+        include_str!("../../templates/identity.sign_in_method_added/en/body.html"),
+    ),
+    (
+        "identity.sign_in_method_added/en/body.txt",
+        include_str!("../../templates/identity.sign_in_method_added/en/body.txt"),
+    ),
+    (
+        "identity.sign_in_method_added/en/inbox.toml",
+        include_str!("../../templates/identity.sign_in_method_added/en/inbox.toml"),
+    ),
+    (
+        "identity.sign_in_method_added/en/subject.txt",
+        include_str!("../../templates/identity.sign_in_method_added/en/subject.txt"),
+    ),
+    (
+        "identity.sign_in_method_added/fr/body.html",
+        include_str!("../../templates/identity.sign_in_method_added/fr/body.html"),
+    ),
+    (
+        "identity.sign_in_method_added/fr/body.txt",
+        include_str!("../../templates/identity.sign_in_method_added/fr/body.txt"),
+    ),
+    (
+        "identity.sign_in_method_added/fr/inbox.toml",
+        include_str!("../../templates/identity.sign_in_method_added/fr/inbox.toml"),
+    ),
+    (
+        "identity.sign_in_method_added/fr/subject.txt",
+        include_str!("../../templates/identity.sign_in_method_added/fr/subject.txt"),
+    ),
+    (
+        "identity.sign_in_method_added/template.toml",
+        include_str!("../../templates/identity.sign_in_method_added/template.toml"),
+    ),
+    (
         "identity.verify_email/en/body.html",
         include_str!("../../templates/identity.verify_email/en/body.html"),
     ),

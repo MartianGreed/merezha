@@ -86,15 +86,21 @@ impl Metrics {
             active,
         }
     }
-    /// `method`: `password`, `magic_link`; `outcome`: TE's closed set.
+    /// `method`: `password`, `magic_link`, `passkey`; `outcome`: TE's
+    /// closed set; provider `local`.
     pub fn login(&self, method: &'static str, outcome: &'static str) {
+        self.login_with(method, outcome, "local");
+    }
+    /// [`Metrics::login`] through `provider`, a configured OAuth provider
+    /// name (a bounded set).
+    pub fn login_with(&self, method: &'static str, outcome: &'static str, provider: &str) {
         if let Some(i) = &self.instruments {
             i.login_attempts.add(
                 1,
                 &[
                     KeyValue::new("identity.method", method),
                     KeyValue::new("identity.outcome", outcome),
-                    KeyValue::new("identity.provider", "local"),
+                    KeyValue::new("identity.provider", provider.to_owned()),
                 ],
             );
         }

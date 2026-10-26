@@ -81,8 +81,8 @@ fn check_accepts_a_valid_section_and_summarises_it() {
     let (code, report) = check(&config, &[("NOTIFY_KEY", KEY)]);
     assert_eq!(code, Some(0), "{report}");
     assert_eq!(report["status"], "ok");
-    assert_eq!(report["topics"], 10);
-    assert_eq!(report["templates"], 10);
+    assert_eq!(report["topics"], 11);
+    assert_eq!(report["templates"], 11);
     assert_eq!(report["locales"], serde_json::json!(["en", "fr"]));
     assert_eq!(report["email"], "capture");
     assert_eq!(report["warnings"], serde_json::json!([]));

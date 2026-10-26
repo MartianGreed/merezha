@@ -114,6 +114,25 @@ impl Core {
         ))
         .ok()
     }
+    /// `Set-Cookie` for the OAuth flow binding cookie, for the flow's
+    /// lifetime, or clearing it when `value` is `None` (section 6).
+    pub fn oauth_binding_cookie(&self, value: Option<&str>) -> Option<HeaderValue> {
+        let secure = if self.settings.dev_cookie {
+            ""
+        } else {
+            "; Secure"
+        };
+        let max_age = match value {
+            Some(_) => self.settings.oauth.flow_ttl.as_secs(),
+            None => 0,
+        };
+        HeaderValue::from_str(&format!(
+            "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}",
+            self.settings.oauth_cookie_name(),
+            value.unwrap_or("")
+        ))
+        .ok()
+    }
     /// `Set-Cookie` that clears the session cookie.
     pub fn clear_cookie(&self) -> HeaderValue {
         let secure = if self.settings.dev_cookie {

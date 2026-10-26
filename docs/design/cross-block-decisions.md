@@ -48,7 +48,8 @@ ID owns the identity topic list; NT predeclares every one of them under
 `identity.`: `identity.verify_email`, `identity.password_reset`,
 `identity.magic_link`, `identity.account_exists`, `identity.password_changed`,
 `identity.email_change_confirm`, `identity.email_change_notice`,
-`identity.invitation`, `identity.new_sign_in`.
+`identity.invitation`, `identity.new_sign_in`, `identity.sign_in_method_added`
+(security, ID PR 3).
 
 ### R3. Secrets in durable rows
 

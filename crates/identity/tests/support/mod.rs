@@ -3,6 +3,8 @@
 //! emailed tokens (and writes the flagged outbox record the notifications
 //! block would write), and a small browser with a cookie jar.
 #![allow(dead_code)]
+pub mod idp;
+
 use axum::{
     Router,
     body::Body,
@@ -37,10 +39,11 @@ use tower::ServiceExt;
 pub const APP: &str = "https://app.example";
 pub const COOKIE: &str = "__Host-merezha_session";
 pub const BINDING: &str = "__Host-merezha_verify";
+pub const OAUTH: &str = "__Host-merezha_oauth";
 pub const SECRET: &str = "an-identity-secret-key-of-at-least-32-bytes";
 pub const SECRET_NEXT: &str = "the-next-identity-secret-key-after-rotation";
 /// Every rate-limit table, so tests can raise the defaults.
-pub const POLICY_TABLES: [&str; 11] = [
+pub const POLICY_TABLES: [&str; 15] = [
     "sign_in_ip",
     "sign_in_account_ip",
     "sign_in_account",
@@ -52,6 +55,10 @@ pub const POLICY_TABLES: [&str; 11] = [
     "reauth_session",
     "invitation_organization",
     "api_key_invalid_ip",
+    "passkey_ip",
+    "oauth_ip",
+    "oauth_callback_ip",
+    "oauth_callback_unknown_ip",
 ];
 /// An identity section: `top` keys, cheap Argon2 at its floor, magic links
 /// on, every rate limit at 1000 per hour unless `limits` names it, then
@@ -303,6 +310,7 @@ pub fn project(dir: &Path, section: &str) -> ConfigInput {
             ("IDENTITY_DB".into(), "postgres://127.0.0.1:1/unused".into()),
             ("IDENTITY_SECRET".into(), SECRET.into()),
             ("IDENTITY_SECRET_NEXT".into(), SECRET_NEXT.into()),
+            ("OAUTH_SECRET".into(), idp::CLIENT_SECRET.into()),
         ],
         overrides: Vec::new(),
     }
@@ -370,6 +378,8 @@ pub async fn database(test: &TestDatabase, pool: usize) -> Database {
 #[derive(Clone)]
 pub struct Instance {
     pub router: Router,
+    /// The started block, for its readiness.
+    pub module: Arc<dyn Module>,
     pub handle: IdentityHandle,
     pub authorizer: Arc<dyn merezha_platform::ports::Authorizer>,
     pub jobs: PgJobs,
@@ -418,6 +428,8 @@ pub struct World {
     pub clock: Arc<FakeClock>,
     pub mail: Arc<Mail>,
     pub section: String,
+    /// Provider endpoint overrides every new instance gets.
+    pub endpoints: Mutex<Vec<(String, merezha_identity::oauth::ProviderEndpoints)>>,
 }
 impl World {
     /// `None` when `MEREZHA_TEST_DATABASE_URL` is unset.
@@ -490,6 +502,7 @@ impl World {
             clock: FakeClock::new(),
             mail: Arc::new(Mail::default()),
             section: section.to_owned(),
+            endpoints: Mutex::new(Vec::new()),
         })
     }
     /// Start one more instance sharing the database, clock and mailbox.
@@ -508,6 +521,9 @@ impl World {
         let dir = tempfile::tempdir().unwrap();
         let input = project(dir.path(), &self.section);
         let mut module = catalogued(IdentityModule::new(Some(HostFacts::loopback())));
+        for (name, endpoints) in self.endpoints.lock().unwrap().iter() {
+            module.override_provider_endpoints(name, endpoints.clone());
+        }
         if let Some(meter) = meter {
             module = module.with_meter(meter);
         }
@@ -547,6 +563,11 @@ impl World {
         }
         let mut errors = ErrorRegistry::kernel();
         errors.register("identity", module.errors()).unwrap();
+        let body_limits: Vec<(axum::http::Method, String, usize)> = module
+            .body_limits()
+            .into_iter()
+            .map(|l| (l.method, format!("/v1/identity{}", l.path), l.limit))
+            .collect();
         // A route of another block, to show the edge checks cover it too.
         let probe = axum::routing::any(|request: axum::extract::Request| async move {
             let subject = request
@@ -571,9 +592,11 @@ impl World {
                 .route("/v1/probe/check", check)
                 .route("/v1/probe", probe),
             edge::EdgeSettings::new(&config.http, Arc::new(errors))
-                .authenticator(Some(authenticator)),
+                .authenticator(Some(authenticator))
+                .route_body_limits(body_limits),
         );
         Instance {
+            module: Arc::from(module),
             router,
             handle,
             authorizer,
@@ -619,6 +642,22 @@ impl Answer {
             .find(|v| v.starts_with(BINDING) || v.starts_with("merezha_verify="))
             .map(str::to_owned)
     }
+    pub fn oauth_cookie(&self) -> Option<String> {
+        self.headers
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|v| v.starts_with(OAUTH) || v.starts_with("merezha_oauth="))
+            .map(str::to_owned)
+    }
+    /// The `Location` of a redirect.
+    pub fn location(&self) -> String {
+        self.headers
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_owned()
+    }
     pub fn set_cookie(&self) -> Option<String> {
         self.headers
             .get_all(header::SET_COOKIE)
@@ -656,6 +695,8 @@ pub struct Browser {
     pub cookie: Option<String>,
     /// The registration binding cookie (pre-hijacking rule).
     pub binding: Option<String>,
+    /// The OAuth flow binding cookie.
+    pub oauth: Option<String>,
     pub csrf: Option<String>,
     pub bearer: Option<String>,
     pub origin: Option<String>,
@@ -669,6 +710,7 @@ impl Browser {
             ip: ip.parse().unwrap(),
             cookie: None,
             binding: None,
+            oauth: None,
             csrf: None,
             bearer: None,
             origin: Some(APP.to_owned()),
@@ -694,6 +736,9 @@ impl Browser {
         }
         if let Some(binding) = &self.binding {
             cookies.push(format!("{BINDING}={binding}"));
+        }
+        if let Some(oauth) = &self.oauth {
+            cookies.push(format!("{OAUTH}={oauth}"));
         }
         if !cookies.is_empty() {
             builder = builder.header(header::COOKIE, cookies.join("; "));
@@ -739,6 +784,10 @@ impl Browser {
         if let Some(set) = answer.binding_cookie() {
             let value = set.split(';').next().unwrap().split_once('=').unwrap().1;
             self.binding = (!value.is_empty()).then(|| value.to_owned());
+        }
+        if let Some(set) = answer.oauth_cookie() {
+            let value = set.split(';').next().unwrap().split_once('=').unwrap().1;
+            self.oauth = (!value.is_empty()).then(|| value.to_owned());
         }
         if let Some(set) = answer.set_cookie() {
             let value = set.split(';').next().unwrap().split_once('=').unwrap().1;

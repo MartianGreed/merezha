@@ -26,7 +26,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-/// Migrations 1 and 2 (section 3), ledger key `identity`.
+/// Migrations 1 to 3 (section 3), ledger key `identity`.
 pub const MIGRATIONS: &[Migration] = &[
     Migration::new(
         1,
@@ -38,6 +38,11 @@ pub const MIGRATIONS: &[Migration] = &[
         "organizations_rbac_api_keys",
         include_str!("../migrations/0002_organizations_rbac_api_keys.sql"),
     ),
+    Migration::new(
+        3,
+        "oauth_passkeys",
+        include_str!("../migrations/0003_oauth_passkeys.sql"),
+    ),
 ];
 
 /// The codes identity returns, with their statuses (section 4, R8). The
@@ -46,6 +51,7 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("ambiguous_credentials", 400),
     ErrorCode::new("invalid_credentials", 401),
     ErrorCode::new("invalid_token", 401),
+    ErrorCode::new("invalid_ceremony", 401),
     ErrorCode::new("reauthentication_required", 401),
     ErrorCode::new("sign_in_required", 401),
     ErrorCode::new("origin_rejected", 403),
@@ -64,6 +70,9 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("role_in_use", 409),
     ErrorCode::new("already_member", 409),
     ErrorCode::new("invitation_stale", 409),
+    ErrorCode::new("last_credential", 409),
+    ErrorCode::new("identity_already_linked", 409),
+    ErrorCode::new("passkey_exists", 409),
     ErrorCode::new("unknown_permission", 422),
     ErrorCode::new("unknown_resource_kind", 422),
     ErrorCode::new("organization_limit", 422),
@@ -71,6 +80,9 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("assignment_limit", 422),
     ErrorCode::new("service_account_limit", 422),
     ErrorCode::new("api_key_limit", 422),
+    ErrorCode::new("passkey_limit", 422),
+    ErrorCode::new("passkey_rejected", 422),
+    ErrorCode::new("passkeys_config", 422),
     ErrorCode::new("declared_role_in_use", 422),
     ErrorCode::new("password_too_short", 422),
     ErrorCode::new("password_too_long", 422),
@@ -78,6 +90,7 @@ pub const ERRORS: &[ErrorCode] = &[
     ErrorCode::new("password_contextual", 422),
     ErrorCode::new("notifications_required", 422),
     ErrorCode::new("blocklist_unavailable", 422),
+    ErrorCode::new("provider_unavailable", 503),
 ];
 
 /// What a started block exposes to embedding code and tests.
@@ -157,6 +170,7 @@ pub struct IdentityModule {
     facts: Option<HostFacts>,
     catalog: Catalog,
     resource_kinds: BTreeSet<String>,
+    endpoints: std::collections::BTreeMap<String, crate::oauth::ProviderEndpoints>,
     settings: Option<Settings>,
     metrics: Arc<OnceLock<Metrics>>,
     core: Arc<OnceLock<Arc<Core>>>,
@@ -177,6 +191,7 @@ impl IdentityModule {
             facts,
             catalog: Catalog::builtin(),
             resource_kinds: BTreeSet::new(),
+            endpoints: std::collections::BTreeMap::new(),
             settings: None,
             metrics: Arc::new(OnceLock::new()),
             core: Arc::new(OnceLock::new()),
@@ -212,6 +227,17 @@ impl IdentityModule {
     pub fn add_resource_kinds(&mut self, kinds: &[&str]) {
         self.resource_kinds
             .extend(kinds.iter().map(|k| (*k).to_owned()));
+    }
+    /// Replace provider `name`'s built-in endpoints: a Google issuer, or
+    /// GitHub's authorization, token and API bases (GitHub Enterprise
+    /// Server, and the mock providers of tests). Code only, never request
+    /// input or configuration.
+    pub fn override_provider_endpoints(
+        &mut self,
+        name: &str,
+        endpoints: crate::oauth::ProviderEndpoints,
+    ) {
+        self.endpoints.insert(name.to_owned(), endpoints);
     }
     /// The permission catalog this module checks grants against.
     pub fn catalog(&self) -> &Catalog {
@@ -288,6 +314,12 @@ impl IdentityModule {
                 crate::core::BREAK_GLASS_SLOTS,
             )),
             resource_kinds: self.resource_kinds.clone(),
+            oauth: crate::oauth::Providers::new(&settings.oauth.providers, &self.endpoints),
+            #[cfg(feature = "passkeys")]
+            webauthn: match &settings.passkeys {
+                Some(passkeys) => Some(Arc::new(crate::passkeys::relying_party(passkeys)?)),
+                None => None,
+            },
             rbac,
             settings,
             ctx,
@@ -322,6 +354,13 @@ impl Module for IdentityModule {
     }
     fn errors(&self) -> &[ErrorCode] {
         ERRORS
+    }
+    fn body_limits(&self) -> Vec<merezha_platform::RouteBodyLimit> {
+        #[cfg(feature = "passkeys")]
+        if self.settings.as_ref().is_some_and(|s| s.passkeys.is_some()) {
+            return crate::passkeys::routes::body_limits();
+        }
+        Vec::new()
     }
     fn events(&self) -> ModuleEvents {
         ModuleEvents {

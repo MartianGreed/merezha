@@ -6,7 +6,10 @@ use merezha_postgres::Statement;
 macro_rules! user_columns {
     () => {
         "u.id, u.email, u.email_normalized, u.email_verified_at, u.display_name, u.locale, \
-         u.status, u.created_at, p.phc"
+         u.status, u.created_at, p.phc, \
+         (SELECT count(*) FROM merezha_identity.passkeys k WHERE k.user_id = u.id), \
+         ARRAY(SELECT o.provider FROM merezha_identity.oauth_identities o \
+                WHERE o.user_id = u.id ORDER BY o.provider)"
     };
 }
 macro_rules! session_columns {
@@ -287,6 +290,18 @@ pub const SESSION_BY_ID: Statement = Statement::new(
         "SELECT ",
         session_columns!(),
         " FROM merezha_identity.sessions s WHERE s.id = $1"
+    ),
+);
+/// The session, share-locked: a concurrent revocation (sign-out, revoke
+/// all, the ownership claim) waits for the caller's transaction, and the
+/// caller sees a revocation that committed first.
+pub const SESSION_HOLD: Statement = Statement::new(
+    "identity.sessions.hold",
+    "SELECT merezha_identity.sessions",
+    concat!(
+        "SELECT ",
+        session_columns!(),
+        " FROM merezha_identity.sessions s WHERE s.id = $1 FOR SHARE"
     ),
 );
 pub const SESSION_LIST: Statement = Statement::new(
@@ -1173,6 +1188,196 @@ pub const INVITATION_ROLES: Statement = Statement::new(
       WHERE invitation_id = $1",
 );
 
+// ----- OAuth and OIDC (section 6) -----
+
+pub const OAUTH_FLOW_INSERT: Statement = Statement::new(
+    "identity.oauth_flows.insert",
+    "INSERT merezha_identity.oauth_flows",
+    "INSERT INTO merezha_identity.oauth_flows
+        (state_hash, binding_hash, provider, intent, user_id, session_id, pkce_verifier, nonce,
+         return_to, created_at, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+);
+/// Single use: of two callbacks with one `state`, one gets the row.
+pub const OAUTH_FLOW_CONSUME: Statement = Statement::new(
+    "identity.oauth_flows.consume",
+    "DELETE merezha_identity.oauth_flows",
+    "DELETE FROM merezha_identity.oauth_flows WHERE state_hash = $1
+     RETURNING binding_hash, provider, intent, user_id, session_id, pkce_verifier, nonce,
+               return_to, expires_at",
+);
+/// Flows still pending for a browser binding: the binding cookie is
+/// cleared only once none is left, so two tabs both complete.
+pub const OAUTH_FLOWS_OF_BINDING: Statement = Statement::new(
+    "identity.oauth_flows.of_binding",
+    "SELECT merezha_identity.oauth_flows",
+    "SELECT count(*) FROM merezha_identity.oauth_flows WHERE binding_hash = $1 AND expires_at > $2",
+);
+pub const OAUTH_FLOWS_DELETE_OF_USER: Statement = Statement::new(
+    "identity.oauth_flows.delete_of_user",
+    "DELETE merezha_identity.oauth_flows",
+    "DELETE FROM merezha_identity.oauth_flows WHERE user_id = $1",
+);
+pub const OAUTH_IDENTITY_BY_SUBJECT: Statement = Statement::new(
+    "identity.oauth_identities.by_subject",
+    "SELECT merezha_identity.oauth_identities",
+    "SELECT id, user_id, issuer FROM merezha_identity.oauth_identities
+      WHERE provider = $1 AND subject = $2",
+);
+/// `None` when `(provider, subject)` or `(user, provider)` is taken.
+pub const OAUTH_IDENTITY_INSERT: Statement = Statement::new(
+    "identity.oauth_identities.insert",
+    "INSERT merezha_identity.oauth_identities",
+    "INSERT INTO merezha_identity.oauth_identities
+        (id, user_id, provider, subject, email_normalized, email_verified, created_at, last_used_at,
+         issuer)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $7, $8)
+     ON CONFLICT DO NOTHING RETURNING id",
+);
+/// Refresh the stored assertion of an identity of user `$6`.
+pub const OAUTH_IDENTITY_TOUCH: Statement = Statement::new(
+    "identity.oauth_identities.touch",
+    "UPDATE merezha_identity.oauth_identities",
+    "UPDATE merezha_identity.oauth_identities
+        SET email_normalized = $3, email_verified = $4, last_used_at = $5
+      WHERE provider = $1 AND subject = $2 AND user_id = $6 AND issuer = $7
+     RETURNING id",
+);
+pub const OAUTH_IDENTITIES_OF_USER: Statement = Statement::new(
+    "identity.oauth_identities.of_user",
+    "SELECT merezha_identity.oauth_identities",
+    "SELECT id, provider, email_normalized, created_at, last_used_at
+       FROM merezha_identity.oauth_identities WHERE user_id = $1 ORDER BY provider",
+);
+pub const OAUTH_IDENTITY_DELETE: Statement = Statement::new(
+    "identity.oauth_identities.delete",
+    "DELETE merezha_identity.oauth_identities",
+    "DELETE FROM merezha_identity.oauth_identities WHERE id = $1 AND user_id = $2
+     RETURNING provider",
+);
+pub const OAUTH_IDENTITIES_DELETE_OF_USER: Statement = Statement::new(
+    "identity.oauth_identities.delete_of_user",
+    "DELETE merezha_identity.oauth_identities",
+    "DELETE FROM merezha_identity.oauth_identities WHERE user_id = $1",
+);
+/// What can still sign user `$1` in once passkey `$2` or identity `$3`
+/// is gone: its password, the other passkeys, the other identities'
+/// providers and whether the address is verified (magic links).
+pub const CREDENTIALS_OF_USER: Statement = Statement::new(
+    "identity.users.credentials",
+    "SELECT merezha_identity.users",
+    "SELECT EXISTS (SELECT 1 FROM merezha_identity.password_credentials p WHERE p.user_id = u.id),
+            (SELECT count(*) FROM merezha_identity.passkeys k
+              WHERE k.user_id = u.id AND k.id IS DISTINCT FROM $2),
+            ARRAY(SELECT o.provider FROM merezha_identity.oauth_identities o
+                   WHERE o.user_id = u.id AND o.id IS DISTINCT FROM $3),
+            u.email_verified_at IS NOT NULL
+       FROM merezha_identity.users u WHERE u.id = $1",
+);
+
+// ----- passkeys (section 6) -----
+
+macro_rules! passkey_columns {
+    () => {
+        "k.id, k.credential_id, k.passkey, k.label, k.aaguid, k.backup_eligible, k.backup_state, \
+         k.discoverable, k.transports, k.revision, k.created_at, k.last_used_at, k.user_id"
+    };
+}
+/// The WebAuthn user handle of user `$1`, assigned `$2` when absent.
+pub const USER_WEBAUTHN_HANDLE: Statement = Statement::new(
+    "identity.users.webauthn_handle",
+    "UPDATE merezha_identity.users",
+    "UPDATE merezha_identity.users SET webauthn_handle = coalesce(webauthn_handle, $2)
+      WHERE id = $1 RETURNING webauthn_handle",
+);
+pub const PASSKEYS_OF_USER: Statement = Statement::new(
+    "identity.passkeys.of_user",
+    "SELECT merezha_identity.passkeys",
+    concat!(
+        "SELECT ",
+        passkey_columns!(),
+        " FROM merezha_identity.passkeys k WHERE k.user_id = $1 ORDER BY k.created_at, k.id LIMIT 100"
+    ),
+);
+/// The passkey of a credential id, with its user's WebAuthn handle.
+pub const PASSKEY_BY_CREDENTIAL: Statement = Statement::new(
+    "identity.passkeys.by_credential",
+    "SELECT merezha_identity.passkeys",
+    concat!(
+        "SELECT ",
+        passkey_columns!(),
+        ", u.webauthn_handle FROM merezha_identity.passkeys k
+           JOIN merezha_identity.users u ON u.id = k.user_id WHERE k.credential_id = $1"
+    ),
+);
+pub const PASSKEY_GET: Statement = Statement::new(
+    "identity.passkeys.get",
+    "SELECT merezha_identity.passkeys",
+    concat!(
+        "SELECT ",
+        passkey_columns!(),
+        " FROM merezha_identity.passkeys k WHERE k.id = $1 AND k.user_id = $2"
+    ),
+);
+pub const PASSKEYS_COUNT: Statement = Statement::new(
+    "identity.passkeys.count",
+    "SELECT merezha_identity.passkeys",
+    "SELECT count(*) FROM merezha_identity.passkeys WHERE user_id = $1",
+);
+/// `None` when the credential id is registered already (`passkey_exists`).
+pub const PASSKEY_INSERT: Statement = Statement::new(
+    "identity.passkeys.insert",
+    "INSERT merezha_identity.passkeys",
+    "INSERT INTO merezha_identity.passkeys
+        (id, user_id, credential_id, passkey, label, aaguid, backup_eligible, backup_state,
+         discoverable, transports, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+     ON CONFLICT (credential_id) DO NOTHING RETURNING id",
+);
+/// Compare-and-swap on `revision` after an authentication.
+pub const PASSKEY_UPDATE: Statement = Statement::new(
+    "identity.passkeys.update",
+    "UPDATE merezha_identity.passkeys",
+    "UPDATE merezha_identity.passkeys
+        SET passkey = $3, backup_eligible = $4, backup_state = $5, last_used_at = $6,
+            revision = revision + 1
+      WHERE id = $1 AND revision = $2",
+);
+pub const PASSKEY_RENAME: Statement = Statement::new(
+    "identity.passkeys.rename",
+    "UPDATE merezha_identity.passkeys",
+    "UPDATE merezha_identity.passkeys SET label = $3 WHERE id = $1 AND user_id = $2",
+);
+pub const PASSKEY_DELETE: Statement = Statement::new(
+    "identity.passkeys.delete",
+    "DELETE merezha_identity.passkeys",
+    "DELETE FROM merezha_identity.passkeys WHERE id = $1 AND user_id = $2",
+);
+pub const PASSKEYS_DELETE_OF_USER: Statement = Statement::new(
+    "identity.passkeys.delete_of_user",
+    "DELETE merezha_identity.passkeys",
+    "DELETE FROM merezha_identity.passkeys WHERE user_id = $1",
+);
+pub const CEREMONY_INSERT: Statement = Statement::new(
+    "identity.webauthn_ceremonies.insert",
+    "INSERT merezha_identity.webauthn_ceremonies",
+    "INSERT INTO merezha_identity.webauthn_ceremonies
+        (id, purpose, user_id, session_id, state, created_at, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+);
+/// Single use: consumed by `DELETE ... RETURNING` whatever comes next.
+pub const CEREMONY_CONSUME: Statement = Statement::new(
+    "identity.webauthn_ceremonies.consume",
+    "DELETE merezha_identity.webauthn_ceremonies",
+    "DELETE FROM merezha_identity.webauthn_ceremonies WHERE id = $1 AND purpose = ANY($2)
+     RETURNING purpose, user_id, session_id, state, expires_at",
+);
+pub const CEREMONIES_DELETE_OF_USER: Statement = Statement::new(
+    "identity.webauthn_ceremonies.delete_of_user",
+    "DELETE merezha_identity.webauthn_ceremonies",
+    "DELETE FROM merezha_identity.webauthn_ceremonies WHERE user_id = $1",
+);
+
 // ----- users (application scope) -----
 
 pub const USERS_LIST: Statement = Statement::new(
@@ -1297,6 +1502,18 @@ pub const CLEANUP_KEYS: Statement = Statement::new(
         SELECT id FROM merezha_identity.api_keys
          WHERE revoked_at < $1 OR expires_at < $1 LIMIT $2)",
 );
+pub const CLEANUP_OAUTH_FLOWS: Statement = Statement::new(
+    "identity.cleanup.oauth_flows",
+    "DELETE merezha_identity.oauth_flows",
+    "DELETE FROM merezha_identity.oauth_flows WHERE state_hash IN (
+        SELECT state_hash FROM merezha_identity.oauth_flows WHERE expires_at <= $1 LIMIT $2)",
+);
+pub const CLEANUP_CEREMONIES: Statement = Statement::new(
+    "identity.cleanup.webauthn_ceremonies",
+    "DELETE merezha_identity.webauthn_ceremonies",
+    "DELETE FROM merezha_identity.webauthn_ceremonies WHERE id IN (
+        SELECT id FROM merezha_identity.webauthn_ceremonies WHERE expires_at <= $1 LIMIT $2)",
+);
 pub const CLEANUP_AUDIT: Statement = Statement::new(
     "identity.cleanup.audit_events",
     "DELETE merezha_identity.audit_events",
@@ -1339,6 +1556,7 @@ pub const STATEMENTS: &[Statement] = &[
     SESSION_EVICT,
     SESSION_TAKE,
     SESSION_BY_ID,
+    SESSION_HOLD,
     SESSION_LIST,
     SESSION_AUTHENTICATE,
     SESSION_TOUCH,
@@ -1436,6 +1654,32 @@ pub const STATEMENTS: &[Statement] = &[
     CLEANUP_INVITATIONS,
     CLEANUP_KEYS,
     CLEANUP_AUDIT,
+    OAUTH_FLOW_INSERT,
+    OAUTH_FLOW_CONSUME,
+    OAUTH_FLOWS_OF_BINDING,
+    OAUTH_FLOWS_DELETE_OF_USER,
+    OAUTH_IDENTITY_BY_SUBJECT,
+    OAUTH_IDENTITY_INSERT,
+    OAUTH_IDENTITY_TOUCH,
+    OAUTH_IDENTITIES_OF_USER,
+    OAUTH_IDENTITY_DELETE,
+    OAUTH_IDENTITIES_DELETE_OF_USER,
+    CREDENTIALS_OF_USER,
+    USER_WEBAUTHN_HANDLE,
+    PASSKEYS_OF_USER,
+    PASSKEY_BY_CREDENTIAL,
+    PASSKEY_GET,
+    PASSKEYS_COUNT,
+    PASSKEY_INSERT,
+    PASSKEY_UPDATE,
+    PASSKEY_RENAME,
+    PASSKEY_DELETE,
+    PASSKEYS_DELETE_OF_USER,
+    CEREMONY_INSERT,
+    CEREMONY_CONSUME,
+    CEREMONIES_DELETE_OF_USER,
+    CLEANUP_OAUTH_FLOWS,
+    CLEANUP_CEREMONIES,
 ];
 
 #[cfg(test)]

@@ -1,0 +1,3 @@
+title = "New sign-in method on your account"
+body = "A new way to sign in was added to your account. If this was not you, remove it and reset your password."
+link = "{% if links.app %}{{ links.app }}{% endif %}"

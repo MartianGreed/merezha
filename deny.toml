@@ -1,0 +1,46 @@
+# cargo-deny policy (`cargo deny check`). Identity PR 3 brings the first
+# entries the designs call for (identity section 9).
+
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+    # `rsa` 0.9 (through `openidconnect` 4.0.1): the Marvin timing attack on
+    # private-key operations, unpatched. Identity only verifies ID token
+    # signatures with public keys, which the advisory does not affect.
+    # Re-check when `openidconnect` moves to `rsa` 0.10.
+    { id = "RUSTSEC-2023-0071", reason = "public-key RSA verification only (openidconnect ID tokens)" },
+    # `crypto-bigint` 0.5 (through `elliptic-curve` 0.13, `p256` and `p384`
+    # in `openidconnect` 4.0.1): secret-dependent branches in constant-time
+    # arithmetic, fixed only in 0.7.6. Identity verifies ES256 signatures
+    # with public keys and holds no elliptic-curve secret. Re-check with the
+    # `openidconnect` release that moves to `elliptic-curve` 0.14.
+    { id = "RUSTSEC-2026-0387", reason = "public-key ECDSA verification only (openidconnect ID tokens)" },
+]
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    # `webauthn-rs` and its crates (identity passkeys): file-level copyleft,
+    # used unmodified; release notes point to the crate source.
+    "MPL-2.0",
+]
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

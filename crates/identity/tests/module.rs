@@ -105,7 +105,33 @@ limit = 0
 burst = 3
 
 [modules.identity.rate_limits.passkey_ip]
-limit = 5
+limit = 0
+
+[modules.identity.links]
+oauth_error = "https://evil.example/error"
+
+[modules.identity.oauth]
+flow_ttl = "2h"
+
+[modules.identity.oauth.providers.Bad]
+client_id = "x"
+
+[modules.identity.oauth.providers.acme]
+kind = "oidc"
+issuer = "http://idp.example"
+client_id = "merezha"
+client_secret = { env = "SHORT_SECRET" }
+scopes = ["email"]
+
+[modules.identity.oauth.providers.github]
+kind = "oidc"
+
+[modules.identity.oauth.providers.google]
+client_id = "123"
+allowed_hosted_domains = ["Example.COM"]
+
+[modules.identity.passkeys]
+rp_id = "other.example"
 
 [modules.identity.organizations]
 max_per_user = 0
@@ -157,11 +183,29 @@ permissions = ["identity.*"]
         ("sessions.idle_timeout", "idle_exceeds_absolute"),
         ("rate_limits.sign_in_ip.limit", "out_of_range"),
         ("rate_limits.sign_in_ip.burst", "unknown_key"),
-        ("rate_limits.passkey_ip", "unknown_key"),
+        ("rate_limits.passkey_ip.limit", "out_of_range"),
+        ("links.oauth_error", "invalid_url"),
+        ("oauth.flow_ttl", "out_of_range"),
+        ("oauth.providers.Bad", "invalid_provider_name"),
+        ("oauth.providers.acme.issuer", "insecure_origin"),
+        ("oauth.providers.acme.scopes", "missing_openid_scope"),
+        ("oauth.providers.github.kind", "invalid_choice"),
+        ("oauth.providers.google.client_secret", "missing_required"),
+        (
+            "oauth.providers.google.allowed_hosted_domains",
+            "invalid_domain",
+        ),
+        ("passkeys.rp_id", "rp_id_mismatch"),
     ]
     .iter()
     .map(|(k, c)| (format!("modules.identity.{k}"), (*c).to_owned()))
     .collect();
+    if !cfg!(feature = "passkeys") {
+        expected.push((
+            "modules.identity.passkeys".to_owned(),
+            "passkeys_unavailable".to_owned(),
+        ));
+    }
     expected.sort();
     assert_eq!(found, expected);
 }
@@ -277,7 +321,7 @@ async fn plain_database(test: &TestDatabase) -> Database {
     Database::connect(&test.config()).unwrap()
 }
 
-/// Acceptance 1 (both PRs): migrations 1 and 2 apply on an empty
+/// Acceptance 1 (every PR): migrations 1 to 3 apply on an empty
 /// database, each recorded with its checksum, and a second start applies
 /// nothing. A changed checksum stops verification.
 #[tokio::test]
@@ -293,7 +337,7 @@ async fn migration_one_applies_once_with_its_checksum() {
     let first = run_migrations(&db, &declared, MigrationMode::Apply, soon())
         .await
         .unwrap();
-    assert_eq!(first.applied.len(), 2);
+    assert_eq!(first.applied.len(), 3);
     let client = db.acquire(soon()).await.unwrap();
     let rows = client
         .query(
@@ -303,11 +347,12 @@ async fn migration_one_applies_once_with_its_checksum() {
         )
         .await
         .unwrap();
-    assert_eq!(rows.len(), 2);
-    for (row, (version, name)) in rows
-        .iter()
-        .zip([(1, "identity_core"), (2, "organizations_rbac_api_keys")])
-    {
+    assert_eq!(rows.len(), 3);
+    for (row, (version, name)) in rows.iter().zip([
+        (1, "identity_core"),
+        (2, "organizations_rbac_api_keys"),
+        (3, "oauth_passkeys"),
+    ]) {
         assert_eq!(row.get::<_, i32>(0), version);
         assert_eq!(row.get::<_, String>(1), name);
         assert_eq!(
@@ -323,7 +368,7 @@ async fn migration_one_applies_once_with_its_checksum() {
         .await
         .unwrap()
         .get(0);
-    assert_eq!(tables, 15);
+    assert_eq!(tables, 19);
     let second = run_migrations(&db, &declared, MigrationMode::Apply, soon())
         .await
         .unwrap();

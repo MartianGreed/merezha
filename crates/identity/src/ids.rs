@@ -25,6 +25,12 @@ pub const ASSIGNMENT: &str = "asg";
 pub const SERVICE_ACCOUNT: &str = "svc";
 /// API keys.
 pub const API_KEY: &str = "key";
+/// Passkeys.
+pub const PASSKEY: &str = "pky";
+/// OAuth identities.
+pub const OAUTH_IDENTITY: &str = "oid";
+/// WebAuthn ceremonies (their ids are random, not time ordered).
+pub const CEREMONY: &str = "cer";
 
 /// `<prefix>_<hex>`.
 pub fn render(prefix: &str, id: Uuid) -> String {
