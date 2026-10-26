@@ -13,7 +13,7 @@ use axum::{
     http::{Method, StatusCode},
 };
 use http::*;
-use merezha_content::media::{Assets, Media};
+use merezha_content::media::{Assets, CleanupReport, Media, Swept};
 use merezha_platform::ports::{BlobKey, BlobStore};
 use merezha_postgres::TestDatabase;
 use serde_json::{Value, json};
@@ -1635,10 +1635,7 @@ async fn a_cleanup_that_lost_its_lease_never_deletes_a_reuploaded_object() {
     let again = uploaded(&fx, "again.txt", "text/plain", bytes).await;
     assert_eq!(dirs.objects(), 1);
     // The stale worker resumes: its claim is lost, nothing is touched.
-    assert_eq!(
-        assets.sweep(&stale[0]).await.unwrap(),
-        merezha_content::media::Swept::Lost
-    );
+    assert_eq!(assets.sweep(&stale[0]).await.unwrap(), Swept::Lost);
     assert_eq!(dirs.objects(), 1);
     assert!(assets_keep_their_blobs(&fx).await);
     let reply = raw(
@@ -1649,6 +1646,200 @@ async fn a_cleanup_that_lost_its_lease_never_deletes_a_reuploaded_object() {
     )
     .await;
     assert_eq!(reply.body, bytes);
+}
+
+/// Wait until the mock S3 server has received an object `DELETE`.
+async fn object_delete_arrived(mock: &s3::MockS3) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !mock
+        .seen()
+        .iter()
+        .any(|seen| seen.method == Method::DELETE && seen.query.is_empty())
+    {
+        assert!(Instant::now() < deadline, "no object DELETE reached S3");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A cleanup run whose lease runs out while its object delete stalls (it
+/// succeeds, or with `fail` it is refused), and a second worker claims the
+/// row meanwhile: the run's fenced row delete, or restore, matches
+/// nothing, so it reports the blob lost, neither deleted nor failed, and
+/// leaves the row to the worker that holds it.
+async fn lose_the_lease_during_the_object_delete(fail: bool) {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let mock = s3::MockS3::start().await;
+    let dirs = Dirs::new();
+    let fx = start(&test, &dirs.s3(&mock, ""), MODEL).await;
+    aged_orphan(&fx, b"a deletion that outlived its lease").await;
+    let assets = assets(&fx);
+    mock.delay_deletes(Duration::from_secs(2));
+    if fail {
+        // Refused for good: no retry.
+        mock.fail_deletes(&[403]);
+    }
+    let run = tokio::spawn({
+        let assets = assets.clone();
+        async move { assets.cleanup(10).await }
+    });
+    object_delete_arrived(&mock).await;
+    execute(
+        &fx.db,
+        "UPDATE merezha_content.blobs SET pending_until = now() - interval '1 second'",
+    )
+    .await;
+    let other = assets.claim_due(10).await.unwrap();
+    assert_eq!(other.len(), 1);
+    let report = run.await.unwrap().unwrap();
+    assert_eq!(
+        report,
+        CleanupReport {
+            deleted: 0,
+            failed: 0,
+            lost: 1
+        }
+    );
+    assert_eq!(
+        strings(&fx.db, "SELECT state FROM merezha_content.blobs").await,
+        ["deleting"]
+    );
+    assert_eq!(mock.object_count(), usize::from(fail));
+    // The worker that holds the lease finishes the job.
+    mock.delay_deletes(Duration::ZERO);
+    assert_eq!(assets.sweep(&other[0]).await.unwrap(), Swept::Deleted);
+    assert!(blob_rows(&fx).await.is_empty());
+    assert_eq!(mock.object_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cleanup_that_loses_its_lease_during_the_object_delete_reports_it_lost() {
+    lose_the_lease_during_the_object_delete(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cleanup_that_loses_its_lease_during_a_failed_object_delete_reports_it_lost() {
+    lose_the_lease_during_the_object_delete(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_claim_never_retakes_a_deletion_another_worker_claimed() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dirs = Dirs::new();
+    let fx = start(&test, &dirs.local(""), MODEL).await;
+    aged_orphan(&fx, b"claimed twice").await;
+    let assets = assets(&fx);
+    // A first worker claims the blob and stalls past its lease; a second
+    // claims it again. The row stays `deleting`: only the token tells the
+    // two claims apart.
+    let stale = assets.claim_due(10).await.unwrap();
+    execute(
+        &fx.db,
+        "UPDATE merezha_content.blobs SET pending_until = now() - interval '1 second'",
+    )
+    .await;
+    let live = assets.claim_due(10).await.unwrap();
+    assert_eq!((stale.len(), live.len()), (1, 1));
+    assert_eq!(assets.sweep(&stale[0]).await.unwrap(), Swept::Lost);
+    assert_eq!(dirs.objects(), 1);
+    assert_eq!(
+        strings(&fx.db, "SELECT state FROM merezha_content.blobs").await,
+        ["deleting"]
+    );
+    assert_eq!(assets.sweep(&live[0]).await.unwrap(), Swept::Deleted);
+    assert!(blob_rows(&fx).await.is_empty());
+    assert_eq!(dirs.objects(), 0);
+}
+
+/// A registered media statement by name.
+fn media_statement(name: &str) -> &'static merezha_postgres::Statement {
+    merezha_content::media::STATEMENTS
+        .iter()
+        .find(|statement| statement.name == name)
+        .unwrap_or_else(|| panic!("no media statement {name}"))
+}
+
+/// The fencing checks in SQL, run directly without the Rust guards in
+/// front of them (the upload's expired-lease check before a takeover, the
+/// sweep's retake before the row delete): each refuses on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_fencing_statements_refuse_on_their_own() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dirs = Dirs::new();
+    let fx = start(&test, &dirs.local(""), MODEL).await;
+    aged_orphan(&fx, b"fenced in sql").await;
+    // A live deletion: `deleting` under a lease whose text is the token.
+    execute(
+        &fx.db,
+        "UPDATE merezha_content.blobs SET state = 'deleting', \
+                pending_until = now() + interval '5 minutes'",
+    )
+    .await;
+    let row = || async {
+        strings(
+            &fx.db,
+            "SELECT scope || ' ' || sha256 || ' ' || state || ' ' || pending_until::text \
+               FROM merezha_content.blobs",
+        )
+        .await
+    };
+    let before = row().await;
+    let fields: Vec<String> = before[0].splitn(4, ' ').map(str::to_owned).collect();
+    let (scope, sha256, token) = (&fields[0], &fields[1], fields[3].as_str());
+    let stale = strings(
+        &fx.db,
+        "SELECT (pending_until - interval '1 second')::text FROM merezha_content.blobs",
+    )
+    .await
+    .remove(0);
+    let lease = i64::try_from(merezha_content::media::DELETE_LEASE.as_millis()).unwrap();
+    let client = fx.db.acquire(soon()).await.unwrap();
+    // An upload never takes over a deletion whose lease is live.
+    let takeover = media_statement("content.blobs.takeover");
+    let taken = fx
+        .db
+        .query_opt(&client, takeover, &[scope, sha256, &lease])
+        .await
+        .unwrap();
+    assert!(taken.is_none());
+    // A retake and a row delete under another token match nothing.
+    let retake = media_statement("content.blobs.retake");
+    let retaken = fx
+        .db
+        .query_opt(&client, retake, &[scope, sha256, &stale, &lease])
+        .await
+        .unwrap();
+    assert!(retaken.is_none());
+    let delete = media_statement("content.blobs.delete");
+    let deleted = fx
+        .db
+        .execute(&client, delete, &[scope, sha256, &stale])
+        .await
+        .unwrap();
+    assert_eq!(deleted, 0);
+    assert_eq!(row().await, before);
+    // Under the live token both go through: the retake renews the lease,
+    // and the row delete matches the renewed one.
+    let renewed: String = fx
+        .db
+        .query_opt(&client, retake, &[scope, sha256, &token, &lease])
+        .await
+        .unwrap()
+        .expect("the live token retakes the row")
+        .get(0);
+    assert_ne!(renewed, token);
+    let deleted = fx
+        .db
+        .execute(&client, delete, &[scope, sha256, &renewed])
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+    assert!(blob_rows(&fx).await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

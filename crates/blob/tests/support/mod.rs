@@ -75,7 +75,7 @@ pub struct MockS3 {
     /// Stream object bodies in chunks of this many bytes with this pause
     /// before each, for read timeouts.
     pace: Mutex<Option<(usize, Duration)>>,
-    /// Pause before answering an object `DELETE`.
+    /// Pause before answering an object `DELETE` (a fault too).
     delete_delay: Mutex<Duration>,
     /// Pause before answering any `PUT` (faults included).
     put_delay: Mutex<Duration>,
@@ -137,7 +137,7 @@ impl MockS3 {
     pub fn pace(&self, chunk: usize, pause: Duration) {
         *self.pace.lock().unwrap() = Some((chunk.max(1), pause));
     }
-    /// Answer object deletes only after `delay`.
+    /// Answer object deletes (a fault too) only after `delay`.
     pub fn delay_deletes(&self, delay: Duration) {
         *self.delete_delay.lock().unwrap() = delay;
     }
@@ -198,6 +198,10 @@ async fn handle(State(mock): State<Arc<MockS3>>, request: Request) -> Response {
     let put_delay = *mock.put_delay.lock().unwrap();
     if parts.method == Method::PUT && !put_delay.is_zero() {
         tokio::time::sleep(put_delay).await;
+    }
+    let delete_delay = *mock.delete_delay.lock().unwrap();
+    if parts.method == Method::DELETE && raw_query.is_empty() && !delete_delay.is_zero() {
+        tokio::time::sleep(delete_delay).await;
     }
     if mock.hang.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -369,10 +373,6 @@ async fn handle(State(mock): State<Arc<MockS3>>, request: Request) -> Response {
             read_object(&parts.method, &parts.headers, &object, pace).await
         }
         (Method::DELETE, None, _) => {
-            let delay = *mock.delete_delay.lock().unwrap();
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
             if let Some(object) = mock.store.lock().unwrap().objects.remove(&key) {
                 let _ = std::fs::remove_file(object.path);
             }

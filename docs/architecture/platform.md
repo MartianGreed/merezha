@@ -3549,8 +3549,17 @@ and deletions a crash abandoned (a ten-minute delete lease), marks them
 row while the lease is still its own (renewing it), deletes the object
 within half the lease and the row under the renewed lease; a failed delete
 restores the previous state. A run whose lease expired and was taken over
-touches nothing, so it never deletes an object uploaded again meanwhile
-(`content.blob_cleanup` logs the count).
+touches nothing, so it never deletes an object uploaded again meanwhile;
+one that loses its lease while the object delete runs leaves the row to
+the new holder and counts the blob lost, not deleted
+(`content.blob_cleanup` logs the count of blobs deleted under the run's
+own lease). The fence lives in the database: a host stalled for longer
+than the whole ten-minute lease between renewing it and sending the
+object delete can still delete an object uploaded again with the same
+bytes (content design section 6, issue #49). The delete is bounded by
+half the lease and each S3 request by `media.s3.timeout`; keep that
+timeout short and keep bucket versioning or soft delete on to recover
+such an object.
 
 Codes added by C7: `asset_not_found` (404), `asset_in_use` (409),
 `asset_too_large` (413), `media_type_rejected` (415), `upload_incomplete`

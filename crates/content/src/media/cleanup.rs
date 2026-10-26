@@ -30,13 +30,14 @@ pub const DELETE_LEASE: Duration = Duration::from_secs(600);
 /// What one cleanup pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CleanupReport {
-    /// Blobs whose object and row were deleted.
+    /// Blobs whose object and row this pass deleted under its own lease
+    /// (the `count` of the `content.blob_cleanup` event).
     pub deleted: usize,
     /// Blobs whose object delete failed, restored for a later run.
     pub failed: usize,
-    /// Claimed blobs this pass no longer owned when it came to them (its
-    /// lease expired and another worker or an upload took the row): left
-    /// alone.
+    /// Claimed blobs this pass no longer owned: its lease expired and
+    /// another worker or an upload took the row, before the retake (left
+    /// alone) or while the object delete ran (the row left to its holder).
     pub lost: usize,
 }
 
@@ -68,7 +69,9 @@ pub enum Swept {
     Deleted,
     /// The object delete failed; the row is back as it was.
     Failed,
-    /// The claim was no longer this worker's: nothing was touched.
+    /// The claim was no longer this worker's: at the retake, nothing was
+    /// touched; after the object delete, the row (not removed, or not
+    /// restored) belongs to whoever took it over.
     Lost,
 }
 
@@ -150,22 +153,29 @@ impl Assets {
     /// Delete one claimed blob (the second step of [`Assets::cleanup`]):
     /// re-take its row under the claim's token, renewing the lease, then
     /// delete the object (bounded by half the lease) and the row, both
-    /// fenced on the renewed token. A lost claim touches nothing.
+    /// fenced on the renewed token. A claim lost before the retake touches
+    /// nothing; one lost while the object delete ran leaves the row (and
+    /// the count) to the worker that holds it now.
     pub async fn sweep(&self, blob: &ClaimedBlob) -> Result<Swept, Rejection> {
         let Some(token) = self.fenced(Step::Retake, blob, &blob.token).await? else {
             return Ok(Swept::Lost);
         };
-        if self.delete_object(&blob.key).await {
-            self.fenced(Step::Forget, blob, &token).await?;
-            Ok(Swept::Deleted)
+        let (step, swept) = if self.delete_object(&blob.key).await {
+            (Step::Forget, Swept::Deleted)
         } else {
-            self.fenced(Step::Restore, blob, &token).await?;
-            Ok(Swept::Failed)
-        }
+            (Step::Restore, Swept::Failed)
+        };
+        Ok(match self.fenced(step, blob, &token).await? {
+            Some(_) => swept,
+            None => Swept::Lost,
+        })
     }
 
     /// Delete an object within half the delete lease, so it never runs
-    /// past the lease that fences it.
+    /// past the lease that fences it. The store does not see the fence: a
+    /// process stalled for the whole lease before the request leaves can
+    /// still delete an object uploaded again meanwhile (the limit of
+    /// database-side fencing, content design section 6, issue #49).
     pub(crate) async fn delete_object(&self, key: &str) -> bool {
         let Ok(key) = BlobKey::new(key.to_owned()) else {
             return false;

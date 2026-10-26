@@ -1592,6 +1592,52 @@ Management `GET /assets/{id}/file` always proxies with `attachment`.
   international names; no `*`, `_` or empty label); the port is 1 to
   65535.
 
+### As built (issue #49, lost sweeps and the fencing limit)
+
+- A sweep checks what its fenced row delete, or its restore after a
+  failed object delete, matched. A lease lost while the object delete ran
+  (another worker or an upload took the row) matches nothing: the blob
+  counts as `lost`, not `deleted` or `failed`, and the row stays with
+  whoever holds it. The `count` of `content.blob_cleanup` is the number
+  of blobs a run deleted under its own lease.
+- Three fencing checks in SQL have a Rust check in front of them:
+  `content.blobs.takeover` requires an expired lease, which the upload
+  read just before under the same row lock (defence in depth);
+  `content.blobs.retake` requires the claim's token, and a batch already
+  stops sweeping once half its lease has passed; `content.blobs.delete`
+  requires the renewed token, which a sweep holds only after its retake.
+  The retake and the row delete are what holds when the lease is lost
+  after the Rust check (a stall, a slow object delete). Each is tested on
+  its own, run straight against PostgreSQL without the Rust check, and
+  the retake and the row delete again through `Assets::sweep` where only
+  the token tells two claims apart.
+- Database fencing has one limit. The fence is checked before the object
+  delete; the store does not check it. If the process stalls for longer
+  than the whole delete lease (ten minutes) between the retake that
+  renewed it and the moment its `DELETE` reaches the store (a frozen VM or
+  container, `SIGSTOP`, a debugger, heavy swapping), another worker can
+  claim the row and delete the object and the row, and an upload can put
+  the same bytes back under the same key, all before the stalled request
+  arrives. That request then deletes the re-uploaded object. A
+  conditional delete cannot help: the new object has the same key, the
+  same bytes and so the same ETag. The asset's blob stays `stored` while
+  its file answers `blob_not_found`, until the object is restored (keep a
+  noncurrent-version or soft-delete rule on the bucket to have one to
+  restore) or the asset is deleted and uploaded again.
+- The mitigation is to keep the longest object delete far below the
+  lease, and the code bounds it twice. Each S3 request is bounded by
+  `media.s3.timeout` (at most 300 s, default 30 s), with at most
+  `MAX_RETRIES` (3) retries, none started later than `RETRY_TIMEOUT`
+  (10 s) after the first attempt. The whole object delete is bounded by
+  half the lease (`DELETE_LEASE / 2`, five minutes): past it the sweep
+  stops waiting and restores the row. So a sweep that is not stalled
+  leaves its object delete with at least five minutes of lease to spare,
+  and only a stall outside the process's control can use the rest. Keep
+  `media.s3.timeout` short, and run hosts where a pause of minutes is not
+  routine. A delete the five-minute bound abandons may already be on the
+  wire; the store applies it on arrival, normally well within the
+  remaining lease.
+
 ## 7. Events
 
 Every event is an outbox record appended inside the transaction of the change
