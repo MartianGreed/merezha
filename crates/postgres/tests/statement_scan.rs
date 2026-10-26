@@ -11,7 +11,9 @@
 //! references of those methods on a driver type (`Transaction::execute`,
 //! `GenericClient::query`); and macros, whose arguments and `macro_rules!`
 //! bodies are scanned too, a method named by a metavariable included.
-//! Comments and string contents are ignored.
+//! Comments and string contents are ignored. The method list is checked
+//! against the locked driver's sources, so an upgrade that adds a way to
+//! run SQL fails until the list has it.
 //!
 //! [`ALLOWED`] lists the files that may still do so, with their exact call
 //! count and the reason. It only shrinks: a new call fails the scan, and so
@@ -180,9 +182,16 @@ fn the_allowlist_has_one_entry_per_file() {
 /// `snippet` as the body of a function, scanned with the statement
 /// constants it declares itself. Lines count from the snippet's first.
 fn calls(snippet: &str) -> Vec<(usize, String)> {
+    calls_beside(snippet, &[])
+}
+
+/// [`calls`] with `elsewhere` declared as statements by another file.
+fn calls_beside(snippet: &str, elsewhere: &[&str]) -> Vec<(usize, String)> {
     let file = scan::parse(&format!("fn fixture() {{{snippet}\n}}"))
         .unwrap_or_else(|e| panic!("{snippet}: {e}"));
-    scan::unregistered_calls(&file, &scan::statement_constants(&file))
+    let mut statements = scan::statement_constants(&file);
+    statements.extend(elsewhere.iter().map(|name| (*name).to_owned()));
+    scan::unregistered_calls(&file, &statements)
 }
 
 #[test]
@@ -297,4 +306,230 @@ fn the_scan_flags_the_forms_the_text_scan_missed() {
         assert_eq!(found.len(), 1, "{form}: {source}: {found:?}");
         assert_eq!(found[0].1, what, "{form}");
     }
+}
+
+/// The PR #70 review: driver methods the first list lacked, a parameter
+/// constant named like a statement of another file, generic and
+/// metavariable paths, and the rules no fixture pinned yet.
+#[test]
+fn the_scan_flags_the_forms_the_review_found() {
+    let forms: [(&str, &str, &str); 12] = [
+        (
+            "scalar query with a turbofish",
+            "client.query_scalar::<i64, _>(\"SELECT 1\", &[]);",
+            "query_scalar",
+        ),
+        (
+            "typed execute",
+            "client.execute_typed(\"DELETE FROM t WHERE id = $1\", &[(&id, Type::INT8)]);",
+            "execute_typed",
+        ),
+        (
+            "raw simple query",
+            "client.simple_query_raw(\"SELECT 1\");",
+            "simple_query_raw",
+        ),
+        (
+            "generic parameter bounded by the driver trait",
+            "fn run<C: GenericClient>(c: &C) { C::execute(c, sql, &[]); }",
+            "C::execute",
+        ),
+        (
+            "generic parameter bounded in a where clause",
+            "fn run<C>(c: &C) where C: tokio_postgres::GenericClient { C::query(c, sql, &[]); }",
+            "C::query",
+        ),
+        (
+            "metavariable type in a macro body",
+            "macro_rules! run { ($t:ident) => { $t::execute(tx, \"DELETE FROM t\", &[]) }; }",
+            "$t::execute",
+        ),
+        (
+            "metavariable method on a qualified path in a macro body",
+            "macro_rules! run { ($t:ty, $m:ident) => { <$t>::$m(tx, \"DELETE FROM t\", &[]) }; }",
+            "$m",
+        ),
+        (
+            "driver type on a qualified path in a macro body",
+            "macro_rules! run { () => { <Transaction as Run>::execute(tx, \"DELETE FROM t\", &[]) }; }",
+            "Transaction::execute",
+        ),
+        (
+            "turbofish in a macro body",
+            "macro_rules! run { ($c:expr) => { $c.query_raw::<_, &dyn ToSql, _>(\"SELECT 1\", p) }; }",
+            "query_raw",
+        ),
+        (
+            "driver type before `as` on a qualified path",
+            "<tokio_postgres::Transaction<'_> as Run>::query(&tx, sql, &[]);",
+            "Run::query",
+        ),
+        (
+            "type alias",
+            "type Conn = tokio_postgres::Client;\nConn::query(&c, sql, &[]);",
+            "Conn::query",
+        ),
+        (
+            "alias of an alias",
+            "type Conn = tokio_postgres::Client;\ntype Again = Conn;\nAgain::execute(&c, sql, &[]);",
+            "Again::execute",
+        ),
+    ];
+    let mut missed = Vec::new();
+    for (form, source, what) in forms {
+        let found = calls(source);
+        if found.len() != 1 || found[0].1 != what {
+            missed.push(format!("{form}: {found:?}"));
+        }
+    }
+    // Another file declares a statement `HEAD`; this file's `HEAD` is a
+    // parameter list, so it is no statement here.
+    for source in [
+        "const HEAD: &[&(dyn ToSql + Sync)] = &[];\ntx.execute(sql, &HEAD);",
+        "static HEAD: &[&(dyn ToSql + Sync)] = &[];\ntx.execute(sql, &HEAD);",
+    ] {
+        let found = calls_beside(source, &["HEAD"]);
+        if found != vec![(2, "execute".to_owned())] {
+            missed.push(format!(
+                "parameter constant named like a statement: {found:?}"
+            ));
+        }
+    }
+    assert!(missed.is_empty(), "missed:\n{}", missed.join("\n"));
+    // Still fine: the statement itself, and a generic bound off the driver.
+    assert_eq!(calls_beside("other.bind(&a, &HEAD);", &["HEAD"]), vec![]);
+    assert_eq!(
+        calls("fn run<C: std::fmt::Display>(c: C) { C::execute(c, a, b); }"),
+        vec![]
+    );
+}
+
+/// The sources of a locked dependency, from `cargo metadata` (downloaded
+/// already: the build compiled them).
+fn dependency_sources(name: &str) -> (String, PathBuf) {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let host = std::process::Command::new(&cargo)
+        .arg("-vV")
+        .output()
+        .expect("cargo -vV");
+    let host = String::from_utf8(host.stdout).expect("utf-8");
+    let host = host
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("the host triple");
+    let output = std::process::Command::new(&cargo)
+        .args([
+            "metadata",
+            "--locked",
+            "--format-version",
+            "1",
+            "--filter-platform",
+            host,
+        ])
+        .current_dir(workspace_crates())
+        .output()
+        .expect("cargo metadata");
+    assert!(
+        output.status.success(),
+        "cargo metadata: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).expect("metadata");
+    let packages = metadata["packages"].as_array().expect("packages");
+    let package = packages
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("{name} is not in the lock"));
+    let manifest = Path::new(package["manifest_path"].as_str().expect("manifest_path"));
+    (
+        package["version"].as_str().expect("version").to_owned(),
+        manifest.parent().expect("crate directory").join("src"),
+    )
+}
+
+/// The public methods of the driver's `Client`, `Transaction` and
+/// `GenericClient` (`tokio_postgres` and `deadpool_postgres`, whose
+/// `ClientWrapper` and `Transaction` add the cached prepares) that take a
+/// query, statement or portal first, as `(name, arguments after self)`.
+fn driver_methods(sources: &Path) -> BTreeSet<(String, usize)> {
+    use syn::{FnArg, ImplItem, Item, Pat, Signature, TraitItem, Type, Visibility};
+    fn takes_sql(signature: &Signature) -> Option<(String, usize)> {
+        let mut inputs = signature.inputs.iter();
+        if !matches!(inputs.next(), Some(FnArg::Receiver(_))) {
+            return None;
+        }
+        let rest: Vec<&FnArg> = inputs.collect();
+        let Some(FnArg::Typed(first)) = rest.first() else {
+            return None;
+        };
+        let Pat::Ident(name) = &*first.pat else {
+            return None;
+        };
+        ["query", "statement", "portal"]
+            .contains(&name.ident.to_string().as_str())
+            .then(|| (signature.ident.to_string(), rest.len()))
+    }
+    let mut files = Vec::new();
+    rust_files(sources, &mut files);
+    let mut methods = BTreeSet::new();
+    for path in files {
+        let source = std::fs::read_to_string(&path).expect("driver source");
+        let file = scan::parse(&source)
+            .unwrap_or_else(|e| panic!("{}: does not parse: {e}", path.display()));
+        for item in &file.items {
+            match item {
+                Item::Impl(item) if item.trait_.is_none() => {
+                    let Type::Path(ty) = &*item.self_ty else {
+                        continue;
+                    };
+                    let Some(last) = ty.path.segments.last() else {
+                        continue;
+                    };
+                    if !["Client", "Transaction", "ClientWrapper"]
+                        .contains(&last.ident.to_string().as_str())
+                    {
+                        continue;
+                    }
+                    for member in &item.items {
+                        if let ImplItem::Fn(f) = member
+                            && matches!(f.vis, Visibility::Public(_))
+                        {
+                            methods.extend(takes_sql(&f.sig));
+                        }
+                    }
+                }
+                Item::Trait(item) if item.ident == "GenericClient" => {
+                    for member in &item.items {
+                        if let TraitItem::Fn(f) = member {
+                            methods.extend(takes_sql(&f.sig));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    methods
+}
+
+/// The scan's method list is exactly the locked driver's, so a driver
+/// upgrade that adds a way to run SQL fails here until the list has it.
+#[test]
+fn the_driver_method_list_is_the_locked_drivers() {
+    let mut driver = BTreeSet::new();
+    for (name, expected) in [
+        ("tokio-postgres", "0.7.18"),
+        ("deadpool-postgres", "0.14.2"),
+    ] {
+        let (version, sources) = dependency_sources(name);
+        // Checked by hand for these versions: the methods above are every
+        // way they run SQL. Re-check on an upgrade, then bump.
+        assert_eq!(version, expected, "{name} moved: re-check DRIVER_METHODS");
+        driver.extend(driver_methods(&sources));
+    }
+    let listed: BTreeSet<(String, usize)> = scan::DRIVER_METHODS
+        .iter()
+        .map(|(name, arity)| ((*name).to_owned(), *arity))
+        .collect();
+    assert_eq!(listed, driver);
 }

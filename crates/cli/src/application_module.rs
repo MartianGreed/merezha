@@ -37,8 +37,7 @@ use std::{
 const CONNECT_BUDGET: Duration = Duration::from_secs(8);
 
 /// The statements [`ApplicationModule`] runs: the application store's.
-pub const STATEMENTS: &[&[merezha_postgres::Statement]] =
-    &[merezha_application::postgres::STATEMENTS];
+const STATEMENTS: &[&[merezha_postgres::Statement]] = &[merezha_application::postgres::STATEMENTS];
 
 pub struct ApplicationModule {
     config: Config,

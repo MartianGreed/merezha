@@ -28,3 +28,5 @@ tempfile.workspace = true
 # `span-locations` gives its findings their line numbers.
 syn = { version = "3.0.9", default-features = false, features = ["full", "parsing", "visit"] }
 proc-macro2 = { version = "1.0.107", default-features = false, features = ["span-locations"] }
+# `cargo metadata` output: where the locked driver sources are.
+serde_json.workspace = true
