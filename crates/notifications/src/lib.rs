@@ -24,16 +24,24 @@
 //! the suppressions its events write, the `brevo register-webhook` call and,
 //! with feature `testkit`, `testkit::FakeBrevo`.
 //!
+//! Slice NT-N6 adds Web Push ([`push`], migration 4): VAPID keys, the
+//! subscription routes, the push delivery behind the same worker, the
+//! egress-guarded client ([`egress`]) with its strict host allowlist, the
+//! `push_expire` task and, with feature `testkit`, `testkit::FakePushService`
+//! and `testkit::TestResolver`.
+//!
 //! Seams for the next slices: Brevo SMS (NT-N4) implements
 //! [`drivers::SmsDriver`] over [`brevo::BrevoClient`] and is installed in
 //! [`notifier::Core`]; until then an SMS `brevo` driver leaves its delivery
-//! jobs queued and unleased. Push (NT-N6)
-//! replaces the `no_subscription` skip of push targets; webhook fan-out
-//! (NT-N7) handles the `notify.webhook_event` jobs `emit_webhook` queues.
+//! jobs queued and unleased. The SSE stream (NT-N5) listens on
+//! [`sql::INBOX_CHANNEL`], which every inbox change notifies. Webhook
+//! fan-out (NT-N7) handles the `notify.webhook_event` jobs `emit_webhook`
+//! queues and sends through [`egress::client`].
 pub mod brevo;
 pub mod config;
 pub mod deliver;
 pub mod drivers;
+pub mod egress;
 pub mod expand;
 pub mod faults;
 pub mod handler;
@@ -46,6 +54,7 @@ pub mod metrics;
 pub mod notifier;
 pub mod payload;
 pub mod policy;
+pub mod push;
 mod routes;
 pub mod sql;
 pub mod stream;
@@ -77,9 +86,10 @@ pub const SCHEMA: &str = "merezha_notify";
 pub const METER_SCOPE: &str = "merezha.notifications";
 
 /// Migration 1, the core tables, migration 2, the inbox (NT §2.4), and
-/// migration 3, pending provider events (NT-N3). Later slices append their
-/// own migrations and never edit these.
-pub const MIGRATIONS: [Migration; 3] = [
+/// migration 3, pending provider events (NT-N3), and migration 4, push
+/// subscriptions (NT-N6). Later slices append their own migrations and
+/// never edit these.
+pub const MIGRATIONS: [Migration; 4] = [
     Migration::new(1, "core", include_str!("../migrations/0001_core.sql")),
     Migration::new(2, "inbox", include_str!("../migrations/0002_inbox.sql")),
     Migration::new(
@@ -87,6 +97,7 @@ pub const MIGRATIONS: [Migration; 3] = [
         "provider_events",
         include_str!("../migrations/0003_provider_events.sql"),
     ),
+    Migration::new(4, "push", include_str!("../migrations/0004_push.sql")),
 ];
 
 /// The permission catalog of NT §7.1 this block checks so far.
@@ -100,13 +111,14 @@ pub const PERMISSIONS: [&str; 5] = [
 
 /// The codes this block's routes and port return, with their statuses
 /// (R8). Canonical kernel codes are listed again with the same status.
-pub const ERRORS: [ErrorCode; 32] = [
+pub const ERRORS: [ErrorCode; 35] = [
     ErrorCode::new("invalid_input", 400),
     ErrorCode::new("invalid_cursor", 400),
     ErrorCode::new("token_invalid", 400),
     ErrorCode::new("unauthenticated", 401),
     ErrorCode::new("unauthorized", 403),
     ErrorCode::new("not_found", 404),
+    ErrorCode::new("push_disabled", 404),
     ErrorCode::new("not_redeliverable", 409),
     ErrorCode::new("secret_purged", 409),
     ErrorCode::new("data_purged", 410),
@@ -128,6 +140,8 @@ pub const ERRORS: [ErrorCode; 32] = [
     ErrorCode::new("invalid_dedupe_key", 422),
     ErrorCode::new("topic_not_configurable", 422),
     ErrorCode::new("invalid_timezone", 422),
+    ErrorCode::new("subscription_invalid", 422),
+    ErrorCode::new("push_host_not_allowed", 422),
     ErrorCode::new("unavailable", 503),
     ErrorCode::new("database_unavailable", 503),
     ErrorCode::new("database_timeout", 503),
@@ -194,6 +208,15 @@ pub struct Notifications {
     email_driver: DriverOverride,
     /// The inbox stream registry, once [`Module::start`] ran.
     streams: Arc<OnceLock<stream::Streams>>,
+    push_lookup: LookupOverride,
+}
+/// A resolver a test installs under the egress guard (feature `testkit`).
+#[derive(Clone, Default)]
+struct LookupOverride(Option<Arc<dyn egress::Lookup>>);
+impl std::fmt::Debug for LookupOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Some(..)" } else { "None" })
+    }
 }
 /// An email driver a test installs in place of the configured one
 /// (feature `testkit`).
@@ -224,6 +247,13 @@ impl Notifications {
     #[cfg(feature = "testkit")]
     pub fn with_email_driver(mut self, driver: Arc<dyn drivers::EmailDriver>) -> Self {
         self.email_driver = DriverOverride(Some(driver));
+        self
+    }
+    /// The block with `lookup` resolving push hosts under the egress guard
+    /// (feature `testkit`), such as [`testkit::TestResolver`].
+    #[cfg(feature = "testkit")]
+    pub fn with_push_lookup(mut self, lookup: Arc<dyn egress::Lookup>) -> Self {
+        self.push_lookup = LookupOverride(Some(lookup));
         self
     }
     /// The validated configuration, once [`Module::configure`] succeeded.
@@ -269,6 +299,9 @@ fn delivering(settings: &Settings) -> Vec<Channel> {
     if settings.sms.driver == config::Driver::Capture {
         channels.push(Channel::Sms);
     }
+    if settings.push.is_some() {
+        channels.push(Channel::Push);
+    }
     channels
 }
 
@@ -299,7 +332,8 @@ impl Module for Notifications {
     /// signed token is the only credential (NT §6). The Brevo email
     /// callback (NT-N3) proves itself with Brevo's bearer and the optional
     /// CIDRs, which the edge must never read as a session; the SMS callback
-    /// of NT-N4 joins this list.
+    /// of NT-N4 joins this list. The VAPID public key is public (NT §7.1),
+    /// so a stale credential cannot keep a page from subscribing.
     fn credential_free_routes(&self) -> Vec<merezha_platform::CredentialFreeRoute> {
         let mut routes: Vec<_> = [axum::http::Method::GET, axum::http::Method::POST]
             .into_iter()
@@ -311,6 +345,10 @@ impl Module for Notifications {
         routes.push(merezha_platform::CredentialFreeRoute {
             method: axum::http::Method::POST,
             path: brevo::events::PATH,
+        });
+        routes.push(merezha_platform::CredentialFreeRoute {
+            method: axum::http::Method::GET,
+            path: "/push/vapid-public-key",
         });
         routes
     }
@@ -355,6 +393,27 @@ impl Module for Notifications {
             };
             let sms: Option<Arc<dyn drivers::SmsDriver>> =
                 (settings.sms.driver == config::Driver::Capture).then(|| Arc::new(capture()) as _);
+            let metrics = metrics::Metrics::new(
+                &ctx.telemetry().meter(METER_SCOPE),
+                settings.topics.keys().cloned(),
+            );
+            let push = match &settings.push {
+                Some(push) => {
+                    let lookup = self
+                        .push_lookup
+                        .0
+                        .clone()
+                        .unwrap_or_else(|| Arc::new(egress::SystemLookup));
+                    Some(Arc::new(push::PushSender::new(
+                        &settings,
+                        push,
+                        self.facts.no_egress,
+                        lookup,
+                        metrics.clone(),
+                    )?))
+                }
+                None => None,
+            };
             let core = notifier::Core {
                 settings: settings.clone(),
                 registry: checked.registry.clone(),
@@ -364,13 +423,11 @@ impl Module for Notifications {
                 directory: ctx.directory().clone(),
                 clock: clock(&ctx),
                 random: random(&ctx),
-                metrics: metrics::Metrics::new(
-                    &ctx.telemetry().meter(METER_SCOPE),
-                    settings.topics.keys().cloned(),
-                ),
+                metrics,
                 faults: self.faults.clone(),
                 email,
                 sms,
+                push,
             };
             let jobs = ctx.jobs(NAME)?;
             jobs.register(

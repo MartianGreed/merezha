@@ -71,7 +71,7 @@ impl JobHandler for Expand {
     }
 }
 
-/// `notify.deliver.email` and `notify.deliver.sms`.
+/// `notify.deliver.email`, `notify.deliver.sms` and `notify.deliver.push`.
 pub struct Deliver(pub Slot, pub Channel);
 impl JobHandler for Deliver {
     fn handle<'a>(

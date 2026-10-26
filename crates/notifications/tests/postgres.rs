@@ -39,6 +39,8 @@ const CORE_CHECKSUM: &str = "40f9a70cd7cacfcc33d316f559a3cf499925152663fe5a1ad27
 const INBOX_CHECKSUM: &str = "1198acd9b4ea2b7011fde9c174ec04e77b9d0d9a8aeeecc1b35af244a9dd9bf8";
 /// SHA-256 of migration 3 (NT-N3, pending provider events), frozen the same way.
 const EVENTS_CHECKSUM: &str = "f9e8fc57df4863cf4602682ada9bbe6f1fbf48932479852c3eecab93ea6e76ab";
+/// SHA-256 of migration 4 (NT-N6, push subscriptions), frozen the same way.
+const PUSH_CHECKSUM: &str = "fac9a5a50789e1802a393c392d339db2923e1b8a82cd08740ba1ec364900d896";
 
 /// A distinct id per call.
 fn fresh() -> Uuid {
@@ -57,7 +59,7 @@ fn soon() -> Instant {
 
 #[test]
 fn migration_checksum_is_pinned() {
-    assert_eq!(MIGRATIONS.len(), 3);
+    assert_eq!(MIGRATIONS.len(), 4);
     assert_eq!((MIGRATIONS[0].version, MIGRATIONS[0].name), (1, "core"));
     assert_eq!(checksum(MIGRATIONS[0].sql), CORE_CHECKSUM);
     assert_eq!((MIGRATIONS[1].version, MIGRATIONS[1].name), (2, "inbox"));
@@ -67,6 +69,8 @@ fn migration_checksum_is_pinned() {
         (3, "provider_events")
     );
     assert_eq!(checksum(MIGRATIONS[2].sql), EVENTS_CHECKSUM);
+    assert_eq!((MIGRATIONS[3].version, MIGRATIONS[3].name), (4, "push"));
+    assert_eq!(checksum(MIGRATIONS[3].sql), PUSH_CHECKSUM);
 }
 
 async fn migrated() -> Option<(TestDatabase, Database)> {
@@ -79,12 +83,12 @@ async fn migrated() -> Option<(TestDatabase, Database)> {
     let report = run_migrations(&db, &declared, MigrationMode::Apply, soon())
         .await
         .unwrap();
-    assert_eq!(report.applied.len(), 3);
+    assert_eq!(report.applied.len(), 4);
     Some((test, db))
 }
 
 #[tokio::test]
-async fn migrations_create_the_core_and_inbox_tables() {
+async fn migrations_create_the_core_inbox_and_push_tables() {
     let Some((_test, db)) = migrated().await else {
         return;
     };
@@ -117,6 +121,7 @@ async fn migrations_create_the_core_and_inbox_tables() {
             "notifications",
             "preferences",
             "provider_events",
+            "push_subscriptions",
             "suppressions",
             "user_settings"
         ]

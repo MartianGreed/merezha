@@ -57,6 +57,10 @@ pub fn inbox_key(user: &str) -> String {
 pub fn push_key(user: &str) -> String {
     format!("push:{user}")
 }
+/// One push subscription: a user gets one push delivery per subscription.
+pub fn push_subscription_key(subscription: Uuid) -> String {
+    format!("pushsub:{subscription}")
+}
 /// A user the Directory did not resolve: one skipped delivery per channel.
 pub fn user_key(user: &str) -> String {
     format!("user:{user}")

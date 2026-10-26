@@ -1,7 +1,8 @@
 //! The NT-N2 routes under `/v1/notifications/` (NT §7.1): `send`,
 //! `status` and `redeliver`, the inbox, preferences, unsubscribe and
-//! suppressions, and the NT-N3 Brevo email callback
-//! ([`crate::brevo::events`]). Self routes need a principal of kind `user` and act on its
+//! suppressions, the NT-N3 Brevo email callback
+//! ([`crate::brevo::events`]), and (NT-N6) the push routes of
+//! [`crate::push`]. Self routes need a principal of kind `user` and act on its
 //! user; application routes check their permission at `Application` scope.
 use crate::{
     Checked, ids, inbox,
@@ -126,6 +127,18 @@ pub(crate) fn router(ctx: Ctx) -> Router {
         .route(
             crate::brevo::events::PATH,
             post(crate::brevo::events::callback),
+        )
+        .route(
+            "/push/vapid-public-key",
+            get(crate::push::routes::public_key),
+        )
+        .route(
+            "/push/subscriptions",
+            get(crate::push::routes::list).post(crate::push::routes::subscribe),
+        )
+        .route(
+            "/push/subscriptions/{id}",
+            delete(crate::push::routes::remove),
         )
         .with_state(ctx)
 }
@@ -592,9 +605,6 @@ async fn redeliver(
                 else {
                     return Err(Failure::conflict("not_redeliverable"));
                 };
-                if channel == "push" {
-                    return Err(Failure::conflict("not_redeliverable"));
-                }
                 let generation: i32 = db
                     .query_one(tx, &sql::REDELIVER_SET, &[&id, &now])
                     .await
@@ -1014,7 +1024,7 @@ async fn unsubscribe_page(State(ctx): State<Ctx>, RawQuery(query): RawQuery) -> 
 // ----- suppressions -----
 
 /// A UUIDv7 from the clock and the platform CSPRNG.
-fn new_id(core: &Core) -> Result<Uuid, Failure> {
+pub(crate) fn new_id(core: &Core) -> Result<Uuid, Failure> {
     let millis = core
         .clock
         .now()

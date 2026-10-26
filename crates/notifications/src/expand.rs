@@ -8,8 +8,13 @@
 //! notification (`ON CONFLICT DO NOTHING`, so a second run of the same job
 //! writes nothing more), the deliveries, the inbox items numbered from the
 //! users' counters locked in ascending user order, the `pg_notify` wake-ups
-//! and the `OutboxTarget::Job` records of the email and SMS deliveries
-//! (R1), at most 256 per append.
+//! and the `OutboxTarget::Job` records of the email, SMS and push
+//! deliveries (R1), at most 256 per append.
+//!
+//! A push target is one subscription (NT-N6): a user gets one push delivery
+//! per live subscription made with the current VAPID key and in the
+//! notification's tenant scope, or one `skipped` / `no_subscription`
+//! delivery without any.
 use crate::{
     faults,
     handler::Outcome,
@@ -77,6 +82,8 @@ struct Target {
     reason: Option<&'static str>,
     provider: Option<&'static str>,
     inbox: Option<InboxContent>,
+    /// The push subscription of a push target.
+    subscription: Option<Uuid>,
 }
 
 /// What a failed resolution means for the job.
@@ -121,7 +128,12 @@ async fn expand(core: &Core, deadline: Instant, payload: ExpandPayload) -> Outco
         Resolve::Ok(people, overflow) => (people, overflow),
         Resolve::Retry(code) => return Outcome::retry(&code),
     };
-    let mut targets = targets(core, &payload, &channels, &people);
+    let subscriptions = match push_subscriptions(core, deadline, &payload, &channels, &people).await
+    {
+        Ok(found) => found,
+        Err(failure) => return Outcome::retry(&failure.code),
+    };
+    let mut targets = targets(core, &payload, &channels, &people, &subscriptions);
     let cap = match topic.category {
         Category::Marketing => core.settings.limits.max_marketing_targets.min(max_targets),
         _ => max_targets,
@@ -359,12 +371,64 @@ where
     }
 }
 
+/// The push subscriptions of the resolved users that this notification may
+/// reach, by user (NT §5.3): made with the current VAPID key, not expired,
+/// and in the notification's tenant scope. At most `max_targets + 1` are
+/// read, so a larger set is rejected as too many targets.
+async fn push_subscriptions(
+    core: &Core,
+    deadline: Instant,
+    payload: &ExpandPayload,
+    channels: &[Channel],
+    people: &[Person],
+) -> Result<HashMap<String, Vec<Uuid>>, merezha_domain::Failure> {
+    let mut found: HashMap<String, Vec<Uuid>> = HashMap::new();
+    let Some(sender) = &core.push else {
+        return Ok(found);
+    };
+    if !channels.contains(&Channel::Push) {
+        return Ok(found);
+    }
+    let users: Vec<String> = people
+        .iter()
+        .filter(|p| p.contact && p.unresolved.is_none())
+        .filter_map(|p| p.user.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if users.is_empty() {
+        return Ok(found);
+    }
+    let limit = i64::try_from(core.settings.limits.max_targets).unwrap_or(i64::MAX - 1) + 1;
+    let client = core.database.acquire(deadline).await?;
+    let rows = core
+        .database
+        .query(
+            &client,
+            &crate::push::sql::TARGETS,
+            &[
+                &users,
+                &sender.vapid().key_id(),
+                &payload.tenant,
+                &core.now(),
+                &limit,
+            ],
+        )
+        .await
+        .map_err(|e| classify(&e))?;
+    for row in rows {
+        found.entry(row.get(0)).or_default().push(row.get(1));
+    }
+    Ok(found)
+}
+
 /// People times channels, one target per `(channel, target key)`.
 fn targets(
     core: &Core,
     payload: &ExpandPayload,
     channels: &[Channel],
     people: &[Person],
+    subscriptions: &HashMap<String, Vec<Uuid>>,
 ) -> Vec<Target> {
     let mut out: Vec<Target> = Vec::new();
     let mut seen: HashMap<(Channel, String), usize> = HashMap::new();
@@ -376,63 +440,92 @@ fn targets(
         candidates.extend(person.locales.iter().map(String::as_str));
         let locale = core.registry.resolve_locale(candidates);
         for channel in channels {
-            let (key, address, status) = match (&person.unresolved, channel) {
-                (Some((key, why)), _) => (key.clone(), None, Some(("skipped", *why))),
+            type Candidate = (String, Option<String>, Option<(&'static str, &'static str)>);
+            let mut found: Vec<(Candidate, Option<Uuid>)> = Vec::new();
+            match (&person.unresolved, channel) {
+                (Some((key, why)), _) => {
+                    found.push(((key.clone(), None, Some(("skipped", *why))), None))
+                }
                 (None, Channel::Email) => match &person.email {
-                    Some(email) => (ids::email_key(email), Some(email.clone()), None),
+                    Some(email) => {
+                        found.push(((ids::email_key(email), Some(email.clone()), None), None))
+                    }
                     None => continue,
                 },
                 (None, Channel::Sms) => match &person.phone {
-                    Some(phone) => (ids::sms_key(phone), Some(phone.clone()), None),
+                    Some(phone) => {
+                        found.push(((ids::sms_key(phone), Some(phone.clone()), None), None))
+                    }
                     None => continue,
                 },
                 (None, Channel::Inbox) => match (&person.user, person.contact) {
-                    (Some(user), true) => (ids::inbox_key(user), None, None),
+                    (Some(user), true) => found.push(((ids::inbox_key(user), None, None), None)),
                     _ => continue,
                 },
                 (None, Channel::Push) => match (&person.user, person.contact) {
-                    // Subscriptions arrive with NT-N6 (migration 3).
-                    (Some(user), true) => (
-                        ids::push_key(user),
-                        None,
-                        Some(("skipped", reason::NO_SUBSCRIPTION)),
-                    ),
+                    // One target per subscription (NT-N6).
+                    (Some(user), true) => match subscriptions.get(user) {
+                        Some(owned) if !owned.is_empty() => {
+                            for subscription in owned {
+                                found.push((
+                                    (ids::push_subscription_key(*subscription), None, None),
+                                    Some(*subscription),
+                                ));
+                            }
+                        }
+                        // Without a push section the channel is disabled,
+                        // which `decide` records.
+                        _ if core.push.is_none() => {
+                            found.push(((ids::push_key(user), None, None), None));
+                        }
+                        _ => found.push((
+                            (
+                                ids::push_key(user),
+                                None,
+                                Some(("skipped", reason::NO_SUBSCRIPTION)),
+                            ),
+                            None,
+                        )),
+                    },
                     _ => continue,
                 },
-            };
-            if key.len() > ids::MAX_TARGET_KEY {
-                continue;
             }
-            if let Some(&index) = seen.get(&(*channel, key.clone())) {
-                // The same mailbox from a user and an address is one
-                // delivery; keep what the first lacked.
-                let existing = &mut out[index];
-                if existing.user.is_none() {
-                    existing.user = person.user.clone();
+            for ((key, address, status), subscription) in found {
+                if key.len() > ids::MAX_TARGET_KEY {
+                    continue;
                 }
-                if existing.name.is_none() {
-                    existing.name = person.name.clone();
+                if let Some(&index) = seen.get(&(*channel, key.clone())) {
+                    // The same mailbox from a user and an address is one
+                    // delivery; keep what the first lacked.
+                    let existing = &mut out[index];
+                    if existing.user.is_none() {
+                        existing.user = person.user.clone();
+                    }
+                    if existing.name.is_none() {
+                        existing.name = person.name.clone();
+                    }
+                    continue;
                 }
-                continue;
+                seen.insert((*channel, key.clone()), out.len());
+                let (status, reason) = match status {
+                    Some((status, reason)) => (status, Some(reason)),
+                    None => ("queued", None),
+                };
+                out.push(Target {
+                    id: ids::delivery_id(payload.notification_id, *channel, &key),
+                    channel: *channel,
+                    key,
+                    user: person.user.clone(),
+                    address,
+                    name: person.name.clone(),
+                    locale: locale.clone(),
+                    status,
+                    reason,
+                    provider: None,
+                    inbox: None,
+                    subscription,
+                });
             }
-            seen.insert((*channel, key.clone()), out.len());
-            let (status, reason) = match status {
-                Some((status, reason)) => (status, Some(reason)),
-                None => ("queued", None),
-            };
-            out.push(Target {
-                id: ids::delivery_id(payload.notification_id, *channel, &key),
-                channel: *channel,
-                key,
-                user: person.user.clone(),
-                address,
-                name: person.name.clone(),
-                locale: locale.clone(),
-                status,
-                reason,
-                provider: None,
-                inbox: None,
-            });
         }
     }
     out
@@ -715,6 +808,7 @@ async fn write(
                         &columns.statuses,
                         &columns.reasons,
                         &columns.providers,
+                        &columns.subscriptions,
                     ],
                 )
                 .await
@@ -786,6 +880,7 @@ struct Columns {
     statuses: Vec<String>,
     reasons: Vec<Option<String>>,
     providers: Vec<Option<String>>,
+    subscriptions: Vec<Option<Uuid>>,
 }
 impl Columns {
     fn of(targets: &[Target]) -> Self {
@@ -812,6 +907,7 @@ impl Columns {
                 .iter()
                 .map(|t| t.provider.map(str::to_owned))
                 .collect(),
+            subscriptions: targets.iter().map(|t| t.subscription).collect(),
         }
     }
 }

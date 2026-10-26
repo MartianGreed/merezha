@@ -6,8 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-# Test kit (NT §8): named crash points for the duplicate-delivery tests and
-# `testkit::FakeBrevo`.
+# Test kit (NT §8): named crash points for the duplicate-delivery tests,
+# `testkit::FakeBrevo`, `testkit::FakePushService` and `testkit::TestResolver`.
 # Dev-dependencies only; release builds never enable it.
 testkit = []
 
@@ -27,11 +27,13 @@ serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 opentelemetry.workspace = true
+reqwest.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 tokio-postgres = { workspace = true, features = ["with-uuid-1", "with-jiff-0_2", "with-serde_json-1"] }
 toml.workspace = true
 tracing.workspace = true
 url = "2.5.8"
+web-push-native = "0.5.0"
 uuid = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]

@@ -376,6 +376,7 @@ mod tests {
                 merezha_postgres::KERNEL_STATEMENTS,
                 super::STATEMENTS,
                 crate::sql::STATEMENTS,
+                crate::push::sql::STATEMENTS,
             ]),
             Ok(())
         );
