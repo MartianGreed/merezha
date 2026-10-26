@@ -17,6 +17,9 @@ use std::{
 use support::Host;
 
 const SECRET: &str = "a-process-test-identity-secret-of-32-bytes";
+/// The bound of every wait on the host: polls return as soon as their
+/// condition holds, so only a host that never answers reaches it.
+const WAIT: Duration = Duration::from_secs(30);
 
 fn project(dir: &Path, identity: &str) -> PathBuf {
     fs::write(
@@ -60,9 +63,9 @@ fn call(
     body: &str,
 ) -> Reply {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
+    // Registration hashes a password with 19 MiB of Argon2 in a debug
+    // build: a loaded machine takes seconds.
+    stream.set_read_timeout(Some(WAIT)).unwrap();
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
         body.len()
@@ -148,7 +151,7 @@ fn run_delivers_identity_mail_through_the_notifications_block() {
             .to_string(),
     );
     assert_eq!(registered.status, 202, "{}", registered.body);
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + WAIT;
     let capture = loop {
         let listed = call(address, "GET", "/v1/notifications/dev/captures", &[], "");
         assert_eq!(listed.status, 200, "{}", listed.body);
@@ -306,7 +309,7 @@ fn run_serves_identity_with_printed_links_on_loopback() {
             .contains("cache-control: no-store")
     );
     // The stderr writer is asynchronous: wait for the line.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + WAIT;
     let link = loop {
         if let Some(link) = host
             .events()
