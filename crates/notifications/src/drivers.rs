@@ -6,7 +6,8 @@
 //! capture drivers: they keep the rendered message in
 //! `merezha_notify.captures` (the newest `retention.captures` rows) and
 //! accept it with provider `capture`, so the whole pipeline runs without a
-//! provider. Brevo (NT-N3, NT-N4) implements the same traits.
+//! provider. Brevo email ([`crate::brevo::BrevoEmail`], NT-N3) and SMS
+//! (NT-N4) implement the same traits.
 use crate::templates::{RenderedEmail, RenderedSms};
 use merezha_domain::Failure;
 use merezha_platform::{
@@ -115,6 +116,11 @@ impl std::fmt::Debug for SmsMessage {
 /// driver, finished before `deadline`; the outcome classifies every result.
 pub trait EmailDriver: Send + Sync {
     fn provider(&self) -> Provider;
+    /// The provider's own deadline for one call (`brevo.timeout`); `None`
+    /// takes the worker's default.
+    fn timeout(&self) -> Option<Duration> {
+        None
+    }
     fn send<'a>(
         &'a self,
         message: &'a EmailMessage,
@@ -124,6 +130,10 @@ pub trait EmailDriver: Send + Sync {
 /// Sends SMS, with the [`EmailDriver`] contract.
 pub trait SmsDriver: Send + Sync {
     fn provider(&self) -> Provider;
+    /// See [`EmailDriver::timeout`].
+    fn timeout(&self) -> Option<Duration> {
+        None
+    }
     fn send<'a>(&'a self, message: &'a SmsMessage, deadline: Instant)
     -> BoxFuture<'a, SendOutcome>;
 }

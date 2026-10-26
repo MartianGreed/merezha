@@ -37,6 +37,8 @@ use uuid::Uuid;
 const CORE_CHECKSUM: &str = "40f9a70cd7cacfcc33d316f559a3cf499925152663fe5a1ad271add029cfdb70";
 /// SHA-256 of migration 2 (NT-N2, the inbox), frozen the same way.
 const INBOX_CHECKSUM: &str = "1198acd9b4ea2b7011fde9c174ec04e77b9d0d9a8aeeecc1b35af244a9dd9bf8";
+/// SHA-256 of migration 3 (NT-N3, pending provider events), frozen the same way.
+const EVENTS_CHECKSUM: &str = "f9e8fc57df4863cf4602682ada9bbe6f1fbf48932479852c3eecab93ea6e76ab";
 
 /// A distinct id per call.
 fn fresh() -> Uuid {
@@ -55,11 +57,16 @@ fn soon() -> Instant {
 
 #[test]
 fn migration_checksum_is_pinned() {
-    assert_eq!(MIGRATIONS.len(), 2);
+    assert_eq!(MIGRATIONS.len(), 3);
     assert_eq!((MIGRATIONS[0].version, MIGRATIONS[0].name), (1, "core"));
     assert_eq!(checksum(MIGRATIONS[0].sql), CORE_CHECKSUM);
     assert_eq!((MIGRATIONS[1].version, MIGRATIONS[1].name), (2, "inbox"));
     assert_eq!(checksum(MIGRATIONS[1].sql), INBOX_CHECKSUM);
+    assert_eq!(
+        (MIGRATIONS[2].version, MIGRATIONS[2].name),
+        (3, "provider_events")
+    );
+    assert_eq!(checksum(MIGRATIONS[2].sql), EVENTS_CHECKSUM);
 }
 
 async fn migrated() -> Option<(TestDatabase, Database)> {
@@ -72,7 +79,7 @@ async fn migrated() -> Option<(TestDatabase, Database)> {
     let report = run_migrations(&db, &declared, MigrationMode::Apply, soon())
         .await
         .unwrap();
-    assert_eq!(report.applied.len(), 2);
+    assert_eq!(report.applied.len(), 3);
     Some((test, db))
 }
 

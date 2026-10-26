@@ -31,6 +31,8 @@ tracing = { workspace = true, features = ["release_max_level_debug"] }
 [dev-dependencies]
 # The process tests drive the relay through MEREZHA_JOBS_TEST_RELAY.
 merezha-jobs = { path = "../jobs", features = ["test-hooks"] }
+# `testkit::FakeBrevo` for `merezha notifications brevo register-webhook`.
+merezha-notifications = { path = "../notifications", features = ["testkit"] }
 merezha-telemetry = { path = "../telemetry", features = ["testing"] }
 tempfile.workspace = true
 wat.workspace = true

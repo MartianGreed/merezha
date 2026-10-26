@@ -12,13 +12,22 @@
 //! `status` and `redeliver`, and the `settle_notifications`, `purge_data`
 //! and `inbox_expire` tasks, with migration 2 ([`MIGRATIONS`]).
 //!
-//! Seams for the next slices: the Brevo drivers (NT-N3, NT-N4) implement
-//! [`drivers::EmailDriver`] and [`drivers::SmsDriver`] and are installed in
-//! [`notifier::Core`]; until then a `brevo` driver leaves its delivery jobs
-//! queued and unleased. The SSE stream (NT-N5) listens on
+//! Slice NT-N3 adds Brevo email ([`brevo`]): the client over the kernel's
+//! outbound HTTP client, the response classifier, the email driver behind
+//! the same worker (attempts, the ambiguity path with a stable
+//! `idempotencyKey`), the credential-free status callback
+//! `POST /v1/notifications/providers/brevo/email` (bearer and CIDR) with
+//! the suppressions its events write, the `brevo register-webhook` call and,
+//! with feature `testkit`, `testkit::FakeBrevo`.
+//!
+//! Seams for the next slices: Brevo SMS (NT-N4) implements
+//! [`drivers::SmsDriver`] over [`brevo::BrevoClient`] and is installed in
+//! [`notifier::Core`]; until then an SMS `brevo` driver leaves its delivery
+//! jobs queued and unleased. The SSE stream (NT-N5) listens on
 //! [`sql::INBOX_CHANNEL`], which every inbox change notifies. Push (NT-N6)
 //! replaces the `no_subscription` skip of push targets; webhook fan-out
 //! (NT-N7) handles the `notify.webhook_event` jobs `emit_webhook` queues.
+pub mod brevo;
 pub mod config;
 pub mod deliver;
 pub mod drivers;
@@ -37,6 +46,8 @@ pub mod policy;
 mod routes;
 pub mod sql;
 pub mod templates;
+#[cfg(feature = "testkit")]
+pub mod testkit;
 pub mod topics;
 
 pub use config::{HostFacts, Settings};
@@ -61,11 +72,17 @@ pub const SCHEMA: &str = "merezha_notify";
 /// The instrumentation scope of the block's instruments (TE §1.3).
 pub const METER_SCOPE: &str = "merezha.notifications";
 
-/// Migration 1, the core tables, and migration 2, the inbox (NT §2.4).
-/// Later slices append their own migrations and never edit these.
-pub const MIGRATIONS: [Migration; 2] = [
+/// Migration 1, the core tables, migration 2, the inbox (NT §2.4), and
+/// migration 3, pending provider events (NT-N3). Later slices append their
+/// own migrations and never edit these.
+pub const MIGRATIONS: [Migration; 3] = [
     Migration::new(1, "core", include_str!("../migrations/0001_core.sql")),
     Migration::new(2, "inbox", include_str!("../migrations/0002_inbox.sql")),
+    Migration::new(
+        3,
+        "provider_events",
+        include_str!("../migrations/0003_provider_events.sql"),
+    ),
 ];
 
 /// The permission catalog of NT §7.1 this block checks so far.
@@ -79,7 +96,7 @@ pub const PERMISSIONS: [&str; 5] = [
 
 /// The codes this block's routes and port return, with their statuses
 /// (R8). Canonical kernel codes are listed again with the same status.
-pub const ERRORS: [ErrorCode; 30] = [
+pub const ERRORS: [ErrorCode; 31] = [
     ErrorCode::new("invalid_input", 400),
     ErrorCode::new("invalid_cursor", 400),
     ErrorCode::new("token_invalid", 400),
@@ -89,6 +106,7 @@ pub const ERRORS: [ErrorCode; 30] = [
     ErrorCode::new("not_redeliverable", 409),
     ErrorCode::new("secret_purged", 409),
     ErrorCode::new("data_purged", 410),
+    ErrorCode::new("body_limit", 413),
     ErrorCode::new("validation_failed", 422),
     ErrorCode::new("invalid_locale", 422),
     ErrorCode::new("unknown_topic", 422),
@@ -231,7 +249,10 @@ impl NotificationsHandle {
 /// The job kind of each delivering channel whose driver this slice has.
 fn delivering(settings: &Settings) -> Vec<Channel> {
     let mut channels = Vec::new();
-    if settings.email.driver == config::Driver::Capture {
+    if matches!(
+        settings.email.driver,
+        config::Driver::Capture | config::Driver::Brevo
+    ) {
         channels.push(Channel::Email);
     }
     if settings.sms.driver == config::Driver::Capture {
@@ -264,16 +285,32 @@ impl Module for Notifications {
     }
     /// The unsubscribe routes take no session: a mail client or a browser
     /// holding a (possibly stale) session cookie must get through, and the
-    /// signed token is the only credential (NT §6). The Brevo callbacks of
-    /// NT-N3 and NT-N4 join this list.
+    /// signed token is the only credential (NT §6). The Brevo email
+    /// callback (NT-N3) proves itself with Brevo's bearer and the optional
+    /// CIDRs, which the edge must never read as a session; the SMS callback
+    /// of NT-N4 joins this list.
     fn credential_free_routes(&self) -> Vec<merezha_platform::CredentialFreeRoute> {
-        [axum::http::Method::GET, axum::http::Method::POST]
+        let mut routes: Vec<_> = [axum::http::Method::GET, axum::http::Method::POST]
             .into_iter()
             .map(|method| merezha_platform::CredentialFreeRoute {
                 method,
                 path: "/unsubscribe",
             })
-            .collect()
+            .collect();
+        routes.push(merezha_platform::CredentialFreeRoute {
+            method: axum::http::Method::POST,
+            path: brevo::events::PATH,
+        });
+        routes
+    }
+    /// The Brevo callback reads up to 1 MiB whatever `http.body_limit` is
+    /// (NT §5.2), and answers `body_limit` itself past it.
+    fn body_limits(&self) -> Vec<merezha_platform::RouteBodyLimit> {
+        vec![merezha_platform::RouteBodyLimit {
+            method: axum::http::Method::POST,
+            path: brevo::events::PATH,
+            limit: brevo::events::MAX_BODY,
+        }]
     }
     fn notifier(&self) -> Option<Arc<dyn NotifierFactory>> {
         self.checked()
@@ -287,11 +324,24 @@ impl Module for Notifications {
             let settings = checked.settings.clone();
             let capture =
                 || drivers::CaptureDriver::new(ctx.database().clone(), settings.retention.captures);
-            let email: Option<Arc<dyn drivers::EmailDriver>> =
-                self.email_driver.0.clone().or_else(|| {
-                    (settings.email.driver == config::Driver::Capture)
-                        .then(|| Arc::new(capture()) as _)
-                });
+            let email: Option<Arc<dyn drivers::EmailDriver>> = match (
+                self.email_driver.0.clone(),
+                settings.email.driver,
+                &settings.brevo,
+            ) {
+                (Some(driver), _, _) => Some(driver),
+                (None, config::Driver::Capture, _) => Some(Arc::new(capture())),
+                (None, config::Driver::Brevo, Some(brevo)) => {
+                    let client = brevo::BrevoClient::new(brevo, ctx.http())?;
+                    Some(Arc::new(brevo::BrevoEmail::new(
+                        client,
+                        settings.email.from.clone(),
+                        settings.email.reply_to.clone(),
+                        brevo.sandbox,
+                    )))
+                }
+                _ => None,
+            };
             let sms: Option<Arc<dyn drivers::SmsDriver>> =
                 (settings.sms.driver == config::Driver::Capture).then(|| Arc::new(capture()) as _);
             let core = notifier::Core {

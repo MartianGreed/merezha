@@ -800,8 +800,8 @@ Guest calls, dispatch and projections are instrumented (TE-T3; TE §1.2,
 | `ready()` | readiness contribution, answered within 1 s |
 | `blob_store()` | the `BlobStore` it provides to every context, opened from its settings; `Ok(None)` (default) provides none. Asked once after `configure`, before any module starts; a failure stops startup naming the module, a second provider stops it with `blob_store_conflict`. Content provides the store `[modules.content.media]` configures |
 | `notifier()` | the `NotifierFactory` it provides to every context in place of the capture fallback; `None` (default) provides none. Asked once after `configure`, before any module starts, so a module that starts earlier already binds it; a second provider stops startup with `notifier_conflict`. The factory answers `unavailable` until its module started. The notifications block provides it |
-| `credential_free_routes()` | `CredentialFreeRoute { method, path }` for routes that take no credential (a signed link, a provider callback): for an exact match the edge never runs the authenticator (no session lookup, Origin or CSRF check, no refusal of a stale cookie) and inserts `Authenticated(None)`, so such a route cannot see a principal and must never act on one; default none. A path must start with `/` and hold no `..`, `%`, `//`, query or fragment; the host prefixes `/v1/<name>` and refuses any other path at startup with `invalid_credential_free_route`. Notifications declares `GET` and `POST /unsubscribe` |
-| `body_limits()` | `RouteBodyLimit { method, path, limit }` for routes that bound their own body (the upload route): the edge reads such a body up to `limit` instead of `http.body_limit` and leaves a declared length to the route; default none |
+| `credential_free_routes()` | `CredentialFreeRoute { method, path }` for routes that take no credential (a signed link, a provider callback): for an exact match the edge never runs the authenticator (no session lookup, Origin or CSRF check, no refusal of a stale cookie) and inserts `Authenticated(None)`, so such a route cannot see a principal and must never act on one; default none. A path must start with `/` and hold no `..`, `%`, `//`, query or fragment; the host prefixes `/v1/<name>` and refuses any other path at startup with `invalid_credential_free_route`. Notifications declares `GET` and `POST /unsubscribe` and `POST /providers/brevo/email` |
+| `body_limits()` | `RouteBodyLimit { method, path, limit }` for routes that bound their own body (the upload route): the edge reads such a body up to `limit` instead of `http.body_limit` and leaves a declared length to the route; default none. Notifications declares 1 MiB for `POST /providers/brevo/email` |
 | `shutdown(deadline)` | stop and drain background work after the listener drained |
 
 `HostParts::jobs` takes the `JobsRuntime`, a `Module` named `jobs` that
@@ -834,7 +834,12 @@ register blocks.
 - `http()`: `OutboundHttp`, a reqwest client with rustls and the platform
   trust store, a 5 s connect timeout, no redirects and no retries. `send`
   takes a deadline and a response size limit and fails `upstream_timeout`,
-  `upstream_unavailable` or `upstream_body_limit`.
+  `upstream_unavailable` or `upstream_body_limit`. `exchange` is the same
+  call with an `OutboundFailure { failure, maybe_sent }`: `maybe_sent` is
+  `false` only when no connection was made (connect, DNS or TLS failure, or
+  a deadline already passed), so a provider client can tell a safe resend
+  from an ambiguous one. `OutboundHttp::with_connect_timeout(d)` builds the
+  same client with another connect timeout (`brevo.connect_timeout`).
 - `outbox(source)`: a `SourceOutbox` bound to `source`; it validates every
   append before the implementation runs.
 - `jobs(source)`: a `JobsHandle` bound to `source`, with the same rule:
@@ -1131,8 +1136,11 @@ Aim for about 60 to 120 ms per hash on production cores.
 templates, previews and capture drivers. Slice NT-N2 adds the `Notifier`
 other blocks request through, expansion, the email and SMS delivery worker
 over the capture drivers, the inbox REST routes, preferences, suppressions,
-unsubscribe, `send`, `status` and `redeliver`. Brevo (NT-N3, NT-N4), the
-SSE stream (NT-N5), push (NT-N6) and webhook fan-out (NT-N7) come later.
+unsubscribe, `send`, `status` and `redeliver`. Slice NT-N3 adds Brevo
+email: the email driver, the email status callback and `merezha
+notifications brevo register-webhook` ([Brevo email](#brevo-email)). Brevo
+SMS (NT-N4), the SSE stream (NT-N5), push (NT-N6) and webhook fan-out
+(NT-N7) come later.
 
 ```toml
 [modules.notifications]
@@ -1245,13 +1253,14 @@ during expansion and stored with `expires_at = now + inbox.retention`;
 inbox deliveries are created `delivered`.
 
 The delivery worker (`notify.deliver.email`, `notify.deliver.sms`)
-registers only for a `capture` driver in this slice; with a `brevo` driver
-the delivery jobs wait in `notify.email` / `notify.sms` until NT-N3/N4
-deploys. Per attempt it locks the delivery (another generation or a
+registers for a `capture` driver and for the `brevo` email driver; with
+`sms.driver = "brevo"` the SMS delivery jobs wait in `notify.sms` until
+NT-N4 deploys. Per attempt it locks the delivery (another generation or a
 settled delivery is done; past `expires_at` it becomes `expired`;
 suppressions and preferences are checked again), commits attempt `n + 1`
 as `started`, renders from the stored data and the job's secret data, sends
-before `min(10 s, job deadline - 2 s)` and records the outcome: `accepted`
+before `min(10 s, job deadline - 2 s)` (`brevo.timeout` in place of 10 s
+for Brevo) and records the outcome: `accepted`
 (capture), `retrying` with the job retried, `failed` with a reason
 (`render_failed`, `data_purged`, `secret_purged`, `invalid_address`,
 `retries_exhausted` on the last attempt), or `unknown` for an ambiguous SMS
@@ -1274,6 +1283,114 @@ Maintenance, each a cron schedule on queue `notify.maintenance` (UTC):
 | `settle_notifications` | every minute | sets `settled_at` on notifications whose deliveries all settled, 1,000 per batch |
 | `purge_data` | every 5 minutes | nulls `data` (and the deliveries' recipient names) of notifications settled more than `retention.data_after_settled` ago; counts `merezha.notification.data_purged` |
 | `inbox_expire` | hourly | deletes items past `expires_at` or archived more than `inbox.archived_retention` ago, 100 users per transaction in ascending order, raising each user's `purged_through` |
+
+### Brevo email
+
+With `email.driver = "brevo"` the worker sends through Brevo's
+`POST {brevo.base_url}/v3/smtp/email` on the kernel's outbound client
+(`brevo.connect_timeout`, deadline `brevo.timeout`, no automatic retry, no
+`traceparent`), with `api-key`, `accept` and `content-type:
+application/json`. Each request has one recipient (names cut to 70
+characters), the topic as tag, `headers.idempotencyKey` (`UUIDv5(delivery_id,
+"g{generation}")`, the same on every attempt of a generation),
+`headers.X-Mailin-custom = mzd:<delivery_id>`, the RFC 8058
+`List-Unsubscribe` and `List-Unsubscribe-Post` headers for non-security
+topics with an unsubscribe link, and `X-Sib-Sandbox: drop` with
+`brevo.sandbox = true`. The 201's `messageId` becomes the delivery's
+`provider_message_id`.
+
+| Brevo answer | Attempt outcome | Delivery |
+| --- | --- | --- |
+| 2xx | `accepted` | `accepted` |
+| 400 `duplicate_parameter` | `duplicate` | `accepted` without a message id |
+| 400 `duplicate_request` | `transient` | `retrying`, at least 60 s later |
+| 401, 402, 403, or code `unauthorized`, `not_enough_credits`, `permission_denied`, `account_under_validation` | `transient` (`provider_account`) | `retrying`, at least 5 min later (at most the `notify.email` `backoff_max_ms`, which must be at least 5 min, else startup fails `backoff_max_too_short`). The answer consumes no attempt: the next try is a new job of the same generation (outbox key `deliver:{id}:g{n}:a{attempt}`), until the notification's `expires_at`, or 24 h after the run's first refusal, then `failed` / `provider_account_unresolved`. One error log `notification.provider_account_error` per run of refusals; `merezha.notification.provider_account_errors` counts each |
+| 408, 425, 429 | `rate_limited` | `retrying` after `max(Retry-After, x-sib-ratelimit-reset)` (at most 1 h, and at most the queue's `backoff_max_ms`); warn log `notification.provider_rate_limited` |
+| other 4xx | `permanent` | `failed` / `provider_rejected_<code>` for `invalid_parameter`, `missing_parameter`, `out_of_range`, `document_not_found`, `not_acceptable`, else `provider_rejected` |
+| 5xx | `transient` (`provider_unavailable`) | `retrying`, after `Retry-After` when sent |
+| no connection (connect, DNS, TLS) | `transient` (`upstream_unavailable`, `upstream_timeout`) | `retrying` |
+| timeout or connection lost once connected | `ambiguous` | `retrying`; the resend reuses the key |
+
+Only Brevo's error `code` is read; its `message` is never stored or logged.
+On the last attempt a retryable answer becomes `failed` /
+`retries_exhausted` and the job is dead-lettered. A crash after the call
+leaves a `started` attempt: the rerun marks it `ambiguous` and resends with
+the same key, which Brevo answers `duplicate_parameter`. A resend must
+start within 25 minutes of the generation's first ambiguous attempt, the
+30-minute key window less a margin: a retry or rerun that would start
+later sets the delivery `unknown` / `idempotency_window` and never resends
+(a provider event can still settle it; `redeliver` starts a new generation
+and key). The block assumes
+that answer is a 400, that only a processed request takes the key and that
+the key holds 30 minutes, as `testkit::FakeBrevo` models; this needs a check
+against a real Brevo account (NT §12).
+
+**Status callback.** `POST /v1/notifications/providers/brevo/email` is a
+credential-free route: the edge never runs the session authenticator on it,
+so Brevo's bearer is never read as a session. The handler checks the client
+address the edge resolved through `http.trusted_proxies` against
+`brevo.webhook_allowed_cidrs` (when not empty), then compares
+`Authorization: Bearer` with `brevo.webhook_token` in constant time;
+either failure answers 401 `unauthenticated`, stores nothing and logs
+`notification.provider_event_rejected` (code `source_not_allowed`,
+`missing_token` or `bad_token`); with CIDRs set, a request whose client
+address the edge could not resolve is refused too. Without a Brevo email driver the route is
+404. The body (an event or an array of at most 2,000, at most 1 MiB, else
+413 `body_limit`) is applied in one transaction:
+
+- events are normalized (`request`, `delivered`, `deferred`, `soft_bounce`,
+  `hard_bounce`, `invalid_email`, `blocked`, `spam`, `unsubscribed`,
+  `error`); opens and clicks are dropped unstored (NT3);
+- each is correlated by `X-Mailin-custom`, then by message id (resolved
+  first, then locked in ascending delivery order), and stored in
+  `provider_events` once per `sha256(brevo|email|message id|event|ts_event)`,
+  the delivery and the address standing in for a missing message id;
+- `delivered` moves `accepted` or `unknown` to `delivered`; `hard_bounce`
+  and `invalid_email` move `accepted`, `unknown` or `delivered` to `bounced`
+  and add a `hard_bounce` or `invalid` suppression of the address; `spam`
+  moves `accepted` or `delivered` to `complained` and adds a
+  `spam_complaint` suppression; `blocked` and `error` move `accepted` or
+  `unknown` to `failed`; `unsubscribed` adds an `unsubscribed` suppression
+  for the delivery's topic; the rest is recorded only. Suppressions use the
+  delivery's own address. An event about a delivery still `queued`,
+  `sending` or `retrying` is stored `pending` (migration 3) and the worker
+  applies its status change in the transaction that records the outcome;
+- an uncorrelated event is stored with no delivery and no effect at all (no
+  status, no suppression: an event can name any address) and still
+  answered 200 `{}`, so Brevo stops retrying.
+
+`provider_events.reason` holds Brevo's reason text (at most 200
+characters), personal data such as a bounced address, until the row's
+retention; it is never logged.
+
+Hard bounce and spam suppressions cover every non-security topic, `invalid`
+every topic, so the next non-security email to a bounced address is
+`skipped` / `suppressed`. Logs and metrics carry the normalized event name
+and whether it was correlated, never an address, subject, reason text or
+message id.
+
+**Webhook registration.**
+
+```sh
+merezha notifications brevo register-webhook --config merezha.toml [--url URL [--allow-host]]
+```
+
+loads and validates the project like `check`, then calls Brevo's `POST
+/v3/webhooks` with `type: "transactional"`, the events `delivered`,
+`hardBounce`, `softBounce`, `blocked`, `spam`, `invalid`, `deferred`,
+`unsubscribed` and `auth: {type: "bearer", token: <brevo.webhook_token>}`,
+to `public_base_url` + `/v1/notifications/providers/brevo/email`, or to
+`URL` (https, or http to loopback), which must have that path and
+`public_base_url`'s host and port; `--allow-host` accepts another host with
+the `host_override` warning (in `warnings` and on stderr). It prints
+`{"status":"registered","id":N,"url":"…","warnings":[…]}` (exit 0) or
+`{"status":"failed","code":"…"}` (exit 1: `brevo_not_configured`,
+`missing_public_base_url`, `invalid_url`, `callback_path_mismatch`,
+`callback_host_mismatch`, `provider_account`,
+`provider_rejected[_<code>]`, `provider_unavailable` or a transport code);
+an invalid project prints the `check` report (exit 2). The key and the
+token are never printed. Switch Brevo's open and click tracking off in the
+console: the block stores no engagement data.
 
 ### Routes of NT-N2
 
@@ -1373,7 +1490,8 @@ non-https `brevo.base_url` or `preview` without `preview_in_public`
 (`refused_when_public`), a missing `public_base_url` with Brevo SMS or with
 Brevo email and a non-security email topic, a `notify.email`,
 `notify.sms` or `notify.webhook` `lease_ms` under three provider timeouts
-(`lease_too_short`), a `notify.webhook` `backoff_max_ms` under 24 h
+(`lease_too_short`), a `notify.webhook` `backoff_max_ms` under 24 h or,
+with the Brevo email driver, a `notify.email` `backoff_max_ms` under 5 min
 (`backoff_max_too_short`), and with `MEREZHA_NOTIFY_NO_EGRESS=1` a
 non-loopback `brevo.base_url` (`egress_not_loopback`).
 

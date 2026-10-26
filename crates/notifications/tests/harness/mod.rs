@@ -345,6 +345,11 @@ pub struct Options {
     pub email_driver: Option<Arc<dyn merezha_notifications::drivers::EmailDriver>>,
     /// The host's meters; no-op by default.
     pub meters: Option<merezha_telemetry::Meters>,
+    /// More environment variables for the configuration (secrets).
+    pub env: Vec<(String, String)>,
+    /// The block's wall clock; the system's by default. The jobs runtime
+    /// keeps PostgreSQL's.
+    pub clock: Option<Arc<dyn merezha_platform::Clock>>,
 }
 impl Options {
     pub fn new(section: &str, directory: Arc<dyn Directory>) -> Self {
@@ -358,6 +363,8 @@ impl Options {
             relay: true,
             email_driver: None,
             meters: None,
+            env: Vec::new(),
+            clock: None,
         }
     }
 }
@@ -380,10 +387,13 @@ impl Instance {
         .unwrap();
         let input = merezha_platform::ConfigInput {
             path: dir.path().join("merezha.toml"),
-            env: vec![
-                ("APP_DATABASE_URL".into(), world.test.url().into()),
-                ("NOTIFY_KEY".into(), KEY.into()),
-            ],
+            env: [
+                ("APP_DATABASE_URL".to_owned(), world.test.url().to_owned()),
+                ("NOTIFY_KEY".to_owned(), KEY.to_owned()),
+            ]
+            .into_iter()
+            .chain(options.env.iter().cloned())
+            .collect(),
             overrides: Vec::new(),
         };
         let config = ProjectConfig::load(&input).unwrap();
@@ -414,6 +424,9 @@ impl Instance {
         if let Some(meters) = options.meters.clone() {
             builder = builder.telemetry(meters);
         }
+        if let Some(clock) = options.clock.clone() {
+            builder = builder.clock(clock);
+        }
         let ctx = builder
             .outbox(ports.outbox)
             .jobs(ports.jobs)
@@ -443,6 +456,13 @@ impl Instance {
                         .credential_free_routes()
                         .into_iter()
                         .map(|r| (r.method, format!("/v1/notifications{}", r.path)))
+                        .collect(),
+                )
+                .route_body_limits(
+                    module
+                        .body_limits()
+                        .into_iter()
+                        .map(|r| (r.method, format!("/v1/notifications{}", r.path), r.limit))
                         .collect(),
                 ),
         );
@@ -541,5 +561,22 @@ impl Instance {
         self.jobs
             .shutdown(Instant::now() + Duration::from_secs(5))
             .await;
+    }
+}
+
+/// The system clock moved forward by [`Shifted::advance`].
+#[derive(Default)]
+pub struct Shifted(std::sync::atomic::AtomicU64);
+impl Shifted {
+    pub fn advance(&self, by: Duration) {
+        self.0.fetch_add(by.as_secs(), Ordering::SeqCst);
+    }
+}
+impl merezha_platform::Clock for Shifted {
+    fn now(&self) -> std::time::SystemTime {
+        std::time::SystemTime::now() + Duration::from_secs(self.0.load(Ordering::SeqCst))
+    }
+    fn monotonic(&self) -> Instant {
+        Instant::now()
     }
 }

@@ -1,6 +1,7 @@
 //! The NT-N2 routes under `/v1/notifications/` (NT §7.1): `send`,
 //! `status` and `redeliver`, the inbox, preferences, unsubscribe and
-//! suppressions. Self routes need a principal of kind `user` and act on its
+//! suppressions, and the NT-N3 Brevo email callback
+//! ([`crate::brevo::events`]). Self routes need a principal of kind `user` and act on its
 //! user; application routes check their permission at `Application` scope.
 use crate::{
     Checked, ids, inbox,
@@ -122,6 +123,10 @@ pub(crate) fn router(ctx: Ctx) -> Router {
             get(list_suppressions).post(add_suppression),
         )
         .route("/suppressions/{id}", delete(remove_suppression))
+        .route(
+            crate::brevo::events::PATH,
+            post(crate::brevo::events::callback),
+        )
         .with_state(ctx)
 }
 

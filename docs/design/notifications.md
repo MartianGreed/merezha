@@ -131,7 +131,12 @@ inbox: created directly as delivered.
 `accepted` is settled but not terminal: provider events can still move it to
 `delivered`, `bounced`, `complained` or `failed`. The other statuses are
 terminal, with one exception: a provider event can move `unknown` to
-`delivered`, `bounced` or `failed`.
+`delivered`, `bounced` or `failed`. A bounce or a spam complaint can also
+follow `delivered` (an asynchronous bounce, a complaint after reading), so
+`hard_bounce` and `invalid_email` may move `delivered` to `bounced` and
+`spam` may move it to `complained` (N3). An event never moves a delivery
+that is still `queued`, `sending` or `retrying`; its worker records the
+outcome.
 
 ### 2.4 Schema `merezha_notify`
 
@@ -235,7 +240,7 @@ CREATE TABLE preferences (
 CREATE TABLE user_settings (
   user_id uuid PRIMARY KEY,
   timezone text,                                -- IANA name, validated with jiff
-  updated_at timestamptz NOT NULL               -- N9 (migration 5) adds quiet_start, quiet_end
+  updated_at timestamptz NOT NULL               -- N9 (migration 6) adds quiet_start, quiet_end
 );
 
 CREATE TABLE suppressions (
@@ -282,7 +287,11 @@ CREATE INDEX inbox_items_unread_idx ON inbox_items (user_id)
   WHERE read_at IS NULL AND archived_at IS NULL;
 CREATE INDEX inbox_items_expiry_idx ON inbox_items (expires_at);
 
--- Migration 3 (slice N6): push
+-- Migration 3 (slice N3): pending provider events (N3 review)
+ALTER TABLE provider_events ADD COLUMN pending boolean NOT NULL DEFAULT false;
+CREATE INDEX provider_events_pending_idx ON provider_events (delivery_id, id) WHERE pending;
+
+-- Migration 4 (slice N6): push
 CREATE TABLE push_subscriptions (
   id uuid PRIMARY KEY,
   user_id uuid NOT NULL,
@@ -298,7 +307,7 @@ CREATE TABLE push_subscriptions (
 );
 CREATE INDEX push_subscriptions_user_idx ON push_subscriptions (user_id);
 
--- Migration 4 (slice N7): webhooks
+-- Migration 5 (slice N7): webhooks
 CREATE TABLE webhook_endpoints (
   id uuid PRIMARY KEY,
   tenant_id uuid,                               -- NULL = application-level endpoint (NT6)
@@ -729,7 +738,7 @@ then follows this table:
 
 | Channel | Ambiguity path |
 | --- | --- |
-| Email | Resend with the same `idempotencyKey`. Brevo's `duplicate_parameter` means the first request was processed: record the outcome `duplicate` and set `accepted` with no message id. Events still correlate through `X-Mailin-custom`. |
+| Email | Resend with the same `idempotencyKey`. Brevo's `duplicate_parameter` means the first request was processed: record the outcome `duplicate` and set `accepted` with no message id. Events still correlate through `X-Mailin-custom`. The resend must start within 25 minutes of the first ambiguous attempt of the generation (Brevo holds a key 30 minutes; N3 review): a retry or rerun that would start later sets `unknown` / `idempotency_window` and never resends, as SMS does. |
 | SMS | Brevo documents no SMS idempotency, and an ambiguous SMS is never resent (NT1): set `unknown` and return `Done`. A later provider event can still move it to `delivered`. |
 | Push | Resend. The payload carries the delivery `id` for client-side deduplication, and `Topic` replaces an undelivered copy at the push service. |
 | Webhook | Resend. Receivers deduplicate on `webhook-id`. |
@@ -789,7 +798,7 @@ The `messageId` number in the 201 response is stored as text.
 | 400 `duplicate_parameter` (email) | duplicate | `accepted`, no message id |
 | 400 `duplicate_request` | transient | retry after at least 60 s |
 | other 400, 404 | permanent | `failed`, `provider_rejected_<code>` (closed enum, else `provider_rejected`) |
-| 401, 402, 403, `unauthorized`, `not_enough_credits`, `permission_denied`, `account_under_validation` | transient `provider_account` | retry after at least 5 min; error log `notification.provider_account_error` and a metric. Mail stays queued while an operator fixes the key or the credits. |
+| 401, 402, 403, `unauthorized`, `not_enough_credits`, `permission_denied`, `account_under_validation` | transient `provider_account` | retry after at least 5 min (capped by the `notify.email` `backoff_max_ms`, which startup requires to be at least 5 min); the answer consumes no attempt: the next try is a new job of the same generation, so mail stays `retrying` while an operator fixes the key or the credits, until the notification's `expires_at` (24 h after the first refusal of the run without one), then `failed` / `provider_account_unresolved`. One error log `notification.provider_account_error` per run of refusals; `merezha.notification.provider_account_errors` counts each (N3 review). |
 | 408, 425, 429 | rate_limited | delay from `Retry-After` or `x-sib-ratelimit-reset` |
 | 5xx | transient | backoff |
 | connect, timeout, TLS or read error | transient; **ambiguous** once the request was fully written | email reuses the key; SMS becomes `unknown` (NT1) |
@@ -827,9 +836,19 @@ Each callback request is processed in one transaction:
    `hard_bounce`, `blacklisted`, `rejected`, `unsubscribed`. Opens and clicks
    are dropped, because the block stores no engagement data.
 3. Correlate the event by `X-Mailin-custom` or the path id, with the message
-   id as fallback.
-4. Deduplicate on `event_key = sha256(provider|channel|message id|event|ts_event)`.
-5. Apply the effect:
+   id as fallback. Every event is resolved first, without a lock; the
+   deliveries are then locked in ascending id order, so concurrent callbacks
+   cannot deadlock on each other.
+4. Deduplicate on `event_key = sha256(provider|channel|message id|event|ts_event)`;
+   without a message id, the delivery id and the address take its place.
+5. Apply the effect to a correlated event only. An uncorrelated event (no
+   delivery of ours by header or message id) is stored and nothing else:
+   it changes no status and writes no suppression, because an event can
+   name any address (N3 review). Suppressions use the delivery's own
+   address. An event about a delivery still `queued`, `sending` or
+   `retrying` is stored `pending` (migration 3) and its status change is
+   applied by the worker in Tx B once the outcome is recorded, or when Tx
+   A settles the delivery; its suppression is written at once.
 
    | Event | Effect |
    | --- | --- |
@@ -838,13 +857,26 @@ Each callback request is processed in one transaction:
    | `spam` | `complained`, plus a `spam_complaint` suppression |
    | `blocked`, `error`, SMS `rejected` | `failed` |
    | SMS `blacklisted`, `unsubscribed` | an `unsubscribed` suppression for SMS |
+   | email `unsubscribed` | an `unsubscribed` suppression for the delivery's topic, as an address unsubscribe token writes (N3); none when uncorrelated |
    | `soft_bounce`, `deferred` | recorded only (Brevo retries) |
 
    `hard_bounce` and `spam_complaint` suppressions cover every non-security
    topic. An `invalid` suppression covers every topic.
 6. Answer 200 even when the event is uncorrelated (it is stored with
    `delivery_id` NULL), so Brevo stops retrying. A failed authentication
-   check gets 401.
+   check gets 401; so does a request without a client address while
+   `webhook_allowed_cidrs` is set. More than 2,000 events get 413
+   `body_limit` and nothing is stored.
+
+`provider_events.reason` keeps Brevo's reason text (at most 200
+characters), which can hold personal data such as the bounced address; it
+is never logged and stays until the `retention` task deletes the row.
+
+`merezha notifications brevo register-webhook [--url URL] [--allow-host]`
+registers `public_base_url` + `/v1/notifications/providers/brevo/email`. An
+explicit URL must have that path and `public_base_url`'s host and port, so
+the bearer token never goes to another server by mistake; `--allow-host`
+accepts another host with the `host_override` warning.
 
 ### 5.3 Web Push
 
@@ -1396,14 +1428,20 @@ reaches Brevo or a real push service.
 **Test kit** (feature `testkit`, dev-dependencies only). It is built on the
 workspace's axum and adds no mock-server dependency.
 
-- `FakeBrevo` listens on `127.0.0.1:0` and serves both send endpoints. It
-  checks `api-key`, records requests, and enforces `idempotencyKey` for 30
-  minutes on an injectable clock: a reused key gets 400
-  `{"code":"duplicate_parameter"}`. Scripted behaviours are `fail_next(n,
-  status)`, `rate_limit(headers)`, `delay(d)` and `close_after_accept()`,
-  which processes the request and then drops the connection without
-  replying. `emit_event(…)` posts Brevo webhooks to the callback with the
-  bearer token.
+- `FakeBrevo` listens on `127.0.0.1:0` and serves both send endpoints and
+  `POST /v3/webhooks`. It checks `api-key`, records requests, and enforces
+  `idempotencyKey` for 30 minutes on its own clock (`advance(d)`): a
+  reused key gets 400 `{"code":"duplicate_parameter"}`. Scripted
+  behaviours are `fail_next(n, status)`, `rate_limit(headers)`, `delay(d)`
+  and `close_after_accept()`, which processes the request and then drops
+  the connection without replying. Because a server framework cannot drop
+  a connection from a handler, it is a small HTTP/1.1 server over a tokio
+  listener rather than axum (N3). `event(name, message)` builds a Brevo
+  webhook payload and `event_request(path, token, payload)` the callback
+  request with the bearer token. It assumes, as the block does, that the
+  duplicate answer is HTTP 400, that only a processed request takes its key
+  (a refused one leaves it free) and that single-recipient sends are
+  covered; see section 12.
 - `FakePushService` decrypts with `web_push_native::decrypt` under a test
   user-agent key, verifies the VAPID JWT (`aud`, `exp` at most 24 h, the
   signature) and answers with a scripted 201, 404, 410, 413 or 429.
@@ -1608,7 +1646,7 @@ in the test kit; a slow consumer is disconnected without blocking writers;
 before commit while B writes for the same user: B waits, and a live stream and
 a resume from before A both get A's and B's items, once, in order.
 
-**N6: Web Push** (migration 3). *Scope:* VAPID config and CLI, the
+**N6: Web Push** (migration 4; N3 took migration 3). *Scope:* VAPID config and CLI, the
 subscription routes, the push worker, the guarded client, `FakePushService`,
 `push_expire`. *Acceptance:* the fake decrypts the payload, and the JWT `aud`
 equals the endpoint origin with `exp` at most 24 h out; 410 deletes the
@@ -1618,7 +1656,7 @@ truncated; subscriptions from an old VAPID key are not targeted. *Tests:*
 duplicate jobs give one push; 429 `Retry-After` is honoured; `jwt-simple`
 builds under `cargo +1.98.0`.
 
-**N7: outgoing webhooks and the egress guard** (migration 4). *Scope:* the
+**N7: outgoing webhooks and the egress guard** (migration 5). *Scope:* the
 endpoint API, secret encryption and rotation, fan-out, the worker and its
 schedule, auto-disable, audit, `WebhookReceiver`, `TestResolver`. *Acceptance:*
 signatures verify against the Standard Webhooks reference vector; a rotation
@@ -1647,7 +1685,7 @@ the checkpoint still advances, while a malformed reply halts the reactor; two
 reactors on one event give two notifications. *Tests:* an example
 application end to end, from guest event to reaction to inbox item to SSE event.
 
-**N9: quiet hours** (migration 5, after v1). *Scope:* the section, the
+**N9: quiet hours** (migration 6, after v1). *Scope:* the section, the
 settings fields and the rule of section 6. *Acceptance:* a push moves to the
 end of the window in `Europe/Paris` across a DST change; a `high` or security
 push is not moved; a delivery expiring inside the window is `expired`.
@@ -1675,7 +1713,13 @@ The owner answered this design's open questions on 2026-10-24. The record is
 ### What could not be verified
 
 - How Brevo answers a duplicate `idempotencyKey` (HTTP status), and whether a
-  failed request consumes the key (verified before N3, section 12).
+  failed request consumes the key. N3 found no sandbox: Brevo's
+  documentation (developers.brevo.com, "Idempotency in batch emails") says
+  the key is a UUID in `headers`, held 30 minutes, and that a reuse gets
+  `duplicate_parameter` without processing; it names neither the status
+  nor the fate of a failed request's key. N3 assumes 400 and "only a
+  processed request takes the key", as `FakeBrevo` models; a real-account
+  check is still owed before production use.
 - Whether Brevo SMS accepts a leading `+` in `recipient`.
 - Whether `error` is an accepted event name for webhook creation, and the
   exact SMS webhook event set for `channel: "sms"`.

@@ -293,6 +293,26 @@ fn queue_leases_and_the_webhook_backoff_are_checked_against_jobs() {
     );
     let checked = fine.configure().unwrap();
     assert!(checked.settings.webhooks.is_some());
+    assert_eq!(
+        checked.settings.provider_retry_cap,
+        Duration::from_secs(3600),
+        "the default 1 h email backoff cap"
+    );
+    // NT-N3: an account problem waits at least five minutes, which the
+    // email queue's backoff cap must allow.
+    let issues = project(
+        "[jobs.queues]\n\"notify.email\" = { lease_ms = 30000, backoff_max_ms = 60000 }\n\
+         \"notify.webhook\" = { backoff_max_ms = 86400000 }\n",
+    )
+    .issues();
+    assert!(
+        has(
+            &issues,
+            "jobs.queues.\"notify.email\".backoff_max_ms",
+            "backoff_max_too_short"
+        ),
+        "{issues:?}"
+    );
 }
 
 #[test]

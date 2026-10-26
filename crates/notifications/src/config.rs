@@ -25,6 +25,12 @@ use std::{
 /// The environment variable CI sets: providers and endpoints must be
 /// loopback (NT §8).
 pub const NO_EGRESS_ENV: &str = "MEREZHA_NOTIFY_NO_EGRESS";
+/// The longest delay between two attempts the email worker schedules
+/// itself.
+const PROVIDER_RETRY_CAP: Duration = Duration::from_secs(3600);
+/// The shortest `notify.email` `backoff_max_ms` with the Brevo driver: an
+/// account problem is retried no sooner than five minutes (NT §5.2).
+pub const MIN_BREVO_BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// Most declared topics, built-ins included.
 pub const MAX_TOPICS: usize = 256;
 /// Most entries in a list setting such as `templates.locales`.
@@ -55,8 +61,9 @@ pub struct HostFacts {
 }
 
 /// The queue settings the cross checks read.
-const CHECKED_QUEUE_KEYS: [(&str, &str); 4] = [
+const CHECKED_QUEUE_KEYS: [(&str, &str); 5] = [
     ("notify.email", "lease_ms"),
+    ("notify.email", "backoff_max_ms"),
     ("notify.sms", "lease_ms"),
     ("notify.webhook", "lease_ms"),
     ("notify.webhook", "backoff_max_ms"),
@@ -433,6 +440,10 @@ pub struct Settings {
     pub webhooks: Option<WebhookSettings>,
     /// Every topic, built-ins included, by name.
     pub topics: BTreeMap<String, Topic>,
+    /// The longest provider-asked delay the email worker waits between two
+    /// attempts it schedules itself (`provider_account`, NT-N3): the
+    /// `notify.email` queue's `backoff_max_ms`, at most an hour.
+    pub provider_retry_cap: Duration,
 }
 impl Settings {
     /// Whether `channel` can deliver: its driver is not disabled and its
@@ -1370,6 +1381,13 @@ fn parse_into(
 
     r.finish();
 
+    let provider_retry_cap = facts
+        .jobs
+        .as_ref()
+        .map_or(PROVIDER_RETRY_CAP, |jobs| {
+            queue_settings(jobs, "notify.email").0.backoff_max
+        })
+        .min(PROVIDER_RETRY_CAP);
     let settings = Settings {
         secret_key: secret_key.unwrap_or_else(|| KeyMaterial(Vec::new())),
         secret_key_previous,
@@ -1387,6 +1405,7 @@ fn parse_into(
         sse,
         webhooks,
         topics,
+        provider_retry_cap,
     };
     cross_checks(section, &settings, facts, issues);
     settings
@@ -1547,6 +1566,16 @@ fn cross_checks(
                 let (effective, _) = queue_settings(jobs, queue);
                 if driver == Driver::Brevo && effective.lease < brevo.timeout * 3 {
                     issues.push(queue_issue(queue, "lease_ms", "lease_too_short"));
+                }
+                if driver == Driver::Brevo
+                    && queue == "notify.email"
+                    && effective.backoff_max < MIN_BREVO_BACKOFF_MAX
+                {
+                    issues.push(queue_issue(
+                        queue,
+                        "backoff_max_ms",
+                        "backoff_max_too_short",
+                    ));
                 }
             }
         }

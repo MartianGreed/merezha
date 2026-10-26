@@ -1,4 +1,4 @@
-//! Every statement of NT-N2, registered with the TE-T4 statement registry
+//! Every statement of NT-N2 and NT-N3, registered with the TE-T4 statement registry
 //! (one constant per statement; [`STATEMENTS`] lists them for the registry
 //! check). Values always travel as parameters.
 use merezha_postgres::Statement;
@@ -100,10 +100,24 @@ pub const DELIVERY_LOCK: Statement = s(
     "SELECT merezha_notify.deliveries",
     "SELECT d.status, d.generation, d.attempt_count, d.channel, d.user_id, d.address, d.name, \
      d.locale, n.id, n.topic, n.template, n.category, n.data, n.has_secret, n.expires_at, \
-     n.requested_at, n.source \
+     n.requested_at, n.source, n.correlation_id, n.tenant_id \
      FROM merezha_notify.deliveries d \
      JOIN merezha_notify.notifications n ON n.id = d.notification_id \
      WHERE d.id = $1 FOR UPDATE OF d",
+);
+/// Of delivery `$1`'s generation `$2`: when its first `ambiguous` attempt
+/// started (Brevo may have processed it, so its idempotency window runs from
+/// there), and when the trailing run of `provider_account` answers began.
+pub const ATTEMPT_HISTORY: Statement = s(
+    "notify.attempt.history",
+    "SELECT merezha_notify.delivery_attempts",
+    "SELECT (SELECT min(started_at) FROM merezha_notify.delivery_attempts \
+       WHERE delivery_id = $1 AND generation = $2 AND outcome = 'ambiguous'), \
+     (SELECT min(a.started_at) FROM merezha_notify.delivery_attempts a \
+       WHERE a.delivery_id = $1 AND a.generation = $2 AND a.error_code = 'provider_account' \
+       AND a.attempt > COALESCE((SELECT max(b.attempt) FROM merezha_notify.delivery_attempts b \
+         WHERE b.delivery_id = $1 AND b.generation = $2 \
+         AND b.error_code IS DISTINCT FROM 'provider_account'), 0))",
 );
 pub const LAST_ATTEMPT: Statement = s(
     "notify.attempt.last",
@@ -408,6 +422,57 @@ pub const PURGED_THROUGH: Statement = s(
      FROM unnest($1::text[], $2::bigint[]) AS t(u, m) WHERE c.user_id = t.u",
 );
 
+// ----- provider events (NT-N3) -----
+
+/// The delivery an event names by id, locked, with its notification's
+/// topic.
+pub const EVENT_DELIVERY_BY_ID: Statement = s(
+    "notify.event.delivery_by_id",
+    "SELECT merezha_notify.deliveries",
+    "SELECT d.id, d.status, d.address, n.topic FROM merezha_notify.deliveries d \
+     JOIN merezha_notify.notifications n ON n.id = d.notification_id \
+     WHERE d.id = $1 AND d.channel = $2 FOR UPDATE OF d",
+);
+/// Resolve an event's delivery by id, without a lock.
+pub const EVENT_RESOLVE_BY_ID: Statement = s(
+    "notify.event.resolve_by_id",
+    "SELECT merezha_notify.deliveries",
+    "SELECT id FROM merezha_notify.deliveries WHERE id = $1 AND channel = $2",
+);
+/// Resolve the delivery that got provider message id `$2`, without a lock.
+pub const EVENT_RESOLVE_BY_MESSAGE: Statement = s(
+    "notify.event.resolve_by_message",
+    "SELECT merezha_notify.deliveries",
+    "SELECT id FROM merezha_notify.deliveries \
+     WHERE provider = $1 AND provider_message_id = $2 AND channel = $3 \
+     ORDER BY updated_at DESC LIMIT 1",
+);
+/// One provider event, unless its key was stored already.
+pub const PROVIDER_EVENT_INSERT: Statement = s(
+    "notify.event.insert",
+    "INSERT merezha_notify.provider_events",
+    "INSERT INTO merezha_notify.provider_events (provider, channel, event, event_key, \
+     delivery_id, provider_message_id, reason, occurred_at, received_at, pending) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+     ON CONFLICT (provider, event_key) DO NOTHING RETURNING id",
+);
+/// An event's status change, only from the statuses `$5` it may leave.
+pub const DELIVERY_EVENT_SET: Statement = s(
+    "notify.event.delivery_set",
+    "UPDATE merezha_notify.deliveries",
+    "UPDATE merezha_notify.deliveries SET status = $2, status_reason = $3, updated_at = $4, \
+     settled_at = COALESCE(settled_at, $4) \
+     WHERE id = $1 AND status = ANY($5::text[])",
+);
+
+/// Take the events waiting for delivery `$1` (migration 3).
+pub const EVENTS_TAKE_PENDING: Statement = s(
+    "notify.event.take_pending",
+    "UPDATE merezha_notify.provider_events",
+    "UPDATE merezha_notify.provider_events SET pending = false \
+     WHERE delivery_id = $1 AND pending RETURNING id, event",
+);
+
 /// Every statement of this module.
 pub const STATEMENTS: &[Statement] = &[
     NOTIFICATION_EXISTS,
@@ -421,6 +486,7 @@ pub const STATEMENTS: &[Statement] = &[
     INBOX_NOTIFY,
     DELIVERY_LOCK,
     LAST_ATTEMPT,
+    ATTEMPT_HISTORY,
     ATTEMPT_START,
     ATTEMPT_FINISH,
     DELIVERY_SENDING,
@@ -457,4 +523,10 @@ pub const STATEMENTS: &[Statement] = &[
     COUNTERS_LOCK,
     INBOX_EXPIRE,
     PURGED_THROUGH,
+    EVENT_DELIVERY_BY_ID,
+    EVENT_RESOLVE_BY_ID,
+    EVENT_RESOLVE_BY_MESSAGE,
+    PROVIDER_EVENT_INSERT,
+    DELIVERY_EVENT_SET,
+    EVENTS_TAKE_PENDING,
 ];
