@@ -12,6 +12,7 @@ fn every_block_registers_beside_the_kernel_without_a_shared_name() {
             merezha_identity::sql::STATEMENTS,
             merezha_notifications::drivers::STATEMENTS,
             merezha_notifications::sql::STATEMENTS,
+            merezha_notifications::stream::STATEMENTS,
             merezha_jobs::STATEMENTS,
             merezha_content::STATEMENTS,
             merezha_content::media::STATEMENTS,

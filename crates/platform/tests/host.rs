@@ -39,6 +39,9 @@ const NOTES: [Migration; 2] = [
 struct Notes {
     started: Arc<AtomicUsize>,
     stopped: Arc<AtomicUsize>,
+    /// `Module::draining` calls, and whether one came before `shutdown`.
+    drained: Arc<AtomicUsize>,
+    drained_first: Arc<AtomicBool>,
     unready: Arc<AtomicBool>,
     fail_start: bool,
     migrations: Option<&'static [Migration]>,
@@ -120,8 +123,14 @@ impl Module for Notes {
             }
         })
     }
+    fn draining(&self) {
+        self.drained.fetch_add(1, Ordering::SeqCst);
+    }
     fn shutdown(&self, _deadline: Instant) -> BoxFuture<'_, ()> {
         Box::pin(async move {
+            if self.drained.load(Ordering::SeqCst) > 0 {
+                self.drained_first.store(true, Ordering::SeqCst);
+            }
             self.stopped.fetch_add(1, Ordering::SeqCst);
         })
     }
@@ -392,6 +401,45 @@ async fn cors_answers_preflight_for_allowed_origins_only() {
     assert!(!headers.contains_key("access-control-allow-origin"));
 }
 
+/// A cross-origin fetch client resuming an event stream sends
+/// `Last-Event-ID` with its bearer token: the preflight allows both.
+#[tokio::test]
+async fn cors_preflight_allows_last_event_id_for_resuming_streams() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let config = config(
+        &test,
+        true,
+        "[http.cors]\nallowed_origins = [\"https://app.example\"]\n",
+    );
+    let host = Host::start(config, vec![Box::new(Notes::default())], parts())
+        .await
+        .unwrap();
+    let router = host.router();
+    let request = Request::options("/v1/notes/count")
+        .header("origin", "https://app.example")
+        .header("access-control-request-method", "GET")
+        .header(
+            "access-control-request-headers",
+            "authorization,last-event-id",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let (_, _, headers) = call(&router, request).await;
+    assert_eq!(
+        headers["access-control-allow-origin"],
+        "https://app.example"
+    );
+    let allowed = headers["access-control-allow-headers"]
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    let allowed: Vec<&str> = allowed.split(',').map(str::trim).collect();
+    assert!(allowed.contains(&"authorization"), "{allowed:?}");
+    assert!(allowed.contains(&"last-event-id"), "{allowed:?}");
+}
+
 #[tokio::test]
 async fn verify_mode_refuses_readiness_until_migrations_are_current() {
     let Some(test) = TestDatabase::create() else {
@@ -568,6 +616,10 @@ async fn shutdown_drains_in_flight_requests_then_stops_modules() {
         .unwrap()
         .unwrap();
     assert_eq!(notes.stopped.load(Ordering::SeqCst), 1);
+    // Modules hear of the drain once, before they are shut down (NT-N5:
+    // the inbox stream ends its responses there).
+    assert_eq!(notes.drained.load(Ordering::SeqCst), 1);
+    assert!(notes.drained_first.load(Ordering::SeqCst));
     assert!(
         tokio::net::TcpStream::connect(address).await.is_err(),
         "the listener closed"

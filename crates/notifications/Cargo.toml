@@ -18,6 +18,7 @@ merezha-postgres = { path = "../postgres" }
 merezha-telemetry = { path = "../telemetry" }
 axum.workspace = true
 base64 = { version = "0.23.1", default-features = false, features = ["std"] }
+futures-core.workspace = true
 hmac.workspace = true
 jiff.workspace = true
 minijinja = { version = "3.0.3", default-features = false, features = ["builtins", "macros", "multi_template", "fuel", "urlencode"] }

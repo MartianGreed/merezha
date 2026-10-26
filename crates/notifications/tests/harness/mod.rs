@@ -233,6 +233,10 @@ impl Tokens {
             .unwrap()
             .insert(token.to_owned(), Arc::new(principal));
     }
+    /// Revoke `token`: it authenticates as `unauthenticated` from now on.
+    pub fn revoke(&self, token: &str) {
+        self.0.lock().unwrap().remove(token);
+    }
 }
 impl Authenticator for Tokens {
     fn authenticate<'a>(

@@ -283,6 +283,7 @@ macro_rules! item_columns {
          read_at, archived_at"
     };
 }
+pub(crate) use item_columns;
 pub const INBOX_LIST: Statement = s(
     "notify.inbox.list",
     "SELECT merezha_notify.inbox_items",

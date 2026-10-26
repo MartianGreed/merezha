@@ -10,7 +10,11 @@
 //! SMS delivery worker over the capture drivers, preferences, suppressions
 //! and signed unsubscribe ([`keys`]), the inbox REST routes, `send`,
 //! `status` and `redeliver`, and the `settle_notifications`, `purge_data`
-//! and `inbox_expire` tasks, with migration 2 ([`MIGRATIONS`]).
+//! and `inbox_expire` tasks, with migration 2 ([`MIGRATIONS`]). Slice NT-N5
+//! adds the inbox stream ([`stream`]): `GET inbox/stream` as Server-Sent
+//! Events, the per-instance stream registry and its limits, and the
+//! `LISTEN` task on [`sql::INBOX_CHANNEL`], which every inbox change
+//! notifies.
 //!
 //! Slice NT-N3 adds Brevo email ([`brevo`]): the client over the kernel's
 //! outbound HTTP client, the response classifier, the email driver behind
@@ -23,8 +27,7 @@
 //! Seams for the next slices: Brevo SMS (NT-N4) implements
 //! [`drivers::SmsDriver`] over [`brevo::BrevoClient`] and is installed in
 //! [`notifier::Core`]; until then an SMS `brevo` driver leaves its delivery
-//! jobs queued and unleased. The SSE stream (NT-N5) listens on
-//! [`sql::INBOX_CHANNEL`], which every inbox change notifies. Push (NT-N6)
+//! jobs queued and unleased. Push (NT-N6)
 //! replaces the `no_subscription` skip of push targets; webhook fan-out
 //! (NT-N7) handles the `notify.webhook_event` jobs `emit_webhook` queues.
 pub mod brevo;
@@ -45,6 +48,7 @@ pub mod payload;
 pub mod policy;
 mod routes;
 pub mod sql;
+pub mod stream;
 pub mod templates;
 #[cfg(feature = "testkit")]
 pub mod testkit;
@@ -96,7 +100,7 @@ pub const PERMISSIONS: [&str; 5] = [
 
 /// The codes this block's routes and port return, with their statuses
 /// (R8). Canonical kernel codes are listed again with the same status.
-pub const ERRORS: [ErrorCode; 31] = [
+pub const ERRORS: [ErrorCode; 32] = [
     ErrorCode::new("invalid_input", 400),
     ErrorCode::new("invalid_cursor", 400),
     ErrorCode::new("token_invalid", 400),
@@ -107,6 +111,7 @@ pub const ERRORS: [ErrorCode; 31] = [
     ErrorCode::new("secret_purged", 409),
     ErrorCode::new("data_purged", 410),
     ErrorCode::new("body_limit", 413),
+    ErrorCode::new("stream_limit", 429),
     ErrorCode::new("validation_failed", 422),
     ErrorCode::new("invalid_locale", 422),
     ErrorCode::new("unknown_topic", 422),
@@ -187,6 +192,8 @@ pub struct Notifications {
     core: notifier::Slot,
     faults: faults::Faults,
     email_driver: DriverOverride,
+    /// The inbox stream registry, once [`Module::start`] ran.
+    streams: Arc<OnceLock<stream::Streams>>,
 }
 /// An email driver a test installs in place of the configured one
 /// (feature `testkit`).
@@ -231,6 +238,10 @@ impl Notifications {
     /// routes use, for embedding and tests.
     pub fn core(&self) -> Option<Arc<notifier::Core>> {
         self.core.get().cloned()
+    }
+    /// The inbox stream registry, once [`Module::start`] ran.
+    pub fn streams(&self) -> Option<stream::Streams> {
+        self.streams.get().cloned()
     }
     /// The block's notifier factory, the one [`Module::notifier`] provides.
     pub fn notifiers(&self) -> BlockNotifiers {
@@ -400,6 +411,11 @@ impl Module for Notifications {
                 })?;
             }
             let _ = self.core.set(Arc::new(core));
+            let streams =
+                stream::Streams::new(settings.sse.clone(), &ctx.telemetry().meter(METER_SCOPE));
+            if self.streams.set(streams.clone()).is_ok() {
+                streams.listen(ctx.database().clone(), random(&ctx));
+            }
             Ok(())
         })
     }
@@ -419,13 +435,34 @@ impl Module for Notifications {
         let api = self.notifiers().notifier(
             Source::new(EXTRA_SOURCES[0]).unwrap_or_else(|_| unreachable!("`api` is a source")),
         );
-        previews.merge(http::router(http::Ctx {
-            slot: self.core.clone(),
-            checked,
-            authorizer: ctx.authorizer().clone(),
-            api,
-            directory: ctx.directory().clone(),
-        }))
+        previews
+            .merge(http::router(http::Ctx {
+                slot: self.core.clone(),
+                checked,
+                authorizer: ctx.authorizer().clone(),
+                api,
+                directory: ctx.directory().clone(),
+            }))
+            .merge(stream::router(stream::StreamState {
+                streams: self.streams.clone(),
+                slot: self.core.clone(),
+                authenticator: ctx.authenticator().cloned(),
+            }))
+    }
+    /// End every inbox stream as the listener stops admitting requests, so
+    /// the drain does not wait on them; clients resume elsewhere with
+    /// `Last-Event-ID`.
+    fn draining(&self) {
+        if let Some(streams) = self.streams.get() {
+            streams.close();
+        }
+    }
+    fn shutdown(&self, deadline: std::time::Instant) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            if let Some(streams) = self.streams.get() {
+                streams.shutdown(deadline).await;
+            }
+        })
     }
 }
 

@@ -312,9 +312,11 @@ CORS is off while `allowed_origins` is empty.
 
 Allowed methods are GET, POST, PUT, PATCH and DELETE. Allowed request
 headers are `content-type`, `authorization`, `x-request-id`, `traceparent`,
-`tracestate`, `merezha-organization` (identity's active organization) and
+`tracestate`, `merezha-organization` (identity's active organization),
 `x-csrf-token` (identity's CSRF header, so a cross-origin
-front end can send it). `x-request-id` is exposed to scripts.
+front end can send it) and `last-event-id` (so a cross-origin fetch-based
+event-stream client resumes the inbox stream). `x-request-id` is exposed to
+scripts.
 
 ### `[database]`
 
@@ -860,6 +862,7 @@ Guest calls, dispatch and projections are instrumented (TE-T3; TE §1.2,
 | `notifier()` | the `NotifierFactory` it provides to every context in place of the capture fallback; `None` (default) provides none. Asked once after `configure`, before any module starts, so a module that starts earlier already binds it; a second provider stops startup with `notifier_conflict`. The factory answers `unavailable` until its module started. The notifications block provides it |
 | `credential_free_routes()` | `CredentialFreeRoute { method, path }` for routes that take no credential (a signed link, a provider callback): for an exact match the edge never runs the authenticator (no session lookup, Origin or CSRF check, no refusal of a stale cookie) and inserts `Authenticated(None)`, so such a route cannot see a principal and must never act on one; default none. A path must start with `/` and hold no `..`, `%`, `//`, query or fragment; the host prefixes `/v1/<name>` and refuses any other path at startup with `invalid_credential_free_route`. Notifications declares `GET` and `POST /unsubscribe` and `POST /providers/brevo/email` |
 | `body_limits()` | `RouteBodyLimit { method, path, limit }` for routes that bound their own body (the upload route): the edge reads such a body up to `limit` instead of `http.body_limit` and leaves a declared length to the route; default none. Notifications declares 1 MiB for `POST /providers/brevo/email` |
+| `draining()` | the listener is about to stop accepting and drain in-flight requests: end long-lived responses (event streams) and refuse new ones, so the drain does not wait on them until its timeout. Called once, after `http.drain_delay_ms`, before the drain and `shutdown`; must not block; default nothing. Notifications ends every inbox stream there |
 | `shutdown(deadline)` | stop and drain background work after the listener drained |
 
 `HostParts::jobs` takes the `JobsRuntime`, a `Module` named `jobs` that
@@ -1322,9 +1325,9 @@ other blocks request through, expansion, the email and SMS delivery worker
 over the capture drivers, the inbox REST routes, preferences, suppressions,
 unsubscribe, `send`, `status` and `redeliver`. Slice NT-N3 adds Brevo
 email: the email driver, the email status callback and `merezha
-notifications brevo register-webhook` ([Brevo email](#brevo-email)). Brevo
-SMS (NT-N4), the SSE stream (NT-N5), push (NT-N6) and webhook fan-out
-(NT-N7) come later.
+notifications brevo register-webhook` ([Brevo email](#brevo-email)). Slice
+NT-N5 adds the inbox stream ([Inbox stream](#inbox-stream)). Brevo SMS
+(NT-N4), push (NT-N6) and webhook fan-out (NT-N7) come later.
 
 ```toml
 [modules.notifications]
@@ -1613,6 +1616,76 @@ are credential-free (`Module::credential_free_routes`): a browser holding a
 session cookie without its CSRF header, or a stale cookie, unsubscribes
 like a mail client.
 
+### Inbox stream
+
+`GET /v1/notifications/inbox/stream` (NT-N5, NT §5.4) streams a user's inbox
+changes as Server-Sent Events.
+
+- **Access.** A principal of kind `user` (401 `unauthenticated` without
+  one, 403 `unauthorized` for any other kind, API keys included: a key
+  never streams), through the session cookie
+  (`EventSource` with `withCredentials`) or `Authorization: Bearer`. The
+  route takes no query string (400 `invalid_input`), so a credential never
+  travels in a URL. Scope is the inbox routes': tenantless items plus those
+  of the active tenant.
+- **Response.** `Content-Type: text/event-stream`, `Cache-Control:
+  no-store`, `X-Accel-Buffering: no`. The stream opens with `retry: 5000`.
+  The edge applies no request deadline and no compression, so nothing
+  cuts or buffers it.
+- **Events.** `item` with `id: <change_seq>` and the `InboxItem` in its
+  current state; `unread` (`{unread}`, no id) after each batch of items; a
+  `: hb` comment after `sse.heartbeat` without other events.
+- **Resume.** `Last-Event-ID` holding a decimal `change_seq` replays every
+  item in scope whose current `change_seq` is above it, once, in order.
+  Without a usable id the stream sends `hello` with `id: <last_seq>` (0
+  without a counter row) and `{unread}`. An id above `last_seq`, at or below
+  `purged_through` once anything was purged, or with more than
+  `sse.replay_max` rows in scope changed since, gets `reset` with `{}` and
+  `id: <last_seq>`; the client refetches and the stream goes on live from
+  there.
+- **Limits.** `sse.max_streams_per_user` streams per user on one instance;
+  one more gets 429 `stream_limit` and no stream is evicted.
+  `sse.max_streams` per instance, then 503 `overloaded` with
+  `Retry-After: 5`. A stream lives `sse.max_lifetime` ±10 % and the client
+  reconnects. Every `sse.reauth_interval` the stream's own credentials run
+  through the `Authenticator` again; a revoked or expired session, another
+  user or active tenant (a switched organization, a removed membership),
+  or a failure to tell ends it. Each check counts as activity of the
+  session, as any request does: an open stream keeps the session's sliding
+  idle timeout (identity `sessions.idle_timeout`) from running out, and
+  only its absolute timeout or a revocation ends it.
+- **Backpressure.** At most 64 events wait for one client. A client that
+  does not take an event within one `sse.heartbeat` interval is
+  disconnected and resumes with `Last-Event-ID`; writers never wait on a
+  stream.
+- **Fan-out.** Each instance holds one `LISTEN merezha_notify_inbox`
+  session outside the pool (`Database::listen`); a notification wakes only
+  the local streams of the user it names, and each stream also reconciles
+  every `sse.reconcile_interval`. A lost session is logged once as
+  `notification.sse_listen_lost` (warn, `code`) and reopened after a
+  backoff that starts at 1 s and doubles to 30 s, each delay drawn from
+  the upper half of its step and never below 1 s. Every attempt after the
+  first waits its delay, and the backoff starts again from 1 s only after
+  a session stayed up 30 s, so a session that connects and drops again
+  keeps backing off. The session is probed every 30 s with
+  `Listener::check`. On its return it logs
+  `notification.sse_listen_restored`, counts
+  `merezha.inbox.listen.reconnects` and wakes every local stream. The same
+  wake follows a burst of 64 notifications, which may have overflowed the
+  session's queue. Such a wake reaches each user with local streams once,
+  spread evenly over 1 s, and runs at most once per second: requests made
+  during one coalesce into a single next one, so the streams of an instance
+  never all query at once. Readiness never depends on it.
+- **Drain.** `Module::draining` ends every stream before the listener
+  drains, and later requests get 503 `overloaded`; clients reconnect to
+  another instance with `Last-Event-ID`.
+- **Telemetry.** `merezha.inbox.sse.connections`, `merezha.inbox.sse.events`
+  (`notify.event`: `item`, `reset`, `hello`, `unread`),
+  `merezha.inbox.sse.rejected` (`notify.reason`: `per_user`, `capacity`,
+  `auth`, the last also for a stream ended by re-authentication) and a short
+  root span `notify sse` (`notify.resumed`) for the opening and for each
+  batch a wake triggers.
+
 ### Templates
 
 Project files live under `templates.dir` (default `notifications/templates`,
@@ -1730,7 +1803,8 @@ first failed use.
   `None` once the session ended, and the caller reconnects;
   `Listener::check(deadline)` runs `SELECT 1` to detect a half-open
   session. The jobs relay
-  holds one per host.
+  holds one per host, and the notifications block one for its inbox
+  stream.
 
 ### Statements and telemetry
 

@@ -2271,6 +2271,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
+ "futures-core",
  "hmac 0.13.0",
  "jiff",
  "merezha-application",

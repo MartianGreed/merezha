@@ -1545,7 +1545,8 @@ Versions were checked with `cargo info` on 2026-10-23, with
 | `ipnet` | 2.12.2 | n/a | CIDR sets for the egress guard and Brevo CIDRs |
 | `url` | 2.5.8 | 1.63 | Endpoint parsing |
 | `jiff` | 0.2.38 | 1.70 | The one time crate (R14): quiet hours, timezone validation, the `datetime` filter; no `chrono`. Workspace pin: `default-features = false, features = ["std", "serde", "tz-system", "tzdb-bundle-always"]`. |
-| `tokio-stream` | 0.1.19 | 1.71 | `ReceiverStream` for SSE (axum 0.8.9 `response::sse`) |
+| `tokio-stream` | not used | | NT-N5 implements `Stream` over the bounded receiver itself |
+| `futures-core` | 0.3.34 | 1.36 | Workspace pin (`std`): the `Stream` trait axum 0.8.9 `response::sse` takes; already in the tree through axum |
 | `tokio-postgres` / `deadpool-postgres` | 0.7.18 / 0.14.2 | 1.85 | From the kernel. The LISTEN connection uses `tokio_postgres::connect` directly and polls `AsyncMessage::Notification`. |
 | `axum`, `tokio`, `serde`, `serde_json` | workspace | | Already pinned |
 

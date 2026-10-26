@@ -45,7 +45,8 @@ pub struct ModuleEvents {
 /// Lifecycle, driven by the host in this order: [`Module::configure`] once
 /// with `[modules.<name>]`, migrations verified or applied, [`Module::start`],
 /// [`Module::routes`] mounted under `/v1/<name>`, then on shutdown
-/// [`Module::shutdown`] after the listener has drained. A module is enabled
+/// [`Module::draining`] as the listener stops accepting and
+/// [`Module::shutdown`] after it has drained. A module is enabled
 /// exactly when its section is present.
 pub trait Module: Send + Sync + 'static {
     /// `[a-z][a-z0-9_]*`, at most 64 bytes, unique, not in [`RESERVED_NAMES`].
@@ -150,6 +151,12 @@ pub trait Module: Send + Sync + 'static {
     fn ready(&self) -> BoxFuture<'_, Result<(), Failure>> {
         Box::pin(async { Ok(()) })
     }
+    /// The listener is about to stop accepting connections and drain the
+    /// requests in flight: end long-lived responses, such as event
+    /// streams, so the drain does not wait on them until its timeout, and
+    /// refuse new ones. Called once, after `http.drain_delay_ms` and before
+    /// the drain, then [`Module::shutdown`] follows. Must not block.
+    fn draining(&self) {}
     /// Stop background work and drain it before `deadline`. Called once,
     /// after the listener stopped admitting requests.
     fn shutdown(&self, deadline: Instant) -> BoxFuture<'_, ()> {
