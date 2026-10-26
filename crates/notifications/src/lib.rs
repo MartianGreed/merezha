@@ -414,7 +414,7 @@ impl Module for Notifications {
             let streams =
                 stream::Streams::new(settings.sse.clone(), &ctx.telemetry().meter(METER_SCOPE));
             if self.streams.set(streams.clone()).is_ok() {
-                streams.listen(ctx.database().clone());
+                streams.listen(ctx.database().clone(), random(&ctx));
             }
             Ok(())
         })

@@ -444,6 +444,26 @@ async fn streams_carry_only_the_active_tenants_items_and_tenantless_ones() {
     instance.stop().await;
 }
 
+/// Review of PR #61: `sse.replay_max` counts only the rows in the stream's
+/// scope. Other tenants' changes never turn a resume into `reset`.
+#[tokio::test]
+async fn replay_max_counts_only_the_rows_in_the_streams_tenant_scope() {
+    let Some((_world, instance)) = started("replay_max = 2\n").await else {
+        return;
+    };
+    for n in 1..=3 {
+        send(&instance, "usr_ada", &format!("o2-{n}"), Some("org_2")).await;
+    }
+    send(&instance, "usr_ada", "o1", Some("org_1")).await;
+    instance.settle().await;
+    // Four rows changed since 0, one of them in org_1's scope: replayed.
+    let mut org = reader(&instance, "ada_org", Some("0")).await;
+    let got = items(&mut org, 1).await;
+    assert_eq!(got[0].1["tenant_id"], json!("org_1"));
+    quiet(&mut org, Duration::from_millis(1200)).await;
+    instance.stop().await;
+}
+
 /// NT-N5 test, concurrent writers: A takes the user's next `change_seq`
 /// and pauses before commit while B writes for the same user. B waits; a
 /// live stream and a resume from before A both get A's and B's changes,
@@ -603,6 +623,155 @@ async fn draining_ends_every_stream_and_refuses_new_ones() {
 /// time (`cargo test -- --test-threads=1 timing::`).
 mod timing {
     use super::*;
+
+    const LISTENING: &str = "SELECT count(*) FROM pg_stat_activity \
+                             WHERE datname = current_database() \
+                             AND query = 'LISTEN merezha_notify_inbox;'";
+    const TERMINATE: &str = "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) \
+                             FROM pg_stat_activity WHERE datname = current_database() \
+                             AND query = 'LISTEN merezha_notify_inbox;') t";
+
+    /// Change Ada's first item as the read route does, without
+    /// `pg_notify`: only a wake or the reconcile interval delivers it.
+    async fn silent_change(world: &World) -> i64 {
+        let seqs = change_seqs(world, "usr_ada").await;
+        world
+            .execute(&format!(
+                "UPDATE merezha_notify.inbox_counters SET last_seq = last_seq + 1 \
+                   WHERE user_id = 'usr_ada'; \
+                 UPDATE merezha_notify.inbox_items SET read_at = now(), change_seq = \
+                   (SELECT last_seq FROM merezha_notify.inbox_counters WHERE user_id = 'usr_ada') \
+                   WHERE id = '{}';",
+                seqs[0].0
+            ))
+            .await;
+        world
+            .scalar("SELECT last_seq FROM merezha_notify.inbox_counters WHERE user_id = 'usr_ada'")
+            .await
+    }
+
+    /// An instance that reconciles every 10 minutes with one item for Ada,
+    /// a stream of Ada's past its `hello`, and its `LISTEN` session up.
+    async fn listening() -> Option<(World, Instance, EventReader)> {
+        let (world, instance) = started("reconcile_interval = \"600s\"\n").await?;
+        send(&instance, "usr_ada", "w1", None).await;
+        instance.settle().await;
+        let mut stream = reader(&instance, "ada", None).await;
+        assert_eq!(next(&mut stream).await.event.as_deref(), Some("hello"));
+        instance.until(LISTENING, 1).await;
+        Some((world, instance, stream))
+    }
+
+    /// Review of PR #61: a `LISTEN` session that connects and drops again
+    /// backs off (1 s, then 2 s and more) instead of reconnecting at once.
+    #[tokio::test]
+    async fn a_listen_session_that_keeps_dropping_backs_off() {
+        let harness = merezha_telemetry::testing::Harness::new();
+        let Some((world, instance)) = started("").await else {
+            return;
+        };
+        instance.until(LISTENING, 1).await;
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut kills = 0;
+        while Instant::now() < until {
+            kills += world.scalar(TERMINATE).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let restored = harness
+            .recorded()
+            .into_iter()
+            .filter(|r| r.name.as_deref() == Some("notification.sse_listen_restored"))
+            .count();
+        // Delays of 1 s, 1 to 2 s and 2 to 4 s allow 2 or 3 sessions in 3 s.
+        assert!(kills >= 1, "the session was never terminated");
+        assert!(
+            restored <= 3,
+            "{restored} reconnects for {kills} kills in 3 s: no backoff"
+        );
+        instance.stop().await;
+    }
+
+    /// Review of PR #61: once the `LISTEN` session is back, every local
+    /// stream is woken and picks up what changed while it was down.
+    #[tokio::test]
+    async fn a_restored_listen_session_wakes_streams_that_missed_a_change() {
+        let Some((world, instance, mut stream)) = listening().await else {
+            return;
+        };
+        let seq = silent_change(&world).await;
+        quiet(&mut stream, Duration::from_millis(700)).await;
+        assert_eq!(world.scalar(TERMINATE).await, 1);
+        let started = Instant::now();
+        let got = items(&mut stream, 1).await;
+        assert_eq!(got[0].0, seq);
+        // A 1 s backoff, then a wake spread over 1 s.
+        let took = started.elapsed();
+        assert!(took <= Duration::from_secs(4), "arrived after {took:?}");
+        instance.stop().await;
+    }
+
+    /// Review of PR #61: a burst of notifications that may have overflowed
+    /// the session's queue wakes every local stream, not only the users it
+    /// names.
+    #[tokio::test]
+    async fn a_burst_that_may_overflow_the_listen_queue_wakes_every_stream() {
+        let Some((world, instance, mut stream)) = listening().await else {
+            return;
+        };
+        let seq = silent_change(&world).await;
+        quiet(&mut stream, Duration::from_millis(700)).await;
+        // 2,000 notifications for other users, delivered at one commit.
+        world
+            .execute(
+                "SELECT pg_notify('merezha_notify_inbox', 'usr_ghost_' || g) \
+                 FROM generate_series(1, 2000) g",
+            )
+            .await;
+        let started = Instant::now();
+        let got = items(&mut stream, 1).await;
+        assert_eq!(got[0].0, seq);
+        let took = started.elapsed();
+        assert!(took <= Duration::from_secs(3), "arrived after {took:?}");
+        instance.stop().await;
+    }
+
+    /// Review of PR #61: re-authentication ends a stream whose credentials
+    /// now give another active tenant, no active tenant (the membership
+    /// was removed) or another user; unchanged credentials keep theirs.
+    #[tokio::test]
+    async fn re_authentication_ends_a_stream_whose_user_or_tenant_changed() {
+        let Some((_world, instance)) = started("reauth_interval = \"10s\"\n").await else {
+            return;
+        };
+        let tokens = &instance.tokens;
+        tokens.add("ada_switch", user("usr_ada", &[], Some("org_1")));
+        tokens.add("ada_removed", user("usr_ada", &[], Some("org_1")));
+        tokens.add("ada_other", user("usr_ada", &[], None));
+        tokens.add("ada_kept", user("usr_ada", &[], Some("org_1")));
+        let mut switched = reader(&instance, "ada_switch", None).await;
+        let mut removed = reader(&instance, "ada_removed", None).await;
+        let mut other = reader(&instance, "ada_other", None).await;
+        let mut kept = reader(&instance, "ada_kept", None).await;
+        // The same credentials now authenticate differently.
+        tokens.add("ada_switch", user("usr_ada", &[], Some("org_2")));
+        tokens.add("ada_removed", user("usr_ada", &[], None));
+        tokens.add("ada_other", user("usr_bob", &[], None));
+        let started = Instant::now();
+        assert!(
+            switched.ends_within(Duration::from_secs(12)).await,
+            "tenant"
+        );
+        assert!(
+            removed.ends_within(Duration::from_secs(2)).await,
+            "membership"
+        );
+        assert!(other.ends_within(Duration::from_secs(2)).await, "user");
+        let took = started.elapsed();
+        assert!(took <= Duration::from_secs(12), "ended after {took:?}");
+        assert!(!kept.ends_within(Duration::from_millis(500)).await);
+        assert_eq!(instance.module.streams().unwrap().open_for("usr_ada"), 1);
+        instance.stop().await;
+    }
 
     /// NT-N5 acceptance: with two host instances on one database, an item
     /// created through B reaches a stream on A within 1 s. A runs no jobs

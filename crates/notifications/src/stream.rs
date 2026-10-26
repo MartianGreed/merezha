@@ -77,6 +77,13 @@ const LISTEN_CHECK_EVERY: Duration = Duration::from_secs(30);
 /// Reconnect backoff of the `LISTEN` session (NT §5.4).
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// A session must stay up this long before the backoff starts again from
+/// [`BACKOFF_MIN`]: one that connects and drops keeps backing off.
+const STABLE_AFTER: Duration = LISTEN_CHECK_EVERY;
+/// [`Streams::wake_all`] spreads its wakes over this long, and runs at most
+/// once per this long, so the streams of an instance do not all query at
+/// once.
+pub const WAKE_ALL_SPREAD: Duration = Duration::from_secs(1);
 
 // ----- statements -----
 
@@ -159,6 +166,9 @@ struct Inner {
     metrics: StreamMetrics,
     /// Stops the `LISTEN` task.
     stop: watch::Sender<bool>,
+    /// Asks the `LISTEN` task for one spread wake of every stream; requests
+    /// made while one runs coalesce into a single next one.
+    sweep: tokio::sync::Notify,
     listen: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 impl Inner {
@@ -222,6 +232,7 @@ impl Streams {
             closing: watch::Sender::new(false),
             metrics: StreamMetrics::new(meter),
             stop: watch::Sender::new(false),
+            sweep: tokio::sync::Notify::new(),
             listen: Mutex::new(None),
         }))
     }
@@ -278,12 +289,16 @@ impl Streams {
             entry.wake.send_modify(|n| *n = n.wrapping_add(1));
         }
     }
-    /// Wake every local stream, after the `LISTEN` session was lost and
-    /// may have missed notifications.
+    /// Ask for a wake of every local stream, after the `LISTEN` session was
+    /// lost or its queue overflowed and notifications may be missing. The
+    /// `LISTEN` task runs it spread over [`WAKE_ALL_SPREAD`], one pass at a
+    /// time: requests made during a pass coalesce into one more pass.
     pub fn wake_all(&self) {
-        for entry in self.0.registry().users.values() {
-            entry.wake.send_modify(|n| *n = n.wrapping_add(1));
-        }
+        self.0.sweep.notify_one();
+    }
+    /// The users with local streams, now.
+    fn users(&self) -> Vec<String> {
+        self.0.registry().users.keys().cloned().collect()
     }
     /// End every stream and refuse new ones: the instance drains. Clients
     /// reconnect to another instance with `Last-Event-ID`.
@@ -294,15 +309,16 @@ impl Streams {
     pub fn closing(&self) -> bool {
         *self.0.closing.borrow()
     }
-    /// Start the `LISTEN` task on `database`; a second call does nothing.
-    pub fn listen(&self, database: Database) {
+    /// Start the `LISTEN` task on `database`, its reconnect jitter drawn
+    /// from `random`; a second call does nothing.
+    pub fn listen(&self, database: Database, random: Arc<dyn merezha_platform::Random>) {
         let mut slot = self.0.listen.lock().unwrap_or_else(PoisonError::into_inner);
         if slot.is_none() {
-            *slot = Some(tokio::spawn(listen_loop(
-                self.clone(),
-                database,
-                self.0.stop.subscribe(),
-            )));
+            let listening = listen_loop(self.clone(), database, random, self.0.stop.subscribe());
+            let sweeping = sweeper(self.clone(), self.0.stop.subscribe());
+            *slot = Some(tokio::spawn(async move {
+                tokio::join!(listening, sweeping);
+            }));
         }
     }
     /// Close every stream, stop the `LISTEN` task and wait for both
@@ -330,21 +346,75 @@ impl Streams {
 
 // ----- LISTEN -----
 
+/// The `LISTEN` session's reconnect delays (NT §5.4): from 1 s, doubling to
+/// 30 s, drawn from the upper half of the step and never below 1 s. Only a
+/// session that stayed up one probe interval (30 s) starts again from 1 s.
+#[derive(Debug)]
+pub struct Backoff {
+    step: Duration,
+}
+impl Default for Backoff {
+    fn default() -> Self {
+        Self { step: BACKOFF_MIN }
+    }
+}
+impl Backoff {
+    /// The delay before the next attempt, `unit` in `[0, 1]` its jitter;
+    /// the step doubles for the attempt after.
+    pub fn next(&mut self, unit: f64) -> Duration {
+        let delay = self
+            .step
+            .mul_f64(0.5 + 0.5 * unit.clamp(0.0, 1.0))
+            .max(BACKOFF_MIN);
+        self.step = (self.step * 2).min(BACKOFF_MAX);
+        delay
+    }
+    /// A session ended after being up `up`.
+    pub fn lost_after(&mut self, up: Duration) {
+        if up >= STABLE_AFTER {
+            self.step = BACKOFF_MIN;
+        }
+    }
+}
+
+/// A jitter unit in `[0, 1]` from `random`; 0.5 when it fails.
+fn unit(random: &dyn merezha_platform::Random) -> f64 {
+    let mut bytes = [0u8; 8];
+    match random.fill(&mut bytes) {
+        Ok(()) => u64::from_le_bytes(bytes) as f64 / u64::MAX as f64,
+        Err(_) => 0.5,
+    }
+}
+
 /// One dedicated session outside the pool, `LISTEN merezha_notify_inbox`.
 /// A notification wakes only the local streams of the user it names. A
 /// lost session is logged once (`notification.sse_listen_lost`) and
-/// reopened with backoff from 1 s to 30 s; once restored it logs
-/// `notification.sse_listen_restored`, counts
-/// `merezha.inbox.listen.reconnects` and wakes every local stream.
+/// reopened after a [`Backoff`] delay, every attempt after the first; once
+/// restored it logs `notification.sse_listen_restored`, counts
+/// `merezha.inbox.listen.reconnects` and asks for [`Streams::wake_all`].
 /// Readiness never depends on it: streams reconcile on their own.
-async fn listen_loop(streams: Streams, database: Database, mut stop: watch::Receiver<bool>) {
-    let mut backoff = BACKOFF_MIN;
+async fn listen_loop(
+    streams: Streams,
+    database: Database,
+    random: Arc<dyn merezha_platform::Random>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut backoff = Backoff::default();
     let mut lost = false;
     let mut connected_once = false;
+    let mut first = true;
     loop {
         if *stop.borrow() {
             return;
         }
+        if !first {
+            let delay = backoff.next(unit(random.as_ref()));
+            tokio::select! {
+                _ = stop.changed() => return,
+                () = tokio::time::sleep(delay) => {}
+            }
+        }
+        first = false;
         let session = database
             .listen(&[sql::INBOX_CHANNEL], Instant::now() + LISTEN_DEADLINE)
             .await;
@@ -359,15 +429,9 @@ async fn listen_loop(streams: Streams, database: Database, mut stop: watch::Rece
                     );
                     lost = true;
                 }
-                tokio::select! {
-                    _ = stop.changed() => return,
-                    () = tokio::time::sleep(backoff) => {}
-                }
-                backoff = (backoff * 2).min(BACKOFF_MAX);
                 continue;
             }
         };
-        backoff = BACKOFF_MIN;
         if lost {
             merezha_telemetry::event!(INFO, "notification.sse_listen_restored");
         }
@@ -377,6 +441,7 @@ async fn listen_loop(streams: Streams, database: Database, mut stop: watch::Rece
             streams.wake_all();
         }
         connected_once = true;
+        let up_since = Instant::now();
         let code = serve(&streams, &mut session, &mut stop).await;
         drop(session);
         match code {
@@ -384,9 +449,36 @@ async fn listen_loop(streams: Streams, database: Database, mut stop: watch::Rece
             Some(code) => {
                 merezha_telemetry::event!(WARN, "notification.sse_listen_lost", code = code);
                 lost = true;
-                // Reconnect at once the first time; a session that keeps
-                // dropping backs off from the next failure on.
+                backoff.lost_after(up_since.elapsed());
             }
+        }
+    }
+}
+
+/// Run the [`Streams::wake_all`] passes until the task stops: each wakes
+/// the users that have local streams at its start, spread evenly over
+/// [`WAKE_ALL_SPREAD`], and the next pass starts no sooner than one spread
+/// after it.
+async fn sweeper(streams: Streams, mut stop: watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            _ = stop.changed() => return,
+            () = streams.0.sweep.notified() => {}
+        }
+        let started = tokio::time::Instant::now();
+        let users = streams.users();
+        let count = users.len().max(1) as f64;
+        for (n, user) in users.iter().enumerate() {
+            let at = started + WAKE_ALL_SPREAD.mul_f64(n as f64 / count);
+            tokio::select! {
+                _ = stop.changed() => return,
+                () = tokio::time::sleep_until(at) => {}
+            }
+            streams.wake(user);
+        }
+        tokio::select! {
+            _ = stop.changed() => return,
+            () = tokio::time::sleep_until(started + WAKE_ALL_SPREAD) => {}
         }
     }
 }
@@ -674,12 +766,7 @@ async fn stream(
 /// `max_lifetime` ±10 %, so streams opened together do not reconnect
 /// together.
 pub fn jittered(lifetime: Duration, random: &dyn merezha_platform::Random) -> Duration {
-    let mut bytes = [0u8; 8];
-    let unit = match random.fill(&mut bytes) {
-        Ok(()) => u64::from_le_bytes(bytes) as f64 / u64::MAX as f64,
-        Err(_) => 0.5,
-    };
-    lifetime.mul_f64(0.9 + 0.2 * unit)
+    lifetime.mul_f64(0.9 + 0.2 * unit(random))
 }
 
 /// The response body: what the task sends, in order.
@@ -929,21 +1016,103 @@ mod tests {
     #[test]
     fn a_wake_reaches_only_the_users_streams_admitted_before_it() {
         let streams = Streams::without_metrics(settings(8, 10));
-        let mut a = streams.admit("usr_a").unwrap();
+        let a = streams.admit("usr_a").unwrap();
         let b = streams.admit("usr_b").unwrap();
         assert!(!a.wake.has_changed().unwrap());
         streams.wake("usr_a");
         streams.wake("usr_nobody");
         assert!(a.wake.has_changed().unwrap());
         assert!(!b.wake.has_changed().unwrap());
-        a.wake.borrow_and_update();
-        streams.wake_all();
-        assert!(a.wake.has_changed().unwrap());
-        assert!(b.wake.has_changed().unwrap());
         // The last stream gone, the user's entry goes too.
         drop(a);
         drop(b);
         assert!(streams.0.registry().users.is_empty());
+    }
+
+    /// Wakes seen by `lease` so far.
+    fn wakes(lease: &Lease) -> u64 {
+        *lease.wake.borrow()
+    }
+
+    /// `wake_all` wakes every user once, spread over `WAKE_ALL_SPREAD`
+    /// rather than all at once; the next pass starts no sooner than one
+    /// spread after the last, and requests made during a pass coalesce
+    /// into one more pass.
+    #[tokio::test]
+    async fn wake_all_spreads_over_a_second_and_coalesces_requests() {
+        let streams = Streams::without_metrics(settings(8, 100));
+        // Four users: woken at 0, 250, 500 and 750 ms of each pass.
+        let leases: Vec<Lease> = (0..4)
+            .map(|n| streams.admit(&format!("usr_{n}")).unwrap())
+            .collect();
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(sweeper(streams.clone(), stopped));
+        let started = Instant::now();
+        streams.wake_all();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let early = leases.iter().filter(|l| wakes(l) == 1).count();
+        assert!(early < 4, "every user woken within 100 ms: not spread");
+        // Three more requests during the pass give exactly one more pass.
+        streams.wake_all();
+        streams.wake_all();
+        streams.wake_all();
+        let until = |want: u64, all: bool| {
+            let leases = &leases;
+            async move {
+                loop {
+                    let reached = |l: &Lease| wakes(l) >= want;
+                    let done = if all {
+                        leases.iter().all(reached)
+                    } else {
+                        leases.iter().any(reached)
+                    };
+                    if done {
+                        return started.elapsed();
+                    }
+                    assert!(started.elapsed() < Duration::from_secs(10));
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        };
+        let first = until(1, true).await;
+        assert!(
+            first >= Duration::from_millis(700),
+            "one pass took {first:?}"
+        );
+        let next = until(2, false).await;
+        assert!(
+            next >= Duration::from_millis(950),
+            "the next pass started {next:?} after the first, within the spread"
+        );
+        until(2, true).await;
+        tokio::time::sleep(WAKE_ALL_SPREAD + Duration::from_millis(500)).await;
+        assert!(
+            leases.iter().all(|l| wakes(l) == 2),
+            "coalesced into one pass"
+        );
+        stop.send_replace(true);
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn the_listen_backoff_doubles_with_jitter_and_resets_only_after_a_stable_session() {
+        let mut backoff = Backoff::default();
+        // 1 s, then the upper half of 2, 4, 8, 16 and 30 s steps.
+        assert_eq!(backoff.next(0.0), Duration::from_secs(1));
+        assert_eq!(backoff.next(0.0), Duration::from_secs(1));
+        assert_eq!(backoff.next(1.0), Duration::from_secs(4));
+        assert_eq!(backoff.next(0.5), Duration::from_secs(6));
+        assert_eq!(backoff.next(1.0), Duration::from_secs(16));
+        assert_eq!(backoff.next(1.0), Duration::from_secs(30));
+        assert_eq!(backoff.next(1.0), Duration::from_secs(30));
+        assert_eq!(backoff.next(0.0), Duration::from_secs(15));
+        // A session that connects and drops again does not reset it.
+        backoff.lost_after(STABLE_AFTER - Duration::from_millis(1));
+        assert_eq!(backoff.next(1.0), Duration::from_secs(30));
+        // One that stayed up a probe interval does.
+        backoff.lost_after(STABLE_AFTER);
+        assert_eq!(backoff.next(1.0), Duration::from_secs(1));
+        assert_eq!(backoff.next(1.0), Duration::from_secs(2));
     }
 
     #[test]
