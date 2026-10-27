@@ -778,7 +778,17 @@ Every field is a code, a count, a configured name or a timestamp:
 Events are emitted with `merezha_telemetry::event!(LEVEL, "area.noun_verb",
 field = …)`, whose name and fields must appear in the catalog
 (`crates/telemetry/src/names.rs`, TE §4); `testing::Harness::assert_catalogued`
-fails a suite that emits anything else. The `merezha` binary installs one
+fails a suite that emits anything else; the process tests' `Host`
+fixtures (`crates/cli/tests/support`, `telemetry_process.rs`) check every
+stderr line with `testing::check_stderr_catalogued` when they drop, as do
+`application_http.rs`, `http.rs` and `content_diff.rs` on the stderr they
+capture (the other one-off spawns, mostly CLI subcommands such as
+`merezha identity` and `merezha notifications`, are left to the source
+scan); and
+`crates/telemetry/tests/event_catalog.rs` reads every `event!(…, "name", …)`
+call in `crates/*/src` outside comments (the level too unless it is a
+macro variable), so a name missing from the catalog fails even when no
+test reaches it. The `merezha` binary installs one
 `tracing` registry with three layers:
 
 1. stderr, at `log_level` for Merezha targets and never more verbose than
@@ -910,6 +920,45 @@ Guest calls, dispatch and projections are instrumented (TE-T3; TE §1.2,
   `merezha_telemetry::spawn_blocking_in_span`, which carries the dispatcher
   and the current span; `clippy.toml` bans `tokio::task::spawn_blocking` and
   `Handle::spawn_blocking` everywhere but `merezha-telemetry`.
+
+### Dashboards and alerts
+
+`deploy/telemetry/` holds the Grafana dashboards (`dashboards/*.json`,
+schema version 39, with `DS_PROMETHEUS`, `DS_LOKI` and `DS_TEMPO` datasource
+variables and a `service` variable over the `job` label), their file
+provisioning (`dashboards.yaml`, for the `grafana/otel-lgtm` image) and the
+Prometheus rule files (`rules/merezha-recording.yaml`,
+`rules/merezha-alerts.yaml`) of TE §7. Their queries use the Prometheus 3 /
+Mimir OTLP translation of the catalog (`merezha.command.duration` is
+`merezha_command_duration_seconds_*`, gauges of unit `1` end in `_ratio`).
+`merezha_telemetry::artifacts::ARTIFACTS` embeds them, and
+
+```sh
+merezha telemetry export --out DIR
+```
+
+writes them below `DIR` (created if missing), each file through a
+temporary sibling that is synced and renamed over the target, replacing
+the files of the same names and leaving others. `DIR` may be a symbolic
+link; `DIR/dashboards` and `DIR/rules` may not (`not_a_directory`). It
+prints one JSON line on stdout:
+`{"status":"exported","out":…,"host_version":…,"files":[…]}` and exits 0;
+`{"status":"failed","error":{"code":"export_failed","file":…,"reason":…},"files":[…]}`
+and exits 1 when a file (or, with `file: null`, `DIR` itself) cannot be
+written, `reason` being the I/O error kind (`permission_denied`,
+`not_a_directory`, …) and `files` the files already replaced; `{"status":"invalid","error":{"code":"invalid_arguments"},"usage":…}`
+and exits 2 otherwise. It reads no configuration and emits no log event.
+
+`crates/telemetry/tests/artifacts.rs` lints them: the dashboard structure
+(uid, schema version, panel types and grid, datasource variables only, a
+`job=~"$service"` filter on every selector) and every metric and label of
+every dashboard and rule query against `names::METRICS`; each catalog
+metric has a panel. `scripts/check-telemetry-artifacts.sh` runs
+`promtool check rules`, the rule unit tests of `deploy/telemetry/tests/`
+and a parse of every dashboard query, with the pinned `prom/prometheus`
+image when `promtool` is not installed; the `Telemetry artifacts` workflow
+runs both. The [telemetry operations guide](../operations/telemetry.md)
+covers backends, collector topology, sampling and the alerts.
 
 ## Module contract
 

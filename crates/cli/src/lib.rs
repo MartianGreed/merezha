@@ -63,6 +63,7 @@ pub mod identity;
 pub mod notifications;
 pub mod reactions;
 pub mod run;
+pub mod telemetry;
 
 /// The blocks the `merezha` binary registers. Each stays disabled until
 /// its `[modules.<name>]` section is present. The notifications and

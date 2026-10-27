@@ -1,0 +1,18 @@
+# Grafana dashboard provisioning for the Merezha dashboards.
+#
+# The path is where ops/telemetry/lgtm.Dockerfile copies dashboards/ inside
+# grafana/otel-lgtm (docs/design/telemetry.md §6). Another Grafana: copy
+# dashboards/ to a directory it can read and set `path` to it, or import the
+# JSON files through the UI. The dashboards pick their Prometheus, Loki and
+# Tempo datasources through the DS_PROMETHEUS, DS_LOKI and DS_TEMPO variables.
+apiVersion: 1
+providers:
+  - name: merezha
+    folder: Merezha
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /otel-lgtm/grafana/conf/provisioning/dashboards/merezha
+      foldersFromFilesStructure: false

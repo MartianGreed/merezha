@@ -1058,6 +1058,12 @@ pub const EVENTS: &[Event] = &[
     ev("migration.refused", ERROR, &[CODE, MODULE, VERSION]),
     ev("migration.invalid_index_dropped", WARN, &[MODULE, VERSION]),
     ev("db.connected", INFO, &[local("pool_size")]),
+    // A PostgreSQL application whose pool is below AP §A.8's guidance.
+    ev(
+        "db.pool_undersized",
+        WARN,
+        &[local("pool_size"), local("recommended")],
+    ),
     ev("db.pool_timeout", WARN, &[CODE]),
     ev("db.unavailable", ERROR, &[CODE]),
     ev("db.listener_lost", WARN, &[CODE]),

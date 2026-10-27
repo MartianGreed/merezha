@@ -1,0 +1,134 @@
+# Merezha recording rules (docs/design/telemetry.md §7).
+#
+# Prometheus rule-file format: Prometheus, Mimir and Grafana alerting load it.
+# Metric and label names follow the Prometheus 3 / Mimir default OTLP
+# translation (UnderscoreEscapingWithSuffixes) of the catalog in
+# crates/telemetry/src/names.rs: dots become underscores, seconds get
+# `_seconds`, counters `_total`, `service.name` is `job` and
+# `service.instance.id` is `instance`. merezha-alerts.yaml uses these series.
+#
+# Every ratio is per `job` (one Merezha application). `/health/*` requests
+# never count toward the HTTP SLOs.
+groups:
+  # HTTP availability, 99.9%: the share of requests answered 5xx. Error budget
+  # 0.001; the burn rate is the ratio divided by it.
+  - name: merezha-http-availability
+    rules:
+      - record: job:merezha_http_errors:ratio_rate5m
+        expr: |
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?", http_response_status_code=~"5.."}[5m]))
+          /
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[5m]))
+      - record: job:merezha_http_errors:ratio_rate30m
+        expr: |
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?", http_response_status_code=~"5.."}[30m]))
+          /
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[30m]))
+      - record: job:merezha_http_errors:ratio_rate1h
+        expr: |
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?", http_response_status_code=~"5.."}[1h]))
+          /
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[1h]))
+      - record: job:merezha_http_errors:ratio_rate6h
+        expr: |
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?", http_response_status_code=~"5.."}[6h]))
+          /
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[6h]))
+      - record: job:merezha_http_errors:ratio_rate3d
+        expr: |
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?", http_response_status_code=~"5.."}[3d]))
+          /
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[3d]))
+
+  # HTTP latency, 99% under 500 ms: the share of requests slower than the
+  # `le="0.5"` bucket. Error budget 0.01.
+  - name: merezha-http-latency
+    rules:
+      - record: job:merezha_http_slow:ratio_rate5m
+        expr: |
+          1 - (
+            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health(/.*)?", le="0.5"}[5m]))
+            /
+            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[5m]))
+          )
+      - record: job:merezha_http_slow:ratio_rate30m
+        expr: |
+          1 - (
+            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health(/.*)?", le="0.5"}[30m]))
+            /
+            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[30m]))
+          )
+      - record: job:merezha_http_slow:ratio_rate1h
+        expr: |
+          1 - (
+            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health(/.*)?", le="0.5"}[1h]))
+            /
+            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[1h]))
+          )
+      - record: job:merezha_http_slow:ratio_rate6h
+        expr: |
+          1 - (
+            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health(/.*)?", le="0.5"}[6h]))
+            /
+            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[6h]))
+          )
+      - record: job:merezha_http_slow:ratio_rate3d
+        expr: |
+          1 - (
+            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health(/.*)?", le="0.5"}[3d]))
+            /
+            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[3d]))
+          )
+
+  # Command outcomes: `failed` counts against the SLO; `rejected` (client
+  # errors) only signals a likely client bug. `conflict` and `denied` count in
+  # the totals and in neither ratio.
+  - name: merezha-commands
+    rules:
+      - record: job:merezha_command_failures:ratio_rate10m
+        expr: |
+          sum by (job) (rate(merezha_command_duration_seconds_count{merezha_outcome="failed"}[10m]))
+          /
+          sum by (job) (rate(merezha_command_duration_seconds_count[10m]))
+      - record: job:merezha_command_rejections:ratio_rate30m
+        expr: |
+          sum by (job) (rate(merezha_command_duration_seconds_count{merezha_outcome="rejected"}[30m]))
+          /
+          sum by (job) (rate(merezha_command_duration_seconds_count[30m]))
+
+  # Lag gauges: every instance reports the same database-level numbers, so
+  # the maximum over instances is the value.
+  - name: merezha-lag
+    rules:
+      - record: job:merezha_projection_lag_age_seconds:max
+        expr: max by (job, merezha_projection_name) (merezha_projection_lag_age_seconds)
+      - record: job:merezha_reactor_lag_age_seconds:max
+        expr: max by (job, merezha_reactor_name) (merezha_reactor_lag_age_seconds)
+      - record: job:merezha_outbox_lag_seconds:max
+        expr: max by (job) (merezha_outbox_lag_seconds)
+      - record: job:merezha_job_lag_seconds:max
+        expr: max by (job, job_queue) (merezha_job_lag_seconds)
+
+  # Notification deliveries that ended failed, bounced or expired, over every
+  # terminal status (all but `accepted`), per channel.
+  - name: merezha-notifications
+    rules:
+      - record: job:merezha_notification_delivery_failures:ratio_rate15m
+        expr: |
+          sum by (job, notify_channel) (rate(merezha_notification_deliveries_total{notify_status=~"failed|bounced|expired"}[15m]))
+          /
+          sum by (job, notify_channel) (rate(merezha_notification_deliveries_total{notify_status!="accepted"}[15m]))
+      - record: job:merezha_notification_delivery_failures:ratio_rate30m
+        expr: |
+          sum by (job, notify_channel) (rate(merezha_notification_deliveries_total{notify_status=~"failed|bounced|expired"}[30m]))
+          /
+          sum by (job, notify_channel) (rate(merezha_notification_deliveries_total{notify_status!="accepted"}[30m]))
+
+  # Guest invocations stopped by a resource limit, per guest service.
+  - name: merezha-guests
+    rules:
+      - record: job:merezha_guest_limit_outcomes:ratio_rate15m
+        expr: |
+          sum by (job, merezha_guest_service) (rate(merezha_guest_invocation_duration_seconds_count{merezha_guest_outcome=~"fuel_exhausted|memory_limit|timeout"}[15m]))
+          /
+          sum by (job, merezha_guest_service) (rate(merezha_guest_invocation_duration_seconds_count[15m]))

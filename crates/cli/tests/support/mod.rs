@@ -44,10 +44,15 @@ impl Host {
             log,
         }
     }
+    /// The JSON events logged so far. Panics when one is missing from the
+    /// event catalog or logged at a level its row does not list: the
+    /// process tests' catalog test (TE §8).
     pub fn events(&self) -> Vec<Value> {
-        fs::read_to_string(&self.log)
-            .unwrap()
-            .lines()
+        let text = fs::read_to_string(&self.log).unwrap();
+        if let Err(problems) = merezha_telemetry::testing::check_stderr_catalogued(&text) {
+            panic!("event catalog: {problems}");
+        }
+        text.lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
     }
@@ -159,9 +164,19 @@ impl Host {
     }
 }
 impl Drop for Host {
+    /// Kill the host, then check everything it logged against the event
+    /// catalog, so a test that never reads the events is checked too.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if std::thread::panicking() {
+            return;
+        }
+        if let Ok(text) = fs::read_to_string(&self.log)
+            && let Err(problems) = merezha_telemetry::testing::check_stderr_catalogued(&text)
+        {
+            panic!("event catalog: {problems}");
+        }
     }
 }
 

@@ -1,0 +1,24 @@
+name: Telemetry artifacts
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths: ['deploy/telemetry/**', 'crates/telemetry/**', 'scripts/check-telemetry-artifacts.sh', '.github/workflows/telemetry.yml']
+permissions:
+  contents: read
+jobs:
+  # promtool from the pinned prom/prometheus image (scripts/check-telemetry-
+  # artifacts.sh): rule syntax, rule unit tests and the PromQL of every
+  # dashboard query. The dashboard schema lint and the catalog name check
+  # run as `cargo test -p merezha-telemetry --test artifacts`, here and in
+  # the Host workflow.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: promtool check rules, test rules and dashboard queries
+        run: scripts/check-telemetry-artifacts.sh
+      - name: Install Rust 1.98.0
+        run: rustup toolchain install 1.98.0 --profile minimal
+      - name: Dashboard schema lint and catalog names
+        run: cargo +1.98.0 test --locked -p merezha-telemetry --test artifacts --test event_catalog

@@ -993,7 +993,9 @@ Datadog.
 
 Decision: ship importable artifacts, versioned with the host. Grafana
 dashboard JSON (schema version 39, `${DS_PROMETHEUS}`, `${DS_TEMPO}` and
-`${DS_LOKI}` datasource inputs, so they import into any Grafana) and
+`${DS_LOKI}` datasource references, so they import into any Grafana; T7
+declares them as datasource template variables rather than `__inputs`,
+which file provisioning does not resolve) and
 Prometheus-format rule files (recording rules plus alerts), which Prometheus,
 Mimir and Grafana alerting import all load. They live in
 `deploy/telemetry/{dashboards,rules}/`, are embedded in the binary, and
@@ -1004,9 +1006,11 @@ monitors) are out of scope; the rule-file PromQL is the reference definition.
 Queries assume the Prometheus 3 / Mimir default OTLP translation
 (`UnderscoreEscapingWithSuffixes`): `http.server.request.duration` becomes
 `http_server_request_duration_seconds_bucket`, counters gain `_total`,
+gauges of unit `1` gain `_ratio` (`merezha.reactor.halted` becomes
+`merezha_reactor_halted_ratio`, checked against Prometheus 3.15 in T7),
 attribute dots become underscores (`job.queue` becomes `job_queue`),
 `service.name` becomes `job` and `service.instance.id` becomes `instance`.
-Every query filters on `job=~"$service"`.
+Every dashboard query filters on `job=~"$service"`.
 
 Five dashboards: **Overview** (request rate, availability, latency
 percentiles per route, command outcome split, instances, error logs from Loki,
@@ -1026,18 +1030,18 @@ SLOs and alerts. Multi-window burn rates follow the SRE workbook, over a
 
 | SLO / alert | Definition (recording rule) | Fire |
 | --- | --- | --- |
-| HTTP availability 99.9% | good = `http_server_request_duration_seconds_count{http_response_status_code!~"5.."}`; total excludes `http_route=~"/health.*"` | page: burn > 14.4 over 1h and 5m, or > 6 over 6h and 30m; ticket: > 1 over 3d |
+| HTTP availability 99.9% | good = `http_server_request_duration_seconds_count{http_response_status_code!~"5.."}`; total excludes `http_route=~"/health(/.*)?"` | page: burn > 14.4 over 1h and 5m, or > 6 over 6h and 30m; ticket: > 1 over 3d and 6h |
 | HTTP latency 99% under 500 ms | good = bucket `le="0.5"` over count, same exclusions | same burn windows |
 | Command failure rate | `failed / all` of `merezha_command_duration_seconds_count`; rejections and conflicts excluded | page > 1% over 10m; the rejection rate is a dashboard panel, alerting only at > 50% over 30m (ticket, likely a client bug) |
 | Projection lag | `max by (merezha_projection_name) (merezha_projection_lag_age_seconds)` | ticket > 60 s for 10m; page > 300 s for 10m |
-| Reactor halted | `max by (merezha_reactor_name) (merezha_reactor_halted) > 0` | page for 5m |
+| Reactor halted | `max by (merezha_reactor_name) (merezha_reactor_halted_ratio) > 0` | page for 5m |
 | Outbox lag | `max(merezha_outbox_lag_seconds)` | page > 120 s for 10m |
 | Job lag | `max by (job_queue) (merezha_job_lag_seconds)` | ticket > 300 s for 15m |
 | Dead letters | `increase(merezha_job_dead_lettered_total[15m]) > 0` | ticket |
 | Delivery failures | `notify_status=~"failed\|bounced\|expired"` over all terminal statuses of `merezha_notification_deliveries_total`, per channel | ticket > 5% over 30m; page > 25% over 15m |
 | DB pool saturation | `db_client_connection_pending_requests > 0` for 5m, or timeouts increase | ticket |
 | Guest limits | `fuel_exhausted`, `memory_limit` or `timeout` outcomes > 1% of invocations over 15m | ticket |
-| Instance absent | `absent_over_time(merezha_telemetry_exported_total[10m])` per expected job (the self-metric exists whenever export is on) | page |
+| Instance absent | a job seen in `merezha_telemetry_exported_total` within 24h with no sample in the last 10m; `absent_over_time(merezha_telemetry_exported_total{job="…"}[10m])` per expected job is the operator's addition (the self-metric exists whenever export is on) | page |
 | Telemetry loss | `increase(merezha_telemetry_dropped_total[15m]) > 0` or an `otel_metric_overflow="true"` series exists | ticket |
 
 ## 8. Test plan
@@ -1253,6 +1257,52 @@ signals land.
 - `testing::Harness` registers one extra inert dispatcher per process: with a
   single registered dispatcher, `tracing-core` would cache a callsite first
   hit on another test's thread as never.
+
+**T7 delivery notes.** As built in TE-T7:
+
+- `deploy/telemetry/` holds `dashboards.yaml`, five dashboards
+  (`merezha-overview`, `merezha-application`, `merezha-data-jobs`,
+  `merezha-delivery`, `merezha-telemetry`) and two rule files
+  (`merezha-recording.yaml`, `merezha-alerts.yaml`), plus promtool unit
+  tests in `deploy/telemetry/tests/` that are not exported.
+  `merezha_telemetry::artifacts` embeds the exported files (default
+  features, so the scaffold can embed the same export), and
+  `merezha telemetry export --out DIR` writes them.
+- The dashboards compute every ratio inline instead of reading the
+  recording rules, so they are populated on the local image, which loads no
+  rule files.
+- The ticket burn-rate alerts pair the 3-day window with a 6-hour one, as
+  the SRE workbook does, so they resolve once the errors stop.
+- Synchronous counters reach Prometheus at their first value, with no 0
+  sample before it, so `increase()` misses a new series' first event (the
+  first dead letter per instance, queue and kind after a start). The
+  dead-letter, pool-timeout and telemetry-drop alerts add an arm for a
+  series with no sample in the hour before the window
+  (`x unless last_over_time(x[1h] offset <window>)`), so an export gap
+  under an hour does not make an old series look new. The instance-absent alert looks back 24
+  hours, so it keeps firing while a service stays down, for up to a day.
+- Health routes are matched as `/health(/.*)?`.
+- CI: the `Telemetry artifacts` workflow runs `promtool check rules`,
+  `promtool test rules` and a parse of every dashboard query
+  (`scripts/check-telemetry-artifacts.sh`, `prom/prometheus:v3.15.0` pinned
+  by digest, the version the local image ships), and the schema and catalog
+  lint (`crates/telemetry/tests/artifacts.rs`). The lint maps every metric
+  and label of every query back to `names::METRICS` and fails a catalog
+  metric no panel shows.
+- The scaffold's copy into `ops/telemetry/`, the example application's
+  Contremaitre manifest and the verification profile that queries Tempo and
+  Prometheus inside `otel` move to the scaffold's slice SC-S4
+  (`docs/design/scaffold.md`, SC-D13). Before writing the artifacts, T7 ran
+  `merezha run` against `grafana/otel-lgtm:0.38.0` with the dashboards
+  provisioned: every Prometheus panel query parsed, the overview panels
+  with traffic returned data, Loki held the logs under `service_name` with
+  `severity_text`, and Tempo answered the TraceQL search.
+- The event catalog test gained two checks after `db.pool_undersized`
+  shipped without a row (it is emitted only inside the process at
+  startup, which only a stderr-reading process test observed):
+  `testing::check_stderr_catalogued` in the process tests, and
+  `tests/event_catalog.rs`, which reads every `event!` call in the
+  workspace's sources.
 
 ## 11. Decisions
 

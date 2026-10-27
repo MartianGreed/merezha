@@ -168,6 +168,7 @@ async fn the_diff_classifies_against_the_database_and_fails_on_refused_changes()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(String::from_utf8(output.stdout).unwrap(), text);
+    assert_catalogued(&String::from_utf8(output.stderr).unwrap());
     // The same version with another fingerprint.
     project(
         dir.path(),
@@ -220,6 +221,7 @@ fn an_invalid_model_or_a_missing_section_exits_2() {
         "{stdout}"
     );
     assert!(stderr.contains("modules.content.model:locales"), "{stderr}");
+    assert_catalogued(&stderr);
     std::fs::write(
         dir.path().join("merezha.toml"),
         "[app]\nid = \"site\"\n[database]\nurl = { env = \"CONTENT_DIFF_DATABASE_URL\" }\n\
@@ -233,14 +235,21 @@ fn an_invalid_model_or_a_missing_section_exits_2() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("content_not_enabled")
-    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("content_not_enabled"));
+    assert_catalogued(&stderr);
     let output = Command::new(env!("CARGO_BIN_EXE_merezha"))
         .args(["content", "check"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
+    assert_catalogued(&String::from_utf8(output.stderr).unwrap());
+}
+
+/// Every JSON line a `merezha` process wrote to stderr is a catalog event at
+/// a catalog level (TE §8).
+fn assert_catalogued(stderr: &str) {
+    if let Err(problems) = merezha_telemetry::testing::check_stderr_catalogued(stderr) {
+        panic!("event catalog: {problems}");
+    }
 }

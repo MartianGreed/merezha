@@ -126,7 +126,11 @@ impl Host {
         fs::read_to_string(&self.log).unwrap()
     }
     fn events(&self) -> Vec<Value> {
-        self.stderr()
+        let stderr = self.stderr();
+        if let Err(problems) = merezha_telemetry::testing::check_stderr_catalogued(&stderr) {
+            panic!("event catalog: {problems}");
+        }
+        stderr
             .lines()
             .map(|l| serde_json::from_str(l).expect("every stderr line is JSON"))
             .collect()
@@ -150,9 +154,16 @@ impl Host {
     }
 }
 impl Drop for Host {
+    /// Kill the host, then check its stderr against the event catalog.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if !std::thread::panicking()
+            && let Ok(text) = fs::read_to_string(&self.log)
+            && let Err(problems) = merezha_telemetry::testing::check_stderr_catalogued(&text)
+        {
+            panic!("event catalog: {problems}");
+        }
     }
 }
 

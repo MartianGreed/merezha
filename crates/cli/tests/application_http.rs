@@ -219,6 +219,15 @@ fn invalid_application_configuration_fails_before_listener_start() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("invalid_config"));
     assert!(!stderr.contains("listener.ready"));
+    assert_catalogued(&stderr);
+}
+
+/// Every JSON line a `merezha` process wrote to stderr is a catalog event at
+/// a catalog level (TE §8).
+fn assert_catalogued(stderr: &str) {
+    if let Err(problems) = merezha_telemetry::testing::check_stderr_catalogued(stderr) {
+        panic!("event catalog: {problems}");
+    }
 }
 
 /// Allows application messages and decides permissions from the principal's

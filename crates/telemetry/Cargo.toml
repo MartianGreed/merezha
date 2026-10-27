@@ -47,5 +47,6 @@ merezha-telemetry = { path = ".", features = ["testing", "http"] }
 axum.workspace = true
 libc.workspace = true
 reqwest.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time"] }
 opentelemetry-semantic-conventions = { workspace = true, features = ["semconv_experimental"] }
