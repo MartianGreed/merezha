@@ -10,6 +10,7 @@
 use super::{
     PostgresStore,
     reactor::{self, Due, ReactorOutcome},
+    retention::RETENTION_INTERVAL,
     runner::{self, Bounds, CatchUp, Lane, Outcome, Until},
 };
 use crate::{
@@ -113,6 +114,8 @@ impl Scheduler {
         if !store.shared().reactors.is_empty() {
             tasks.push(handle.spawn(reactor_interval(context.clone()).with_current_subscriber()));
         }
+        // Rows of reactors removed from the configuration age out too.
+        tasks.push(handle.spawn(reactor_retention(context.clone()).with_current_subscriber()));
         if options.catch_up == CatchUp::Auto && !options.hooks().skip_listen {
             store.shared().listener.store(2, Ordering::SeqCst);
             tasks.push(handle.spawn(listen(context).with_current_subscriber()));
@@ -509,6 +512,33 @@ async fn reactor_interval(context: Arc<Context>) {
             return;
         }
         shared.wake_reactors();
+    }
+}
+/// Reactor retention (`[application.reactors] retention`): a pass at start
+/// and every [`RETENTION_INTERVAL`]. A failure is logged once per streak
+/// (`reactor.retention_failed`); the next pass tries again.
+async fn reactor_retention(context: Arc<Context>) {
+    let mut failing = false;
+    loop {
+        if stopped(&context) {
+            return;
+        }
+        match context.store.purge_reactor_records().await {
+            Ok(_) => failing = false,
+            Err(failure) => {
+                if !failing {
+                    merezha_telemetry::event!(
+                        WARN,
+                        "reactor.retention_failed",
+                        code = failure.code.as_str()
+                    );
+                }
+                failing = true;
+            }
+        }
+        if !sleep_until(&context, Instant::now() + RETENTION_INTERVAL).await {
+            return;
+        }
     }
 }
 /// Wait for `notify` until `at`; `false` on stop.

@@ -1310,3 +1310,45 @@ fn otlp_export_is_opt_in_through_an_endpoint() {
         .is_empty()
     );
 }
+
+/// Issue #69: `[application.reactors] retention` keeps rejections and
+/// skips 30 days by default, takes string durations from 1 h to 3650 d,
+/// and is overridable from the environment.
+#[test]
+fn reactor_retention_defaults_to_thirty_days_within_its_range() {
+    let day = Duration::from_secs(86_400);
+    let config = load("[application]\npath = \"a.toml\"\n", &[], &[]).unwrap();
+    assert_eq!(config.application.unwrap().reactors.retention, day * 30);
+    let config = load(
+        "[application]\npath = \"a.toml\"\n[application.reactors]\nretention = \"90d\"\n",
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(config.application.unwrap().reactors.retention, day * 90);
+    let config = load(
+        "[application]\npath = \"a.toml\"\n",
+        &[("MEREZHA_APPLICATION__REACTORS__RETENTION", "2h")],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        config.application.unwrap().reactors.retention,
+        Duration::from_secs(7_200)
+    );
+    for out in ["30m", "3651d"] {
+        let errors = load(
+            &format!(
+                "[application]\npath = \"a.toml\"\n[application.reactors]\nretention = \"{out}\"\n"
+            ),
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(
+            codes(&errors),
+            vec![("application.reactors.retention".into(), "out_of_range")],
+            "{out}"
+        );
+    }
+}

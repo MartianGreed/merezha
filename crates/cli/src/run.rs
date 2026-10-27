@@ -528,6 +528,7 @@ async fn start(
                                 section.reactors.retry_base,
                                 section.reactors.retry_max,
                             ),
+                            reactor_retention: section.reactors.retention,
                             ..BackgroundOptions::default()
                         },
                         // The module binds its notifier, outbox and

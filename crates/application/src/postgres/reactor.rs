@@ -16,14 +16,16 @@
 //!    reply is the reactor's failure, a well-formed effect that fails
 //!    validation is rejected and recorded;
 //! 3. run the port's pure [`Effects::check`] on each notify effect and ask
-//!    [`Effects::is_member`] for the tenant membership of its user
-//!    recipients;
+//!    [`Effects::members`] for the tenant membership of its user
+//!    recipients, one call per tenant and at most
+//!    [`MAX_MEMBERS_PER_CALL`] users;
 //! 4. one transaction on the run's detached session: lock the row (CAS on
 //!    `row_revision` and the checkpoint, not paused), [`Effects::write`]
-//!    each accepted effect, record the rejections, advance.
+//!    each accepted effect, record the rejections, advance;
+//! 5. once it committed, [`Effects::committed`] with the effects written.
 use super::{
     PostgresStore, invalid, read_error,
-    runner::{Bounds, LINGER, pause_in},
+    runner::{Bounds, DEADLINE_SLACK, LINGER, pause_in},
     signed, sql, unsigned,
 };
 use crate::{
@@ -48,9 +50,15 @@ use std::{
 };
 use tokio::sync::Notify;
 
-/// After this many consecutive transient guest failures of a batch of
-/// several events, the batch is retried one event at a time.
+/// After this many consecutive transient failures of the guest itself
+/// (`guest_failures`) on a batch of several events, the batch is retried
+/// one event at a time. Host failures (the runtime's `overloaded`, a
+/// timeout at the run's own deadline, storage, the Directory, the
+/// notifier) never count.
 pub const ISOLATE_AFTER: u32 = 3;
+/// Most users in one [`Effects::members`] call: the Directory's own bound
+/// (`MAX_USERS_PER_CALL`).
+pub const MAX_MEMBERS_PER_CALL: usize = 100;
 /// The queue command effects run on (`[jobs.queues.application]`).
 pub const COMMAND_QUEUE: &str = "application";
 /// The job kind of a command effect, handled by the host's
@@ -92,7 +100,7 @@ pub enum EffectBody {
         data: Map<String, Value>,
         delay_ms: Option<u64>,
         /// The `user` recipients confirmed members of the event's tenant
-        /// through [`Effects::is_member`]; empty without a tenant.
+        /// through [`Effects::members`]; empty without a tenant.
         members: Vec<Identity>,
     },
     /// `Notifier::emit_webhook`: the event's tenant endpoints, or the
@@ -153,30 +161,41 @@ impl CommandJob {
 /// platform implements it over `Notifier`, `Outbox` and `Directory`, bound
 /// to the source `application`.
 ///
-/// Contract: [`Effects::check`] is pure. [`Effects::is_member`] runs on its
+/// Contract: [`Effects::check`] is pure. [`Effects::members`] runs on its
 /// own pooled connection and is only called before the checkpoint
 /// transaction opens. [`Effects::write`] writes inside the caller's
 /// transaction and never commits it; it fails *permanent* only for an
 /// effect it refused before writing anything (the effect is then recorded
 /// as rejected and the batch goes on), and with any other classification
 /// when the write failed (the transaction rolls back and the batch
-/// retries).
+/// retries). [`Effects::committed`] follows only a committed transaction.
 pub trait Effects: Send + Sync {
     /// The notifications block's pure `validate` for a notify effect; `Ok`
     /// for other effects. A failure rejects the effect with its code.
     fn check(&self, request: &EffectRequest) -> Result<(), Failure>;
-    /// `Directory::is_member(user, tenant)`.
-    fn is_member<'a>(
+    /// The Directory's set query: which of `users` (1 to
+    /// [`MAX_MEMBERS_PER_CALL`], distinct) are members of `tenant`, as
+    /// `Directory::is_member` counts them. Users it does not return are
+    /// not members.
+    fn members<'a>(
         &'a self,
-        user: &'a Identity,
         tenant: &'a Identity,
-    ) -> BoxFuture<'a, Result<bool, Failure>>;
+        users: &'a [Identity],
+    ) -> BoxFuture<'a, Result<Vec<Identity>, Failure>>;
     /// The effect's write inside the checkpoint transaction.
     fn write<'a>(
         &'a self,
         tx: &'a mut Tx<'_>,
         request: &'a EffectRequest,
     ) -> BoxFuture<'a, Result<(), Failure>>;
+    /// After the checkpoint transaction that wrote `written` committed:
+    /// what the port reports only once its writes are durable (the
+    /// capture fallback logs its redacted record here, so a batch rolled
+    /// back and run again logs once). Never called for a batch that rolled
+    /// back; nothing by default.
+    fn committed(&self, written: &[EffectRequest]) {
+        let _ = written;
+    }
 }
 
 /// Per configured reactor, shared by the scheduler, the runs and the
@@ -232,6 +251,8 @@ struct Row {
     failures: u32,
     /// Milliseconds until `retry_at`; 0 when due.
     retry_ms: u64,
+    /// Consecutive transient failures of the guest itself (isolation).
+    guest_failures: u32,
 }
 /// One rejected effect, recorded in `reactor_rejections`.
 #[derive(Clone, Debug, PartialEq)]
@@ -370,6 +391,7 @@ impl Session<'_> {
             status: row.get(2),
             failures: u32::try_from(row.get::<_, i32>(4)).map_err(|_| invalid())?,
             retry_ms: unsigned(row.get(5))?,
+            guest_failures: u32::try_from(row.get::<_, i32>(6)).map_err(|_| invalid())?,
         })
     }
     fn head(&self) -> Result<u64, Failure> {
@@ -406,9 +428,9 @@ impl Session<'_> {
     }
     /// The checkpoint transaction (AP §C.5): lock the row and compare it,
     /// write each accepted effect, record the rejections (with those the
-    /// port refused) and `skip`, and advance to `end`. Returns the types
-    /// of the effects written and the rejections the port added. `reactor_conflict` when the row moved
-    /// or was paused; nothing is written then.
+    /// port refused) and `skip`, and advance to `end`. Returns the effects
+    /// written and the rejections the port added. `reactor_conflict` when
+    /// the row moved or was paused; nothing is written then.
     fn commit(
         &mut self,
         expected: &Row,
@@ -416,7 +438,7 @@ impl Session<'_> {
         plan: Plan,
         skip: Option<(u64, String)>,
         effects: Arc<dyn Effects>,
-    ) -> Result<(Vec<&'static str>, Vec<Rejection>), Failure> {
+    ) -> Result<(Vec<EffectRequest>, Vec<Rejection>), Failure> {
         let name = self.name.clone();
         let (start, revision) = (signed(expected.checkpoint)?, expected.row_revision);
         let end = signed(end)?;
@@ -446,9 +468,9 @@ impl Session<'_> {
                         } = plan;
                         let before = rejected.len();
                         let mut written = Vec::with_capacity(accepted.len());
-                        for request in &accepted {
-                            match effects.write(tx, request).await {
-                                Ok(()) => written.push(request.body.kind()),
+                        for request in accepted {
+                            match effects.write(tx, &request).await {
+                                Ok(()) => written.push(request),
                                 Err(failure)
                                     if failure.classification == Classification::Permanent =>
                                 {
@@ -521,7 +543,9 @@ impl Session<'_> {
         checkpoint: u64,
         delay: Duration,
         halt: Option<u64>,
+        guest: GuestOutcome,
     ) -> Result<(), Failure> {
+        let guest = guest.parameter();
         let class = classification(failure.classification);
         let delay = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
         let halt = halt.map(signed).transpose()?;
@@ -539,6 +563,7 @@ impl Session<'_> {
                         &delay,
                         &halt,
                         &checkpoint,
+                        &guest,
                     ],
                 )
                 .await
@@ -795,31 +820,42 @@ fn plan(
 }
 
 /// The batch's tenant memberships (AP §C.5 step 4), before any
-/// transaction: each `(user, tenant)` pair of a notify effect on a tenant
-/// event is asked once, and the confirmed users fill `members`. A
-/// Directory failure fails the batch (transient).
+/// transaction: the user recipients of the notify effects on tenant events,
+/// deduplicated per tenant, are asked in one [`Effects::members`] call per
+/// tenant and [`MAX_MEMBERS_PER_CALL`] users, so a batch of 64 effects of
+/// 100 recipients each takes at most 64 calls rather than 6,400. The
+/// confirmed users fill `members`. A Directory failure fails the batch
+/// (transient).
 fn memberships(
     store: &PostgresStore,
     bounds: &Bounds,
     effects: &dyn Effects,
     plan: &mut Plan,
 ) -> Result<(), Failure> {
-    let mut pairs = BTreeSet::new();
+    let mut asked: BTreeMap<Identity, BTreeSet<Identity>> = BTreeMap::new();
     for request in &plan.accepted {
         if let (EffectBody::Notify { recipients, .. }, Some(tenant)) =
             (&request.body, &request.tenant)
         {
             for recipient in recipients {
                 if let Recipient::User { id } = recipient {
-                    pairs.insert((id.clone(), tenant.clone()));
+                    asked.entry(tenant.clone()).or_default().insert(id.clone());
                 }
             }
         }
     }
-    let mut confirmed = BTreeMap::new();
-    for (user, tenant) in pairs {
-        let member = store.step(bounds, effects.is_member(&user, &tenant))?;
-        confirmed.insert((user, tenant), member);
+    let mut confirmed = BTreeSet::new();
+    for (tenant, users) in asked {
+        let users: Vec<Identity> = users.into_iter().collect();
+        for chunk in users.chunks(MAX_MEMBERS_PER_CALL) {
+            let members = store.step(bounds, effects.members(&tenant, chunk))?;
+            // Only the users asked about count, whatever the port answers.
+            for member in members {
+                if chunk.contains(&member) {
+                    confirmed.insert((member, tenant.clone()));
+                }
+            }
+        }
     }
     for request in &mut plan.accepted {
         if let (
@@ -833,10 +869,7 @@ fn memberships(
         {
             for recipient in recipients.iter() {
                 if let Recipient::User { id } = recipient
-                    && confirmed
-                        .get(&(id.clone(), tenant.clone()))
-                        .copied()
-                        .unwrap_or(false)
+                    && confirmed.contains(&(id.clone(), tenant.clone()))
                     && !members.contains(id)
                 {
                     members.push(id.clone());
@@ -849,17 +882,75 @@ fn memberships(
 
 /// How a batch failed.
 enum Failed {
-    /// The guest's own transient failure (`timeout`, `overloaded`, a
-    /// transient trap): retried with backoff like [`Failed::Transient`],
-    /// and after [`ISOLATE_AFTER`] consecutive ones on several events, one
-    /// event at a time.
+    /// The guest's own transient failure ([`guest_caused`]): retried with
+    /// backoff like [`Failed::Transient`], and after [`ISOLATE_AFTER`]
+    /// consecutive ones on several events, one event at a time.
     GuestTransient(RunFailure),
-    /// Retry the same range later, with backoff (`timeout`, `overloaded`,
-    /// storage, the Directory, `unavailable`).
-    Transient(RunFailure),
+    /// Retry the same range later, with backoff: the host's failure (the
+    /// runtime's `overloaded` or `internal`, a timeout at the run's own
+    /// deadline, storage, the Directory, `unavailable`), with what the
+    /// batch said about the guest.
+    Transient {
+        run: RunFailure,
+        guest: GuestOutcome,
+    },
     /// The guest failed permanently (`malformed = false`) or broke the
     /// reply contract (`malformed = true`).
     Guest { run: RunFailure, malformed: bool },
+}
+impl Failed {
+    /// A host failure after the guest answered.
+    fn answered(failure: Failure) -> Self {
+        Self::Transient {
+            run: failure.into(),
+            guest: GuestOutcome::Answered,
+        }
+    }
+    /// A host failure without a guest outcome.
+    fn unknown(failure: Failure) -> Self {
+        Self::Transient {
+            run: failure.into(),
+            guest: GuestOutcome::Unknown,
+        }
+    }
+}
+/// What a failed batch says about the guest, for the consecutive count of
+/// its own transient failures (`guest_failures`, issue #69).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuestOutcome {
+    /// The guest's own transient failure: counted.
+    Failed,
+    /// The guest answered (a reply, or a permanent failure), then
+    /// something else failed: the count starts again.
+    Answered,
+    /// The host failed before the guest could answer (the runtime's
+    /// `overloaded`, a cut at the run's deadline): the count stays.
+    Unknown,
+}
+impl GuestOutcome {
+    /// `REACTOR_FAILURE`'s `$7`.
+    fn parameter(self) -> i32 {
+        match self {
+            Self::Failed => 1,
+            Self::Answered => 0,
+            Self::Unknown => -1,
+        }
+    }
+}
+/// Whether a transient failure out of the guest call is the guest's own:
+/// its own reply ([`RunFailure::from_guest`]), or its budget running out
+/// (`fuel_exhausted`, or a `timeout` that came before the run's own hard
+/// deadline `hard`, checked at `at`, when the call returned). The
+/// runtime's `overloaded` and `internal` and a timeout at the run's
+/// deadline are the host's and never count toward isolation: isolating
+/// under host overload would only add guest calls.
+fn guest_caused(run: &RunFailure, at: Instant, hard: Instant) -> bool {
+    run.from_guest
+        || match run.failure.code.as_str() {
+            "fuel_exhausted" => true,
+            "timeout" => at + DEADLINE_SLACK < hard,
+            _ => false,
+        }
 }
 
 /// One reactor run under its `r:` lock (AP §C.5): batches until the head,
@@ -963,13 +1054,7 @@ pub(crate) fn react(
                 Ok(_) => continue,
                 Err(failure) if failure.code == "reactor_conflict" => continue,
                 Err(failure) => {
-                    let wait = fail(
-                        &session,
-                        reactor,
-                        &row,
-                        Failed::Transient(failure.into()),
-                        options,
-                    )?;
+                    let wait = fail(&session, reactor, &row, Failed::unknown(failure), options)?;
                     return Ok(ReactorOutcome::Waiting(Some(wait)));
                 }
             }
@@ -998,7 +1083,9 @@ pub(crate) fn react(
                     .observe_reactor(reactor.name.as_str(), end, false);
                 lane.halted.store(false, Ordering::SeqCst);
             }
-            Err(Failed::Transient(failure)) if failure.failure.code == "reactor_conflict" => {
+            Err(Failed::Transient { run: failure, .. })
+                if failure.failure.code == "reactor_conflict" =>
+            {
                 run.finish_failed(&failure, false);
             }
             Err(Failed::Guest { run: failure, .. }) if read > 1 => {
@@ -1039,19 +1126,13 @@ pub(crate) fn react(
                     }
                     Err(conflict) if conflict.code == "reactor_conflict" => {}
                     Err(other) => {
-                        let wait = fail(
-                            &session,
-                            reactor,
-                            &row,
-                            Failed::Transient(other.into()),
-                            options,
-                        )?;
+                        let wait = fail(&session, reactor, &row, Failed::answered(other), options)?;
                         return Ok(ReactorOutcome::Waiting(Some(wait)));
                     }
                 }
             }
             Err(Failed::GuestTransient(failure))
-                if read > 1 && row.failures.saturating_add(1) >= ISOLATE_AFTER =>
+                if read > 1 && row.guest_failures.saturating_add(1) >= ISOLATE_AFTER =>
             {
                 // An event that keeps failing transiently must not stall
                 // the events before it: from now on one event at a time,
@@ -1080,7 +1161,7 @@ pub(crate) fn react(
             Err(failed) => {
                 let halting = matches!(failed, Failed::Guest { .. });
                 match &failed {
-                    Failed::Transient(f)
+                    Failed::Transient { run: f, .. }
                     | Failed::GuestTransient(f)
                     | Failed::Guest { run: f, .. } => run.finish_failed(f, halting),
                 }
@@ -1112,11 +1193,26 @@ fn fail(
     );
     let position = row.checkpoint + 1;
     match failed {
-        Failed::Transient(run) | Failed::GuestTransient(run) => {
-            session.record_failure(&run.failure, row.checkpoint, delay, None)?;
+        Failed::Transient { run, guest } => {
+            session.record_failure(&run.failure, row.checkpoint, delay, None, guest)?;
+        }
+        Failed::GuestTransient(run) => {
+            session.record_failure(
+                &run.failure,
+                row.checkpoint,
+                delay,
+                None,
+                GuestOutcome::Failed,
+            )?;
         }
         Failed::Guest { run, malformed } => {
-            session.record_failure(&run.failure, row.checkpoint, delay, Some(position))?;
+            session.record_failure(
+                &run.failure,
+                row.checkpoint,
+                delay,
+                Some(position),
+                GuestOutcome::Answered,
+            )?;
             if row.status != "halted" {
                 merezha_telemetry::event!(
                     ERROR,
@@ -1136,8 +1232,9 @@ fn fail(
     Ok(delay)
 }
 /// One batch with matching events: the guest call, both reply tiers, the
-/// memberships and the checkpoint transaction. Returns the types of the
-/// effects written and every rejection.
+/// memberships, the checkpoint transaction and, once it committed,
+/// [`Effects::committed`]. Returns the types of the effects written and
+/// every rejection.
 fn batch_of(
     app: &Application,
     session: &mut Session<'_>,
@@ -1152,10 +1249,7 @@ fn batch_of(
         .bounds
         .hard
         .min(Instant::now() + Duration::from_millis(limits.timeout_ms));
-    let guest = app
-        .guest()
-        .session()
-        .map_err(|failure| Failed::Transient(failure.into()))?;
+    let guest = app.guest().session().map_err(Failed::unknown)?;
     let events: Vec<StoredEvent> = kept.iter().map(|(event, _)| event.clone()).collect();
     let reply = app
         .call_guest(
@@ -1177,7 +1271,13 @@ fn batch_of(
                     ),
                     run,
                 },
-                _ => Failed::GuestTransient(run),
+                _ if guest_caused(&run, Instant::now(), session.bounds.hard) => {
+                    Failed::GuestTransient(run)
+                }
+                _ => Failed::Transient {
+                    run,
+                    guest: GuestOutcome::Unknown,
+                },
             }
         })?;
     let reactions =
@@ -1185,17 +1285,17 @@ fn batch_of(
             run: failure.into(),
             malformed: true,
         })?;
-    let mut plan = plan(reactor, effects.as_ref(), &kept, reactions)
-        .map_err(|f| Failed::Transient(f.into()))?;
+    let mut plan = plan(reactor, effects.as_ref(), &kept, reactions).map_err(Failed::answered)?;
     memberships(session.store, session.bounds, effects.as_ref(), &mut plan)
-        .map_err(|f| Failed::Transient(f.into()))?;
+        .map_err(Failed::answered)?;
     let mut rejected = plan.rejected.clone();
     let (written, added) = session
         .commit(row, end, plan, None, effects.clone())
-        .map_err(|f| Failed::Transient(f.into()))?;
+        .map_err(Failed::answered)?;
+    effects.committed(&written);
     rejected.extend(added);
     rejected.sort_by_key(|r| (r.position, r.index));
-    Ok((written, rejected))
+    Ok((written.iter().map(|r| r.body.kind()).collect(), rejected))
 }
 
 #[cfg(test)]
@@ -1216,5 +1316,32 @@ mod tests {
             }
         }
         assert_eq!(backoff(Duration::ZERO, Duration::ZERO, 3), Duration::ZERO);
+    }
+
+    /// Issue #69: only the guest's own transient failures count toward
+    /// isolation. A timeout counts only when it came before the run's own
+    /// deadline; the runtime's `overloaded` and `internal` never count.
+    #[test]
+    fn only_the_guests_own_transient_failures_are_guest_caused() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(5);
+        let run = |code: &str| RunFailure::from_guest_call(Failure::transient(code));
+        // The guest's own transient reply, whatever the deadline.
+        assert!(guest_caused(&run("rate_limited"), now, later));
+        assert!(guest_caused(&run("rate_limited"), later, later));
+        // Its budget: fuel, or a timeout well before the run's deadline.
+        assert!(guest_caused(&run("fuel_exhausted"), later, later));
+        assert!(guest_caused(&run("timeout"), now, later));
+        // A timeout at the run's own deadline is the run's cut.
+        assert!(!guest_caused(&run("timeout"), later, later));
+        assert!(!guest_caused(
+            &run("timeout"),
+            later - DEADLINE_SLACK / 2,
+            later
+        ));
+        // The host's: the runtime refused or failed the call.
+        for code in ["overloaded", "internal"] {
+            assert!(!guest_caused(&run(code), now, later), "{code}");
+        }
     }
 }

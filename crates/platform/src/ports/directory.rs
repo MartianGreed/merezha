@@ -76,7 +76,8 @@ impl<T> Page<T> {
 /// match tenant roles or application roles, `None` meaning everyone.
 /// Service accounts never appear. `is_member` counts memberships of the
 /// users `users` would return (active, verified) only, not
-/// application grants. Every call uses its own pooled connection, so callers
+/// application grants; `members_among` answers the same for a set of at
+/// most [`MAX_USERS_PER_CALL`] users (`too_many_ids`). Every call uses its own pooled connection, so callers
 /// resolve recipients and memberships before they open a transaction (R4);
 /// no port waits on a second connection while a caller transaction is open.
 pub trait Directory: Send + Sync {
@@ -97,6 +98,29 @@ pub trait Directory: Send + Sync {
         user: &'a UserId,
         tenant: &'a TenantId,
     ) -> BoxFuture<'a, Result<bool, Failure>>;
+    /// The users among `users` (at most [`MAX_USERS_PER_CALL`],
+    /// `too_many_ids`) that are members of `tenant`, as `is_member` counts
+    /// them, in no particular order; each id is returned as given. The
+    /// default asks `is_member` for each in turn; identity answers in one
+    /// query, so a caller checking many users waits on one round trip.
+    fn members_among<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        users: &'a [UserId],
+    ) -> BoxFuture<'a, Result<Vec<UserId>, Failure>> {
+        Box::pin(async move {
+            if users.len() > MAX_USERS_PER_CALL {
+                return Err(Failure::permanent("too_many_ids"));
+            }
+            let mut members = Vec::new();
+            for user in users {
+                if self.is_member(user, tenant).await? && !members.contains(user) {
+                    members.push(user.clone());
+                }
+            }
+            Ok(members)
+        })
+    }
     /// `false` only for [`EmptyDirectory`]: nothing can resolve, so
     /// notifications record user, tenant and application recipients as
     /// skipped with `no_directory` rather than `unknown_user` (NT §3.2).
@@ -140,6 +164,18 @@ impl Directory for EmptyDirectory {
         _: &'a TenantId,
     ) -> BoxFuture<'a, Result<bool, Failure>> {
         Box::pin(async { Ok(false) })
+    }
+    fn members_among<'a>(
+        &'a self,
+        _: &'a TenantId,
+        users: &'a [UserId],
+    ) -> BoxFuture<'a, Result<Vec<UserId>, Failure>> {
+        let result = if users.len() > MAX_USERS_PER_CALL {
+            Err(Failure::permanent("too_many_ids"))
+        } else {
+            Ok(Vec::new())
+        };
+        Box::pin(async move { result })
     }
     fn resolves(&self) -> bool {
         false

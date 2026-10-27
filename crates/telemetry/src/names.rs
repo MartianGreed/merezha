@@ -1172,8 +1172,9 @@ pub const EVENTS: &[Event] = &[
             CODE,
         ],
     ),
-    // A batch of several events failed transiently `ISOLATE_AFTER` times in
-    // a row: the reactor retries it one event at a time (AP-C3).
+    // The guest failed transiently `ISOLATE_AFTER` times in a row on a
+    // batch of several events: the reactor retries it one event at a time
+    // (AP-C3; host failures never count, issue #69).
     ev(
         "reactor.isolating",
         WARN,
@@ -1184,6 +1185,9 @@ pub const EVENTS: &[Event] = &[
             CODE,
         ],
     ),
+    // A reactor retention pass failed; logged once per failure streak, the
+    // next hourly pass tries again (issue #69).
+    ev("reactor.retention_failed", WARN, &[CODE]),
     // Jobs and outbox.
     ev("job.leased", DEBUG, &[JOB_ID, QUEUE, KIND, ATTEMPT]),
     ev("job.completed", DEBUG, &[JOB_ID, QUEUE, KIND, ATTEMPT]),

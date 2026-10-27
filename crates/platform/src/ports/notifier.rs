@@ -375,6 +375,12 @@ pub trait Notifier: Send + Sync {
         tx: &'a mut Tx<'_>,
         event: WebhookEvent,
     ) -> BoxFuture<'a, Result<WebhookEventHandle, NotifyError>>;
+    /// The capture fallback itself, for callers that record what it
+    /// captured only once their transaction committed (reactions); `None`
+    /// for a notifier that writes in the transaction.
+    fn as_capture(&self) -> Option<&CaptureNotifier> {
+        None
+    }
 }
 
 /// The only sources whose tenant requests may name users outside
@@ -466,11 +472,17 @@ pub struct CaptureNotifier {
     captured: Arc<Mutex<VecDeque<CapturedNotification>>>,
 }
 impl CaptureNotifier {
+    /// What `request` checks, keeping and logging nothing: validate, then
+    /// the membership rule. A caller that captures after its commit
+    /// refuses with this inside its transaction.
+    pub fn check(&self, request: &NotificationRequest) -> Result<(), NotifyError> {
+        self.validate(request)?;
+        check_members(&self.source, request)
+    }
     /// What `request` does, without the transaction it never writes to:
     /// validate, apply the membership rule, keep the redacted record.
     pub fn capture(&self, request: NotificationRequest) -> Result<NotificationHandle, NotifyError> {
-        self.validate(&request)?;
-        check_members(&self.source, &request)?;
+        self.check(&request)?;
         self.keep(CapturedNotification {
             source: self.source.clone(),
             kind: "notification",
@@ -483,6 +495,22 @@ impl CaptureNotifier {
             notification_id: random_id(),
             duplicate: false,
         })
+    }
+    /// What `emit_webhook` does, without the transaction: keep the
+    /// redacted record of `event`.
+    pub fn capture_webhook(&self, event: &WebhookEvent) -> WebhookEventHandle {
+        self.keep(CapturedNotification {
+            source: self.source.clone(),
+            kind: "webhook",
+            name: event.event_type.clone(),
+            recipient_kinds: Vec::new(),
+            dedupe_key: event.source_event_id.as_str().to_owned(),
+            had_secret_data: false,
+        });
+        WebhookEventHandle {
+            webhook_event_id: random_id(),
+            duplicate: false,
+        }
     }
     fn keep(&self, record: CapturedNotification) {
         merezha_telemetry::event!(
@@ -555,19 +583,10 @@ impl Notifier for CaptureNotifier {
         _: &'a mut Tx<'_>,
         event: WebhookEvent,
     ) -> BoxFuture<'a, Result<WebhookEventHandle, NotifyError>> {
-        self.keep(CapturedNotification {
-            source: self.source.clone(),
-            kind: "webhook",
-            name: event.event_type,
-            recipient_kinds: Vec::new(),
-            dedupe_key: event.source_event_id.as_str().to_owned(),
-            had_secret_data: false,
-        });
-        Box::pin(async {
-            Ok(WebhookEventHandle {
-                webhook_event_id: random_id(),
-                duplicate: false,
-            })
-        })
+        let handle = self.capture_webhook(&event);
+        Box::pin(async move { Ok(handle) })
+    }
+    fn as_capture(&self) -> Option<&CaptureNotifier> {
+        Some(self)
     }
 }

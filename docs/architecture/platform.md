@@ -437,6 +437,7 @@ apply to a PostgreSQL application ([application storage](#application-storage),
 | `[application.reactors]` | `interval_ms` | duration | `5000` | 100 ms to 10 min; the reactors' wake that covers lost notifications |
 | | `retry_base_ms` | duration | `1000` | 100 ms to 10 min; at most `retry_max_ms` (`retry_base_exceeds_max`); the first retry of a failed reactor batch waits half of it to all of it (equal jitter), doubling per consecutive failure |
 | | `retry_max_ms` | duration | `300000` | 1 s to 1 day; the ceiling of that backoff, also for a halted reactor's retries |
+| | `retention` | string duration | `"30d"` | 1 h to 3650 d; `merezha_app.reactor_rejections` and `reactor_skips` rows older than this are deleted by an hourly pass (one at start), oldest first, 1,000 rows per transaction, at most 100,000 per table and pass, one instance at a time (`pg_try_advisory_xact_lock(1297760594, hashtext('retention'))`) |
 | `[application.background]` | `max_concurrent` | integer | `2` | 1 to 16, shared by projection, rebuild and reactor runs; at most `database.max_detached - 1`. It also caps the explicit catch-ups holding their own lock session. The runtime manifest's `max_concurrent_invocations` must be at least `limits.max_concurrent` plus this (`invalid_concurrency_budget` at startup), and `/v1/reload` refuses a manifest below it (`invalid_manifest`, the old generation keeps serving) |
 | `[application.append]` | `lock_timeout_max_ms` | duration | `5000` | 10 ms to 30 s; the append waits for the head lock at most `min(remaining deadline - 50 ms, lock_timeout_max_ms)`, then fails `503 storage_busy` |
 
@@ -1067,8 +1068,8 @@ pass what they learned in (`NotificationRequest::members`).
 | `Authorizer` | extends the application `Authorizer` with `check(Option<&Principal>, permission, scope) -> Result<Allowed, AccessDenied>`; synchronous and I/O-free. Without a principal it denies `Unauthenticated` (401), otherwise `unauthorized` (403). Identity's `RbacAuthorizer` evaluates the principal's snapshot | `LoopbackAllowAll` on a private listener (constructible only for loopback addresses), `DenyAll` otherwise (401 anonymous, 403 with a principal) |
 | `Outbox` | `append(tx, source, &[OutboxRecord], OnDuplicate) -> Appended` (AP §B.3); records carry a `DedupeKey` (at most 160 bytes, R4a; `DedupeKey::api(subject, key)` namespaces HTTP keys), an `OutboxTarget` (`Event { topic }` or `Job { queue, kind }`), a JSON payload of at most 64 KiB, `contains_secret`, `run_at`, `priority` and a `MessageContext`; at most 256 records per call. `OutboxRecord::event(source, topic, NewEvent)` (or `SourceOutbox::event`) builds an event record whose payload is the `IntegrationEvent` envelope (R11). `JobFailure` carries the code, classification and `retry_after` job handlers report | `UnavailableOutbox`: fails `outbox_unavailable`, so the caller's transaction rolls back. `merezha_jobs::PgOutbox` is the PostgreSQL implementation |
 | `Jobs` | through `JobsHandle`: `enqueue(NewJob) -> Enqueued` in its own transaction, idempotent on the queue and `{source}:{key}`; `cancel(id)`; `register(kind, queue, Arc<dyn JobHandler>, KindOptions)` and `subscribe(topic, kind)` before the jobs runtime starts; `queue_status() -> QueueStatus` (per queue `ready`, `delayed`, `leased`, `dead`, `oldest_ready_age_s` and slots, plus the outbox backlog and up to 100 quarantined records), the read behind `GET /v1/jobs/admin/queues` and `outbox` and TE's status and gauges (R10). `JobHandler`, `JobContext`, `KindOptions` and `Reissue` are AP §B.3's; `NewJob` hides its payload from `Debug` | `UnavailableJobs`: every call fails `jobs_unavailable` |
-| `Notifier` | `validate(&request)` (pure), `request(tx, NotificationRequest)` and `emit_webhook(tx, WebhookEvent)` (NT §3.1); a webhook's `source_event_id` is an `EventId` of up to 225 bytes, room for `{source}:{dedupe_key}`. Requests carry topic, 1 to 100 recipients (`User`, `Tenant`, `Application { roles }`, `Address`), channels, template, `data`, `secret_data`, locale, dedupe key, tenant, `members`, `not_before`, `expires_at`, collapse key and correlation. With a tenant every user recipient must be in `members` (`recipient_not_in_tenant`) for every source but `identity` (`MEMBERSHIP_EXEMPT_SOURCES`; the rule fails closed). `Debug` never shows data, secret data or addresses. `NotifierFactory::bind(source)` hands out bound notifiers | `CaptureNotifications`: validates structurally, logs a redacted `notification.captured` warning, keeps the last 64 redacted records (never `data`, `secret_data` or addresses) and delivers nothing. With `[modules.notifications]` the block's `BlockNotifiers` replaces it (`Module::notifier`) |
-| `Directory` | `users(ids)` (at most 100) to verified `Contact`s, `tenant_members(tenant, roles?, PageRequest)` and `application_members(roles?, PageRequest)` (pages of at most 500, keyset by user id), `is_member(user, tenant)` (R7). Installed through `HostOptions::directory`; identity's implements it. `resolves()` is `true` except for the fallback, so notifications can tell "no such user" from "no directory" | `EmptyDirectory`: resolves nothing; nobody is a member; `resolves()` is `false` |
+| `Notifier` | `validate(&request)` (pure), `request(tx, NotificationRequest)` and `emit_webhook(tx, WebhookEvent)` (NT §3.1); a webhook's `source_event_id` is an `EventId` of up to 225 bytes, room for `{source}:{dedupe_key}`. Requests carry topic, 1 to 100 recipients (`User`, `Tenant`, `Application { roles }`, `Address`), channels, template, `data`, `secret_data`, locale, dedupe key, tenant, `members`, `not_before`, `expires_at`, collapse key and correlation. With a tenant every user recipient must be in `members` (`recipient_not_in_tenant`) for every source but `identity` (`MEMBERSHIP_EXEMPT_SOURCES`; the rule fails closed). `Debug` never shows data, secret data or addresses. `NotifierFactory::bind(source)` hands out bound notifiers | `CaptureNotifications`: validates structurally, logs a redacted `notification.captured` warning, keeps the last 64 redacted records (never `data`, `secret_data` or addresses) and delivers nothing. `Notifier::as_capture` hands its `CaptureNotifier` to callers that keep the record after their commit (`check` inside the transaction, `capture` and `capture_webhook` after it). With `[modules.notifications]` the block's `BlockNotifiers` replaces it (`Module::notifier`) |
+| `Directory` | `users(ids)` (at most 100) to verified `Contact`s, `tenant_members(tenant, roles?, PageRequest)` and `application_members(roles?, PageRequest)` (pages of at most 500, keyset by user id), `is_member(user, tenant)` and `members_among(tenant, users)` (at most 100 users, the members among them in one call; the provided default asks `is_member` in turn) (R7). Installed through `HostOptions::directory`; identity's implements it. `resolves()` is `true` except for the fallback, so notifications can tell "no such user" from "no directory" | `EmptyDirectory`: resolves nothing; nobody is a member; `resolves()` is `false` |
 | `BlobStore` | `put(key, BlobBody, attrs) -> BlobStat` streaming, `get(key, range?) -> BlobRead` streaming, `head`, idempotent `delete`, `signed_get_url(key, ttl) -> Option<String>` (CT §6); `BlobKey` is 1 to 1024 bytes of `[A-Za-z0-9._-]` segments; `BlobError` maps to classified failures | `UnavailableBlobStore`: fails permanent `blob_store_unavailable`. `merezha_blob::ObjectBlobStore` is the local and S3 implementation |
 
 ## Identity block
@@ -2622,7 +2623,7 @@ max_concurrent` runs at once ([design](../design/application-platform.md)
 `merezha_app_events` notification (the application's own `LISTEN` session,
 reconnected with backoff from 100 ms to 10 s, logging `db.listener_lost` and
 `db.listener_restored`; a reconnect wakes every live lane) and every
-`interval_ms`. A run holds the session advisory lock `pg_try_advisory_lock(1297760592,
+`interval_ms`. A run holds the session advisory lock `pg_try_advisory_lock(1297760594,
 hashtext('p:{name}:{revision}'))` (`b:` for a rebuild) on a connection
 detached from the pool and named `merezha p:{name}:{revision}` in
 `pg_stat_activity`, so one host runs a projection at a time; pooled sessions
@@ -2713,7 +2714,9 @@ interval_ms` and at its retry time; a run holds
 named `merezha r:{name}`, so one host runs a reactor at a time. Migration
 0003 adds `merezha_app.reactors` (checkpoint, row revision, `active`, `paused`
 or `halted`, failure bookkeeping, `retry_at`), `reactor_skips` and
-`reactor_rejections`. A new reactor's row starts at the head (or 0 with
+`reactor_rejections`; 0004 adds `reactors.guest_failures`, and 0005 and 0006
+(non-transactional, `CREATE INDEX CONCURRENTLY`) index the rejections and
+skips by age for retention. A new reactor's row starts at the head (or 0 with
 `start = "beginning"`); a reactor removed from configuration keeps its row.
 
 Each batch's checkpoint transaction runs on the run's session and writes,
@@ -2722,11 +2725,14 @@ in order: every accepted effect through the module's notifier
 `application`/`application.command` job record), bound to the source
 `application` and keyed `reaction:{reactor}:{event_id}:{index}`; the
 rejected effects; and the new checkpoint, compared with the row revision.
-Directory membership checks run before it opens. `application` recipients
+Directory membership checks run before it opens, one
+`Directory::members_among` set query per tenant and 100 users. `application` recipients
 are refused on tenant events (`invalid_recipient`): application roles span
 every tenant. Without the notifications
 block the capture fallback logs `notification.captured` and delivers
-nothing. When any reactor allows `command` effects, the module registers
+nothing; for reactions it checks each effect inside the transaction and
+keeps and logs the record once the transaction committed, so a batch rolled
+back and run again logs once. When any reactor allows `command` effects, the module registers
 the `application.command` handler on queue `application`
 (`[jobs.queues.application]`, defaults with a startup warning when absent):
 it runs the command as `sys_reactor_{name}` on the event's tenant with the
@@ -2738,9 +2744,12 @@ configured) dead-letter. Routes that declare neither `permission` nor
 
 Logs: `reactor.halted` (error, once per halt), `reactor.skipped` (info),
 `reactor.effect_rejected` (warn, with the effect type as `reason` and the
-code), `reactor.isolating` (warn: a batch of several events failed
-transiently three times in a row and is retried one event at a time from
-`position`). Metrics: `merezha.reactor.batch.duration` (`accepted`, `failed`,
+code), `reactor.isolating` (warn: the guest itself failed transiently three
+times in a row on a batch of several events, which is retried one event at a
+time from `position`; the runtime's `overloaded`, a timeout at the run's own
+deadline, storage, Directory and notifier failures never count),
+`reactor.retention_failed` (warn, `code`, once per failing streak of the
+hourly retention pass). Metrics: `merezha.reactor.batch.duration` (`accepted`, `failed`,
 `halted`), `merezha.reactor.effects` (`accepted`, `rejected` per effect
 type), `merezha.reactor.skipped`, `merezha.reactor.halted`,
 `merezha.reactor.lag.events`, `merezha.reactor.lag.age`,
@@ -4022,7 +4031,9 @@ itself.
   the `task-notifier` example is contract-tested natively and builds as a
   component, and the end-to-end example application (`merezha new`, stage 3)
   wires it with an `ArchiveTask` route.
-- `merezha_app.reactor_rejections` and `reactor_skips` have no retention yet;
-  `GET reactors` counts rejections up to 10,000. A reactor batch asks the
-  Directory one `(user, tenant)` pair after another, and the capture notifier
-  logs `notification.captured` before the checkpoint transaction commits.
+- `GET reactors` counts rejections up to 10,000; rows older than
+  `[application.reactors] retention` are deleted hourly.
+- Outside reactions, the capture notifier still logs `notification.captured`
+  when `request` is called, inside the caller's transaction (identity's
+  mails, for one); a rolled-back caller may log a record that never
+  committed.

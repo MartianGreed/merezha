@@ -101,12 +101,12 @@ impl Effects for Recording {
             _ => Ok(()),
         }
     }
-    fn is_member<'a>(
+    fn members<'a>(
         &'a self,
         _: &'a Identity,
-        _: &'a Identity,
-    ) -> merezha_postgres::BoxFuture<'a, Result<bool, Failure>> {
-        Box::pin(async { Ok(true) })
+        users: &'a [Identity],
+    ) -> merezha_postgres::BoxFuture<'a, Result<Vec<Identity>, Failure>> {
+        Box::pin(async move { Ok(users.to_vec()) })
     }
     fn write<'a>(
         &'a self,
@@ -823,6 +823,13 @@ fn the_store_runs_exactly_its_registered_statements_and_reports_the_append() {
     runtime
         .block_on(store.reactor_due("notifier", deadline()))
         .unwrap();
+    // Retention: the lock and both purges.
+    assert!(
+        !runtime
+            .block_on(store.purge_reactor_records())
+            .unwrap()
+            .skipped
+    );
     assert!(runtime.block_on(verify(&db, deadline())).unwrap().ok);
     // A missing position makes `verify` list the gap.
     runtime.block_on(async {

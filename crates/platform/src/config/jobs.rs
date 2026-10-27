@@ -51,6 +51,9 @@ pub struct ApplicationReactors {
     pub retry_base: Duration,
     /// 1 s to 1 day, default 5 min.
     pub retry_max: Duration,
+    /// How long `reactor_rejections` and `reactor_skips` rows are kept: a
+    /// string duration from 1 h to 3650 d, default 30 days.
+    pub retention: Duration,
 }
 /// `[application.background]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,10 +104,12 @@ pub(super) fn application_extensions(
             base_origin.unwrap_or(Origin::Default),
         );
     }
+    let retention = r.duration("retention", ms(30 * DAY), (ms(3_600_000), ms(3_650 * DAY)));
     let reactors = ApplicationReactors {
         interval,
         retry_base,
         retry_max,
+        retention,
     };
     r.finish();
     let (mut r, _) = reader(layers, "application.background", issues);

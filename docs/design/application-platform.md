@@ -1638,8 +1638,9 @@ Runner: the same scheduler, triggers, `r:` advisory lock and bounds as projectio
    call.
 3. Call the guest `react` outside SQL, check the reply (C.2) and run NT's pure
    `Notifier::validate` on each effect, so the transaction only writes.
-4. Before any transaction (R4), for each `notify` effect on a tenant event, call
-   `Directory::is_member(user, tenant)` for its `user` recipients (pairs deduplicated per batch) and
+4. Before any transaction (R4), for the `notify` effects on tenant events, call
+   `Directory::members_among(tenant, users)` for their `user` recipients (deduplicated per tenant,
+   at most 100 users per call; issue #69) and
    fill `NotificationRequest.members` with the confirmed users; `request` rejects a user left out
    with `recipient_not_in_tenant`. A Directory failure is transient (failure table).
 5. Run one transaction on the run's detached connection (A.7); no call in it reaches another port:
@@ -1821,6 +1822,7 @@ warm_readiness = true
 interval_ms = 5000
 retry_base_ms = 1000
 retry_max_ms = 300000
+retention = "30d"            # 1 h ..= 3650 d: reactor_rejections and reactor_skips
 
 [application.background]
 max_concurrent = 2           # 1 ..= 16, shared by projection, rebuild and reactor runs
@@ -2284,9 +2286,55 @@ presence and subject to the key scope. *Closed in C2 by the second option (below
     as `TaskCreated`), so `task-notifier` notifies the owner as §C.3 says,
     also when an admin completed the task. This replaces the earlier
     "notify the completer" deviation.
-  - Follow-ups, not changed: the capture notifier logs
-    `notification.captured` inside the checkpoint transaction, before it
-    commits; the batch's `is_member` calls run one after another.
+  - Follow-ups, not changed here, done in issue #69 (below): the capture
+    notifier logged `notification.captured` inside the checkpoint
+    transaction, before it committed; the batch's `is_member` calls ran one
+    after another.
+- Issue #69 (follow-ups of the #65 review):
+  - *Isolation counts only the guest.* The isolation threshold used
+    `failures`, which also counts Directory, storage and notifier failures,
+    and every transient code out of the guest call counted as the guest's,
+    including the runtime's own `overloaded` and a `timeout` at the run's
+    deadline: two Directory outages and one `overloaded` blip sent a
+    healthy four-event batch into one-at-a-time mode, adding guest calls
+    exactly when the host was short of capacity. Migration 0004 adds
+    `reactors.guest_failures`, the consecutive transient failures of the
+    guest itself: its own reply (`RunFailure::from_guest`),
+    `fuel_exhausted`, or a `timeout` before the run's hard deadline. A
+    batch whose guest answered and then failed elsewhere clears it; a host
+    failure before the guest answered leaves it; a commit or a skip clears
+    it. `ISOLATE_AFTER` compares `guest_failures`; `failures` still drives
+    the backoff. A column rather than an in-memory count: every retry is a
+    new run any instance may take, and restarts must not reset it.
+  - *Retention.* `[application.reactors] retention` (default `30d`, 1 h to
+    3650 d) bounds `reactor_rejections` and `reactor_skips`: the scheduler
+    runs a pass at start and hourly, 1,000 rows per transaction under
+    `pg_try_advisory_xact_lock(1297760594, hashtext('retention'))`, at most
+    100 batches per table and pass, oldest first through the age indexes of
+    migrations 0005 and 0006 (built concurrently). A failed pass logs
+    `reactor.retention_failed` once per streak (a TE catalog row). An
+    operator's skip ages out like the rest; the audit trail of admin
+    writes is `merezha_jobs.admin_actions`, not this table.
+  - *Memberships in sets.* `Effects::is_member` is replaced by
+    `Effects::members(tenant, users)`, at most `MAX_MEMBERS_PER_CALL`
+    (100) users, over the new `Directory::members_among` (one query in
+    identity; the provided default asks `is_member` in turn, for test
+    directories). A batch of 64 effects of 100 recipients makes at most 64
+    calls instead of 6,400, so a slow Directory no longer pushes it past
+    its deadline one pair at a time.
+  - *Capture after commit.* `Effects::committed(written)` follows a
+    committed checkpoint transaction. Without the notifications block,
+    `PlatformEffects` only checks each effect inside the transaction
+    (`CaptureNotifier::check`, through `Notifier::as_capture`) and keeps
+    and logs the redacted records in `committed`, so a rolled-back batch
+    run again logs once. A commit whose outcome is unknown and which did
+    commit is not run again (the rerun's CAS fails), so its capture record
+    can be missing; the capture fallback delivers nothing either way.
+  - *Mixed-version rollouts.* A `task-view` or `task-domain` build from
+    before the owner field rejects an owned `TaskCompleted` (schema
+    version 2) with `unsupported_schema_version`, as it does an owned
+    `TaskCreated`; see the task board's rollout note in
+    [services](../services/README.md#rolling-upgrades).
 - Not in this slice (NT-N8's other parts): the identity topics, content
   subscriptions, `max_per_target_per_hour`, the `webhook_disabled` alert,
   the operations guide and the end-to-end example application.

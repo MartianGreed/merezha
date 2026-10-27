@@ -355,12 +355,13 @@ pub const INSERT_REACTOR: Statement = Statement::new(
     ON CONFLICT (name) DO NOTHING",
 );
 /// A reactor's row, with the milliseconds until `retry_at` (0 when due or
-/// unset).
+/// unset) and the consecutive transient failures of the guest itself.
 pub const REACTOR: Statement = Statement::new(
     "app.reactors.read",
     "SELECT merezha_app.reactors",
     "SELECT checkpoint, row_revision, status, halted_position, failures, \
-        greatest(0, ceil(extract(epoch FROM coalesce(retry_at, now()) - now()) * 1000))::bigint \
+        greatest(0, ceil(extract(epoch FROM coalesce(retry_at, now()) - now()) * 1000))::bigint, \
+        guest_failures \
     FROM merezha_app.reactors WHERE name = $1",
 );
 /// Checkpoint transaction step 1 (AP §C.5): the row, locked, so the batch
@@ -395,17 +396,23 @@ pub const ADVANCE_REACTOR: Statement = Statement::new(
     "UPDATE merezha_app.reactors",
     "UPDATE merezha_app.reactors \
     SET checkpoint = $2, row_revision = row_revision + 1, status = 'active', halted_position = NULL, \
-        failures = 0, failure_code = NULL, failure_class = NULL, retry_at = NULL, updated_at = now() \
+        failures = 0, guest_failures = 0, failure_code = NULL, failure_class = NULL, retry_at = NULL, \
+        updated_at = now() \
     WHERE name = $1 RETURNING row_revision",
 );
 /// A failed batch (`$5` halts at that position when set): the checkpoint
 /// stays, `failures` grows and the next attempt waits `$4` ms. A paused
-/// reactor stays paused.
+/// reactor stays paused. `$7` is what the batch said about the guest:
+/// 1 (its own transient failure) counts `guest_failures`, 0 (the guest
+/// answered, something else failed) clears it, and -1 (no guest outcome:
+/// the host failed first) leaves it.
 pub const REACTOR_FAILURE: Statement = Statement::new(
     "app.reactors.record_failure",
     "UPDATE merezha_app.reactors",
     "UPDATE merezha_app.reactors \
     SET failure_code = $2, failure_class = $3, failures = failures + 1, \
+        guest_failures = CASE $7::integer WHEN 1 THEN guest_failures + 1 \
+            WHEN 0 THEN 0 ELSE guest_failures END, \
         retry_at = now() + $4::bigint * interval '1 millisecond', \
         status = CASE WHEN status = 'paused' THEN 'paused' WHEN $5::bigint IS NULL THEN status ELSE 'halted' END, \
         halted_position = CASE WHEN status = 'paused' THEN NULL WHEN $5::bigint IS NULL THEN halted_position ELSE $5 END, \
@@ -437,7 +444,8 @@ pub const SKIP_REACTOR: Statement = Statement::new(
     "UPDATE merezha_app.reactors \
     SET checkpoint = $2, row_revision = row_revision + 1, \
         status = CASE WHEN status = 'paused' THEN 'paused' ELSE 'active' END, halted_position = NULL, \
-        failures = 0, failure_code = NULL, failure_class = NULL, retry_at = NULL, updated_at = now() \
+        failures = 0, guest_failures = 0, failure_code = NULL, failure_class = NULL, retry_at = NULL, \
+        updated_at = now() \
     WHERE name = $1 AND $2 <= (SELECT position FROM merezha_app.head WHERE id = 1) \
     RETURNING checkpoint",
 );
@@ -468,6 +476,34 @@ pub const REJECTIONS: Statement = Statement::new(
     FROM merezha_app.reactor_rejections \
     WHERE name = $1 AND (position, index) > ($2, $3::smallint) \
     ORDER BY position, index LIMIT $4",
+);
+
+/// Reactor retention (`[application.reactors] retention`): one instance
+/// purges at a time, each batch's transaction under this lock. Its class
+/// is `'MZAR'` (1297760594), apart from the run locks' `'MZAP'`, which
+/// only run sessions hold.
+pub const RETENTION_LOCK: Statement = Statement::new(
+    "app.retention.lock",
+    "SELECT pg_try_advisory_xact_lock()",
+    "SELECT pg_try_advisory_xact_lock(1297760594, hashtext('retention'))",
+);
+/// Up to `$2` rejections recorded more than `$1` seconds ago, oldest first.
+pub const PURGE_REJECTIONS: Statement = Statement::new(
+    "app.reactor_rejections.purge",
+    "DELETE merezha_app.reactor_rejections",
+    "DELETE FROM merezha_app.reactor_rejections WHERE (name, position, index) IN ( \
+        SELECT name, position, index FROM merezha_app.reactor_rejections \
+         WHERE rejected_at < now() - make_interval(secs => $1::float8) \
+         ORDER BY rejected_at LIMIT $2 FOR UPDATE SKIP LOCKED)",
+);
+/// Up to `$2` skips recorded more than `$1` seconds ago, oldest first.
+pub const PURGE_SKIPS: Statement = Statement::new(
+    "app.reactor_skips.purge",
+    "DELETE merezha_app.reactor_skips",
+    "DELETE FROM merezha_app.reactor_skips WHERE (name, position) IN ( \
+        SELECT name, position FROM merezha_app.reactor_skips \
+         WHERE skipped_at < now() - make_interval(secs => $1::float8) \
+         ORDER BY skipped_at LIMIT $2 FOR UPDATE SKIP LOCKED)",
 );
 
 /// Every statement the store runs, the verification's included.
@@ -519,6 +555,9 @@ pub const STATEMENTS: &[Statement] = &[
     SKIP_REACTOR,
     REACTORS_OVERVIEW,
     REJECTIONS,
+    RETENTION_LOCK,
+    PURGE_REJECTIONS,
+    PURGE_SKIPS,
     ADMIN_SNAPSHOT,
     COMMIT_DELAY,
     super::verify::SNAPSHOT,

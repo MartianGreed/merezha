@@ -608,7 +608,9 @@ notifications block (`unknown_topic`, `recipient_not_in_tenant`, ...).
 
 A batch reads up to `batch_size` events after the reactor's checkpoint,
 calls the guest outside SQL with the events its filter keeps, asks the
-Directory which `user` recipients belong to the event's tenant, then writes
+Directory which `user` recipients belong to the event's tenant (one set
+query per tenant and 100 users, `Effects::members`, so a batch of 64 effects
+with 100 recipients each makes at most 64 Directory calls), then writes
 every accepted effect, its rejections and the new checkpoint in one
 transaction on the run's locked session. The host's
 `postgres::Effects` port writes them (the platform's `Notifier` and
@@ -627,7 +629,27 @@ lanes, under the advisory lock `r:{name}`, so one host at a time runs it.
 | Failure | What happens |
 | --- | --- |
 | Transient (guest `timeout` or `overloaded`, storage, the Directory, the notifier's `unavailable`) | the checkpoint stays; `failures + 1` and a retry after an equal-jitter backoff (`[application.reactors] retry_base_ms` to `retry_max_ms`) |
-| The guest's transient failure on a batch of several events, three times in a row | the same range again, one event at a time (`reactor.isolating`): the events before the failing one commit, and it becomes `checkpoint + 1`, which `skip` accepts |
+| The guest's own transient failure on a batch of several events, three times in a row | the same range again, one event at a time (`reactor.isolating`): the events before the failing one commit, and it becomes `checkpoint + 1`, which `skip` accepts |
+
+Only the guest's own transient failures count toward isolation, in the
+row's `guest_failures` (migration 0004): a transient code the guest
+answered itself, `fuel_exhausted`, or a `timeout` that came before the run's
+own deadline. The runtime's `overloaded` and `internal`, a timeout at the
+run's deadline, and storage, Directory and notifier failures never count,
+since isolating under host trouble only adds guest calls. A batch whose
+guest answered and then failed elsewhere (the Directory, the commit) starts
+the count again; a host failure before the guest answered leaves it. The
+count lives in the row, not in memory, because every retry is a new run that
+any instance may take and the count must survive a restart.
+
+`merezha_app.reactor_rejections` and `reactor_skips` rows older than
+`[application.reactors] retention` (default 30 days) are deleted by an
+hourly pass of the `Scheduler` (one at start), oldest first, in batches of
+1,000 rows and at most 100 batches per table and pass, each batch a
+transaction under `pg_try_advisory_xact_lock(1297760594,
+hashtext('retention'))` so one instance purges at a time
+(`PostgresStore::purge_reactor_records` runs one pass now). Migrations 0005
+and 0006 index both tables by age, built concurrently.
 | Permanent guest failure or malformed reply on a batch of several events | the same range again, one event at a time, isolating the poison event |
 | Malformed reply on one event, or a permanent failure with `on_error = "halt"` | `halted` at that position (`reactor.halted`); retried at its retry time, so a fixed guest resumes it; an operator can `retry` now or `skip` |
 | Permanent guest failure on one event with `on_error = "skip"` | a `reactor_skips` row (`on_error_skip`) and the checkpoint past it, in one transaction |
