@@ -1,0 +1,7 @@
+Hello{% if recipient.name %} {{ recipient.name }}{% endif %},
+
+The note "{{ title }}" was shared with you.{% if links.app %}
+
+Open it: {{ links.app }}/notes/{{ note_id }}{% endif %}{% if links.unsubscribe %}
+
+Unsubscribe: {{ links.unsubscribe }}{% endif %}

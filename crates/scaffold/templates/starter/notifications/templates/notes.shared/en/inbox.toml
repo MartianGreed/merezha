@@ -1,0 +1,3 @@
+title = "{{ title }} was shared with you"
+body = "Someone shared the note {{ title }} with you."
+link = "{% if links.app %}{{ links.app }}/notes/{{ note_id }}{% endif %}"

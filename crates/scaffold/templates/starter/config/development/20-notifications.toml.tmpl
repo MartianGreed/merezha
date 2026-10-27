@@ -1,0 +1,28 @@
+
+[modules.notifications]
+secret_key = { env = "MEREZHA_NOTIFY_SECRET_KEY" }
+public_base_url = "http://127.0.0.1:8080"
+egress = { allow_private_networks = true }   # local webhook receivers; refused with http.public
+
+[modules.notifications.templates]
+dir = "notifications/templates"
+default_locale = "en"
+locales = ["en"]
+app_name = "%%app_name%%"
+app_base_url = "http://localhost:5173"
+allow_http_links = true                # identity's http dev links; refused with http.public
+
+[modules.notifications.email]
+driver = "capture"                     # GET /v1/notifications/dev/captures; refused with http.public
+from = "%%app_name%% <no-reply@example.com>"
+
+# To try real mail in development, switch the driver to "brevo" and uncomment.
+# sandbox = true makes Brevo accept and drop every message (X-Sib-Sandbox: drop).
+# [modules.notifications.brevo]
+# api_key = { env = "BREVO_API_KEY" }
+# webhook_token = { env = "BREVO_WEBHOOK_TOKEN" }
+# sandbox = true
+
+[modules.notifications.sms]
+driver = "disabled"                    # no phone numbers on users in v1 (ID10)
+

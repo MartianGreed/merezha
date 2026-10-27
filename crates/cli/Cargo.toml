@@ -14,6 +14,7 @@ merezha-application = { path = "../application", features = ["postgres"] }
 merezha-domain = { path = "../domain" }
 merezha-guest-build = { path = "../guest-build" }
 merezha-runtime = { path = "../runtime" }
+merezha-scaffold = { path = "../scaffold" }
 merezha-platform = { path = "../platform" }
 merezha-jobs = { path = "../jobs" }
 merezha-notifications = { path = "../notifications" }
@@ -22,6 +23,7 @@ merezha-identity = { path = "../identity", features = ["passkeys"] }
 merezha-postgres = { path = "../postgres" }
 merezha-telemetry = { path = "../telemetry", features = ["pipeline"] }
 anyhow.workspace = true
+base64.workspace = true
 serde_json.workspace = true
 axum.workspace = true
 jiff.workspace = true
@@ -38,6 +40,10 @@ merezha-jobs = { path = "../jobs", features = ["test-hooks"] }
 merezha-notifications = { path = "../notifications", features = ["testkit"] }
 merezha-telemetry = { path = "../telemetry", features = ["testing"] }
 tempfile.workspace = true
+# tests/new.rs signals `merezha new` mid-write through MEREZHA_NEW_TEST_PAUSE_MS.
+merezha-scaffold = { path = "../scaffold", features = ["test-hooks"] }
+# tests/new.rs reads the generated TOML.
+toml.workspace = true
 wat.workspace = true
 # tests/statement_registry.rs reads the statement constants each crate declares.
 syn = { version = "3.0.9", default-features = false, features = ["full", "parsing", "visit"] }

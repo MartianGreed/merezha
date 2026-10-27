@@ -1,0 +1,5 @@
+
+[modules.notifications.push]
+vapid_private_key = { env = "MEREZHA_VAPID_PRIVATE_KEY" }
+vapid_subject = "mailto:ops@example.invalid"
+

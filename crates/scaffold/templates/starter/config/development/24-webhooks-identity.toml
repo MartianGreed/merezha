@@ -1,0 +1,6 @@
+
+[modules.notifications.webhooks]
+allow_http = true                      # local receivers; refused with http.public
+alert_roles = []                       # no organizations in the starter
+application_alert_roles = ["operator"] # identity's operator role
+event_types = { "notes.note_shared" = { description = "A note was shared" } }

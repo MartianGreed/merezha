@@ -1,0 +1,4 @@
+
+[modules.notifications.webhooks]
+alert_roles = []                       # no organizations in the starter
+event_types = { "notes.note_shared" = { description = "A note was shared" } }

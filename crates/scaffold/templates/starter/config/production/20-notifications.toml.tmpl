@@ -1,0 +1,25 @@
+
+[modules.notifications]
+secret_key = { env = "MEREZHA_NOTIFY_SECRET_KEY" }
+public_base_url = "https://api.example.invalid"
+
+[modules.notifications.templates]
+dir = "notifications/templates"
+default_locale = "en"
+locales = ["en"]
+app_name = "%%app_name%%"
+app_base_url = "https://app.example.invalid"
+preview = false                        # a public listener refuses previews without preview_in_public
+
+[modules.notifications.email]
+driver = "brevo"
+from = "%%app_name%% <no-reply@example.invalid>"
+
+[modules.notifications.brevo]
+api_key = { env = "BREVO_API_KEY" }
+webhook_token = { env = "BREVO_WEBHOOK_TOKEN" }
+webhook_allowed_cidrs = ["1.179.112.0/20", "172.246.240.0/20"]   # Brevo's webhook ranges
+
+[modules.notifications.sms]
+driver = "disabled"                    # no phone numbers on users in v1 (ID10)
+

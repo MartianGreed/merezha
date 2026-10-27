@@ -1,0 +1,6 @@
+
+[modules.notifications.topics."notes.shared"]
+category = "transactional"
+channels = ["inbox", "email"]
+default_channels = ["inbox", "email"]
+description = "Someone shared a note with you"

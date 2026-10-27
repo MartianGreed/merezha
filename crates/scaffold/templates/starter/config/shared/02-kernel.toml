@@ -1,0 +1,1 @@
+application = { concurrency = 2 }  # reactor command effects (application.command)

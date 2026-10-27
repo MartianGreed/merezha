@@ -60,6 +60,7 @@ pub mod application_module;
 pub mod content;
 pub mod guest;
 pub mod identity;
+pub mod new;
 pub mod notifications;
 pub mod reactions;
 pub mod run;
@@ -84,7 +85,12 @@ pub fn host_blocks(
     let identity = identity_module(input);
     let handle = identity.handle();
     (
-        blocks_with(input, merezha_content::ContentModule::new(), identity),
+        blocks_with(
+            input,
+            merezha_content::ContentModule::new(),
+            identity,
+            notifications_module(input),
+        ),
         handle,
     )
 }
@@ -95,7 +101,34 @@ pub fn blocks(
     input: &merezha_platform::ConfigInput,
     content: merezha_content::ContentModule,
 ) -> Vec<Box<dyn merezha_platform::Module>> {
-    blocks_with(input, content, identity_module(input))
+    blocks_with(
+        input,
+        content,
+        identity_module(input),
+        notifications_module(input),
+    )
+}
+
+/// [`host_blocks`] with the given notifications module, so the caller keeps
+/// its [`merezha_notifications::NotificationsHandle`] (`merezha notifications
+/// check` and `brevo register-webhook` load the project as `merezha run`
+/// does, every block registered).
+pub fn blocks_with_notifications(
+    input: &merezha_platform::ConfigInput,
+    notifications: merezha_notifications::Notifications,
+) -> Vec<Box<dyn merezha_platform::Module>> {
+    blocks_with(
+        input,
+        merezha_content::ContentModule::new(),
+        identity_module(input),
+        notifications,
+    )
+}
+
+fn notifications_module(
+    input: &merezha_platform::ConfigInput,
+) -> merezha_notifications::Notifications {
+    merezha_notifications::Notifications::new(merezha_notifications::HostFacts::load(input))
 }
 
 /// The identity block with the full permission catalog of this binary
@@ -171,6 +204,7 @@ fn blocks_with(
     input: &merezha_platform::ConfigInput,
     content: merezha_content::ContentModule,
     identity: merezha_identity::IdentityModule,
+    notifications: merezha_notifications::Notifications,
 ) -> Vec<Box<dyn merezha_platform::Module>> {
     // Organization content types need identity's organizations (CT-C9);
     // `delivery.public_base_url` may be plain HTTP on a private loopback
@@ -181,9 +215,7 @@ fn blocks_with(
     vec![
         Box::new(identity),
         Box::new(content),
-        Box::new(merezha_notifications::Notifications::new(
-            merezha_notifications::HostFacts::load(input),
-        )),
+        Box::new(notifications),
     ]
 }
 
