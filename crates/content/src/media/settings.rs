@@ -449,10 +449,12 @@ fn s3_config(
     config.endpoint = r.string("endpoint");
     config.path_style = r.boolean("path_style", true);
     config.allow_http = r.boolean("allow_http", false);
+    // Capped below the driver's own range so an object delete that gets
+    // no answer ends within half the delete lease.
     config.timeout = r.duration(
         "timeout",
         merezha_blob::DEFAULT_S3_TIMEOUT,
-        merezha_blob::S3_TIMEOUT_RANGE,
+        (merezha_blob::S3_TIMEOUT_RANGE.0, super::MAX_S3_TIMEOUT),
     );
     config.key_prefix = r.string("key_prefix").unwrap_or_default();
     if !present {

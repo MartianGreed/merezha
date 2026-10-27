@@ -3,16 +3,20 @@
 //! deletions a crash abandoned are claimed `deleting` (`FOR UPDATE SKIP
 //! LOCKED`) and committed; then each object is deleted and its row
 //! removed, each step fenced on the claim's delete lease (a worker whose
-//! lease expired and was taken over touches nothing). A failed delete
-//! restores the row's previous state. At most
+//! lease expired and was taken over touches nothing). A delete the store
+//! refused restores the row's previous state; one whose outcome is unknown
+//! (a timeout, a transport error, a 5xx after the retries, or the
+//! half-lease bound) leaves the row `deleting` until its lease expires.
+//! At most
 //! [`CLEANUP_LIMIT`] blobs per run, declared as the cron schedule of the
 //! same name with `media.cleanup_cron` in UTC. Each run first purges the
 //! asset trash past `trash.retention`, which orphans the blobs it frees.
 use super::{Assets, sql, sql_error, upload::millis};
 use crate::store::{Rejection, transaction};
+use merezha_blob::RETRY_TIMEOUT;
 use merezha_platform::{
     BoxFuture,
-    ports::{BlobKey, BlobStore, JobContext, JobFailure, JobHandler},
+    ports::{BlobError, BlobKey, BlobStore, JobContext, JobFailure, JobHandler},
 };
 use serde_json::Value;
 use std::time::Duration;
@@ -26,17 +30,31 @@ pub const CLEANUP_BATCH: i64 = 100;
 /// How long a claimed deletion is leased: past it, a deletion a crash
 /// abandoned is claimed again.
 pub const DELETE_LEASE: Duration = Duration::from_secs(600);
+/// The longest `media.s3.timeout` content accepts. `object_store` treats a
+/// `DELETE` as not idempotent: one that gets no answer is not retried and
+/// fails after one `timeout`. Answers that ask for a retry (5xx, 408, 429)
+/// are retried, none later than `RETRY_TIMEOUT`, after a backoff of at most
+/// a second, so the longest delete is `RETRY_TIMEOUT` + 1 s + `timeout`.
+/// With this cap that stays under half the delete lease, the bound on
+/// every object delete, so the bound cuts a delete only when the process
+/// stalls.
+pub const MAX_S3_TIMEOUT: Duration = Duration::from_secs(240);
+const _: () =
+    assert!(RETRY_TIMEOUT.as_secs() + 1 + MAX_S3_TIMEOUT.as_secs() < DELETE_LEASE.as_secs() / 2);
 
 /// What one cleanup pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CleanupReport {
-    /// Blobs whose object and row were deleted.
+    /// Blobs whose object and row this pass deleted under its own lease
+    /// (the `count` of the `content.blob_cleanup` event).
     pub deleted: usize,
-    /// Blobs whose object delete failed, restored for a later run.
+    /// Blobs whose object delete failed: refused by the store (the row
+    /// restored for a later run), or with an unknown outcome (the row left
+    /// `deleting` until its lease expires).
     pub failed: usize,
-    /// Claimed blobs this pass no longer owned when it came to them (its
-    /// lease expired and another worker or an upload took the row): left
-    /// alone.
+    /// Claimed blobs this pass no longer owned: its lease expired and
+    /// another worker or an upload took the row, before the retake (left
+    /// alone) or while the object delete ran (the row left to its holder).
     pub lost: usize,
 }
 
@@ -61,14 +79,35 @@ enum Step {
     Restore,
 }
 
+/// How one object delete ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Deletion {
+    /// The store answered success, or that the object does not exist.
+    Deleted,
+    /// The delete did not happen: the store answered a 3xx or a 4xx other
+    /// than 404, 408 and 429 (`BlobError::Rejected`), or the request never
+    /// left (`BlobError::Invalid`, a bad key).
+    Refused,
+    /// The request may have reached the store and may still apply: a
+    /// timeout, a reset connection, a 5xx, 408 or 429 after the retries
+    /// (`BlobError::Unavailable`), or the half-lease bound cut it.
+    Unknown,
+}
+
 /// What became of one claimed blob.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Swept {
     /// The object and the row are gone.
     Deleted,
-    /// The object delete failed; the row is back as it was.
+    /// The object delete failed. Refused by the store: the row is back as
+    /// it was. With an unknown outcome (timeout, transport error, 5xx, the
+    /// half-lease bound): the row stays `deleting` under the renewed lease,
+    /// so a delete that still lands does so while the row is fenced, and
+    /// the next claim after the lease deletes it again.
     Failed,
-    /// The claim was no longer this worker's: nothing was touched.
+    /// The claim was no longer this worker's: at the retake, nothing was
+    /// touched; after the object delete, the row (not removed, or not
+    /// restored) belongs to whoever took it over.
     Lost,
 }
 
@@ -91,7 +130,7 @@ impl Assets {
             }
             let started = std::time::Instant::now();
             for blob in &claimed {
-                if started.elapsed() >= DELETE_LEASE / 2 {
+                if started.elapsed() >= self.delete_lease / 2 {
                     report.lost += 1;
                     continue;
                 }
@@ -105,12 +144,14 @@ impl Assets {
                 break;
             }
         }
-        if report.deleted > 0 || report.failed > 0 {
+        if report.deleted > 0 || report.failed > 0 || report.lost > 0 {
             merezha_telemetry::event!(
                 INFO,
                 "content.blob_cleanup",
                 driver = self.blobs.driver().as_str(),
-                count = report.deleted
+                count = report.deleted,
+                failed = report.failed,
+                lost = report.lost
             );
         }
         Ok(report)
@@ -122,7 +163,7 @@ impl Assets {
         let db = self.db().clone();
         let state = self.state().clone();
         let grace = millis(self.settings().orphan_grace);
-        let lease = millis(DELETE_LEASE);
+        let lease = millis(self.delete_lease);
         let batch = i64::try_from(batch).unwrap_or(CLEANUP_BATCH);
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {
@@ -150,30 +191,42 @@ impl Assets {
     /// Delete one claimed blob (the second step of [`Assets::cleanup`]):
     /// re-take its row under the claim's token, renewing the lease, then
     /// delete the object (bounded by half the lease) and the row, both
-    /// fenced on the renewed token. A lost claim touches nothing.
+    /// fenced on the renewed token. A claim lost before the retake touches
+    /// nothing; one lost while the object delete ran leaves the row (and
+    /// the count) to the worker that holds it now. A delete whose outcome
+    /// is unknown leaves the row `deleting` under the renewed lease.
     pub async fn sweep(&self, blob: &ClaimedBlob) -> Result<Swept, Rejection> {
         let Some(token) = self.fenced(Step::Retake, blob, &blob.token).await? else {
             return Ok(Swept::Lost);
         };
-        if self.delete_object(&blob.key).await {
-            self.fenced(Step::Forget, blob, &token).await?;
-            Ok(Swept::Deleted)
-        } else {
-            self.fenced(Step::Restore, blob, &token).await?;
-            Ok(Swept::Failed)
-        }
+        let (step, swept) = match self.delete_object(&blob.key).await {
+            Deletion::Deleted => (Step::Forget, Swept::Deleted),
+            Deletion::Refused => (Step::Restore, Swept::Failed),
+            // Restoring now would let an upload reuse the row (`orphaned`
+            // means "the object exists") while the request may still
+            // delete the object.
+            Deletion::Unknown => return Ok(Swept::Failed),
+        };
+        Ok(match self.fenced(step, blob, &token).await? {
+            Some(_) => swept,
+            None => Swept::Lost,
+        })
     }
 
     /// Delete an object within half the delete lease, so it never runs
-    /// past the lease that fences it.
-    pub(crate) async fn delete_object(&self, key: &str) -> bool {
+    /// past the lease that fences it. The store does not see the fence: a
+    /// process stalled for the whole lease before the request leaves can
+    /// still delete an object uploaded again meanwhile (the limit of
+    /// database-side fencing, content design section 6, issue #49).
+    pub(crate) async fn delete_object(&self, key: &str) -> Deletion {
         let Ok(key) = BlobKey::new(key.to_owned()) else {
-            return false;
+            return Deletion::Refused;
         };
-        matches!(
-            tokio::time::timeout(DELETE_LEASE / 2, self.blobs.delete(&key)).await,
-            Ok(Ok(()))
-        )
+        match tokio::time::timeout(self.delete_lease / 2, self.blobs.delete(&key)).await {
+            Ok(Ok(()) | Err(BlobError::NotFound)) => Deletion::Deleted,
+            Ok(Err(BlobError::Rejected(_) | BlobError::Invalid(_))) => Deletion::Refused,
+            Ok(Err(BlobError::Unavailable(_))) | Err(_) => Deletion::Unknown,
+        }
     }
 
     /// Run one fenced step on `blob` with `token`: the retake returns the
@@ -186,7 +239,7 @@ impl Assets {
     ) -> Result<Option<String>, Rejection> {
         let db = self.db().clone();
         let state = self.state().clone();
-        let lease = millis(DELETE_LEASE);
+        let lease = millis(self.delete_lease);
         let (scope, sha256, token) = (blob.scope.clone(), blob.sha256.clone(), token.to_owned());
         let (previous, previous_lease) = (blob.state.clone(), blob.lease.clone());
         transaction(self.db(), self.deadline(), move |tx| {

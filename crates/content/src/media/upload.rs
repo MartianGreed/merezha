@@ -9,7 +9,9 @@
 //! transaction flips the locked row to `stored` only from `stored`,
 //! `orphaned`, or `pending` after its own put. A row that moved meanwhile
 //! sends the upload back to the claim with the same spool file.
-use super::{ASSET_UPLOADED, AssetView, Assets, blob_key, hex, sniff, sql, sql_error};
+use super::{
+    ASSET_UPLOADED, AssetView, Assets, blob_key, cleanup::Deletion, hex, sniff, sql, sql_error,
+};
 use crate::store::{Actor, Rejection, Target, new_id, transaction};
 use axum::body::Body;
 use futures_util::StreamExt;
@@ -377,10 +379,13 @@ impl Assets {
     /// blob row (or took it over) removes the row and the object while the
     /// lease is still its own, so a refused upload leaves nothing; both
     /// steps are fenced on the delete lease the release returns. When the
-    /// object delete fails the row goes back to `pending` with a lease
-    /// already over, so the next upload of these bytes joins it and puts
-    /// again (and cleanup may take it). A joined claim, a lost race or a
-    /// failing database leave the row to cleanup once its lease expires.
+    /// store refuses the object delete the row goes back to `pending` with
+    /// a lease already over, so the next upload of these bytes joins it and
+    /// puts again (and cleanup may take it). A delete whose outcome is
+    /// unknown (a timeout, a transport error, a 5xx, the half-lease bound)
+    /// may still land after such a put, so its row stays `deleting` until
+    /// the lease expires, like a joined claim, a lost race or a failing
+    /// database: cleanup takes it then, or an upload takes it over.
     async fn give_up(&self, scope: &str, sha256: &str, key: &BlobKey, claim: &Claim) {
         let Claim::Inserted(lease) = claim else {
             return;
@@ -391,10 +396,10 @@ impl Assets {
         else {
             return;
         };
-        let next = if self.delete_object(key.as_str()).await {
-            GiveUp::Forget
-        } else {
-            GiveUp::Abandon
+        let next = match self.delete_object(key.as_str()).await {
+            Deletion::Deleted => GiveUp::Forget,
+            Deletion::Refused => GiveUp::Abandon,
+            Deletion::Unknown => return,
         };
         let _ = self.give_up_step(scope, sha256, next, &token).await;
     }
@@ -411,7 +416,7 @@ impl Assets {
     ) -> Result<Option<String>, Rejection> {
         let db = self.db().clone();
         let state = self.state().clone();
-        let delete_lease = millis(super::DELETE_LEASE);
+        let delete_lease = millis(self.delete_lease);
         let (scope, sha256, token) = (scope.to_owned(), sha256.to_owned(), token.to_owned());
         transaction(self.db(), self.deadline(), move |tx| {
             Box::pin(async move {

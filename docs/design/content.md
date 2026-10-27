@@ -1592,6 +1592,87 @@ Management `GET /assets/{id}/file` always proxies with `attachment`.
   international names; no `*`, `_` or empty label); the port is 1 to
   65535.
 
+### As built (issue #49, lost sweeps and the fencing limit)
+
+- A sweep checks what its fenced row delete, or its restore after a
+  refused object delete, matched. A lease lost while the object delete
+  ran (another worker or an upload took the row) matches nothing: the
+  blob counts as `lost`, not `deleted` or `failed`, and the row stays
+  with whoever holds it. The `count` of `content.blob_cleanup` is the
+  number of blobs a run deleted under its own lease; the event also
+  carries `failed` and `lost`, and a run that only failed or lost blobs
+  still logs it.
+- An object delete ends one of three ways.
+  - Deleted: the store answered success, or 404 (the object was already
+    gone). The row goes.
+  - Refused: the delete did not happen. The store answered a 3xx or a
+    4xx other than 404, 408 and 429 (`BlobError::Rejected`), or the
+    request never left (`BlobError::Invalid`). The row is restored at
+    once.
+  - Unknown: the request may have reached the store and may still apply.
+    That covers an answer that never came (`object_store` does not retry
+    a timed-out `DELETE`, which is not idempotent, so this fails after
+    one `media.s3.timeout`), a connection reset after sending, a 5xx,
+    408 or 429 that persisted through the retries (all
+    `BlobError::Unavailable`), and the half-lease bound. The sweep
+    counts it `failed` and leaves the row `deleting` under its renewed
+    lease.
+
+  A restored `orphaned` row would read as "the object exists", and an
+  upload of the same bytes would reuse it without a put just before the
+  late delete removed the object; a restored `pending` row (the give-up)
+  would let the next upload put the bytes just before. An upload that
+  meets a `deleting` row waits (`blob_unavailable` after two seconds);
+  once the lease is over it takes the row over and puts, or cleanup
+  claims it and deletes again. Either way a late delete lands while the
+  row is fenced, as long as it lands within the lease. An upload's
+  give-up follows the same rule. On the local driver every I/O error is
+  `Unavailable`, so a failed unlink waits for the lease too.
+- Three fencing checks in SQL have a Rust check in front of them:
+  `content.blobs.takeover` requires an expired lease, which the upload
+  read just before under the same row lock (defence in depth);
+  `content.blobs.retake` requires the claim's token, and a batch already
+  stops sweeping once half its lease has passed; `content.blobs.delete`
+  requires the renewed token, which a sweep holds only after its retake.
+  The retake and the row delete are what holds when the lease is lost
+  after the Rust check (a stall, a slow object delete). Each is tested on
+  its own, run straight against PostgreSQL without the Rust check, and
+  the retake and the row delete again through `Assets::sweep` where only
+  the token tells two claims apart.
+- Database fencing has one limit. The fence is checked before the object
+  delete; the store does not check it. If the process stalls for longer
+  than the whole delete lease (ten minutes) between the retake that
+  renewed it and the moment its `DELETE` reaches the store (a frozen VM or
+  container, `SIGSTOP`, a debugger, heavy swapping), another worker can
+  claim the row and delete the object and the row, and an upload can put
+  the same bytes back under the same key, all before the stalled request
+  arrives. That request then deletes the re-uploaded object. A
+  conditional delete cannot help: the new object has the same key, the
+  same bytes and so the same ETag. The asset's blob stays `stored` while
+  its file answers `blob_not_found`, until the object is restored (keep a
+  noncurrent-version or soft-delete rule on the bucket to have one to
+  restore) or the asset is deleted and uploaded again.
+- The mitigation is to keep the longest object delete far below the
+  lease, and the code bounds it twice. A hung delete is not retried and
+  ends after one `media.s3.timeout` (default 30 s). Answers that ask for
+  a retry (5xx, 408, 429) are retried at most `MAX_RETRIES` (3) times,
+  none started later than `RETRY_TIMEOUT` (10 s) after the first
+  attempt, with backoffs of at most a second, so the longest delete is
+  10 s + 1 s + one timeout. Content caps the timeout at 240 s
+  (`MAX_S3_TIMEOUT`; `out_of_range` past it, though the driver alone
+  allows 300 s), which puts that upper bound at 251 s. The whole object
+  delete is also bounded by half the lease (`DELETE_LEASE / 2`, five
+  minutes), which a delete can therefore reach only when the process
+  stalls. The lease starts when the retake's statement runs, and the
+  object delete starts once that transaction commits, at most
+  `limits.query_timeout` later. So when the delete ends, by itself or by
+  the bound, at least five minutes of lease minus that commit time
+  remain, and a delete with an unknown outcome has that long to land
+  while the row is still fenced. Only a stall outside the process's
+  control, or a request that sits on the network for minutes, can use
+  the rest. Keep `media.s3.timeout` short, and run hosts where a pause
+  of minutes is not routine.
+
 ## 7. Events
 
 Every event is an outbox record appended inside the transaction of the change
@@ -1813,7 +1894,7 @@ multi-application platform keeps that rule, so the layout survives it.
 | `media.s3.allow_http` | bool | `false` | Must be `true` for a plain HTTP MinIO endpoint. |
 | `media.s3.access_key_id` | secret | required for `s3` | `{ env = "..." }` or `{ file = "..." }`. |
 | `media.s3.secret_access_key` | secret | required for `s3` | |
-| `media.s3.timeout` | duration | `"30s"` | 1 s to 300 s, per request. |
+| `media.s3.timeout` | duration | `"30s"` | 1 s to 240 s, per request (the driver allows 300 s; content keeps an unanswered delete under half the delete lease, section 6). |
 | `media.s3.key_prefix` | string | `""` | Key-safe characters. Prepended to every key. |
 | `media.serve` | `proxy`, `redirect` | `proxy` | `redirect` needs `s3`. |
 | `media.signed_url_ttl` | duration | `"5m"` | 60 s to 3600 s. |

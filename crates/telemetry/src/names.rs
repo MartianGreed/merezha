@@ -1642,10 +1642,17 @@ pub const EVENTS: &[Event] = &[
             CODE,
         ],
     ),
+    // `count`: blobs deleted under the run's own lease; `failed` and
+    // `lost` are not in it (CT §6, issue #49).
     ev(
         "content.blob_cleanup",
         INFO,
-        &[f("driver", "content.driver"), local("count")],
+        &[
+            f("driver", "content.driver"),
+            local("count"),
+            local("failed"),
+            local("lost"),
+        ],
     ),
     ev(
         "content.spool_cleared",
