@@ -266,8 +266,9 @@ fn purge_arguments(
     Ok((organization.ok_or_else(invalid)?, force, arguments(rest)?))
 }
 
-/// Whether identity still holds `organization`.
-enum InIdentity {
+/// Whether identity still holds `organization` (also used by `merezha
+/// notifications purge-organization`).
+pub(crate) enum InIdentity {
     /// Its row is there: identity has not deleted it.
     Live,
     /// No row: deleted (or never created) in identity.
@@ -277,7 +278,7 @@ enum InIdentity {
     Unknown(&'static str),
 }
 
-async fn in_identity(
+pub(crate) async fn in_identity(
     database: &Database,
     organization: &str,
     deadline: Instant,

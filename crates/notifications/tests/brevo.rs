@@ -1381,11 +1381,7 @@ mod timing {
 }
 
 /// Run the email delivery handler once, as the jobs runtime would on
-/// `attempt` of 10, with `payload`.
-async fn run_delivery(instance: &Instance, payload: Value, attempt: u32) -> Result<(), String> {
-    run_keyed(instance, payload, attempt, "").await
-}
-/// [`run_delivery`] for a job of idempotency key `key`.
+/// `attempt` of 10, for a job of idempotency key `key` with `payload`.
 async fn run_keyed(
     instance: &Instance,
     payload: Value,
@@ -1431,56 +1427,59 @@ async fn a_job_run_again_after_handing_the_delivery_on_sends_nothing() {
         request("tasks.assigned", email("fen@example.org", None), "f:1"),
     )
     .await;
-    // The continuation waits at least five minutes.
+    // The continuation waits at least five minutes; its key names the
+    // attempt it continues after (the first job's state also counts as
+    // available while it is retried, so wait for the continuation itself).
+    let continuation_job = "SELECT count(*) FROM merezha_jobs.jobs \
+        WHERE kind = 'notify.deliver.email' AND state = 'available' \
+        AND idempotency_key LIKE '%:g0:a1'";
+    instance.until(continuation_job, 1).await;
     instance
         .until(
-            "SELECT count(*) FROM merezha_jobs.jobs WHERE kind = 'notify.deliver.email' \
-             AND state = 'available'",
+            "SELECT count(*) FROM merezha_notify.deliveries \
+             WHERE status = 'retrying' AND status_reason = 'provider_account'",
             1,
         )
         .await;
-    assert_eq!(
-        delivery(&world, "fen@example.org").await,
-        "retrying:provider_account"
-    );
     let delivery_id = world
         .text("SELECT id::text FROM merezha_notify.deliveries")
         .await
         .remove(0);
-    let continuation: Value = serde_json::from_str(
-        &world
+    let (key, continuation) = {
+        let row = world
             .text(
-                "SELECT payload::text FROM merezha_jobs.jobs WHERE kind = 'notify.deliver.email' \
-                 AND state = 'available'",
+                "SELECT idempotency_key || ' ' || payload::text FROM merezha_jobs.jobs \
+                 WHERE kind = 'notify.deliver.email' AND state = 'available' \
+                 AND idempotency_key LIKE '%:g0:a1'",
             )
             .await
-            .remove(0),
-    )
-    .unwrap();
-    assert_eq!(continuation["after_attempt"], json!(1));
-    // The first job, run again with its own payload, finds another chain.
+            .remove(0);
+        let (key, payload) = row.split_once(' ').unwrap();
+        (
+            key.to_owned(),
+            serde_json::from_str::<Value>(payload).unwrap(),
+        )
+    };
+    // The payload carries no fence, so no older binary refuses it.
+    assert!(
+        continuation.get("after_attempt").is_none(),
+        "{continuation}"
+    );
+    // The first job, run again with its own key, finds another chain.
+    let first_key = key.trim_end_matches(":a1").to_owned();
     let first = json!({ "delivery_id": delivery_id, "generation": 0 });
-    assert_eq!(run_delivery(&instance, first, 2).await, Ok(()));
+    assert_eq!(run_keyed(&instance, first, 2, &first_key).await, Ok(()));
     assert_eq!(attempts(&world).await, ["transient"]);
     assert!(fake.processed().is_empty(), "no second chain sent");
-    // A job carrying another attempt than the last one is dropped too.
-    let mut stray = continuation.clone();
-    stray["after_attempt"] = json!(7);
-    assert_eq!(run_delivery(&instance, stray, 1).await, Ok(()));
+    // A job naming another attempt than the last one is dropped too.
+    let stray = key.replace(":a1", ":a7");
+    assert_eq!(
+        run_keyed(&instance, continuation.clone(), 1, &stray).await,
+        Ok(())
+    );
     assert_eq!(attempts(&world).await, ["transient"]);
-    // The continuation is the live chain. One queued before its payload
-    // carried the attempt is fenced by the attempt in its key.
-    let key = world
-        .text(
-            "SELECT idempotency_key FROM merezha_jobs.jobs WHERE kind = 'notify.deliver.email' \
-             AND state = 'available'",
-        )
-        .await
-        .remove(0);
-    assert!(key.ends_with(":g0:a1"), "{key}");
-    let mut legacy = continuation.clone();
-    legacy.as_object_mut().unwrap().remove("after_attempt");
-    assert_eq!(run_keyed(&instance, legacy, 1, &key).await, Ok(()));
+    // The continuation, fenced by its key alone, is the live chain.
+    assert_eq!(run_keyed(&instance, continuation, 1, &key).await, Ok(()));
     assert_eq!(attempts(&world).await, ["transient", "accepted"]);
     assert_eq!(fake.processed().len(), 1);
     assert_eq!(delivery(&world, "fen@example.org").await, "accepted:");

@@ -10,9 +10,11 @@
 //!   tenant's shared lock and checks the mark first (`guard`): the
 //!   expansion of a notification of the tenant (nothing is written, the
 //!   request is logged `notification.rejected` / `tenant_deleted`), the
-//!   webhook fan-out of its events (dropped), a new webhook endpoint or a
-//!   test event in its registry and a push subscription made in it (404
-//!   `not_found`).
+//!   webhook fan-out of its events (dropped), both delivery workers' Tx A
+//!   (an open delivery is `cancelled` / `tenant_deleted` before any
+//!   attempt), every route that changes or redelivers one of its
+//!   endpoints or deliveries, and a push subscription made in it (404
+//!   `not_found`). Its inbox and stream answer 404 from the mark on.
 //!   A writer in flight commits before the mark and is purged; none
 //!   commits after it.
 //! - The kind [`ORGANIZATION_PURGE_KIND`] deletes the tenant's rows in
@@ -21,7 +23,8 @@
 //!   `delete` by `sys_notifications` each), push subscriptions made in the
 //!   tenant, inbox items (raising each user's `purged_through`, as
 //!   `inbox_expire` does), and notifications with their deliveries,
-//!   attempts and provider events, deliveries locked in id order first as
+//!   attempts, provider events and development captures, deliveries
+//!   locked in id order first as
 //!   `retention` does. Pending deliveries go with their notification: a
 //!   job that finds its delivery gone finishes. The last step sets
 //!   `purged_at`. Every step is idempotent, so a run killed mid-way is
@@ -64,6 +67,9 @@ pub const PURGE_BATCH: i64 = 100;
 pub const CONSUMED: [&str; 1] = [ORGANIZATION_DELETED_TOPIC];
 /// The `notification.rejected` code of a request for a deleted tenant.
 pub const TENANT_DELETED: &str = "tenant_deleted";
+/// The failure of a purge (job or command) of a tenant not marked
+/// deleted.
+pub const TENANT_NOT_DELETED: &str = "tenant_not_deleted";
 /// Longest tenant id the tables store.
 const MAX_TENANT: usize = 128;
 /// No purge step but a run's first starts closer than this to its
@@ -91,7 +97,85 @@ pub(crate) async fn guard(db: &Database, tx: &mut Tx<'_>, tenant: &str) -> Resul
         .is_some())
 }
 
-fn valid_tenant(tenant: &str) -> bool {
+/// Whether `tenant` was deleted, outside a transaction: the check of the
+/// inbox reads and the stream, which answer 404 from the mark on.
+pub(crate) async fn is_deleted(
+    core: &Core,
+    tenant: &str,
+    deadline: Instant,
+) -> Result<bool, Failure> {
+    let client = core.database.acquire(deadline).await?;
+    Ok(core
+        .database
+        .query_opt(&client, &sql::TENANT_DELETED, &[&tenant])
+        .await
+        .map_err(|e| classify(&e))?
+        .is_some())
+}
+
+/// Who marked a tenant deleted (`tenants_deleted.source`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeletedBy {
+    /// The `identity.organization_deleted` subscription.
+    Event,
+    /// `merezha notifications purge-organization`.
+    Operator,
+}
+impl DeletedBy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::Operator => "operator",
+        }
+    }
+}
+
+/// Mark `tenant` deleted by `by` at `now` inside `tx`, under the tenant's
+/// exclusive transaction lock, which waits for every writer holding the
+/// shared one. `true` when this call marked it, `false` when it already
+/// was.
+pub async fn mark_in(
+    db: &Database,
+    tx: &mut Tx<'_>,
+    tenant: &str,
+    now: jiff::Timestamp,
+    by: DeletedBy,
+) -> Result<bool, Failure> {
+    if !valid_tenant(tenant) {
+        return Err(Failure::permanent("invalid_organization"));
+    }
+    db.query_one(
+        tx,
+        &sql::TENANT_DELETE_LOCK,
+        &[&sql::TENANT_LOCK_CLASS, &tenant],
+    )
+    .await
+    .map_err(|e| classify(&e))?;
+    Ok(db
+        .query_opt(tx, &sql::TENANT_MARK, &[&tenant, &now, &by.as_str()])
+        .await
+        .map_err(|e| classify(&e))?
+        .is_some())
+}
+
+/// Whether the database holds migration 7 (`tenants_deleted`), which
+/// `merezha notifications purge-organization` needs before it writes.
+pub async fn deletion_ready(db: &Database, deadline: Instant) -> Result<bool, Failure> {
+    let client = db.acquire(deadline).await?;
+    let row = db
+        .query_one(&**client, &sql::TENANTS_DELETED_EXIST, &[])
+        .await
+        .map_err(|e| classify(&e))?;
+    Ok(row.get(0))
+}
+
+/// Whether `organization` is a tenant id the block stores (1 to 128
+/// characters of an identity name).
+pub fn valid_organization(organization: &str) -> bool {
+    valid_tenant(organization)
+}
+
+pub(crate) fn valid_tenant(tenant: &str) -> bool {
     !tenant.is_empty() && tenant.len() <= MAX_TENANT && Identity::new(tenant).is_ok()
 }
 
@@ -147,18 +231,7 @@ pub async fn mark_deleted(
     db.clone()
         .transaction(deadline, move |tx| {
             Box::pin(async move {
-                db.query_one(
-                    tx,
-                    &sql::TENANT_DELETE_LOCK,
-                    &[&sql::TENANT_LOCK_CLASS, &tenant],
-                )
-                .await
-                .map_err(|e| classify(&e))?;
-                let marked = db
-                    .query_opt(tx, &sql::TENANT_MARK, &[&tenant, &now])
-                    .await
-                    .map_err(|e| classify(&e))?
-                    .is_some();
+                let marked = mark_in(&db, tx, &tenant, now, DeletedBy::Event).await?;
                 outbox.append(tx, &[record], OnDuplicate::Ignore).await?;
                 Ok(marked)
             })
@@ -178,6 +251,8 @@ pub enum PurgeStep {
     Done {
         now: bool,
     },
+    /// The tenant is not marked deleted: nothing was touched.
+    NotDeleted,
 }
 
 /// What a whole purge deleted, for `notification.organization_purged`.
@@ -197,7 +272,7 @@ impl Purged {
             PurgeStep::PushSubscriptions(n) => self.push_subscriptions += n,
             PurgeStep::InboxItems(n) => self.inbox_items += n,
             PurgeStep::Notifications(n) => self.notifications += n,
-            PurgeStep::Done { .. } => {}
+            PurgeStep::Done { .. } | PurgeStep::NotDeleted => {}
         }
     }
 }
@@ -207,16 +282,25 @@ impl Purged {
 /// (`purged_at`). Idempotent: a step that rolled back or ran twice leaves
 /// the same rows.
 pub async fn purge_step(
-    core: &Core,
+    db: &Database,
     tenant: &str,
+    now: jiff::Timestamp,
     deadline: Instant,
 ) -> Result<PurgeStep, Failure> {
-    let db = core.database.clone();
-    let now = core.now();
+    let db = db.clone();
     let tenant = tenant.to_owned();
     db.clone()
         .transaction(deadline, move |tx| {
             Box::pin(async move {
+                // Only a tenant identity deleted is ever purged.
+                if db
+                    .query_opt(tx, &sql::TENANT_DELETED, &[&tenant])
+                    .await
+                    .map_err(|e| classify(&e))?
+                    .is_none()
+                {
+                    return Ok(PurgeStep::NotDeleted);
+                }
                 let limit = PURGE_BATCH;
                 let events = db
                     .execute(tx, &sql::TENANT_PURGE_EVENTS, &[&tenant, &limit])
@@ -308,6 +392,9 @@ pub async fn purge_step(
                     db.execute(tx, &sql::TENANT_PURGE_PROVIDER_EVENTS, &[&deliveries])
                         .await
                         .map_err(|e| classify(&e))?;
+                    db.execute(tx, &sql::TENANT_PURGE_CAPTURES, &[&deliveries])
+                        .await
+                        .map_err(|e| classify(&e))?;
                     let deleted = db
                         .execute(tx, &sql::TENANT_PURGE_NOTIFICATIONS, &[&ids])
                         .await
@@ -323,6 +410,57 @@ pub async fn purge_step(
             })
         })
         .await
+}
+
+/// What [`purge_organization`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PurgeReport {
+    /// This call marked the tenant deleted (it was not yet).
+    pub marked: bool,
+    pub purged: Purged,
+    /// The purge had already finished when the call began its last step.
+    pub already_purged: bool,
+}
+
+/// Mark `tenant` deleted (by `by`) and run every [`purge_step`] to the
+/// end, each bounded by `step_timeout`: the operator's purge (`merezha
+/// notifications purge-organization`), for organizations identity
+/// deleted before the block consumed its event. Safe beside a running
+/// purge job, whose steps find less to do.
+pub async fn purge_organization(
+    db: &Database,
+    tenant: &str,
+    by: DeletedBy,
+    step_timeout: std::time::Duration,
+) -> Result<PurgeReport, Failure> {
+    let owned = db.clone();
+    let mark = tenant.to_owned();
+    let marked = db
+        .transaction(Instant::now() + step_timeout, move |tx| {
+            Box::pin(async move { mark_in(&owned, tx, &mark, jiff::Timestamp::now(), by).await })
+        })
+        .await?;
+    let mut report = PurgeReport {
+        marked,
+        ..PurgeReport::default()
+    };
+    loop {
+        let step = purge_step(
+            db,
+            tenant,
+            jiff::Timestamp::now(),
+            Instant::now() + step_timeout,
+        )
+        .await?;
+        match step {
+            PurgeStep::Done { now } => {
+                report.already_purged = !now;
+                return Ok(report);
+            }
+            PurgeStep::NotDeleted => return Err(Failure::transient(TENANT_NOT_DELETED)),
+            other => report.purged.add(other),
+        }
+    }
 }
 
 /// The tenant an organization event names (its `organization_id`, the
@@ -365,7 +503,9 @@ impl JobHandler for OrganizationDeleted {
                 merezha_telemetry::event!(
                     INFO,
                     "notification.organization_deleted",
-                    tenant = tenant.as_str()
+                    tenant = tenant.as_str(),
+                    source = DeletedBy::Event.as_str(),
+                    forced = false
                 );
             }
             Ok(())
@@ -411,7 +551,10 @@ impl JobHandler for OrganizationPurge {
                     return Ok(());
                 }
                 steps += 1;
-                let step = purge_step(&core, &tenant, deadline).await?;
+                let step = purge_step(&core.database, &tenant, core.now(), deadline).await?;
+                if step == PurgeStep::NotDeleted {
+                    return Err(JobFailure::permanent(TENANT_NOT_DELETED));
+                }
                 purged.add(step);
                 if let PurgeStep::Done { now } = step {
                     if now {
@@ -419,6 +562,8 @@ impl JobHandler for OrganizationPurge {
                             INFO,
                             "notification.organization_purged",
                             tenant = tenant.as_str(),
+                            source = DeletedBy::Event.as_str(),
+                            forced = false,
                             webhook_events = purged.webhook_events,
                             webhook_endpoints = purged.webhook_endpoints,
                             push_subscriptions = purged.push_subscriptions,

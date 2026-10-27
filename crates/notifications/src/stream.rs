@@ -715,6 +715,14 @@ async fn stream(
     let Some(core) = state.slot.get().cloned() else {
         return reply(Failure::transient("unavailable"));
     };
+    // A deleted organization's inbox is not streamed (issue #63).
+    if let Some(tenant) = &tenant {
+        match crate::tenants::is_deleted(&core, tenant, Instant::now() + REAUTH_DEADLINE).await {
+            Ok(false) => {}
+            Ok(true) => return reply(Failure::permanent("not_found")),
+            Err(failure) => return reply(failure),
+        }
+    }
     let lease = match streams.admit(&user) {
         Ok(lease) => lease,
         Err(Refusal::PerUser) => {
@@ -961,8 +969,18 @@ impl Task {
 
     /// Check the credentials again (NT §5.4): the same user with the same
     /// active tenant keeps the stream; anything else, a revoked or expired
-    /// session or key, or a failure to tell, ends it.
+    /// session or key, a deleted active tenant (issue #63), or a failure to
+    /// tell, ends it.
     async fn reauthenticate(&self) -> bool {
+        if let Some(tenant) = &self.tenant {
+            let deadline = Instant::now() + REAUTH_DEADLINE;
+            if !matches!(
+                crate::tenants::is_deleted(&self.core, tenant, deadline).await,
+                Ok(false)
+            ) {
+                return false;
+            }
+        }
         let Some(authenticator) = &self.authenticator else {
             return true;
         };

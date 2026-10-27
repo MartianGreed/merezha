@@ -1498,17 +1498,26 @@ pub const EVENTS: &[Event] = &[
         &[f("task", "notify.task"), f("reason", "notify.reason"), CODE],
     ),
     // Deleted organizations (issue #63): the tenant was marked deleted;
-    // its purge finished (the counts of the run that finished it).
+    // its purge finished (the counts of the run that finished it). Also
+    // logged by `merezha notifications purge-organization`.
     ev(
         "notification.organization_deleted",
         INFO,
-        &[f("tenant", key::TENANT_ID)],
+        &[
+            f("tenant", key::TENANT_ID),
+            local("source"),
+            local("forced"),
+        ],
     ),
+    // `merezha notifications purge-organization` cannot run.
+    ev("notification.purge_failed", ERROR, &[CODE, local("usage")]),
     ev(
         "notification.organization_purged",
         INFO,
         &[
             f("tenant", key::TENANT_ID),
+            local("source"),
+            local("forced"),
             local("webhook_events"),
             local("webhook_endpoints"),
             local("push_subscriptions"),

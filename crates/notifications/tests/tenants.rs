@@ -68,6 +68,16 @@ async fn start(world: &World, edit: impl FnOnce(&mut Options)) -> Instance {
 /// `identity.password_changed` (email and inbox) for `user` in `tenant`,
 /// as identity requests it.
 async fn notify(instance: &Instance, user: &str, tenant: &str, key: &str) {
+    notify_at(instance, user, tenant, key, None).await;
+}
+/// [`notify`] held back until `not_before`.
+async fn notify_at(
+    instance: &Instance,
+    user: &str,
+    tenant: &str,
+    key: &str,
+    not_before: Option<jiff::Timestamp>,
+) {
     let request = NotificationRequest {
         topic: id("identity.password_changed"),
         recipients: vec![Recipient::User { id: id(user) }],
@@ -79,7 +89,7 @@ async fn notify(instance: &Instance, user: &str, tenant: &str, key: &str) {
         dedupe_key: DedupeKey::new(key).unwrap(),
         tenant: Some(id(tenant)),
         members: Vec::new(),
-        not_before: None,
+        not_before,
         expires_at: None,
         collapse_key: None,
         correlation: Correlation {
@@ -417,6 +427,286 @@ async fn the_mark_waits_for_a_writer_in_flight() {
             .scalar("SELECT count(*) FROM merezha_notify.webhook_events")
             .await,
         0
+    );
+    instance.stop().await;
+}
+
+/// Record the deletion of `tenant` as the mark does, without its purge job:
+/// what the workers see between the mark and the purge reaching the rows.
+async fn mark_only(world: &World, tenant: &str) {
+    world
+        .execute(&format!(
+            "INSERT INTO merezha_notify.tenants_deleted (tenant_id, deleted_at, source) \
+             VALUES ('{tenant}', now(), 'event')"
+        ))
+        .await;
+}
+
+/// Security review of #82 (Medium): a deleted tenant's queued deliveries
+/// stop at the mark, not when the purge reaches them. A delivery job that
+/// runs after the mark cancels its delivery `tenant_deleted` before any
+/// attempt, and nothing is captured. From the mark on, the tenant's inbox
+/// and stream answer 404, while a session without the tenant still reads
+/// its own inbox.
+#[tokio::test]
+async fn a_queued_delivery_of_a_deleted_tenant_is_cancelled_at_its_next_run() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    // Delivery job records stay in the outbox until relayed by hand.
+    let instance = start(&world, |o| o.relay = false).await;
+    instance.tokens.add("ada_alone", user("usr_ada", &[], None));
+    notify(&instance, "usr_ada", "org_a", "pw:queued").await;
+    instance.relay_now().await;
+    instance
+        .until(
+            "SELECT count(*) FROM merezha_notify.deliveries \
+             WHERE channel = 'email' AND status = 'queued'",
+            1,
+        )
+        .await;
+    let (status, _) = instance
+        .call("GET", "/v1/notifications/inbox", Some("ada"), None)
+        .await;
+    assert_eq!(status, 200);
+    mark_only(&world, "org_a").await;
+    instance.relay_now().await;
+    instance
+        .until(
+            "SELECT count(*) FROM merezha_notify.deliveries \
+             WHERE channel = 'email' AND status = 'cancelled' AND status_reason = 'tenant_deleted'",
+            1,
+        )
+        .await;
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.delivery_attempts")
+            .await,
+        0
+    );
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.captures")
+            .await,
+        0,
+        "nothing sent"
+    );
+    for path in [
+        "/v1/notifications/inbox",
+        "/v1/notifications/inbox/unread-count",
+        "/v1/notifications/inbox/stream",
+    ] {
+        let (status, _) = instance.call("GET", path, Some("ada"), None).await;
+        assert_eq!(status.as_u16(), 404, "{path}");
+    }
+    let (status, _) = instance
+        .call(
+            "POST",
+            "/v1/notifications/inbox/read-all",
+            Some("ada"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status.as_u16(), 404);
+    let (status, body) = instance
+        .call("GET", "/v1/notifications/inbox", Some("ada_alone"), None)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["items"],
+        json!([]),
+        "the tenant's items are out of scope"
+    );
+    instance.stop().await;
+}
+
+/// The review's proof of concept: a notification of the tenant held back
+/// by `not_before`, the tenant deleted while it waits. Nothing is sent,
+/// captured or served.
+#[tokio::test]
+async fn a_notification_waiting_at_the_mark_sends_nothing() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let instance = start(&world, |_| {}).await;
+    let later = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(3);
+    notify_at(&instance, "usr_ada", "org_a", "pw:later", Some(later)).await;
+    mark_only(&world, "org_a").await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    instance.settle().await;
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.captures")
+            .await,
+        0
+    );
+    assert_eq!(
+        world
+            .scalar(
+                "SELECT count(*) FROM merezha_notify.deliveries \
+                 WHERE status IN ('accepted', 'delivered')"
+            )
+            .await,
+        0
+    );
+    let (status, _) = instance
+        .call("GET", "/v1/notifications/inbox", Some("ada"), None)
+        .await;
+    assert_eq!(status.as_u16(), 404);
+    instance.stop().await;
+}
+
+/// Security review of #82: a deleted tenant's webhook delivery still being
+/// retried is cancelled `tenant_deleted` at its next attempt, and the
+/// endpoint gets no further request.
+#[tokio::test]
+async fn a_retried_webhook_of_a_deleted_tenant_is_cancelled() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    receiver.fail_next(1, 500, "down");
+    let instance = start(&world, |_| {}).await;
+    let (status, _) = instance
+        .call(
+            "POST",
+            "/v1/notifications/tenants/org_a/webhooks",
+            Some("ada"),
+            Some(json!({ "url": receiver.url("a") })),
+        )
+        .await;
+    assert_eq!(status, 201);
+    content_event(
+        &instance,
+        &world,
+        "content.entry_published",
+        "org_a:entry:retry",
+        Some("org_a"),
+    )
+    .await;
+    instance
+        .until(
+            "SELECT count(*) FROM merezha_notify.webhook_deliveries WHERE status = 'retrying'",
+            1,
+        )
+        .await;
+    assert_eq!(receiver.received().len(), 1);
+    mark_only(&world, "org_a").await;
+    world
+        .execute(
+            "UPDATE merezha_jobs.jobs SET run_at = now() \
+             WHERE kind = 'notify.webhook.deliver' AND state = 'available'",
+        )
+        .await;
+    instance
+        .until(
+            "SELECT count(*) FROM merezha_notify.webhook_deliveries \
+             WHERE status = 'cancelled' AND last_error_code = 'tenant_deleted'",
+            1,
+        )
+        .await;
+    assert_eq!(receiver.received().len(), 1, "no request after the mark");
+    instance.stop().await;
+}
+
+/// Security review of #82 (write fence): from the mark on, the tenant's
+/// endpoints take no update, rotation, enable or redelivery, and its
+/// notifications no redelivery (404); a purge of a tenant never marked
+/// touches nothing.
+#[tokio::test]
+async fn a_marked_tenant_takes_no_change_or_redelivery() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let instance = start(&world, |o| o.workers = false).await;
+    instance
+        .tokens
+        .add("admin", user("usr_admin", &["notifications.admin"], None));
+    let (status, endpoint) = instance
+        .call(
+            "POST",
+            "/v1/notifications/tenants/org_a/webhooks",
+            Some("ada"),
+            Some(json!({ "url": receiver.url("a") })),
+        )
+        .await;
+    assert_eq!(status, 201);
+    let endpoint = endpoint["id"].as_str().unwrap().to_owned();
+    let core = instance.core();
+    // Never marked: the purge refuses and deletes nothing.
+    assert_eq!(
+        merezha_notifications::tenants::purge_step(
+            &core.database,
+            "org_a",
+            jiff::Timestamp::now(),
+            soon()
+        )
+        .await,
+        Ok(merezha_notifications::tenants::PurgeStep::NotDeleted)
+    );
+    assert_eq!(rows(&world, "webhook_endpoints", "org_a").await, 1);
+    // A failed delivery of the tenant and a failed webhook delivery.
+    world
+        .execute(&format!(
+            "INSERT INTO merezha_notify.notifications (id, source, dedupe_key, topic, template, \
+               tenant_id, category, priority, data, channels, status, target_count, requested_at, \
+               expanded_at, settled_at) VALUES ('00000000-0000-0000-0000-0000000000a1', 'api', \
+               'k:a', 'identity.password_changed', 'identity.password_changed', 'org_a', \
+               'security', 'normal', '{{}}', '{{email}}', 'expanded', 1, now(), now(), now());
+             INSERT INTO merezha_notify.deliveries (id, notification_id, channel, target_key, \
+               address, locale, status, status_reason, run_at, created_at, updated_at, \
+               settled_at) VALUES ('00000000-0000-0000-0000-0000000000b1', \
+               '00000000-0000-0000-0000-0000000000a1', 'email', 'email:ada@example.com', \
+               'ada@example.com', 'en', 'failed', 'blocked', now(), now(), now(), now());
+             INSERT INTO merezha_notify.webhook_events (id, source, source_event_id, tenant_id, \
+               event_type, occurred_at, body, created_at) VALUES \
+               ('00000000-0000-0000-0000-0000000000c1', 'content', 'e1', 'org_a', \
+                'content.entry_published', now(), '\\x7b7d', now());
+             INSERT INTO merezha_notify.webhook_deliveries (id, event_id, endpoint_id, status, \
+               created_at, updated_at, settled_at) VALUES \
+               ('00000000-0000-0000-0000-0000000000d1', '00000000-0000-0000-0000-0000000000c1', \
+                '{endpoint}', 'failed', now(), now(), now());"
+        ))
+        .await;
+    mark_only(&world, "org_a").await;
+    let base = format!("/v1/notifications/tenants/org_a/webhooks/{endpoint}");
+    for (method, path, body) in [
+        (
+            "PATCH",
+            base.clone(),
+            Some(json!({ "description": "x", "revision": 1 })),
+        ),
+        ("POST", format!("{base}/rotate-secret"), None),
+        ("POST", format!("{base}/disable"), None),
+        ("POST", format!("{base}/enable"), None),
+        (
+            "POST",
+            format!("{base}/deliveries/00000000-0000-0000-0000-0000000000d1/redeliver"),
+            None,
+        ),
+    ] {
+        let (status, _) = instance.call(method, &path, Some("ada"), body).await;
+        assert_eq!(status.as_u16(), 404, "{method} {path}");
+    }
+    let (status, _) = instance
+        .call(
+            "POST",
+            "/v1/notifications/deliveries/00000000-0000-0000-0000-0000000000b1/redeliver",
+            Some("admin"),
+            None,
+        )
+        .await;
+    assert_eq!(status.as_u16(), 404);
+    assert_eq!(
+        world
+            .text(
+                "SELECT status || ':' || generation FROM merezha_notify.deliveries \
+                 UNION ALL SELECT status || ':' || generation \
+                 FROM merezha_notify.webhook_deliveries"
+            )
+            .await,
+        ["failed:0", "failed:0"]
     );
     instance.stop().await;
 }

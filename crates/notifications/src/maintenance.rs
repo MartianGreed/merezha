@@ -344,8 +344,13 @@ const RECLAIM_BATCH: i64 = 100;
 /// letter the operator never replayed, a lost outbox record) and would
 /// stay open forever, its notification never settled and never deleted
 /// by `retention` (issue #63). It is settled `job_lost`: `unknown` when
-/// its last attempt was still `started` (the send may have gone out, so
-/// it is never resent by itself, NT1), else `failed`. Provider events
+/// an attempt was still `started` or its generation has an `ambiguous`
+/// attempt (the send may have gone out, so it is never resent by itself,
+/// NT1), else `failed`. The cutoff is the delivery's own clock: after a
+/// worker outage or a queue backlog of more than a day, a delivery whose
+/// job is still waiting is settled too (its job then finds it settled and
+/// stops); redeliver it. The jobs runtime's tables are its own, so the
+/// task does not look the job up. Provider events
 /// stored `pending` for it apply in the same transaction, as Tx B would
 /// have applied them. Webhook deliveries open and due for as long are
 /// settled `failed` / `job_lost` the same way. The rows it settled.
@@ -452,7 +457,7 @@ pub async fn reclaim_stuck(core: &Core, deadline: Instant) -> Result<u64, Failur
     Ok(total)
 }
 /// The reason of a delivery `reclaim_stuck` settled.
-pub const JOB_LOST: &str = "job_lost";
+pub const JOB_LOST: &str = crate::policy::reason::JOB_LOST;
 
 /// Keep the newest `retention.captures` captures, as the capture drivers
 /// do on every capture, for a lowered setting or a driver switched off.

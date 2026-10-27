@@ -39,6 +39,11 @@ pub mod reason {
     /// The target already got the topic's `max_per_target_per_hour`
     /// deliveries in the last hour (NT §6, NT-N8).
     pub const TARGET_RATE_LIMITED: &str = "target_rate_limited";
+    /// The notification's organization was deleted (issue #63): an open
+    /// delivery is `cancelled` with it at its next Tx A.
+    pub const TENANT_DELETED: &str = "tenant_deleted";
+    /// `reclaim_stuck`: the delivery's job was lost (issue #63).
+    pub const JOB_LOST: &str = "job_lost";
 }
 
 /// Whether `channel` is on for a user target of `topic` (NT §6): security

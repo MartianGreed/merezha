@@ -214,6 +214,14 @@ pub const DELIVERY_SET: Statement = s(
      WHERE id = $1 AND generation = $2 \
      AND ($7::int IS NULL OR (status = 'sending' AND attempt_count = $7::int))",
 );
+/// Record at `$2` that a job still holds open delivery `$1` without an
+/// attempt (a push retried for another VAPID key), so `reclaim_stuck`
+/// does not take a live chain for a lost one.
+pub const DELIVERY_TOUCH: Statement = s(
+    "notify.delivery.touch",
+    "UPDATE merezha_notify.deliveries",
+    "UPDATE merezha_notify.deliveries SET updated_at = $2 WHERE id = $1",
+);
 pub const DELIVERY_ACCEPT: Statement = s(
     "notify.delivery.accept",
     "UPDATE merezha_notify.deliveries",
@@ -566,13 +574,18 @@ pub const RECLAIM_ATTEMPTS: Statement = s(
      RETURNING delivery_id",
 );
 /// Settle the still open deliveries `$1` as `job_lost` at `$3`: `unknown`
-/// for those in `$2` (a send may have gone out), `failed` for the others.
+/// for those in `$2` (an attempt was still `started`) and those whose
+/// generation has an `ambiguous` attempt (a send may have gone out either
+/// way, so a redelivery could duplicate it), `failed` for the others.
 /// Each with its channel, new status and topic.
 pub const RECLAIM_SET: Statement = s(
     "notify.delivery.reclaim",
     "UPDATE merezha_notify.deliveries",
     "UPDATE merezha_notify.deliveries d SET \
-       status = CASE WHEN d.id = ANY($2::uuid[]) THEN 'unknown' ELSE 'failed' END, \
+       status = CASE WHEN d.id = ANY($2::uuid[]) OR EXISTS (SELECT 1 \
+         FROM merezha_notify.delivery_attempts a WHERE a.delivery_id = d.id \
+         AND a.generation = d.generation AND a.outcome = 'ambiguous') \
+         THEN 'unknown' ELSE 'failed' END, \
        status_reason = 'job_lost', updated_at = $3, settled_at = $3 \
      FROM merezha_notify.notifications n \
      WHERE d.id = ANY($1::uuid[]) AND n.id = d.notification_id \
@@ -640,13 +653,19 @@ pub const TENANT_DELETED: Statement = s(
     "SELECT merezha_notify.tenants_deleted",
     "SELECT 1 FROM merezha_notify.tenants_deleted WHERE tenant_id = $1",
 );
-/// Mark tenant `$1` deleted at `$2`, unless it is; the row when this call
-/// marked it.
+/// Mark tenant `$1` deleted at `$2` by `$3` (`event`, `operator`), unless
+/// it is; the row when this call marked it.
 pub const TENANT_MARK: Statement = s(
     "notify.tenant.mark",
     "INSERT merezha_notify.tenants_deleted",
-    "INSERT INTO merezha_notify.tenants_deleted (tenant_id, deleted_at) VALUES ($1, $2) \
-     ON CONFLICT DO NOTHING RETURNING tenant_id",
+    "INSERT INTO merezha_notify.tenants_deleted (tenant_id, deleted_at, source) \
+     VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING tenant_id",
+);
+/// Whether the `tenants_deleted` table (migration 7) exists.
+pub const TENANTS_DELETED_EXIST: Statement = s(
+    "notify.tenant.table_exists",
+    "SELECT to_regclass()",
+    "SELECT to_regclass('merezha_notify.tenants_deleted') IS NOT NULL",
 );
 /// Record that tenant `$1`'s purge finished at `$2`; the row the first
 /// time.
@@ -680,7 +699,9 @@ pub const TENANT_PURGE_PUSH: Statement = s(
     "DELETE FROM merezha_notify.push_subscriptions WHERE id IN \
      (SELECT id FROM merezha_notify.push_subscriptions WHERE tenant_id = $1 LIMIT $2)",
 );
-/// At most `$2` users with inbox items of tenant `$1`, in ascending order.
+/// At most `$2` users with inbox items of tenant `$1`, in ascending order,
+/// read in index order (`inbox_items_tenant_idx` on `(tenant_id, user_id)`),
+/// so a step stops at its limit instead of scanning the whole tenant.
 pub const TENANT_INBOX_USERS: Statement = s(
     "notify.tenant.inbox_users",
     "SELECT merezha_notify.inbox_items",
@@ -708,6 +729,12 @@ pub const TENANT_PURGE_PROVIDER_EVENTS: Statement = s(
     "DELETE merezha_notify.provider_events",
     "DELETE FROM merezha_notify.provider_events WHERE delivery_id = ANY($1::uuid[])",
 );
+/// Delete the development captures of deliveries `$1`.
+pub const TENANT_PURGE_CAPTURES: Statement = s(
+    "notify.tenant.purge_captures",
+    "DELETE merezha_notify.captures",
+    "DELETE FROM merezha_notify.captures WHERE delivery_id = ANY($1::uuid[])",
+);
 /// Delete notifications `$1`; their deliveries and attempts cascade.
 pub const TENANT_PURGE_NOTIFICATIONS: Statement = s(
     "notify.tenant.purge_notifications",
@@ -721,6 +748,7 @@ pub const STATEMENTS: &[Statement] = &[
     TENANT_DELETE_LOCK,
     TENANT_DELETED,
     TENANT_MARK,
+    TENANTS_DELETED_EXIST,
     TENANT_PURGED,
     TENANT_PURGE_EVENTS,
     TENANT_PURGE_ENDPOINTS,
@@ -729,6 +757,7 @@ pub const STATEMENTS: &[Statement] = &[
     TENANT_PURGE_INBOX,
     TENANT_NOTIFICATIONS,
     TENANT_PURGE_PROVIDER_EVENTS,
+    TENANT_PURGE_CAPTURES,
     TENANT_PURGE_NOTIFICATIONS,
     TARGET_LOCKS,
     TARGET_RECENT,
@@ -757,6 +786,7 @@ pub const STATEMENTS: &[Statement] = &[
     ATTEMPT_FINISH,
     DELIVERY_SENDING,
     DELIVERY_SET,
+    DELIVERY_TOUCH,
     DELIVERY_ACCEPT,
     PREFERENCES_FOR_USER,
     SUPPRESSIONS_FOR_ADDRESS,

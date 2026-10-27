@@ -398,3 +398,134 @@ fn vapid_generate_prints_a_pair_the_push_section_accepts() {
     let text = fs::read_to_string(&host.log).unwrap();
     assert!(!text.contains(&private), "the VAPID key is never logged");
 }
+
+/// `merezha notifications purge-organization` with `args` on `config`:
+/// exit code, stdout and stderr.
+fn purge(config: &Path, url: &str, args: &[&str]) -> (Option<i32>, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_merezha"))
+        .args(["notifications", "purge-organization"])
+        .args(args)
+        .arg("--config")
+        .arg(config)
+        .env("NOTIFY_TEST_DATABASE_URL", url)
+        .env("NOTIFY_KEY", KEY)
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+    )
+}
+
+/// Security review of #82: `merezha notifications purge-organization`
+/// marks and purges an organization deleted before the block consumed
+/// `identity.organization_deleted`. Without identity's tables it cannot
+/// confirm the deletion and refuses (exit 1) unless `--force`, which warns
+/// first; the purge logs its events with source `operator`; a second run
+/// finds it done; bad arguments exit 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_operator_purges_an_organization_deleted_before() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let config = project(
+        dir.path(),
+        "[modules.notifications]\nsecret_key = { env = \"NOTIFY_KEY\" }\n",
+    );
+    // `merezha run` applies the block's migrations.
+    {
+        let mut host = Host::spawn(
+            &config,
+            &[
+                ("NOTIFY_TEST_DATABASE_URL", test.url()),
+                ("NOTIFY_KEY", KEY),
+            ],
+            "run",
+        );
+        host.ready();
+        host.stop();
+    }
+    let db = merezha_postgres::Database::connect(&test.config()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let client = db.acquire(deadline).await.unwrap();
+    client
+        .batch_execute(
+            "INSERT INTO merezha_notify.notifications (id, source, dedupe_key, topic, template, \
+               tenant_id, category, priority, data, channels, status, target_count, requested_at, \
+               expanded_at, settled_at) VALUES \
+               ('00000000-0000-0000-0000-0000000000a1', 'api', 'k:x', 'identity.password_changed', \
+                'identity.password_changed', 'org_x', 'security', 'normal', '{}', '{inbox}', \
+                'expanded', 1, now(), now(), now()), \
+               ('00000000-0000-0000-0000-0000000000a2', 'api', 'k:y', 'identity.password_changed', \
+                'identity.password_changed', 'org_y', 'security', 'normal', '{}', '{inbox}', \
+                'expanded', 1, now(), now(), now());
+             INSERT INTO merezha_notify.inbox_items (id, user_id, tenant_id, notification_id, \
+               topic, title, body, seq, change_seq, created_at, expires_at) VALUES \
+               (gen_random_uuid(), 'usr_ada', 'org_x', '00000000-0000-0000-0000-0000000000a1', \
+                'identity.password_changed', 't', 'b', 1, 1, now(), now() + interval '1 day'), \
+               (gen_random_uuid(), 'usr_ada', 'org_y', '00000000-0000-0000-0000-0000000000a2', \
+                'identity.password_changed', 't', 'b', 2, 2, now(), now() + interval '1 day');
+             INSERT INTO merezha_notify.inbox_counters (user_id, last_seq) VALUES ('usr_ada', 2);",
+        )
+        .await
+        .unwrap();
+    let count = |sql: &'static str| {
+        let db = db.clone();
+        async move {
+            let client = db.acquire(deadline).await.unwrap();
+            client.query_one(sql, &[]).await.unwrap().get::<_, i64>(0)
+        }
+    };
+    let (code, stdout, _) = purge(&config, test.url(), &[]);
+    assert_eq!(code, Some(2), "{stdout}");
+    let (code, stdout, _) = purge(&config, test.url(), &["org_x"]);
+    assert_eq!(code, Some(1), "{stdout}");
+    assert!(
+        stdout.starts_with("refused: identity cannot confirm"),
+        "{stdout}"
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM merezha_notify.tenants_deleted").await,
+        0
+    );
+    let (code, stdout, stderr) = purge(&config, test.url(), &["org_x", "--force"]);
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(stdout.starts_with("warning: --force:"), "{stdout}");
+    assert!(
+        stdout.contains("organization org_x marked deleted"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("inbox_items 1 notifications 1"), "{stdout}");
+    assert!(stdout.contains("status purged\n"), "{stdout}");
+    for event in [
+        "notification.organization_deleted",
+        "notification.organization_purged",
+    ] {
+        assert!(stderr.contains(event), "{event}: {stderr}");
+    }
+    assert!(stderr.contains("\"source\":\"operator\""), "{stderr}");
+    assert_eq!(
+        count(
+            "SELECT count(*) FROM merezha_notify.tenants_deleted \
+             WHERE tenant_id = 'org_x' AND source = 'operator' AND purged_at IS NOT NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM merezha_notify.notifications").await,
+        1,
+        "org_y's stays"
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM merezha_notify.inbox_items").await,
+        1
+    );
+    let (code, stdout, _) = purge(&config, test.url(), &["org_x", "--force"]);
+    assert_eq!(code, Some(0), "{stdout}");
+    assert!(stdout.contains("already marked deleted"), "{stdout}");
+    assert!(stdout.contains("status purged (already)"), "{stdout}");
+    db.close();
+}

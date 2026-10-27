@@ -1334,6 +1334,17 @@ async fn a_push_leased_by_an_instance_on_another_key_is_retried_for_its_own() {
     );
     assert_eq!(queued("rot:1").await, std::slice::from_ref(&first));
     assert!(attempts(world).await.is_empty());
+    // The live chain shows on the row, so `reclaim_stuck` does not take it
+    // for a lost one.
+    assert_eq!(
+        world
+            .scalar(&format!(
+                "SELECT count(*) FROM merezha_notify.deliveries \
+                 WHERE id = '{first}' AND updated_at > created_at"
+            ))
+            .await,
+        1
+    );
     assert!(fake.received().is_empty());
     // ... and the old key's instance sends it.
     assert_eq!(run_push(&old, &first, 2).await, Ok(()));

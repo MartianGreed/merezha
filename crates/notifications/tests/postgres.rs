@@ -49,7 +49,7 @@ const INTEGRATIONS_CHECKSUM: &str =
     "15de39892ceb48fa016353efb6c612f6f1486fa2b98c4686ce364bf473f20318";
 /// SHA-256 of migration 7 (hardening: message ids per attempt, deleted
 /// tenants and their indexes), frozen the same way.
-const HARDENING_CHECKSUM: &str = "87aeafb542a900bebf80b32e4768fc493845b50e1606cdfffaeb89289a2d5ceb";
+const HARDENING_CHECKSUM: &str = "347ec0a370584219c1bdf62cfb3198f5aafde6f36e255f55f8406ac30f2d6a71";
 
 /// A distinct id per call.
 fn fresh() -> Uuid {

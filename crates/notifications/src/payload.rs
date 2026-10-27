@@ -167,20 +167,18 @@ impl ExpandPayload {
 
 /// The `notify.deliver.<channel>` payload. `Debug` shows ids only.
 ///
-/// `after_attempt` fences the job chain of a generation (issue #63): a
-/// `provider_account` answer hands the delivery to a new job that carries
-/// the attempt it answered, and Tx A drops any job whose `after_attempt`
-/// is not the last such attempt of the generation (`None`: there is none
-/// yet). A job that ran again after its Tx B had handed the delivery on
-/// (a crash before the job was marked done) then finishes without a send,
-/// instead of running a second chain beside its continuation.
+/// The job chain of a generation is fenced on the attempt a continuation
+/// names in its key (`deliver:{id}:g{n}:a{attempt}`, issue #63), not on
+/// the payload. `after_attempt` is accepted when read, as a fallback for
+/// a job without the key part, and never written, so that a binary that
+/// refuses unknown fields never dead-letters a continuation.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeliverPayload {
     #[serde(with = "uuid_text")]
     pub delivery_id: Uuid,
     pub generation: i32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub after_attempt: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_data: Option<Map<String, Value>>,

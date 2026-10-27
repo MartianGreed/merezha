@@ -185,17 +185,43 @@ When identity deletes an organization, the block (subscribed to
 `merezha_notify.tenants_deleted` and purges, in short transactions, its
 webhook endpoints (one audit row `delete` by `sys_notifications` each) and
 webhook events with their deliveries, the push subscriptions made in it,
-its inbox items, and its notifications with their deliveries, attempts and
-provider events. Logs: `notification.organization_deleted` at the mark,
+its inbox items, and its notifications with their deliveries, attempts,
+provider events and development captures. Logs:
+`notification.organization_deleted` at the mark,
 `notification.organization_purged` when the purge finished. From the mark
-on, nothing of the tenant is written: its content events reach no
-endpoint, its notifications expand to nothing (`notification.rejected`,
-`tenant_deleted`), and creating an endpoint in its registry or a push
-subscription in it answers 404. A send already past its first transaction
-(one email, push or webhook request) may still go out. Users' preferences
-and the endpoints' audit rows are kept. A purge job that dead-letters
-leaves the rows at rest, still refused; replay it through the jobs admin
-API.
+on, nothing of the tenant is written or sent:
+
+- its notifications expand to nothing (`notification.rejected`,
+  `tenant_deleted`), and its content events reach no endpoint;
+- a delivery or webhook delivery still queued or retrying is `cancelled`
+  / `tenant_deleted` by its next job run, before any attempt, even if the
+  purge has not reached it yet;
+- its inbox, unread count, read routes and stream answer 404, and a stream
+  already open ends at its next re-authentication;
+- creating, updating, rotating, enabling, disabling, deleting or testing
+  an endpoint of its registry, redelivering one of its deliveries, and a
+  push subscription made in it answer 404.
+
+Only a send whose attempt had already started when the mark committed
+(one email, SMS, push or webhook request) can still go out. Users'
+preferences and the endpoints' audit rows are kept. A purge job that
+dead-letters leaves the rows at rest, still refused; replay it through the
+jobs admin API, or run the command below.
+
+For an organization identity deleted before this release (or a missed
+event), run the purge by hand:
+
+```sh
+merezha notifications purge-organization org_0123… --config merezha.toml
+```
+
+It marks the tenant (source `operator`) and purges it to the end, printing
+the counts; a second run reports it already purged. It refuses (exit 1) an
+organization identity still has, or one it cannot confirm deleted (no
+identity tables, an id identity never issues); `--force` purges anyway
+after a `warning: --force:` line, and the block refuses the tenant from
+then on. Exit 2 is bad arguments, configuration or database
+(`notification.purge_failed`).
 
 ## Rate cap per target
 
@@ -249,7 +275,10 @@ every delivery still `queued`, `sending` or `retrying` whose `run_at` and
 itself), applying the provider events that waited for it. Webhook
 deliveries open and due for as long become `failed` / `job_lost`. A rise
 of `notify.reason = job_lost` means jobs are dying: look at the dead
-letters of the `notify.*` queues.
+letters of the `notify.*` queues. The cutoff counts from the delivery's
+own row: after a worker outage or a queue backlog of more than a day, a
+delivery whose job is still waiting is settled too (its job then finds it
+settled and stops). Redeliver those once the workers are back.
 
 A notification deleted by `retention` frees its `(source, dedupe_key)`: the
 same key requested again afterwards makes a new notification. Identity's

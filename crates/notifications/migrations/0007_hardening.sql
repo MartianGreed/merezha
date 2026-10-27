@@ -21,6 +21,7 @@ ALTER TABLE merezha_notify.delivery_attempts
 CREATE TABLE merezha_notify.tenants_deleted (
   tenant_id text PRIMARY KEY CHECK (length(tenant_id) BETWEEN 1 AND 128),
   deleted_at timestamptz NOT NULL,
+  source text NOT NULL CHECK (source IN ('event', 'operator')),  -- who marked it
   purged_at timestamptz
 );
 
@@ -32,7 +33,7 @@ CREATE INDEX webhook_deliveries_open_idx ON merezha_notify.webhook_deliveries (u
 -- The tenant purge reads each table by tenant.
 CREATE INDEX notifications_tenant_idx ON merezha_notify.notifications (tenant_id)
   WHERE tenant_id IS NOT NULL;
-CREATE INDEX inbox_items_tenant_idx ON merezha_notify.inbox_items (tenant_id)
+CREATE INDEX inbox_items_tenant_idx ON merezha_notify.inbox_items (tenant_id, user_id)
   WHERE tenant_id IS NOT NULL;
 CREATE INDEX push_subscriptions_tenant_idx ON merezha_notify.push_subscriptions (tenant_id)
   WHERE tenant_id IS NOT NULL;

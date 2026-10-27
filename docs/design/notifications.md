@@ -385,12 +385,15 @@ CREATE INDEX provider_events_received_idx ON provider_events (received_at);
 ALTER TABLE delivery_attempts ADD COLUMN provider_message_id text
   CHECK (length(provider_message_id) <= 256);   -- of an accepted attempt
 CREATE TABLE tenants_deleted (                   -- identity.organization_deleted
-  tenant_id text PRIMARY KEY, deleted_at timestamptz NOT NULL, purged_at timestamptz
+  tenant_id text PRIMARY KEY, deleted_at timestamptz NOT NULL,
+  source text NOT NULL,                          -- 'event' | 'operator'
+  purged_at timestamptz
 );
 CREATE INDEX webhook_deliveries_open_idx ON webhook_deliveries (updated_at)
   WHERE status IN ('queued','sending','retrying');
 -- plus (tenant_id) WHERE tenant_id IS NOT NULL on notifications,
--- inbox_items, push_subscriptions and webhook_events, and
+-- push_subscriptions and webhook_events, (tenant_id, user_id) on
+-- inbox_items, and
 -- ((COALESCE(tenant_id, '')), id DESC) on webhook_audit
 ```
 
@@ -455,8 +458,10 @@ the same generation.
 Payloads are JSON. Data travels in the request payload, because the
 notification row does not exist until expansion. Delivery job payloads carry
 `{ delivery_id, generation }`, plus `secret_data` for email, SMS and push when
-the request had any, and `after_attempt` on the job a `provider_account`
-answer hands the generation to (the attempt it answered; 5.1). Relayed outbox rows keep non-secret data for
+the request had any. The job a `provider_account` answer hands the
+generation to names the attempt it answered in its key (5.1); payloads
+carry no fence, so a binary that refuses unknown payload fields never
+dead-letters it. Relayed outbox rows keep non-secret data for
 `jobs.retention.outbox` (`"7d"`); flagged rows are nulled at relay (R3).
 
 Maintenance tasks, all with the skip missed-run policy:
@@ -490,7 +495,8 @@ again forever.
 
 `reclaim_stuck` as built (issue #63): batches of 100 open deliveries past
 the 24 h cutoff, locked `FOR UPDATE SKIP LOCKED`; a delivery whose last
-attempt is still `started` may have been sent, so that attempt becomes
+attempt is still `started`, or whose generation has an `ambiguous`
+attempt, may have been sent, so a `started` attempt becomes
 `ambiguous` / `lost_outcome` and the delivery `unknown` / `job_lost`
 (never resent by itself, as NT1 treats an ambiguous SMS; a later provider
 event can still move it), the others become `failed` / `job_lost`. The
@@ -775,11 +781,14 @@ the preview is refused unless `templates.preview_in_public = true`.
 
 1. **Tx A.** `SELECT … FOR UPDATE` the delivery.
    - If its generation differs from the job's, or it is settled: `Done`.
-   - If the job's `after_attempt` is not the generation's last
-     `provider_account` attempt (none for the generation's first job):
-     `Done`. A job that runs again after its Tx B handed the delivery to a
-     new job (a crash before the job was marked done) would otherwise run
-     a second chain beside it (issue #63).
+   - If the attempt the job's key names (`deliver:{id}:g{n}:a{attempt}`)
+     is not the generation's last `provider_account` attempt (none for the
+     generation's first job): `Done`. A job that runs again after its Tx B
+     handed the delivery to a new job (a crash before the job was marked
+     done) would otherwise run a second chain beside it (issue #63).
+   - If the notification's tenant was deleted (its shared lock taken, the
+     mark checked): `cancelled` / `tenant_deleted`, `Done`. The webhook
+     worker's Tx A does the same.
    - If `expires_at < now`: set `expired`, `Done`.
    - Re-check suppressions and preferences (a bounce or opt-out may have
      happened since expansion): `skipped`, `Done`.
@@ -1911,19 +1920,23 @@ task board's `task-notifier` needs the stage 3 example application to run
 under a cargo test.
 
 **Hardening (issues #63, #66, #68, #76), as built** (migration 7). The
-`after_attempt` fence of 5.1; `reclaim_stuck` (2.5) with the pending
+attempt fence of 5.1 (on the continuation's key, never the payload);
+`reclaim_stuck` (2.5) with the pending
 events of the deliveries it settles, so their notifications settle and
 `retention` deletes them; `retention` always runs a step's first batch,
 chains only after progress, and startup refuses a `notify.maintenance`
 `timeout_ms` below 5 s; deleted organizations: the block consumes
 `identity.organization_deleted`, records the tenant in `tenants_deleted`,
-refuses every write of it from then on (the expansion of its
-notifications, the fan-out of its events, a new endpoint in its registry,
-a push subscription made in it; writers take the tenant's shared advisory
-lock, the mark the exclusive one), and purges its webhook events and
-endpoints, push subscriptions, inbox items and notifications with their
-deliveries, attempts and provider events in bounded steps, as content does
-for #56; per-attempt message ids and the stale rules of 5.2 (#68); the
+refuses every write and send of it from then on (the expansion of its
+notifications, the fan-out of its events, both workers' Tx A, which
+cancel its open deliveries `tenant_deleted`, every endpoint and redeliver
+route, a push subscription made in it; writers take the tenant's shared
+advisory lock, the mark the exclusive one), stops serving its inbox and
+stream (404), and purges its webhook events and endpoints, push
+subscriptions, inbox items and notifications with their deliveries,
+attempts, provider events and captures in bounded steps, as content does
+for #56, with `merezha notifications purge-organization` for
+organizations deleted before; per-attempt message ids and the stale rules of 5.2 (#68); the
 VAPID key mismatch retry of 5.3 (#66); the unreadable mark over
 `secret_ct || secret_nonce`, `max_payload_bytes` capped at the outbox's
 64 KiB, and `GET …webhook-audit` (#76). The Brevo real-account check of

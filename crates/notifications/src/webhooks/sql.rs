@@ -60,7 +60,7 @@ pub const DELIVERY_LOCK: Statement = s(
     "SELECT merezha_notify.webhook_deliveries",
     "SELECT d.status, d.generation, e.status, e.url, e.secret_ct, e.secret_nonce, \
      e.previous_secret_ct, e.previous_secret_nonce, e.previous_expires_at, v.body, \
-     d.endpoint_id, e.key_id, e.previous_key_id \
+     d.endpoint_id, e.key_id, e.previous_key_id, v.tenant_id \
      FROM merezha_notify.webhook_deliveries d \
      JOIN merezha_notify.webhook_endpoints e ON e.id = d.endpoint_id \
      JOIN merezha_notify.webhook_events v ON v.id = d.event_id \

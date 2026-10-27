@@ -577,7 +577,15 @@ async fn lock(
         .await
         .map_err(|e| classify(&e))?
         .ok_or_else(|| Failure::permanent("not_found"))?;
-    Ok((row.get(0), row.get(1), row.get(2)))
+    let tenant: Option<String> = row.get(2);
+    // A deleted organization's endpoints are not found from the mark on
+    // (issue #63): no update, rotation, enable, disable, delete or test.
+    if let Some(tenant) = &tenant
+        && crate::tenants::guard(db, tx, tenant).await?
+    {
+        return Err(Failure::permanent("not_found"));
+    }
+    Ok((row.get(0), row.get(1), tenant))
 }
 
 /// `PATCH …webhooks/{id}` (manage): `{ url?, description?, event_types?,
@@ -942,12 +950,6 @@ async fn test(
                 db.query_one(tx, &sql::REGISTRY_LOCK, &[&key])
                     .await
                     .map_err(|e| classify(&e))?;
-                // No test event is written for a deleted organization.
-                if let Some(tenant) = &tenant
-                    && crate::tenants::guard(&db, tx, tenant).await?
-                {
-                    return Err(Failure::permanent("not_found"));
-                }
                 let window = now
                     .checked_sub(jiff::SignedDuration::try_from(TEST_WINDOW).unwrap_or_default())
                     .unwrap_or(now);
@@ -1260,6 +1262,12 @@ async fn redeliver(
                     Option<String>,
                     bool,
                 ) = (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+                // Nothing of a deleted organization is sent again.
+                if let Some(tenant) = &tenant
+                    && crate::tenants::guard(&db, tx, tenant).await?
+                {
+                    return Err(Failure::permanent("not_found"));
+                }
                 if purged {
                     return Err(Failure::permanent(code::EVENT_BODY_EXPIRED));
                 }

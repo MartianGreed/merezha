@@ -593,6 +593,13 @@ async fn redeliver(
                 let tenant: Option<String> = row.get(4);
                 let correlation: Option<String> = row.get(5);
                 let notification: Uuid = row.get(6);
+                // Nothing of a deleted organization is sent again (issue
+                // #63).
+                if let Some(tenant) = &tenant
+                    && crate::tenants::guard(&db, tx, tenant).await?
+                {
+                    return Err(Failure::permanent("not_found"));
+                }
                 // Invariant 5: only from failed, unknown or expired.
                 if !matches!(status.as_str(), "failed" | "unknown" | "expired") {
                     return Err(Failure::conflict("not_redeliverable"));

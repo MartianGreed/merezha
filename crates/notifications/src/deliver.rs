@@ -17,9 +17,10 @@
 //! (`provider_account`) is logged at error level and counted, a rate limit
 //! at warn. An accepted SMS counts its segments.
 //!
-//! Tx A also fences the job chain (issue #63): a job whose
-//! `after_attempt` is not the generation's last `provider_account` attempt
-//! was handed over and finishes without a send.
+//! Tx A also fences the job chain (issue #63): a job whose key names
+//! another attempt than the generation's last `provider_account` attempt
+//! (a generation's first job names none) was handed over and finishes
+//! without a send.
 //!
 //! Push (NT-N6) runs the same steps: Tx A also reads the delivery's
 //! subscription (gone, moved to another user, expired or out of the
@@ -137,9 +138,7 @@ async fn deliver(
     let id = payload.delivery_id;
     let job = JobRun {
         generation: payload.generation,
-        after_attempt: payload
-            .after_attempt
-            .or_else(|| keyed_attempt(&ctx.idempotency_key)),
+        after_attempt: keyed_attempt(&ctx.idempotency_key).or(payload.after_attempt),
         last: ctx.attempt >= ctx.max_attempts,
     };
     let prepared = match prepare(core, channel, deadline, id, job).await {
@@ -347,9 +346,10 @@ struct JobRun {
 }
 
 /// The attempt a continuation job names in its key
-/// (`notifications:deliver:{id}:g{generation}:a{attempt}`): the fence of a
-/// continuation queued before its payload carried `after_attempt`, so an
-/// upgrade does not drop it. A generation's first job has no `:a` part.
+/// (`notifications:deliver:{id}:g{generation}:a{attempt}`): the fence of
+/// its chain (issue #63). A generation's first job has no `:a` part. The
+/// key carries it, not the payload, so a continuation queued by any
+/// version is fenced and no older binary refuses its payload.
 fn keyed_attempt(key: &str) -> Option<i32> {
     let (_, attempt) = key.rsplit_once(":a")?;
     attempt.parse().ok().filter(|attempt| *attempt > 0)
@@ -410,6 +410,33 @@ async fn prepare(
                 let user: Option<String> = row.get(4);
                 let address: Option<String> = row.get(5);
                 let topic: String = row.get(9);
+                // A deleted organization's deliveries are cancelled before
+                // the purge reaches them (issue #63).
+                if let Some(tenant) = row.get::<_, Option<String>>(18)
+                    && crate::tenants::guard(&db, tx, &tenant).await?
+                {
+                    let why = reason::TENANT_DELETED;
+                    db.execute(
+                        tx,
+                        &sql::DELIVERY_SET,
+                        &[
+                            &id,
+                            &generation,
+                            &"cancelled",
+                            &why,
+                            &now,
+                            &None::<jiff::Timestamp>,
+                            &None::<i32>,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| classify(&e))?;
+                    events::apply_pending(&db, tx, id, now).await?;
+                    return Ok((
+                        Prepared::Finished(Outcome::Done),
+                        Some(("cancelled", why, topic)),
+                    ));
+                }
                 let category_text: String = row.get(11);
                 let data: Option<Value> = row.get(12);
                 let expires_at: Option<jiff::Timestamp> = row.get(14);
@@ -476,8 +503,13 @@ async fn prepare(
                         Some(target) if target.key_id == *key_id => push = Some(target),
                         // Made with another VAPID key: during a rolling
                         // rotation an instance holding it sends the push
-                        // (issue #66); nothing is written.
+                        // (issue #66); no attempt is started.
                         Some(_) if !job.last => {
+                            // The chain is alive: `reclaim_stuck` must not
+                            // take it for a lost one.
+                            db.execute(tx, &sql::DELIVERY_TOUCH, &[&id, &now])
+                                .await
+                                .map_err(|e| classify(&e))?;
                             return Ok((
                                 Prepared::Finished(Outcome::retry(VAPID_KEY_MISMATCH)),
                                 Some(("retrying", VAPID_KEY_MISMATCH, topic)),
@@ -951,8 +983,11 @@ async fn record(
                     payload: DeliverPayload {
                         delivery_id: id,
                         generation: locked.generation,
-                        // Fences the chain this job ends (issue #63).
-                        after_attempt: Some(locked.attempt),
+                        // The fence is the attempt in the record's key
+                        // (`…:a{attempt}`), never the payload: a payload
+                        // field would be refused by older binaries
+                        // during a rollout (issue #63).
+                        after_attempt: None,
                         secret_data: secret.cloned(),
                     }
                     .to_value(),

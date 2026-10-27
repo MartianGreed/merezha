@@ -1057,6 +1057,8 @@ async fn deliveries_whose_job_was_lost_are_reclaimed_and_retention_deletes_them(
         vec![
             password_changed("usr_ada", "lost"),
             password_changed("usr_ada", "sent"),
+            password_changed("usr_ada", "maybe"),
+            password_changed("usr_ada", "later"),
             password_changed("usr_ada", "fresh"),
         ],
     )
@@ -1066,7 +1068,7 @@ async fn deliveries_whose_job_was_lost_are_reclaimed_and_retention_deletes_them(
         .until(
             "SELECT count(*) FROM merezha_notify.deliveries WHERE channel = 'email' \
              AND status = 'queued'",
-            3,
+            5,
         )
         .await;
     let email = |key: &str| {
@@ -1075,11 +1077,18 @@ async fn deliveries_whose_job_was_lost_are_reclaimed_and_retention_deletes_them(
               ON n.id = d.notification_id WHERE n.dedupe_key = '{key}' AND d.channel = 'email')"
         )
     };
-    let (lost, sent) = (email("lost"), email("sent"));
+    let (lost, sent, maybe, later) = (email("lost"), email("sent"), email("maybe"), email("later"));
     world
         .execute(&format!(
             "UPDATE merezha_notify.deliveries SET run_at = now() - interval '25 hours', \
-               updated_at = now() - interval '25 hours' WHERE id IN ({lost}, {sent});
+               updated_at = now() - interval '25 hours' WHERE id IN ({lost}, {sent}, {maybe});
+             UPDATE merezha_notify.deliveries SET run_at = now() + interval '2 days', \
+               updated_at = now() - interval '25 hours' WHERE id = {later};
+             UPDATE merezha_notify.deliveries SET status = 'retrying', attempt_count = 1 \
+               WHERE id = {maybe};
+             INSERT INTO merezha_notify.delivery_attempts (delivery_id, attempt, generation, \
+               started_at, finished_at, outcome, error_code) SELECT {maybe}, 1, 0, \
+               now() - interval '25 hours', now() - interval '25 hours', 'ambiguous', 'timeout';
              UPDATE merezha_notify.deliveries SET status = 'sending', attempt_count = 1 \
                WHERE id = {sent};
              INSERT INTO merezha_notify.delivery_attempts (delivery_id, attempt, generation, \
@@ -1116,11 +1125,15 @@ async fn deliveries_whose_job_was_lost_are_reclaimed_and_retention_deletes_them(
     let reclaimed = maintenance::run(&core, Task::ReclaimStuck, soon())
         .await
         .unwrap();
-    assert_eq!(reclaimed, 3);
+    assert_eq!(reclaimed, 4);
     assert_eq!(of(&world, "lost").await[0], "email:failed:job_lost");
     // `unknown` / `job_lost`, then the pending `delivered` applied.
     assert_eq!(of(&world, "sent").await[0], "email:delivered:");
     assert_eq!(of(&world, "fresh").await[0], "email:queued:");
+    // A send may have gone out: never failed, which would invite a resend.
+    assert_eq!(of(&world, "maybe").await[0], "email:unknown:job_lost");
+    // Due in two days (`not_before`): its job is not lost.
+    assert_eq!(of(&world, "later").await[0], "email:queued:");
     assert_eq!(
         world
             .text(&format!(
@@ -1163,9 +1176,12 @@ async fn deliveries_whose_job_was_lost_are_reclaimed_and_retention_deletes_them(
         .unwrap();
     assert_eq!(
         world
-            .text("SELECT dedupe_key FROM merezha_notify.notifications WHERE settled_at IS NULL")
+            .text(
+                "SELECT dedupe_key FROM merezha_notify.notifications WHERE settled_at IS NULL \
+                 ORDER BY dedupe_key"
+            )
             .await,
-        ["fresh"]
+        ["fresh", "later"]
     );
     world
         .execute(
@@ -1178,9 +1194,9 @@ async fn deliveries_whose_job_was_lost_are_reclaimed_and_retention_deletes_them(
         .unwrap();
     assert_eq!(
         world
-            .text("SELECT dedupe_key FROM merezha_notify.notifications")
+            .text("SELECT dedupe_key FROM merezha_notify.notifications ORDER BY dedupe_key")
             .await,
-        ["fresh"]
+        ["fresh", "later"]
     );
     instance.stop().await;
 }
