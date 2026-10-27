@@ -659,9 +659,18 @@ async fn a_build_killed_mid_way_leaves_the_host_not_ready_and_the_next_start_rep
     // The host dies mid-build: its task stops and its session drops. No
     // pg_terminate_backend: the detached session's
     // client_connection_check_interval ends the backend, and with it the
-    // activation lock, within about half a second.
+    // activation lock, within about half a second. The bound is forty
+    // check intervals, so only a backend that never ends fails, however
+    // loaded the server is. It stays below the statement timeout, which
+    // would end the waiting build without the check interval.
     host.abort();
     let _ = host.await;
+    let bound = merezha_postgres::CONNECTION_CHECK_INTERVAL * 40;
+    assert!(
+        bound < db.statement_timeout(),
+        "{bound:?} must stay below the statement timeout {:?}",
+        db.statement_timeout()
+    );
     let gone = std::time::Instant::now();
     loop {
         let alive = scalar_i64(
@@ -678,8 +687,8 @@ async fn a_build_killed_mid_way_leaves_the_host_not_ready_and_the_next_start_rep
             break;
         }
         assert!(
-            gone.elapsed() < Duration::from_secs(2),
-            "the build backend or the activation lock outlived the host by 2 s"
+            gone.elapsed() < bound,
+            "the build backend or the activation lock outlived the host by {bound:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -837,6 +846,11 @@ async fn the_write_check_refuses_once_a_newer_model_is_active() {
     let mut client = db.acquire(soon()).await.unwrap();
     let mut tx = client.transaction().await.unwrap();
     lock_model_version(&db, &mut tx, 1).await.unwrap();
+    let writer: i32 = tx
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
     // v2 adds a field and no index, so it reaches the activation commit at once.
     let v2 = model(&V1.replace("version = 1", "version = 2").replace(
         "  { name = \"seo\", type = \"component\", component = \"seo\" },\n",
@@ -846,7 +860,9 @@ async fn the_write_check_refuses_once_a_newer_model_is_active() {
         let db = db.clone();
         tokio::spawn(async move { run(&db, &v2).await })
     };
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Observed blocked on the write's lock, it cannot finish before the
+    // write commits.
+    wait_blocked_by(&db, writer).await;
     assert!(!activation.is_finished(), "activation waits for the write");
     assert_eq!(models(&db).await, [(1, "active".to_owned())]);
     tx.commit().await.unwrap();

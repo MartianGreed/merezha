@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -204,16 +204,23 @@ async fn saves_around_another_hosts_activation_commit_before_it_or_are_refused()
            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.log_commit();",
     )
     .await;
+    // Savers loop until stopped. Each marks the saves it started once the
+    // activation returned, and counts those that finished.
     let stop = Arc::new(AtomicBool::new(false));
+    let activated_flag = Arc::new(AtomicBool::new(false));
+    let finished_after = Arc::new(AtomicUsize::new(0));
     let mut savers = Vec::new();
     for saver in 0..4 {
         let client = old.client.clone();
         let stop = stop.clone();
+        let activated_flag = activated_flag.clone();
+        let finished_after = finished_after.clone();
         savers.push(tokio::spawn(async move {
             let mut results: Vec<(Instant, StatusCode, String)> = Vec::new();
             let mut n = 0;
             while !stop.load(Ordering::SeqCst) {
                 n += 1;
+                let after = activated_flag.load(Ordering::SeqCst);
                 let started = Instant::now();
                 let reply = client
                     .post("/v1/content/manage/entries/article")
@@ -221,15 +228,32 @@ async fn saves_around_another_hosts_activation_commit_before_it_or_are_refused()
                     .send()
                     .await;
                 results.push((started, reply.status, reply.code().to_owned()));
+                if after {
+                    finished_after.fetch_add(1, Ordering::SeqCst);
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             results
         }));
     }
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Activate only once saves have committed on v1, whatever the load.
+    let deadline = soon();
+    while scalar(&old.db, "SELECT count(*) FROM public.commits").await < 4 {
+        assert!(Instant::now() < deadline, "no save committed on v1");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let new = start(&test, "", &v2()).await;
     let activated = Instant::now();
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    activated_flag.store(true, Ordering::SeqCst);
+    // Stop once four saves started after activation have finished.
+    let deadline = soon();
+    while finished_after.load(Ordering::SeqCst) < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "no save finished after activation"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     stop.store(true, Ordering::SeqCst);
     let mut committed = 0;
     let mut refused = 0;
@@ -475,12 +499,12 @@ async fn a_job_leased_before_the_host_turns_outdated_is_released_and_runs_on_a_c
         .unwrap()
         .get(0);
     // Leased and running on the v1 host when v2 activates.
-    tokio::time::timeout(Duration::from_secs(5), started.notified())
+    tokio::time::timeout_at(soon().into(), started.notified())
         .await
         .expect("the old instance leased the job");
     let new = start(&test, "", &v2()).await;
     proceed.notify_one();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = soon();
     while job_attempts(&old.db, id)
         .await
         .first()
@@ -522,7 +546,7 @@ async fn a_job_leased_before_the_host_turns_outdated_is_released_and_runs_on_a_c
         })),
     )
     .await;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = soon();
     while job_attempts(&old.db, id).await.len() < 2
         || job_attempts(&old.db, id).await[1].1.is_none()
     {

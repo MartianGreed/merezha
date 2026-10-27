@@ -93,7 +93,7 @@ async fn the_mark_waits_for_a_write_in_flight_and_refuses_later_ones() {
             .send()
             .await
     });
-    tokio::time::timeout(Duration::from_secs(10), pause.reached())
+    tokio::time::timeout_at(soon().into(), pause.reached())
         .await
         .expect("the save holds its gate");
     organization_deleted(&fx, ORG_B).await;

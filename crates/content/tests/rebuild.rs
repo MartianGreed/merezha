@@ -71,11 +71,16 @@ async fn page_rows(db: &merezha_platform::Database, locale: &str) -> i64 {
     .await
 }
 
+/// `limits.query_timeout` at its maximum: it bounds every save and every
+/// rebuild batch transaction, so a loaded server never times one out.
+const SLOW_QUERIES: &str = "limits = { query_timeout = \"30s\" }";
+
 const REBUILD_STATES: &str = "SELECT coalesce(string_agg(version || ':' || state, ',' \
      ORDER BY version), '') FROM merezha_content.rebuilds";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_rebuild_runs_in_the_background_while_the_host_is_ready() {
+    let _slot = host_slot().await;
     let Some(test) = TestDatabase::create() else {
         return;
     };
@@ -126,6 +131,7 @@ async fn the_rebuild_runs_in_the_background_while_the_host_is_ready() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_killed_mid_rebuild_leaves_it_for_another_to_finish() {
+    let _slot = host_slot().await;
     let Some(test) = TestDatabase::create() else {
         return;
     };
@@ -206,6 +212,7 @@ async fn a_host_killed_mid_rebuild_leaves_it_for_another_to_finish() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_newer_activation_carries_a_pending_rebuild_forward() {
+    let _slot = host_slot().await;
     let Some(test) = TestDatabase::create() else {
         return;
     };
@@ -286,6 +293,7 @@ async fn first_page(db: &merezha_platform::Database) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_save_referencing_an_entry_of_the_batch_never_waits_for_the_rebuild() {
+    let _slot = host_slot().await;
     let Some(test) = TestDatabase::create() else {
         return;
     };
@@ -308,7 +316,8 @@ async fn a_save_referencing_an_entry_of_the_batch_never_waits_for_the_rebuild() 
             .await,
     );
     old.publish("article", &article, "en", 1).await;
-    let pending = start_with(&test, NO_WORKERS, "", &v2()).await;
+    // The save stays open until the rebuild finished.
+    let pending = start_with(&test, NO_WORKERS, SLOW_QUERIES, &v2()).await;
     // A save holds its own entry (`FOR SHARE`) and its target (`FOR KEY
     // SHARE`), stopped as it writes the ref.
     execute(
@@ -348,6 +357,7 @@ async fn a_save_referencing_an_entry_of_the_batch_never_waits_for_the_rebuild() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_runs_of_one_rebuild_never_repeat_a_batch() {
+    let _slot = host_slot().await;
     let Some(test) = TestDatabase::create() else {
         return;
     };
@@ -387,7 +397,7 @@ async fn two_runs_of_one_rebuild_never_repeat_a_batch() {
                  '{\"version\":2}'::json, sha256('{\"version\":2}'::bytea), 3, 'c2')",
     )
     .await;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = soon();
     loop {
         let on_cursor = scalar(
             &worker.db,
@@ -441,6 +451,7 @@ async fn two_runs_of_one_rebuild_never_repeat_a_batch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_retried_run_finds_its_continuation_and_succeeds() {
+    let _slot = host_slot().await;
     let Some(test) = TestDatabase::create() else {
         return;
     };
@@ -448,8 +459,8 @@ async fn a_retried_run_finds_its_continuation_and_succeeds() {
     seed_pages(&old.db, 1100).await;
     // A job timeout no longer than `limits.query_timeout`: every run does
     // one batch, then appends its continuation.
-    let tight = "[jobs.queues.content]\ntimeout_ms = 5000\n";
-    let worker = start_with(&test, tight, "", &v2()).await;
+    let tight = "[jobs.queues.content]\ntimeout_ms = 30000\n";
+    let worker = start_with(&test, tight, SLOW_QUERIES, &v2()).await;
     wait_for(&worker.db, REBUILD_STATES, "2:done").await;
     let continuations = strings(
         &worker.db,
@@ -499,6 +510,7 @@ async fn a_retried_run_finds_its_continuation_and_succeeds() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pending_rebuild_without_a_live_job_is_enqueued_again_at_start() {
+    let _slot = host_slot().await;
     let Some(test) = TestDatabase::create() else {
         return;
     };
@@ -522,14 +534,13 @@ async fn a_pending_rebuild_without_a_live_job_is_enqueued_again_at_start() {
     let worker = start(&test, "", &v2()).await;
     wait_for(&worker.db, REBUILD_STATES, "2:done").await;
     assert_eq!(page_rows(&worker.db, "de").await, 30);
-    assert_eq!(
-        strings(
-            &worker.db,
-            "SELECT state FROM merezha_jobs.jobs WHERE idempotency_key = 'content:rebuild:2:resume:start'"
-        )
-        .await,
-        ["succeeded"]
-    );
+    // The last batch commits `done`; the worker settles the job after it.
+    wait_for(
+        &worker.db,
+        "SELECT state FROM merezha_jobs.jobs WHERE idempotency_key = 'content:rebuild:2:resume:start'",
+        "succeeded",
+    )
+    .await;
     // A start with nothing pending enqueues nothing.
     start(&test, "", &v2()).await;
     assert_eq!(
@@ -544,6 +555,7 @@ async fn a_pending_rebuild_without_a_live_job_is_enqueued_again_at_start() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_beside_a_live_rebuild_job_never_repeats_a_batch() {
+    let _slot = host_slot().await;
     let Some(test) = TestDatabase::create() else {
         return;
     };

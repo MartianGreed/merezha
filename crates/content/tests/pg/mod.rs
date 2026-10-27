@@ -241,3 +241,31 @@ fields = [
   { name = "seo", type = "component", component = "seo" },
 ]
 "#;
+
+/// Wait for a backend of `db`'s database blocked by backend `pid` (as
+/// `pg_blocking_pids` reports it); returns the first found. Polls until
+/// [`soon`], so only a backend that never blocks fails.
+pub async fn wait_blocked_by(db: &Database, pid: i32) -> i32 {
+    let deadline = soon();
+    loop {
+        let client = db.acquire(soon()).await.unwrap();
+        let found: Option<i32> = client
+            .query_opt(
+                "SELECT pid FROM pg_stat_activity \
+                  WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid)) LIMIT 1",
+                &[&pid],
+            )
+            .await
+            .unwrap()
+            .map(|row| row.get(0));
+        drop(client);
+        if let Some(found) = found {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nothing blocked by backend {pid}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
