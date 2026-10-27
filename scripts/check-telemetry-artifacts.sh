@@ -20,8 +20,8 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # Prometheus 3.15.0, the version grafana/otel-lgtm 0.38.0 ships; the digest
-# pins the multi-architecture image.
-image="prom/prometheus:v3.15.0@sha256:6b41f7a45cfbd1d259a78701ee5e14fc2ad9383c9aa5d0427345a18539bc3c91"
+# pins the multi-architecture manifest list (amd64 and arm64 alike).
+image="prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e"
 
 cd "$root"
 if [[ -n ${PROMTOOL:-} ]]; then
