@@ -60,7 +60,7 @@ pub const DELIVERY_LOCK: Statement = s(
     "SELECT merezha_notify.webhook_deliveries",
     "SELECT d.status, d.generation, e.status, e.url, e.secret_ct, e.secret_nonce, \
      e.previous_secret_ct, e.previous_secret_nonce, e.previous_expires_at, v.body, \
-     d.endpoint_id, e.key_id, e.previous_key_id \
+     d.endpoint_id, e.key_id, e.previous_key_id, v.tenant_id \
      FROM merezha_notify.webhook_deliveries d \
      JOIN merezha_notify.webhook_endpoints e ON e.id = d.endpoint_id \
      JOIN merezha_notify.webhook_events v ON v.id = d.event_id \
@@ -286,6 +286,17 @@ pub const TEST_RATE: Statement = s(
      (SELECT count(*) FROM merezha_notify.webhook_events \
        WHERE COALESCE(tenant_id, '') = $2 AND event_type = 'webhook.test' AND created_at > $3)",
 );
+/// One page of registry `$1`'s audit rows, newest first, optionally of
+/// endpoint `$2`, before row id `$3`, at most `$4` (`GET …webhook-audit`,
+/// issue #76).
+pub const AUDIT_PAGE: Statement = s(
+    "notify.webhook.audit_page",
+    "SELECT merezha_notify.webhook_audit",
+    "SELECT id, endpoint_id, action, reason, actor, revision, occurred_at \
+     FROM merezha_notify.webhook_audit \
+     WHERE COALESCE(tenant_id, '') = $1 AND ($2::uuid IS NULL OR endpoint_id = $2) \
+     AND ($3::bigint IS NULL OR id < $3) ORDER BY id DESC LIMIT $4",
+);
 /// Lock delivery `$1` of endpoint `$2` in registry `$3`, with whether it
 /// is open and untouched since `$4` (its job is presumed dead).
 pub const REDELIVER_LOCK: Statement = s(
@@ -321,6 +332,24 @@ pub const AUTO_DISABLE_CANDIDATES: Statement = s(
        AND a.outcome IN ('failed', 'blocked', 'ambiguous') \
        AND a.error_code IS DISTINCT FROM 'endpoint_busy' LIMIT $2) AS f) >= $2 \
      ORDER BY e.failing_since LIMIT $3",
+);
+/// `reclaim_stuck` for webhooks: at most `$2` open deliveries untouched
+/// since before `$1` and due since before then, whose job was lost, are
+/// settled `failed` / `job_lost` at `$3`, their `started` attempt marked
+/// `ambiguous` / `lost_outcome`. A delivery a worker holds is skipped.
+pub const RECLAIM: Statement = s(
+    "notify.webhook.reclaim",
+    "UPDATE merezha_notify.webhook_deliveries",
+    "WITH lost AS (SELECT id FROM merezha_notify.webhook_deliveries \
+       WHERE status IN ('queued', 'sending', 'retrying') AND updated_at < $1 \
+       AND COALESCE(next_attempt_at, updated_at) < $1 \
+       ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED), \
+     attempts AS (UPDATE merezha_notify.webhook_attempts a SET outcome = 'ambiguous', \
+       finished_at = $3, error_code = 'lost_outcome' FROM lost \
+       WHERE a.delivery_id = lost.id AND a.outcome = 'started' RETURNING a.delivery_id) \
+     UPDATE merezha_notify.webhook_deliveries d SET status = 'failed', \
+       last_error_code = 'job_lost', next_attempt_at = NULL, updated_at = $3, settled_at = $3 \
+     FROM lost WHERE d.id = lost.id RETURNING d.id",
 );
 /// Null the bodies of events created before `$1`, at most `$2`.
 pub const RETENTION_BODIES: Statement = s(
@@ -359,21 +388,23 @@ pub const PREVIOUS_EXPIRE: Statement = s(
 );
 /// After id `$1`, the endpoints with a secret sealed under another key
 /// than `$2`, at most `$3`, except those found unreadable under the key
-/// pair `$4` with their current ciphertext.
+/// pair `$4` with their current ciphertext and nonce (the mark hashes
+/// both, issue #76, so repairing either one clears it).
 pub const STALE_SECRETS: Statement = s(
     "notify.webhook.stale_secrets",
     "SELECT merezha_notify.webhook_endpoints",
     "SELECT id, secret_ct, secret_nonce, key_id, previous_secret_ct, previous_secret_nonce, \
      previous_key_id FROM merezha_notify.webhook_endpoints \
      WHERE id > $1 AND (key_id <> $2 OR previous_key_id <> $2) \
-     AND unreadable_under IS DISTINCT FROM ($4::bytea || substring(sha256(secret_ct) FROM 1 FOR 8)) \
+     AND unreadable_under IS DISTINCT FROM \
+       ($4::bytea || substring(sha256(secret_ct || secret_nonce) FROM 1 FOR 8)) \
      ORDER BY id LIMIT $3",
 );
 /// How many endpoints still hold a secret sealed under another key than
 /// `$1`, and how many were found unreadable under the current key pair
-/// `$2` with their current ciphertext. A row marked under another pair
-/// (another previous key) counts in the first: the keys now configured
-/// were not all tried on it.
+/// `$2` with their current ciphertext and nonce. A row marked under
+/// another pair (another previous key) counts in the first: the keys now
+/// configured were not all tried on it.
 pub const SECRET_COUNTS: Statement = s(
     "notify.webhook.secret_counts",
     "SELECT merezha_notify.webhook_endpoints",
@@ -381,18 +412,19 @@ pub const SECRET_COUNTS: Statement = s(
      count(*) FILTER (WHERE unreadable) \
      FROM (SELECT key_id, previous_key_id, \
        COALESCE(substring(unreadable_under FROM 1 FOR 16) = $2 \
-         AND substring(unreadable_under FROM 17 FOR 8) = substring(sha256(secret_ct) FROM 1 FOR 8), \
+         AND substring(unreadable_under FROM 17 FOR 8) = substring(sha256(secret_ct || secret_nonce) FROM 1 FOR 8), \
          false) AS unreadable \
        FROM merezha_notify.webhook_endpoints) AS e",
 );
-/// Mark endpoint `$1` unreadable under key pair `$2` and its ciphertext,
-/// unless its secret changed since it was read (`$3`).
+/// Mark endpoint `$1` unreadable under key pair `$2` and the hash of its
+/// ciphertext and nonce, unless either changed since it was read (`$3`,
+/// `$4`).
 pub const MARK_UNREADABLE: Statement = s(
     "notify.webhook.mark_unreadable",
     "UPDATE merezha_notify.webhook_endpoints",
     "UPDATE merezha_notify.webhook_endpoints \
-     SET unreadable_under = $2::bytea || substring(sha256(secret_ct) FROM 1 FOR 8) \
-     WHERE id = $1 AND secret_ct = $3",
+     SET unreadable_under = $2::bytea || substring(sha256(secret_ct || secret_nonce) FROM 1 FOR 8) \
+     WHERE id = $1 AND secret_ct = $3 AND secret_nonce = $4",
 );
 /// Store secrets re-sealed under key `$7`, unless the endpoint's secret
 /// changed since it was read (`$6`).
@@ -436,9 +468,11 @@ pub const STATEMENTS: &[Statement] = &[
     ENDPOINT_DELETE,
     DELIVERY_PAGE,
     ATTEMPTS_FOR,
+    AUDIT_PAGE,
     REDELIVER_LOCK,
     REDELIVER_SET,
     AUTO_DISABLE_CANDIDATES,
+    RECLAIM,
     RETENTION_BODIES,
     RETENTION_EVENTS,
     RETENTION_AUDIT,

@@ -6,7 +6,9 @@
 //! notifications settled more than `retention.deliveries` ago with their
 //! deliveries and attempts, provider events received before then, and the
 //! captures past the newest `retention.captures` (NT-N8), then runs the
-//! webhook part ([`crate::webhooks::tasks::retention`]).
+//! webhook part ([`crate::webhooks::tasks::retention`]). `reclaim_stuck`
+//! (every five minutes, issue #63, [`reclaim_stuck`]) settles the
+//! deliveries whose job was lost.
 //! Each run works in bounded batches within its deadline.
 use crate::{notifier::Core, sql};
 use merezha_domain::{Failure, Identity};
@@ -32,15 +34,17 @@ pub enum Task {
     PushExpire,
     WebhookAutoDisable,
     Retention,
+    ReclaimStuck,
 }
 impl Task {
-    pub const ALL: [Task; 6] = [
+    pub const ALL: [Task; 7] = [
         Task::SettleNotifications,
         Task::PurgeData,
         Task::InboxExpire,
         Task::PushExpire,
         Task::WebhookAutoDisable,
         Task::Retention,
+        Task::ReclaimStuck,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -50,6 +54,7 @@ impl Task {
             Task::PushExpire => "push_expire",
             Task::WebhookAutoDisable => "webhook_auto_disable",
             Task::Retention => "retention",
+            Task::ReclaimStuck => "reclaim_stuck",
         }
     }
     /// The job kind and the schedule name: `notify.maintenance.<task>`.
@@ -64,6 +69,7 @@ impl Task {
             Task::PushExpire => "43 * * * *",
             Task::WebhookAutoDisable => "*/5 * * * *",
             Task::Retention => "29 3 * * *",
+            Task::ReclaimStuck => "*/5 * * * *",
         }
     }
 }
@@ -91,6 +97,7 @@ pub async fn run(core: &Arc<Core>, task: Task, deadline: Instant) -> Result<u64,
         },
         Task::WebhookAutoDisable => crate::webhooks::tasks::auto_disable(core, deadline).await,
         Task::Retention => retention(core, deadline).await,
+        Task::ReclaimStuck => reclaim_stuck(core, deadline).await,
     }
 }
 
@@ -116,11 +123,19 @@ impl Default for RetentionBounds {
         }
     }
 }
-/// No retention batch starts closer than this to the job's deadline.
+/// No retention batch but a step's first starts closer than this to the
+/// job's deadline.
 pub const RETENTION_MARGIN: std::time::Duration = std::time::Duration::from_secs(3);
+/// The shortest `notify.maintenance` `timeout_ms` startup accepts: the
+/// [`RETENTION_MARGIN`] plus room for batches, so a `retention` run always
+/// gets work done before its margin (issue #63).
+pub const MIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn time_left(deadline: Instant) -> bool {
-    Instant::now() + RETENTION_MARGIN < deadline
+/// Whether a step may start batch `batches + 1`: its first batch always
+/// runs, so a run with work makes progress whatever its deadline (issue
+/// #63); later ones only while the deadline is more than the margin away.
+pub(crate) fn may_continue(batches: usize, deadline: Instant) -> bool {
+    batches == 0 || Instant::now() + RETENTION_MARGIN < deadline
 }
 
 /// Delete notifications settled before `before`, batch by batch (see
@@ -138,7 +153,7 @@ async fn delete_notifications(
     let mut total = 0;
     let mut batches = 0;
     loop {
-        if batches >= bounds.max_batches || !time_left(deadline) {
+        if batches >= bounds.max_batches || !may_continue(batches, deadline) {
             return Ok((total, true));
         }
         batches += 1;
@@ -187,7 +202,7 @@ async fn delete_provider_events(
     let mut total = 0;
     let mut batches = 0;
     loop {
-        if batches >= bounds.max_batches || !time_left(deadline) {
+        if batches >= bounds.max_batches || !may_continue(batches, deadline) {
             return Ok((total, true));
         }
         batches += 1;
@@ -212,9 +227,12 @@ async fn delete_provider_events(
 /// a backlog remains): the rows it deleted or changed. Every step runs
 /// whatever the earlier ones did; the first failure is the task's outcome
 /// and each is logged `notification.maintenance_step_failed`. When a step
-/// stopped with work left, the run appends one more
-/// `notify.maintenance.retention` job (outbox key `retention:more:{ms}`),
-/// which runs as soon as a worker is free.
+/// stopped with work left and the run changed rows, the run appends one
+/// more `notify.maintenance.retention` job (outbox key
+/// `retention:more:{ms}`), which runs as soon as a worker is free. A run
+/// that changed nothing chains nothing, so a deadline too short for any
+/// work cannot keep the maintenance queue busy (issue #63); the next daily
+/// run tries again.
 pub async fn retention(core: &Arc<Core>, deadline: Instant) -> Result<u64, Failure> {
     let bounds = core.retention;
     let mut first_failure = None;
@@ -266,7 +284,10 @@ pub async fn retention(core: &Arc<Core>, deadline: Instant) -> Result<u64, Failu
             first_failure.get_or_insert(failure);
         }
     }
-    if more && let Err(failure) = continue_retention(core, deadline).await {
+    if more
+        && total > 0
+        && let Err(failure) = continue_retention(core, deadline).await
+    {
         merezha_telemetry::event!(
             WARN,
             "notification.maintenance_step_failed",
@@ -310,6 +331,133 @@ async fn continue_retention(core: &Core, deadline: Instant) -> Result<(), Failur
         })
         .await
 }
+
+/// A delivery still open whose `run_at` and `updated_at` are both older
+/// than this lost its job without a recorded outcome (NT §2.5).
+pub const STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// Deliveries per `reclaim_stuck` transaction.
+const RECLAIM_BATCH: i64 = 100;
+
+/// `reclaim_stuck` (every 5 minutes, NT §2.5): a delivery still `queued`,
+/// `sending` or `retrying` whose `run_at` and `updated_at` are both more
+/// than [`STUCK_AFTER`] old lost its job (to `handler_panic`, a dead
+/// letter the operator never replayed, a lost outbox record) and would
+/// stay open forever, its notification never settled and never deleted
+/// by `retention` (issue #63). It is settled `job_lost`: `unknown` when
+/// an attempt was still `started` or its generation has an `ambiguous`
+/// attempt (the send may have gone out, so it is never resent by itself,
+/// NT1), else `failed`. The cutoff is the delivery's own clock: after a
+/// worker outage or a queue backlog of more than a day, a delivery whose
+/// job is still waiting is settled too (its job then finds it settled and
+/// stops); redeliver it. The jobs runtime's tables are its own, so the
+/// task does not look the job up. Provider events
+/// stored `pending` for it apply in the same transaction, as Tx B would
+/// have applied them. Webhook deliveries open and due for as long are
+/// settled `failed` / `job_lost` the same way. The rows it settled.
+pub async fn reclaim_stuck(core: &Core, deadline: Instant) -> Result<u64, Failure> {
+    let now = core.now();
+    let before = jiff::SignedDuration::try_from(STUCK_AFTER)
+        .ok()
+        .and_then(|age| now.checked_sub(age).ok())
+        .ok_or_else(|| Failure::permanent("invalid_config"))?;
+    let mut total = 0;
+    for batch in 0..MAX_BATCHES {
+        if !may_continue(batch, deadline) {
+            break;
+        }
+        let db = core.database.clone();
+        let (found, settled): (usize, Vec<(Uuid, String, String, String)>) = db
+            .clone()
+            .transaction(deadline, move |tx| {
+                Box::pin(async move {
+                    let ids: Vec<Uuid> = db
+                        .query(tx, &sql::RECLAIM_CANDIDATES, &[&before, &RECLAIM_BATCH])
+                        .await
+                        .map_err(|e| classify(&e))?
+                        .iter()
+                        .map(|row| row.get(0))
+                        .collect();
+                    if ids.is_empty() {
+                        return Ok((0, Vec::new()));
+                    }
+                    let started: Vec<Uuid> = db
+                        .query(tx, &sql::RECLAIM_ATTEMPTS, &[&ids, &now])
+                        .await
+                        .map_err(|e| classify(&e))?
+                        .iter()
+                        .map(|row| row.get(0))
+                        .collect();
+                    let rows = db
+                        .query(tx, &sql::RECLAIM_SET, &[&ids, &started, &now])
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    let mut settled = Vec::with_capacity(rows.len());
+                    for row in &rows {
+                        let id: Uuid = row.get(0);
+                        crate::brevo::events::apply_pending(&db, tx, id, now).await?;
+                        settled.push((id, row.get(1), row.get(2), row.get(3)));
+                    }
+                    Ok((ids.len(), settled))
+                })
+            })
+            .await?;
+        for (id, channel, status, topic) in &settled {
+            let Some(channel) = crate::topics::channel(channel) else {
+                continue;
+            };
+            let delivery = id.to_string();
+            if status == "unknown" {
+                merezha_telemetry::event!(
+                    WARN,
+                    "notification.ambiguous",
+                    channel = channel.as_str(),
+                    topic = topic.as_str(),
+                    delivery_id = delivery.as_str(),
+                    reason = JOB_LOST
+                );
+                core.metrics.delivery(channel, topic, "unknown", JOB_LOST);
+            } else {
+                merezha_telemetry::event!(
+                    WARN,
+                    "notification.failed",
+                    channel = channel.as_str(),
+                    topic = topic.as_str(),
+                    delivery_id = delivery.as_str(),
+                    code = JOB_LOST
+                );
+                core.metrics.delivery(channel, topic, "failed", JOB_LOST);
+            }
+        }
+        total += settled.len() as u64;
+        if (found as i64) < RECLAIM_BATCH {
+            break;
+        }
+    }
+    for batch in 0..MAX_BATCHES {
+        if !may_continue(batch, deadline) {
+            break;
+        }
+        let client = core.database.acquire(deadline).await?;
+        let reclaimed = core
+            .database
+            .query(
+                &client,
+                &crate::webhooks::sql::RECLAIM,
+                &[&before, &RECLAIM_BATCH, &now],
+            )
+            .await
+            .map_err(|e| classify(&e))?
+            .len() as u64;
+        core.metrics.webhook_delivery("failed", reclaimed);
+        total += reclaimed;
+        if (reclaimed as i64) < RECLAIM_BATCH {
+            break;
+        }
+    }
+    Ok(total)
+}
+/// The reason of a delivery `reclaim_stuck` settled.
+pub const JOB_LOST: &str = crate::policy::reason::JOB_LOST;
 
 /// Keep the newest `retention.captures` captures, as the capture drivers
 /// do on every capture, for a lowered setting or a driver switched off.

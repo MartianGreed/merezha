@@ -240,7 +240,7 @@ CREATE TABLE preferences (
 CREATE TABLE user_settings (
   user_id uuid PRIMARY KEY,
   timezone text,                                -- IANA name, validated with jiff
-  updated_at timestamptz NOT NULL               -- N9 (migration 7, after v1) adds quiet_start, quiet_end
+  updated_at timestamptz NOT NULL               -- N9 (migration 8, after v1) adds quiet_start, quiet_end
 );
 
 CREATE TABLE suppressions (
@@ -374,11 +374,27 @@ CREATE TABLE webhook_attempts (
 );
 
 -- Migration 6 (slice N8): the rate cap and retention indexes. N8 took the
--- number this section first reserved for N9, which is deferred from v1;
--- N9 is migration 7.
+-- number this section first reserved for N9, which is deferred from v1.
 CREATE INDEX deliveries_target_recent_idx ON deliveries (target_key, channel, created_at);
 CREATE INDEX notifications_settled_idx ON notifications (settled_at) WHERE settled_at IS NOT NULL;
 CREATE INDEX provider_events_received_idx ON provider_events (received_at);
+
+-- Migration 7 (hardening, issues #63, #68, #76; N9 moves to migration 8):
+-- message ids per attempt, deleted tenants, and the indexes of
+-- reclaim_stuck, the tenant purge and the webhook audit route.
+ALTER TABLE delivery_attempts ADD COLUMN provider_message_id text
+  CHECK (length(provider_message_id) <= 256);   -- of an accepted attempt
+CREATE TABLE tenants_deleted (                   -- identity.organization_deleted
+  tenant_id text PRIMARY KEY, deleted_at timestamptz NOT NULL,
+  source text NOT NULL,                          -- 'event' | 'operator'
+  purged_at timestamptz
+);
+CREATE INDEX webhook_deliveries_open_idx ON webhook_deliveries (updated_at)
+  WHERE status IN ('queued','sending','retrying');
+-- plus (tenant_id) WHERE tenant_id IS NOT NULL on notifications,
+-- push_subscriptions and webhook_events, (tenant_id, user_id) on
+-- inbox_items, and
+-- ((COALESCE(tenant_id, '')), id DESC) on webhook_audit
 ```
 
 ### 2.5 Jobs and outbox usage
@@ -423,6 +439,8 @@ exhaustion. Dead letters are kept 30 days and replayed through AP's admin API.
 | Push delivery | `notify.push` / `notify.deliver.push` | same pattern | same |
 | Webhook delivery | `notify.webhook` / `notify.webhook.deliver` | `webhook:{webhook_delivery_id}:g{generation}` | fan-out tx or redelivery tx |
 | Maintenance | `notify.maintenance` / `notify.maintenance.{task}` | AP's `cron:{name}:{epoch}` | AP scheduler, declared with `JobsHandle::schedule` |
+| Deleted organization | `notify.expand` / `notify.organization_deleted` (subscription to `identity.organization_deleted`) | identity's own; AP keys the job `outbox:{id}:{kind}` | identity's tx, as `OutboxTarget::Event` |
+| Tenant purge | `notify.expand` / `notify.organization_purge` | `tenant_purge:{UUIDv5(tenant)}`, a continuation `…:after:{job id}` | the mark's tx, or the purge run it continues |
 
 `notification_id` and `webhook_event_id` are UUIDv5 of the caller's source and
 key (2.2), so outbox keys are short and unique per caller, and job keys stay
@@ -440,7 +458,10 @@ the same generation.
 Payloads are JSON. Data travels in the request payload, because the
 notification row does not exist until expansion. Delivery job payloads carry
 `{ delivery_id, generation }`, plus `secret_data` for email, SMS and push when
-the request had any. Relayed outbox rows keep non-secret data for
+the request had any. The job a `provider_account` answer hands the
+generation to names the attempt it answered in its key (5.1); payloads
+carry no fence, so a binary that refuses unknown payload fields never
+dead-letters it. Relayed outbox rows keep non-secret data for
 `jobs.retention.outbox` (`"7d"`); flagged rows are nulled at relay (R3).
 
 Maintenance tasks, all with the skip missed-run policy:
@@ -448,7 +469,8 @@ Maintenance tasks, all with the skip missed-run policy:
 `settled_at`), `reclaim_stuck` (every 5 min: a delivery still `queued`,
 `sending` or `retrying` whose `run_at` and `updated_at` are both more than 24 h
 old lost its job without a recorded outcome, for example to `handler_panic`,
-and is set to `failed` / `job_lost`), `webhook_auto_disable` (every 5 min),
+and is set to `failed` / `job_lost`; as built, `unknown` / `job_lost` when
+its last attempt was still `started`, see below), `webhook_auto_disable` (every 5 min),
 `push_expire` (hourly), `inbox_expire` (hourly), `retention` (daily: delivery
 and attempt rows, provider events, webhook bodies and captures past
 retention). As built (N8), `retention` deletes notifications settled more
@@ -464,8 +486,26 @@ deleting the notifications still settled before the cutoff, as `redeliver`
 locks a delivery before reopening its notification: a reopened
 notification is kept and the two never deadlock. `retention.deliveries`
 shorter than `retention.data_after_settled` fails startup
-(`shorter_than_data_after_settled`).
-`reclaim_stuck` is not built yet.
+(`shorter_than_data_after_settled`). After the N8 re-review (issue #63)
+each step runs its first batch whatever the deadline, a run chains a
+continuation only when it changed rows, and startup refuses a
+`notify.maintenance` `timeout_ms` below 5 s (`timeout_too_short`): before,
+a timeout of 3 s or less made every run delete nothing and queue itself
+again forever.
+
+`reclaim_stuck` as built (issue #63): batches of 100 open deliveries past
+the 24 h cutoff, locked `FOR UPDATE SKIP LOCKED`; a delivery whose last
+attempt is still `started`, or whose generation has an `ambiguous`
+attempt, may have been sent, so a `started` attempt becomes
+`ambiguous` / `lost_outcome` and the delivery `unknown` / `job_lost`
+(never resent by itself, as NT1 treats an ambiguous SMS; a later provider
+event can still move it), the others become `failed` / `job_lost`. The
+provider events stored `pending` for them apply in the same transaction,
+as Tx B would have applied them. Webhook deliveries still open, untouched
+and due for more than 24 h are settled `failed` / `job_lost` the same way,
+so `retention` can delete their events. Without it, a delivery whose job
+was lost kept its notification open forever, and `retention` deletes only
+settled notifications.
 
 ## 3. The `Notifier` port
 
@@ -741,6 +781,14 @@ the preview is refused unless `templates.preview_in_public = true`.
 
 1. **Tx A.** `SELECT … FOR UPDATE` the delivery.
    - If its generation differs from the job's, or it is settled: `Done`.
+   - If the attempt the job's key names (`deliver:{id}:g{n}:a{attempt}`)
+     is not the generation's last `provider_account` attempt (none for the
+     generation's first job): `Done`. A job that runs again after its Tx B
+     handed the delivery to a new job (a crash before the job was marked
+     done) would otherwise run a second chain beside it (issue #63).
+   - If the notification's tenant was deleted (its shared lock taken, the
+     mark checked): `cancelled` / `tenant_deleted`, `Done`. The webhook
+     worker's Tx A does the same.
    - If `expires_at < now`: set `expired`, `Done`.
    - Re-check suppressions and preferences (a bounce or opt-out may have
      happened since expansion): `skipped`, `Done`.
@@ -896,7 +944,13 @@ Each callback request is processed in one transaction:
    earlier generation. It is stored and may suppress the delivery's own
    address, but moves no status, also when applied from `pending`, so a
    late report about the first send cannot settle or fail the second (N4
-   review; email and SMS).
+   review; email and SMS). As built after issue #68, each accepted
+   attempt keeps its message id (migration 7), and a report whose message
+   id was an earlier generation's is about that generation also when the
+   current one has no message id (an ambiguous SMS, a duplicate email):
+   N1. A report without a message id on a delivery redelivered at least
+   once moves it only to `delivered` (N2). Both are judged when the event
+   arrives, so such an event is never stored `pending`.
 4. Deduplicate on `event_key = sha256(provider|channel|message id|event|ts_event)`;
    without a message id, the delivery id and the address take its place.
 5. Apply the effect to a correlated event only. An uncorrelated event (no
@@ -956,7 +1010,17 @@ accepts another host with the `host_override` warning.
   targeted and get deleted by `push_expire` once unused for 7 days. The
   grace keeps a rolling deploy safe: instances on the old and the new key
   each refresh `last_used_at` of the subscriptions they target, so neither
-  deletes the other's.
+  deletes the other's. As built after issue #66, Tx A reads the
+  subscription whatever its key; a job leased by an instance on another
+  key returns `Retry("vapid_key_mismatch")` before starting an attempt, so
+  an instance holding the subscription's key sends it, and on the job's
+  last attempt the delivery is `skipped` / `no_subscription` as before.
+  The alternative, `push.vapid_private_key_previous` to sign with the key
+  a row was made with (as `secret_key_previous` opens webhook secrets),
+  was not taken: an instance still on the old configuration cannot know
+  the new key, so a rolling rotation would still lose that direction's
+  pushes without the retry, and the retry alone covers both directions
+  without a new key.
 - **Subscribe.** The route takes `PushSubscription.toJSON()` plus `label?`.
   - The endpoint must be https on port 443, with a host equal to or a
     dot-suffix of an entry in `push.allowed_hosts`.
@@ -1125,7 +1189,13 @@ rows still on the previous key.
 1. Insert into `webhook_events` with `ON CONFLICT DO NOTHING`. If the row
    already exists, return `Done`.
 2. Serialize the envelope once, `{"type":"…","timestamp":"<RFC 3339>","data":{…}}`,
-   at most `webhooks.max_payload_bytes` (256 KiB).
+   at most `webhooks.max_payload_bytes`. As built (issue #76) it defaults
+   to and may not exceed 65,536 bytes, the outbox's record cap: the data
+   reaches the fan-out inside an outbox record (`emit_webhook`'s job
+   payload or the module's event envelope), so a larger envelope could
+   never be produced, and storing bodies out of line or raising the
+   outbox cap for one kind would change the jobs runtime for a limit no
+   caller needs in v1.
 3. Insert one delivery per matching active endpoint and append its job
    record (2.5). The rule is `tenant_id IS NOT DISTINCT FROM $event_tenant`:
    a tenant event reaches only its tenant's endpoints, a tenantless event only
@@ -1187,7 +1257,9 @@ written to the audit stream, without the secret. As built (N7) the stream is
 the block's own `merezha_notify.webhook_audit` table, written in the
 transaction of the change (actor subject, or `sys_notifications` for the
 block's own disables) and kept 400 days by the `retention` task: no shared
-audit port exists for blocks other than identity.
+audit port exists for blocks other than identity. `GET …webhook-audit`
+(`notifications.webhooks.manage`, issue #76) reads one registry's rows,
+newest first, a page at a time (7.1).
 
 ### 5.6 Egress guard (SSRF)
 
@@ -1353,6 +1425,7 @@ Cookie-authenticated state changes need the Origin check and the CSRF token.
 | `POST tenants/{tenant_id}/webhooks/{id}/test` | manage | none | 202 `{ delivery_id }` (event `webhook.test`) | 404; 409 `endpoint_disabled` |
 | `GET tenants/{tenant_id}/webhooks/{id}/deliveries?status=&cursor=` | read | none | 200 `{ items: [{ id, event_type, status, attempt_count, last_http_status, created_at, attempts: [{ attempt, outcome, http_status, duration_ms, started_at }] }], next_cursor }` | 404 |
 | `POST tenants/{tenant_id}/webhooks/{id}/deliveries/{delivery_id}/redeliver` | manage | none | 202 `{ generation }` | 404; 410 `event_body_expired` |
+| `GET tenants/{tenant_id}/webhook-audit?endpoint_id=&cursor=&limit=` | manage | limit 1 to 100 (default 50) | 200 `{ items: [{ id, endpoint_id, action, reason, actor, revision, occurred_at }], next_cursor }`, newest first (issue #76) | 400 `invalid_input`, `invalid_cursor` |
 | `POST providers/brevo/email` | bearer `brevo.webhook_token` (+ CIDR) | Brevo event or array | 200 `{}` | 401 `unauthenticated`; 413 `body_limit` |
 | `POST providers/brevo/sms/{delivery_id}/{mac}` | path MAC (+ CIDR) | Brevo SMS event | 200 `{}` | 401 |
 | `GET dev/captures?channel=&limit=` | loopback only, and only when a capture driver is active | none | 200 `[{ delivery_id, channel, target, rendered, captured_at }]` | 404 otherwise |
@@ -1448,7 +1521,7 @@ reauth_interval = "5m"
 
 [modules.notifications.webhooks] # optional; present = on
 max_endpoints_per_tenant = 20
-max_payload_bytes = 262144
+max_payload_bytes = 65536         # at most 65536, the outbox's record cap (issue #76)
 timeout = "10s"
 connect_timeout = "5s"
 concurrency_per_endpoint = 4
@@ -1505,8 +1578,9 @@ The built-in topics are predeclared: every identity topic of R2
   `allow_private_networks`, `allow_http`, `allow_http_links`, a non-https
   `brevo.base_url`, or `preview` without `preview_in_public`;
 - a missing `public_base_url` while unsubscribe links or Brevo SMS are needed;
-- a queue `lease_ms` shorter than three times its provider timeout, or a
-  `notify.webhook` `backoff_max_ms` below 24 h;
+- a queue `lease_ms` shorter than three times its provider timeout, a
+  `notify.webhook` `backoff_max_ms` below 24 h, or a `notify.maintenance`
+  `timeout_ms` below 5 s;
 - an inbox template that references `secret`;
 - any of the template checks in section 4.
 
@@ -1845,7 +1919,31 @@ through the reaction to an inbox item on an open SSE stream
 task board's `task-notifier` needs the stage 3 example application to run
 under a cargo test.
 
-**N9: quiet hours** (migration 7, after v1; N8 took migration 6). *Scope:* the section, the
+**Hardening (issues #63, #66, #68, #76), as built** (migration 7). The
+attempt fence of 5.1 (on the continuation's key, never the payload);
+`reclaim_stuck` (2.5) with the pending
+events of the deliveries it settles, so their notifications settle and
+`retention` deletes them; `retention` always runs a step's first batch,
+chains only after progress, and startup refuses a `notify.maintenance`
+`timeout_ms` below 5 s; deleted organizations: the block consumes
+`identity.organization_deleted`, records the tenant in `tenants_deleted`,
+refuses every write and send of it from then on (the expansion of its
+notifications, the fan-out of its events, both workers' Tx A, which
+cancel its open deliveries `tenant_deleted`, every endpoint and redeliver
+route, a push subscription made in it; writers take the tenant's shared
+advisory lock, the mark the exclusive one), stops serving its inbox and
+stream (404), and purges its webhook events and endpoints, push
+subscriptions, inbox items and notifications with their deliveries,
+attempts, provider events and captures in bounded steps, as content does
+for #56, with `merezha notifications purge-organization` for
+organizations deleted before; per-attempt message ids and the stale rules of 5.2 (#68); the
+VAPID key mismatch retry of 5.3 (#66); the unreadable mark over
+`secret_ct || secret_nonce`, `max_payload_bytes` capped at the outbox's
+64 KiB, and `GET …webhook-audit` (#76). The Brevo real-account check of
+#63 needs an account key and stays open (section 12).
+
+**N9: quiet hours** (migration 8, after v1; N8 took migration 6 and the
+hardening migration 7). *Scope:* the section, the
 settings fields and the rule of section 6. *Acceptance:* a push moves to the
 end of the window in `Europe/Paris` across a DST change; a `high` or security
 push is not moved; a delivery expiring inside the window is `expired`.
@@ -1882,6 +1980,12 @@ The owner answered this design's open questions on 2026-10-24. The record is
   check is still owed before production use.
 - Whether Brevo SMS accepts a leading `+` in `recipient` (the block never
   sends one).
+- Whether the send response's `messageId` and the status report's
+  `message-id` / `messageId` are written the same way, in particular with
+  or without `<>` around email message ids (issue #68). Stale detection
+  (5.2) compares them exactly: if they differ, every report about a
+  redelivered message is taken for one about an earlier send and moves no
+  status.
 - The SMS status report fields (N4 reads `msg_status`, `messageId`,
   `ts_event`, `to` and `description`, with `event`, `message-id` and `ts`
   as fallbacks), whether `tag` takes an array, and how Brevo joins

@@ -5,7 +5,7 @@
 //! row, locked until commit, and calls `pg_notify` in the same transaction,
 //! so a user's changes commit in `change_seq` order (invariant 11). Another
 //! user's item answers 404, as a missing one does.
-use crate::{http::Ctx, sql};
+use crate::{http::Ctx, notifier::Core, sql};
 use axum::{
     Extension, Json,
     body::Bytes,
@@ -83,6 +83,18 @@ fn scope(asked: Option<String>, active: Option<String>) -> Result<Option<String>
     }
 }
 
+/// 404 `not_found` when the tenant in scope was deleted (issue #63): from
+/// the mark on, its inbox is not served, as content stops serving a
+/// deleted organization.
+async fn refuse_deleted(core: &Core, scope: Option<&str>) -> Option<Response> {
+    let tenant = scope?;
+    match crate::tenants::is_deleted(core, tenant, Instant::now() + DEADLINE).await {
+        Ok(false) => None,
+        Ok(true) => Some(reply("not_found")),
+        Err(error) => Some(failure(error)),
+    }
+}
+
 pub(crate) async fn list(
     State(ctx): State<Ctx>,
     principal: Option<Extension<Authenticated>>,
@@ -125,6 +137,9 @@ pub(crate) async fn list(
     let Ok(core) = ctx.core() else {
         return reply("unavailable");
     };
+    if let Some(refusal) = refuse_deleted(&core, scope.as_deref()).await {
+        return refusal;
+    }
     let deadline = Instant::now() + DEADLINE;
     let result = async {
         let client = core.database.acquire(deadline).await?;
@@ -179,6 +194,9 @@ pub(crate) async fn unread_count(
     let Ok(core) = ctx.core() else {
         return reply("unavailable");
     };
+    if let Some(refusal) = refuse_deleted(&core, scope.as_deref()).await {
+        return refusal;
+    }
     let deadline = Instant::now() + DEADLINE;
     let result = async {
         let client = core.database.acquire(deadline).await?;
@@ -254,6 +272,9 @@ async fn change(
     let Ok(core) = ctx.core() else {
         return reply("unavailable");
     };
+    if let Some(refusal) = refuse_deleted(&core, active.as_deref()).await {
+        return refusal;
+    }
     let deadline = Instant::now() + DEADLINE;
     let db = core.database.clone();
     let now = core.now();
@@ -354,6 +375,9 @@ pub(crate) async fn read_all(
     let Ok(core) = ctx.core() else {
         return reply("unavailable");
     };
+    if let Some(refusal) = refuse_deleted(&core, scope.as_deref()).await {
+        return refusal;
+    }
     let deadline = Instant::now() + DEADLINE;
     let db = core.database.clone();
     let now = core.now();

@@ -1496,11 +1496,21 @@ mail to `skipped`), and exit code 0; or `status` `invalid` with
   `webhook_attempts` and `webhook_audit`. Migration 6 (`integrations`,
   NT-N8) adds three indexes: deliveries by `(target_key, channel,
   created_at)` for the rate cap, settled notifications by `settled_at` and
-  provider events by `received_at` for `retention`. The checksums are
-  pinned by a test; later slices add migrations.
+  provider events by `received_at` for `retention`. Migration 7
+  (`hardening`, issues #63, #68, #76) adds `delivery_attempts.provider_message_id`
+  (the message id of each accepted attempt), the `tenants_deleted` table
+  (deleted organizations, with who marked them: `event` or `operator`) and
+  the indexes of `reclaim_stuck` (open webhook
+  deliveries by `updated_at`), the tenant purge (notifications, inbox
+  items, push subscriptions and webhook events by tenant) and the webhook
+  audit route. The checksums are pinned by a test; later slices add
+  migrations.
 - At start the block registers `notify.expand` (queue `notify.expand`),
   the delivery kinds of its capture drivers and the maintenance kinds and
-  schedules with the jobs runtime.
+  schedules with the jobs runtime, and `notify.organization_deleted`
+  (subscribed to `identity.organization_deleted`) and
+  `notify.organization_purge`, both on `notify.expand` ([Deleted
+  organizations](#deleted-organizations-notifications)).
 - The block claims the `api` source (`Module::extra_sources`) for its HTTP
   send route.
 - Routes under `/v1/notifications/`:
@@ -1547,8 +1557,8 @@ present, else `webhooks_disabled`; content's types are refused
 `unknown_event_type`, since they arrive only through the subscription),
 which the webhook fan-out handles ([Outgoing webhooks](#outgoing-webhooks)).
 The whole record, envelope and metadata, is at most
-`webhooks.max_payload_bytes` and the outbox's 64 KiB payload limit
-(`data_too_large`).
+`webhooks.max_payload_bytes`, which defaults to and cannot exceed the
+outbox's 64 KiB record limit, 65,536 bytes (`data_too_large`; issue #76).
 Metrics label only declared topics; any other `notify.topic` is
 `unknown`.
 
@@ -1573,7 +1583,7 @@ get `skipped` with a reason:
 | `preference` | the user's `(topic, channel)` or `('*', channel)` preference is off, or the channel is outside a transactional topic's `default_channels` without an opt-in; security topics ignore preferences |
 | `not_opted_in` | a marketing topic without the user's explicit `enabled = true` for the topic and channel |
 | `suppressed` | a suppression covers the address: `invalid` for every topic, the other reasons for non-security topics (topic-scoped ones for their topic only) |
-| `no_subscription` | a push target whose user has no live subscription made with the current VAPID key in the notification's tenant scope; at send, a subscription that is gone, moved to another user or expired since |
+| `no_subscription` | a push target whose user has no live subscription made with the current VAPID key in the notification's tenant scope; at send, a subscription that is gone, moved to another user or expired since, or made with another VAPID key than the sending instance's on the job's last attempt (before that the job retries `vapid_key_mismatch` without an attempt, so an instance holding that key sends it during a rolling rotation; issue #66) |
 | `target_rate_limited` | the topic (transactional or marketing; security topics refuse a cap) sets `max_per_target_per_hour` (1 to 10,000, unset by default) and the target (one address, phone number, push subscription or user inbox, per channel) already has that many of the topic's deliveries created in the last hour that were not skipped. Checked in the expansion transaction under transaction advisory locks (class `ntfy`) on the target's bucket, one of 64 per `(topic, channel)`, taken in ascending key order: concurrent expansions for one target count one after the other, and an expansion holds at most 64 locks per channel whatever its target count. A redelivery is never capped |
 
 More targets than `limits.max_targets` (or `max_marketing_targets` for a
@@ -1586,7 +1596,13 @@ inbox deliveries are created `delivered`.
 The delivery worker (`notify.deliver.email`, `notify.deliver.sms`, and
 `notify.deliver.push` with a push section) registers email and SMS for a
 `capture` or `brevo` driver. Per attempt it locks the delivery (another generation or a
-settled delivery is done; past `expires_at` it becomes `expired`;
+settled delivery is done; so is a job of a chain the delivery was handed
+on from: a `provider_account` answer hands the generation to a new job
+whose key names the answered attempt (`deliver:{id}:g{n}:a{attempt}`; the
+payload carries no fence, so no older binary refuses it), and a job whose
+key names another attempt than the generation's last such one finishes
+without a send, issue #63; a delivery of a deleted organization is
+`cancelled` / `tenant_deleted`; past `expires_at` it becomes `expired`;
 suppressions and preferences are checked again), commits attempt `n + 1`
 as `started`, renders from the stored data and the job's secret data, sends
 before `min(10 s, job deadline - 2 s)` (`brevo.timeout` in place of 10 s
@@ -1614,7 +1630,8 @@ Maintenance, each a cron schedule on queue `notify.maintenance` (UTC):
 | `purge_data` | every 5 minutes | nulls `data` (and the deliveries' recipient names) of notifications settled more than `retention.data_after_settled` ago; counts `merezha.notification.data_purged` |
 | `inbox_expire` | hourly | deletes items past `expires_at` or archived more than `inbox.archived_retention` ago, 100 users per transaction in ascending order, raising each user's `purged_through` |
 | `webhook_auto_disable` | every 5 minutes | with `[modules.notifications.webhooks]`: disables the endpoints failing for `webhooks.auto_disable_after` with at least 10 failed attempts since, and alerts ([Outgoing webhooks](#outgoing-webhooks)) |
-| `retention` | daily (03:29), and again through continuation jobs while a backlog remains | deletes notifications settled more than `retention.deliveries` ago, 100 per transaction, with their deliveries and attempts (inbox items keep their own `inbox.retention`; each batch locks the deliveries in id order first, as `redeliver` does, and keeps a notification reopened meanwhile); deletes provider events received before then, 1,000 per transaction; keeps the newest `retention.captures` captures; batches go on until one comes back short or the job deadline is 3 s away, and a run that stopped with work left (here or in a webhook step) appends one more `notify.maintenance.retention` job (outbox key `retention:more:{ms}`); then the webhook rows: nulls event bodies older than `retention.webhook_deliveries`, deletes events older than `retention.deliveries` with no open delivery (their deliveries and attempts with them), deletes audit rows older than 400 days, drops previous secrets whose rotation window closed, and with `secret_key_previous` set seals again under `secret_key` the secrets still under another key (by their key id), then records `merezha.webhook.secrets.previous_key` and `merezha.webhook.secrets.unreadable`; 500 rows per batch. Each step runs whatever the earlier ones did: a failing step is logged `notification.maintenance_step_failed` (`task`, `reason` = the step, `code`) and becomes the run's outcome after the others ran |
+| `retention` | daily (03:29), and again through continuation jobs while a backlog remains | deletes notifications settled more than `retention.deliveries` ago, 100 per transaction, with their deliveries and attempts (inbox items keep their own `inbox.retention`; each batch locks the deliveries in id order first, as `redeliver` does, and keeps a notification reopened meanwhile); deletes provider events received before then, 1,000 per transaction; keeps the newest `retention.captures` captures; each step runs its first batch whatever the deadline, and further batches until one comes back short or the job deadline is 3 s away; a run that changed rows and stopped with work left (here or in a webhook step) appends one more `notify.maintenance.retention` job (outbox key `retention:more:{ms}`), and a run that changed nothing appends none (startup refuses a `notify.maintenance` `timeout_ms` below 5 s, `timeout_too_short`; issue #63); then the webhook rows: nulls event bodies older than `retention.webhook_deliveries`, deletes events older than `retention.deliveries` with no open delivery (their deliveries and attempts with them), deletes audit rows older than 400 days, drops previous secrets whose rotation window closed, and with `secret_key_previous` set seals again under `secret_key` the secrets still under another key (by their key id), then records `merezha.webhook.secrets.previous_key` and `merezha.webhook.secrets.unreadable`; 500 rows per batch. Each step runs whatever the earlier ones did: a failing step is logged `notification.maintenance_step_failed` (`task`, `reason` = the step, `code`) and becomes the run's outcome after the others ran |
+| `reclaim_stuck` | every 5 minutes | settles each delivery still `queued`, `sending` or `retrying` whose `run_at` and `updated_at` are both more than 24 h old, its job lost without a recorded outcome: `unknown` / `job_lost` when its last attempt was still `started` (that attempt becomes `ambiguous` / `lost_outcome`) or its generation has an `ambiguous` attempt (the send may have gone out; never resent by itself), else `failed` / `job_lost` (a push retried for another VAPID key touches `updated_at`, so a live chain is not taken for a lost one; after a worker outage or a backlog of more than 24 h, deliveries whose jobs still wait are settled too, and are redelivered by hand), 100 per transaction (`FOR UPDATE SKIP LOCKED`), applying its `pending` provider events in the same transaction, logged `notification.ambiguous` / `notification.failed` and counted in `merezha.notification.deliveries`; then webhook deliveries still open, untouched and due for more than 24 h, `failed` / `job_lost` (issue #63). Their notifications and events then settle, and `retention` deletes them |
 | `push_expire` | hourly (minute 43) | with `[modules.notifications.push]`: deletes subscriptions past `expires_at`, made with another VAPID key and unused for 7 days, or with 10 consecutive failures and no success in 30 days, 1,000 per batch; counts `merezha.notification.push_subscriptions_removed` (`expired`, `key_changed`, `failures`) |
 
 ### Brevo email
@@ -1678,6 +1695,15 @@ address the edge could not resolve is refused too. Without a Brevo email driver 
   first, then locked in ascending delivery order), and stored in
   `provider_events` once per `sha256(brevo|email|message id|event|ts_event)`,
   the delivery and the address standing in for a missing message id;
+- a correlated report about an earlier generation of a redelivered
+  delivery is stored, may still suppress the delivery's own address, and
+  moves no status: its message id is not the current generation's, or it
+  was an earlier generation's (each accepted attempt keeps its message id,
+  migration 7, so this holds when the current generation has none, after
+  an ambiguous send or a duplicate). On a delivery redelivered at least
+  once, a report without a message id moves it only to `delivered`
+  (issue #68). The message ids are compared exactly (see the real-account
+  check in the operations guide);
 - `delivered` moves `accepted` or `unknown` to `delivered`; `hard_bounce`
   and `invalid_email` move `accepted`, `unknown` or `delivered` to `bounced`
   and add a `hard_bounce` or `invalid` suppression of the address; `spam`
@@ -1981,7 +2007,10 @@ Routes under `/v1/notifications/`:
 - **Key rotation.** Deploy the new `vapid_private_key`; clients compare the
   `key_id` of `GET push/vapid-public-key` with the one they subscribed
   with and resubscribe. Each instance targets only the subscriptions of
-  its own key, and `push_expire` deletes another key's subscriptions only
+  its own key at expansion; at send, a job for a subscription of another
+  key starts no attempt and retries `vapid_key_mismatch`, so an instance
+  holding that key sends it, and only the job's last attempt skips it
+  `no_subscription` (issue #66). `push_expire` deletes another key's subscriptions only
   once they have gone unused for 7 days (`last_used_at`). During a rolling
   deploy the instances on the old and on the new key each keep using their
   own subscriptions, so neither deletes the other's; after the rollout the
@@ -2043,7 +2072,7 @@ three request timeouts per lease (startup refuses otherwise):
 ```toml
 [modules.notifications.webhooks]
 # max_endpoints_per_tenant = 20
-# max_payload_bytes = 262144
+# max_payload_bytes = 65536      # at most 65536, the outbox's record cap
 # timeout = "10s"
 # connect_timeout = "5s"
 # concurrency_per_endpoint = 4
@@ -2070,6 +2099,7 @@ every route answers 422 `webhooks_disabled`.
 | Method and path | Permission | Answer |
 | --- | --- | --- |
 | `GET webhook-secrets/status` | `notifications.admin` at `Application` | `{current_key_id, previous_key_configured, previous_key, unreadable, previous_key_removable}`, counted from the database (see Secrets below) |
+| `GET …webhook-audit?endpoint_id=&cursor=&limit=` | `notifications.webhooks.manage` | the registry's audit rows (`merezha_notify.webhook_audit`, endpoints deleted since included), newest first: `{items: [{id, endpoint_id, action, reason, actor, revision, occurred_at}], next_cursor}`, `limit` 1 to 100 (default 50); 400 `invalid_input` (`/endpoint_id`, `/limit`), `invalid_cursor` (issue #76) |
 | `GET webhook-event-types` | any authenticated principal | `[{type, description}]`: the application's `event_types`, the content module's `content.entry_published`, `content.entry_unpublished`, `content.entry_deleted`, and `webhook.test` |
 | `GET …webhooks` | `notifications.webhooks.read` | `[Endpoint]`, oldest first, never the secret |
 | `POST …webhooks` | `notifications.webhooks.manage` | `{url, description?, event_types?}`: 201 `Endpoint + {secret}`. 422 `webhook_url_rejected` (`details: [{path: "/url", code}]`, `code` one of `scheme`, `userinfo`, `fragment`, `blocked_address`, `unresolvable`, `too_long`, `invalid_url`), `unknown_event_type` (`/event_types/<i>`), `validation_failed` (`/description`, `/event_types`); 409 `webhook_endpoint_limit` past `max_endpoints_per_tenant` |
@@ -2236,6 +2266,75 @@ type of the catalog or `prefix.*`; an empty filter matches every type.
   whether an internal name exists, not what it serves. A deployment that
   must hide its internal names gives the block a resolver without them.
 
+### Deleted organizations (notifications)
+
+When identity deletes an organization (issue #63, as content does since
+issue #56), the block's `notify.organization_deleted` job, subscribed to
+`identity.organization_deleted` (source `identity`, payload
+`organization_id`), takes the tenant's exclusive transaction advisory lock
+(class `ntdl`), records the tenant in `merezha_notify.tenants_deleted` and
+appends `notify.organization_purge` (outbox key `tenant_purge:<hash of the
+tenant>`, never the id). A redelivered event marks nothing and appends no
+second purge. Logged `notification.organization_deleted` (`tenant`).
+
+`merezha_notify.tenants_deleted.source` is `event`.
+
+Every writer of a tenant's rows takes the tenant's shared lock and checks
+the mark in its own statement, so a writer in flight commits before the
+mark (and is purged) and none commits after it:
+
+- the expansion of a notification of the tenant writes nothing and logs
+  `notification.rejected` with `code = tenant_deleted`;
+- the webhook fan-out drops the tenant's events (no event row, no
+  delivery);
+- the delivery worker's and the webhook worker's Tx A cancel a delivery
+  of the tenant still open (`cancelled` / `tenant_deleted`) before any
+  attempt, so queued and retrying sends stop at the mark, not when the
+  purge reaches them;
+- `POST tenants/{tenant}/webhooks`, every route of an existing endpoint
+  of the registry that changes it (PATCH, DELETE, `rotate-secret`,
+  `enable`, `disable`, `test`, delivery `redeliver`), `POST
+  deliveries/{id}/redeliver` for a delivery of the tenant and `POST
+  push/subscriptions` from a session in the tenant answer 404
+  `not_found`.
+
+From the mark on, the tenant's inbox is not served either: `GET inbox`,
+`GET inbox/unread-count`, the read, unread, archive and read-all routes
+and `GET inbox/stream` answer 404 `not_found` for a session whose active
+tenant was deleted, and an open stream ends at its next
+re-authentication. A purge step for a tenant that is not marked deleted
+touches nothing (`tenant_not_deleted`).
+
+The purge runs bounded, idempotent steps of 100 rows, one transaction
+each: the tenant's webhook events (their deliveries and attempts
+cascade), its webhook endpoints (an audit row `delete` by
+`sys_notifications` each; earlier audit rows are kept for their 400
+days), the push subscriptions made in it, its inbox items (raising each
+user's `purged_through`, so a stream resuming from before gets `reset`),
+then its notifications with their deliveries, attempts, provider events
+and development captures (deliveries locked in id order first, as
+`retention` does). A
+delivery or webhook job that then finds its row gone finishes. The last
+step sets `purged_at` and logs `notification.organization_purged`
+(`tenant` and the counts of the run that finished). A run near its
+deadline appends its continuation (`tenant_purge:<hash>:after:<job id>`).
+Users' preferences and settings are not tenant data and stay. Only a send
+whose attempt had started before the mark committed can still go out.
+
+`merezha notifications purge-organization ORGANIZATION --config PATH
+[--force] [--set SECTION.KEY=VALUE]...` marks the tenant (source
+`operator`) and runs the same steps to the end, for organizations identity
+deleted before the block consumed the event, or a missed event. It refuses
+(exit 1) an organization identity still has, or cannot confirm deleted (no
+identity tables, an id identity never issues), unless `--force`, which
+prints `warning: --force: …` first; exit 2 is bad arguments, configuration
+or database (logged `notification.purge_failed` with `code`). It prints
+`organization … marked deleted` (or `already marked deleted`), the purged
+counts and `status purged` (`(already)` on a rerun), logs
+`notification.organization_deleted` and `notification.organization_purged`
+with `source = operator` and `forced`, and is safe beside a running purge
+job.
+
 ### Templates
 
 Project files live under `templates.dir` (default `notifications/templates`,
@@ -2285,7 +2384,7 @@ Keys and defaults are NT §7.2. Bounds and checks the block adds:
 | `egress` | `allow_private_networks` (development and tests; also lets push endpoints use `http` and any port), `deny_cidrs` at most 64 networks, always refused |
 | `inbox` | durations 1 d to 3650 d |
 | `sse` | `heartbeat` 1 s to 5 min, `reconcile_interval` 1 s to 10 min, `replay_max` 1 to 10000, `max_streams_per_user` 1 to 64, `max_streams` 1 to 100000, `max_lifetime` 1 min to 1 d, `reauth_interval` 10 s to 1 h |
-| `webhooks` | `max_endpoints_per_tenant` 1 to 1000, `max_payload_bytes` 1024 to 1048576, `timeout` 1 s to 60 s, `concurrency_per_endpoint` 1 to 64, `auto_disable_after` 1 h to 30 d; `event_types` names follow R11, at most 256 |
+| `webhooks` | `max_endpoints_per_tenant` 1 to 1000, `max_payload_bytes` 1024 to 65536 (default 65536), `timeout` 1 s to 60 s, `concurrency_per_endpoint` 1 to 64, `auto_disable_after` 1 h to 30 d; `event_types` names follow R11, at most 256 |
 | `topics."<name>"` | names follow R11 (`invalid_topic_name`); `category` and `channels` required for project topics; built-ins keep their category (`category_fixed`); security topics are never `user_configurable` (`security_not_configurable`), never take `max_per_target_per_hour` (`security_not_rate_limited`) and never default to no channel (`security_default_channels_empty`); identity's token mail topics keep `email` in `default_channels` (`token_mail_needs_email`) |
 | `quiet_hours` | refused in v1 (`unsupported_section`) |
 
@@ -2300,7 +2399,8 @@ Brevo email and a non-security email topic, a `notify.email`,
 `notify.sms` or `notify.webhook` `lease_ms` under three provider timeouts
 (`lease_too_short`), a `notify.webhook` `backoff_max_ms` under 24 h or,
 with the Brevo email driver, a `notify.email` `backoff_max_ms` under 5 min
-(`backoff_max_too_short`), and with `MEREZHA_NOTIFY_NO_EGRESS=1` a
+(`backoff_max_too_short`), a `notify.maintenance` `timeout_ms` under 5 s
+(`timeout_too_short`, issue #63), and with `MEREZHA_NOTIFY_NO_EGRESS=1` a
 non-loopback `brevo.base_url` (`egress_not_loopback`).
 
 `Module::configure` sees only the module's section, so the binary hands

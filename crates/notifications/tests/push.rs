@@ -1259,3 +1259,105 @@ mod timing {
         instance.stop().await;
     }
 }
+
+/// Run the push delivery handler of `instance` once, on `attempt` of 6.
+async fn run_push(instance: &Instance, delivery: &str, attempt: u32) -> Result<(), String> {
+    use merezha_platform::ports::{Channel, JobContext, JobHandler};
+    let slot: merezha_notifications::notifier::Slot =
+        Arc::new(std::sync::OnceLock::from(instance.core()));
+    let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+    let ctx = JobContext {
+        id: 0,
+        kind: id("notify.deliver.push"),
+        attempt,
+        max_attempts: 6,
+        idempotency_key: String::new(),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(20),
+        cancel: cancelled,
+        correlation_id: id("corr1"),
+        causation_id: None,
+        tenant: None,
+    };
+    merezha_notifications::handler::Deliver(slot, Channel::Push)
+        .handle(ctx, json!({ "delivery_id": delivery, "generation": 0 }))
+        .await
+        .map_err(|failure| failure.code.clone())
+}
+
+/// Issue #66: during a rolling VAPID rotation, an instance on the new key
+/// that leases a push for a subscription of the old key starts no attempt
+/// and retries `vapid_key_mismatch`, so an instance holding the old key
+/// sends it; on the job's last attempt the push is skipped
+/// `no_subscription`, as before.
+#[tokio::test]
+async fn a_push_leased_by_an_instance_on_another_key_is_retried_for_its_own() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakePushService::start().await;
+    let section = section("\"127.0.0.1\"", true, "");
+    let (old_keys, new_keys) = (push::generate().unwrap(), push::generate().unwrap());
+    fake.expect_vapid_key(&old_keys.public_key);
+    // Delivery jobs are run by hand: their records are never relayed.
+    let mut on_old = options(&section, &old_keys);
+    on_old.relay = false;
+    let old = Instance::start(&world, on_old).await;
+    let mut on_new = options(&section, &new_keys);
+    on_new.workers = false;
+    let new = Instance::start(&world, on_new).await;
+    old.tokens.add("ada", user("usr_ada", &[], None));
+    assert_eq!(subscribe(&old, "ada", fake.subscription("k1")).await.0, 201);
+    let world = &world;
+    let queued = |key: &'static str| async move {
+        world
+            .text(&format!(
+                "SELECT d.id::text FROM merezha_notify.deliveries d \
+                 JOIN merezha_notify.notifications n ON n.id = d.notification_id \
+                 WHERE n.dedupe_key = '{key}' AND d.status = 'queued'"
+            ))
+            .await
+    };
+    for key in ["rot:1", "rot:2"] {
+        commit(&old, request("usr_ada", key, assigned())).await;
+    }
+    old.relay_now().await;
+    old.until(
+        "SELECT count(*) FROM merezha_notify.deliveries WHERE status = 'queued'",
+        2,
+    )
+    .await;
+    let first = queued("rot:1").await.remove(0);
+    // The new key's instance retries without an attempt...
+    assert_eq!(
+        run_push(&new, &first, 1).await,
+        Err("vapid_key_mismatch".to_owned())
+    );
+    assert_eq!(queued("rot:1").await, std::slice::from_ref(&first));
+    assert!(attempts(world).await.is_empty());
+    // The live chain shows on the row, so `reclaim_stuck` does not take it
+    // for a lost one.
+    assert_eq!(
+        world
+            .scalar(&format!(
+                "SELECT count(*) FROM merezha_notify.deliveries \
+                 WHERE id = '{first}' AND updated_at > created_at"
+            ))
+            .await,
+        1
+    );
+    assert!(fake.received().is_empty());
+    // ... and the old key's instance sends it.
+    assert_eq!(run_push(&old, &first, 2).await, Ok(()));
+    let received = fake.received();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].problem, None, "{:?}", received[0]);
+    // On the last attempt the mismatch skips the push.
+    let second = queued("rot:2").await.remove(0);
+    assert_eq!(run_push(&new, &second, 6).await, Ok(()));
+    assert_eq!(
+        deliveries(world).await,
+        ["push:accepted:", "push:skipped:no_subscription"]
+    );
+    assert_eq!(fake.received().len(), 1);
+    old.stop().await;
+}

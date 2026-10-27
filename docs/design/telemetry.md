@@ -816,6 +816,8 @@ Block events (AP's former `jobs.*` events are `job.*`):
 | `notification.provider_event_applied` / `notification.provider_event_uncorrelated` / `notification.provider_event_rejected` | debug / info / warn | `provider`, `channel`, `event`, `code` |
 | `notification.webhook_endpoint_disabled` / `notification.egress_blocked` / `notification.push_subscription_removed` | warn / warn / info | `endpoint_id`, `target`, `reason` |
 | `notification.maintenance_step_failed` | warn | `task` (the maintenance task), `reason` (its failed step), `code`: one step of a task failed and the next ones still ran (NT-N7) |
+| `notification.organization_deleted` / `notification.organization_purged` (issue #63, deleted organizations; also logged by `merezha notifications purge-organization`) | info | `tenant`, `source` (`event`, `operator`), `forced` / the same and `webhook_events`, `webhook_endpoints`, `push_subscriptions`, `inbox_items`, `notifications` (rows the run that finished the purge deleted) |
+| `notification.purge_failed` (`merezha notifications purge-organization` cannot run) | error | `code`, `usage` |
 | `notification.sse_listen_lost` / `notification.sse_listen_restored` / `notification.template_reload_failed` | warn / info / warn | `code` |
 | `content.model_loaded` / `content.model_activated` / `content.model_tightened` / `content.model_breaking` | info / info / warn / error | `version`, `fingerprint`, `types`, `locales` / `previous_version`, `change_classes` / `content_type`, `counts`, `truncated` / `path`, `change`, `code` |
 | `content.migration_batch` / `content.index_created` / `content.index_dropped` | info | `type`, `rows` / `index`, `content_type`, `field`, `table`, `purpose` / `index`, `reason` |

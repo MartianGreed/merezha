@@ -84,19 +84,21 @@ pub const TARGETS: Statement = s(
 
 // ----- delivery worker -----
 
-/// The subscription of push delivery `$1` and the fields of its
-/// notification the request needs, while the subscription still belongs to
-/// the delivery's user, uses VAPID key `$2`, has not expired at `$3` and
-/// is in the notification's tenant scope.
+/// The subscription of push delivery `$1`, with the VAPID key it was made
+/// with, and the fields of its notification the request needs, while the
+/// subscription still belongs to the delivery's user, has not expired at
+/// `$2` and is in the notification's tenant scope. The key is compared by
+/// the worker, so a job leased by an instance on another key during a
+/// rolling rotation is retried rather than skipped (issue #66).
 pub const TARGET: Statement = s(
     "notify.push.target",
     "SELECT merezha_notify.push_subscriptions",
-    "SELECT s.id, s.endpoint, s.p256dh, s.auth, n.collapse_key, n.priority \
+    "SELECT s.id, s.endpoint, s.p256dh, s.auth, n.collapse_key, n.priority, s.vapid_key_id \
      FROM merezha_notify.deliveries d \
      JOIN merezha_notify.notifications n ON n.id = d.notification_id \
      JOIN merezha_notify.push_subscriptions s ON s.id = d.push_subscription_id \
-     WHERE d.id = $1 AND s.user_id = d.user_id AND s.vapid_key_id = $2 \
-     AND (s.expires_at IS NULL OR s.expires_at > $3) \
+     WHERE d.id = $1 AND s.user_id = d.user_id \
+     AND (s.expires_at IS NULL OR s.expires_at > $2) \
      AND (n.tenant_id IS NULL OR n.tenant_id = s.tenant_id)",
 );
 /// An accepted push.

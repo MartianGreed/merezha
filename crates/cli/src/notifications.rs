@@ -31,6 +31,18 @@
 //! the uncompressed point, the browser's `applicationServerKey`) and
 //! `key_id`. It reads no configuration and writes nothing else; store the
 //! private key as a secret (`{ env = "…" }` or `{ file = "…" }`).
+//!
+//! `merezha notifications purge-organization ORGANIZATION --config PATH
+//! [--force]` (issue #63) marks the organization's tenant deleted and runs
+//! the block's purge to the end, for organizations identity deleted before
+//! the block consumed `identity.organization_deleted`, or a missed event,
+//! as `merezha content purge-organization` does for content. It refuses
+//! (exit 1) an organization identity still has, or one identity cannot
+//! confirm deleted, unless `--force`, which prints a `warning: --force:`
+//! line first. It logs `notification.organization_deleted` (when it
+//! marked the tenant) and `notification.organization_purged`, source
+//! `operator`; exit 2 means bad arguments, configuration or database
+//! (`notification.purge_failed`).
 use merezha_notifications::{HostFacts, Notifications};
 use merezha_platform::{ConfigInput, Module, host};
 use serde_json::{Value, json};
@@ -38,7 +50,13 @@ use std::process::ExitCode;
 
 pub const USAGE: &str = "merezha notifications check --config PATH [--listen ADDRESS] \
      [--set SECTION.KEY=VALUE]... | merezha notifications brevo register-webhook --config PATH \
-     [--url URL [--allow-host]] [--set SECTION.KEY=VALUE]... | merezha notifications vapid generate";
+     [--url URL [--allow-host]] [--set SECTION.KEY=VALUE]... | merezha notifications vapid generate \
+     | merezha notifications purge-organization ORGANIZATION --config PATH [--force] \
+     [--set SECTION.KEY=VALUE]...";
+/// The usage of `merezha notifications purge-organization`.
+pub const PURGE_USAGE: &str = "merezha notifications purge-organization ORGANIZATION --config PATH [--force] [--set SECTION.KEY=VALUE]...";
+/// Bound on each purge transaction of the command.
+const PURGE_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long `brevo register-webhook` waits for Brevo.
 const REGISTER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -100,6 +118,7 @@ pub fn main(mut args: impl Iterator<Item = String>) -> ExitCode {
     let register = match args.next().as_deref() {
         Some("check") => false,
         Some("brevo") if args.next().as_deref() == Some("register-webhook") => true,
+        Some("purge-organization") => return purge_main(args),
         Some("vapid") => {
             if args.next().as_deref() != Some("generate") || args.next().is_some() {
                 return invalid();
@@ -223,4 +242,242 @@ pub fn vapid_generate() -> (Value, ExitCode) {
             ExitCode::from(1),
         ),
     }
+}
+
+/// Log `notification.purge_failed` at error through the bootstrap
+/// dispatcher (the command installs no subscriber).
+fn report_purge_failure(code: &str, usage: bool) {
+    tracing::dispatcher::with_default(&merezha_telemetry::pipeline::bootstrap(), || {
+        if usage {
+            merezha_telemetry::event!(
+                ERROR,
+                "notification.purge_failed",
+                code,
+                usage = PURGE_USAGE
+            )
+        } else {
+            merezha_telemetry::event!(ERROR, "notification.purge_failed", code)
+        }
+    });
+}
+
+/// The command's own arguments: the organization and `--force`, the rest
+/// as `merezha run` takes them.
+fn purge_arguments(
+    args: impl IntoIterator<Item = String>,
+) -> Result<(String, bool, crate::run::RunArguments), merezha_domain::Failure> {
+    let invalid = || merezha_domain::Failure::permanent("invalid_arguments");
+    let mut organization = None;
+    let mut force = false;
+    let mut rest = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--force" if !force => force = true,
+            "--config" | "--set" => {
+                rest.push(argument);
+                rest.push(args.next().ok_or_else(invalid)?);
+            }
+            other if !other.starts_with('-') && organization.is_none() => {
+                organization = Some(argument);
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    Ok((
+        organization.ok_or_else(invalid)?,
+        force,
+        crate::run::arguments(rest)?,
+    ))
+}
+
+/// Exit codes: 0 when the organization's notification data is purged (now
+/// or before), 1 when identity still has the organization (or cannot say)
+/// and `--force` is absent, 2 when the arguments, the configuration or the
+/// database fail.
+fn purge_main(args: impl Iterator<Item = String>) -> ExitCode {
+    let (organization, force, arguments) = match purge_arguments(args) {
+        Ok(parsed) => parsed,
+        Err(failure) => {
+            report_purge_failure(&failure.code, true);
+            return ExitCode::from(2);
+        }
+    };
+    let input = ConfigInput {
+        path: arguments.config,
+        env: std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect(),
+        overrides: arguments.overrides,
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            report_purge_failure("internal", false);
+            return ExitCode::from(2);
+        }
+    };
+    match runtime.block_on(purge(&input, &organization, force)) {
+        Ok((text, code)) => {
+            print!("{text}");
+            ExitCode::from(code)
+        }
+        Err(code) => ExitCode::from(code),
+    }
+}
+
+/// The report and its exit code, or the exit code after logging why the
+/// purge could not run.
+pub async fn purge(
+    input: &ConfigInput,
+    organization: &str,
+    force: bool,
+) -> Result<(String, u8), u8> {
+    use crate::content::{InIdentity, in_identity};
+    use merezha_notifications::tenants;
+    use std::{fmt::Write as _, time::Instant};
+    let blocks = crate::blocks(input, merezha_content::ContentModule::new());
+    let config = match host::configure(input, blocks) {
+        Ok((config, _)) => config,
+        Err(_) => {
+            report_purge_failure("invalid_config", false);
+            return Err(2);
+        }
+    };
+    if !config.modules.contains_key(merezha_notifications::NAME) {
+        report_purge_failure("notifications_not_enabled", false);
+        return Err(2);
+    }
+    if !tenants::valid_organization(organization) {
+        report_purge_failure("invalid_organization", true);
+        return Err(2);
+    }
+    let unavailable = |failure: merezha_domain::Failure| {
+        report_purge_failure(&failure.code, false);
+        2
+    };
+    let database = merezha_platform::Database::connect(&config.database).map_err(unavailable)?;
+    let deadline =
+        Instant::now() + config.database.connect_timeout + std::time::Duration::from_secs(10);
+    let result = async {
+        if !tenants::deletion_ready(&database, deadline)
+            .await
+            .map_err(unavailable)?
+        {
+            report_purge_failure("notifications_migration_pending", false);
+            return Err(2);
+        }
+        let mut out = String::new();
+        let mut forced = false;
+        match in_identity(&database, organization, deadline)
+            .await
+            .map_err(unavailable)?
+        {
+            InIdentity::Deleted => {}
+            InIdentity::Live if !force => {
+                let _ = writeln!(
+                    out,
+                    "refused: identity still has organization {organization}; delete it there \
+                     (its notification data then purges on its own) or pass --force"
+                );
+                return Ok((out, 1));
+            }
+            InIdentity::Unknown(why) if !force => {
+                let _ = writeln!(
+                    out,
+                    "refused: identity cannot confirm organization {organization} is deleted \
+                     ({why}); pass --force to purge it anyway"
+                );
+                return Ok((out, 1));
+            }
+            InIdentity::Live => {
+                forced = true;
+                let _ = writeln!(
+                    out,
+                    "warning: --force: identity still has organization {organization}; its \
+                     notification data is purged for good and the block refuses the \
+                     organization from now on, while its members keep it in identity"
+                );
+            }
+            InIdentity::Unknown(why) => {
+                forced = true;
+                let _ = writeln!(
+                    out,
+                    "warning: --force: identity cannot confirm organization {organization} is \
+                     deleted ({why}); its notification data is purged for good and the block \
+                     refuses the organization from now on"
+                );
+            }
+        }
+        let report = tenants::purge_organization(
+            &database,
+            organization,
+            tenants::DeletedBy::Operator,
+            PURGE_STEP_TIMEOUT,
+        )
+        .await
+        .map_err(unavailable)?;
+        let source = tenants::DeletedBy::Operator.as_str();
+        let purged = report.purged;
+        tracing::dispatcher::with_default(&merezha_telemetry::pipeline::bootstrap(), || {
+            if report.marked {
+                merezha_telemetry::event!(
+                    INFO,
+                    "notification.organization_deleted",
+                    tenant = organization,
+                    source,
+                    forced
+                );
+            }
+            if !report.already_purged {
+                merezha_telemetry::event!(
+                    INFO,
+                    "notification.organization_purged",
+                    tenant = organization,
+                    source,
+                    forced,
+                    webhook_events = purged.webhook_events,
+                    webhook_endpoints = purged.webhook_endpoints,
+                    push_subscriptions = purged.push_subscriptions,
+                    inbox_items = purged.inbox_items,
+                    notifications = purged.notifications
+                );
+            }
+        });
+        let _ = writeln!(
+            out,
+            "organization {organization} {}",
+            if report.marked {
+                "marked deleted"
+            } else {
+                "already marked deleted"
+            }
+        );
+        let _ = writeln!(
+            out,
+            "purged webhook_events {} webhook_endpoints {} push_subscriptions {} inbox_items {} \
+             notifications {}",
+            purged.webhook_events,
+            purged.webhook_endpoints,
+            purged.push_subscriptions,
+            purged.inbox_items,
+            purged.notifications
+        );
+        let _ = writeln!(
+            out,
+            "status purged{}",
+            if report.already_purged {
+                " (already)"
+            } else {
+                ""
+            }
+        );
+        Ok((out, 0))
+    }
+    .await;
+    database.close();
+    result
 }

@@ -1379,3 +1379,204 @@ mod timing {
         instance.stop().await;
     }
 }
+
+/// Run the email delivery handler once, as the jobs runtime would on
+/// `attempt` of 10, for a job of idempotency key `key` with `payload`.
+async fn run_keyed(
+    instance: &Instance,
+    payload: Value,
+    attempt: u32,
+    key: &str,
+) -> Result<(), String> {
+    use merezha_platform::ports::{Channel, JobContext, JobHandler};
+    let slot: merezha_notifications::notifier::Slot =
+        Arc::new(std::sync::OnceLock::from(instance.core()));
+    let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+    let ctx = JobContext {
+        id: 0,
+        kind: id("notify.deliver.email"),
+        attempt,
+        max_attempts: 10,
+        idempotency_key: key.to_owned(),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(20),
+        cancel: cancelled,
+        correlation_id: id("corr1"),
+        causation_id: None,
+        tenant: None,
+    };
+    merezha_notifications::handler::Deliver(slot, Channel::Email)
+        .handle(ctx, payload)
+        .await
+        .map_err(|failure| failure.code.clone())
+}
+
+/// Issue #63: a `provider_account` answer hands the delivery to a new job
+/// that carries the attempt it answered. The first job running again
+/// (its worker died after Tx B, before the job was marked done) is
+/// dropped by Tx A: no second chain sends. The continuation still sends.
+#[tokio::test]
+async fn a_job_run_again_after_handing_the_delivery_on_sends_nothing() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakeBrevo::start(API_KEY).await.unwrap();
+    fake.fail_next(1, 401);
+    let instance = Instance::start(&world, options(&section(&fake, PROVIDER_DELAYS, "", ""))).await;
+    commit(
+        &instance,
+        request("tasks.assigned", email("fen@example.org", None), "f:1"),
+    )
+    .await;
+    // The continuation waits at least five minutes; its key names the
+    // attempt it continues after (the first job's state also counts as
+    // available while it is retried, so wait for the continuation itself).
+    let continuation_job = "SELECT count(*) FROM merezha_jobs.jobs \
+        WHERE kind = 'notify.deliver.email' AND state = 'available' \
+        AND idempotency_key LIKE '%:g0:a1'";
+    instance.until(continuation_job, 1).await;
+    instance
+        .until(
+            "SELECT count(*) FROM merezha_notify.deliveries \
+             WHERE status = 'retrying' AND status_reason = 'provider_account'",
+            1,
+        )
+        .await;
+    let delivery_id = world
+        .text("SELECT id::text FROM merezha_notify.deliveries")
+        .await
+        .remove(0);
+    let (key, continuation) = {
+        let row = world
+            .text(
+                "SELECT idempotency_key || ' ' || payload::text FROM merezha_jobs.jobs \
+                 WHERE kind = 'notify.deliver.email' AND state = 'available' \
+                 AND idempotency_key LIKE '%:g0:a1'",
+            )
+            .await
+            .remove(0);
+        let (key, payload) = row.split_once(' ').unwrap();
+        (
+            key.to_owned(),
+            serde_json::from_str::<Value>(payload).unwrap(),
+        )
+    };
+    // The payload carries no fence, so no older binary refuses it.
+    assert!(
+        continuation.get("after_attempt").is_none(),
+        "{continuation}"
+    );
+    // The first job, run again with its own key, finds another chain.
+    let first_key = key.trim_end_matches(":a1").to_owned();
+    let first = json!({ "delivery_id": delivery_id, "generation": 0 });
+    assert_eq!(run_keyed(&instance, first, 2, &first_key).await, Ok(()));
+    assert_eq!(attempts(&world).await, ["transient"]);
+    assert!(fake.processed().is_empty(), "no second chain sent");
+    // A job naming another attempt than the last one is dropped too.
+    let stray = key.replace(":a1", ":a7");
+    assert_eq!(
+        run_keyed(&instance, continuation.clone(), 1, &stray).await,
+        Ok(())
+    );
+    assert_eq!(attempts(&world).await, ["transient"]);
+    // The continuation, fenced by its key alone, is the live chain.
+    assert_eq!(run_keyed(&instance, continuation, 1, &key).await, Ok(()));
+    assert_eq!(attempts(&world).await, ["transient", "accepted"]);
+    assert_eq!(fake.processed().len(), 1);
+    assert_eq!(delivery(&world, "fen@example.org").await, "accepted:");
+    instance.stop().await;
+}
+
+/// Issue #68: message ids are kept per attempt, so a late report about an
+/// earlier generation's message moves no status even when the current
+/// generation has none of its own (N1: here a duplicate accepted the
+/// redelivery). Without a message id, a report on a redelivered delivery
+/// may only move it to `delivered` (N2).
+#[tokio::test]
+async fn late_reports_never_settle_a_redelivery_without_a_message_id() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let fake = FakeBrevo::start(API_KEY).await.unwrap();
+    let instance = Instance::start(&world, options(&section(&fake, "", "", ""))).await;
+    commit(
+        &instance,
+        request("tasks.assigned", email("gen2@example.org", None), "g:2"),
+    )
+    .await;
+    wait_status(&instance, "accepted", 1).await;
+    let first = fake.processed().remove(0);
+    assert_eq!(
+        callback(&instance, &fake.event("blocked", &first)).await.0,
+        200
+    );
+    assert_eq!(delivery(&world, "gen2@example.org").await, "failed:blocked");
+    assert_eq!(
+        world
+            .text(
+                "SELECT generation || ':' || provider_message_id \
+                 FROM merezha_notify.delivery_attempts WHERE provider_message_id IS NOT NULL"
+            )
+            .await,
+        [format!("0:{}", first.message_id)]
+    );
+    // The redelivery is processed, its connection dropped, and the resend
+    // answered as a duplicate: accepted without a message id.
+    fake.close_after_accept();
+    instance
+        .tokens
+        .add("admin", user("usr_admin", &["notifications.admin"], None));
+    let id = world
+        .text("SELECT id::text FROM merezha_notify.deliveries")
+        .await
+        .remove(0);
+    let (status, _) = instance
+        .call(
+            "POST",
+            &format!("/v1/notifications/deliveries/{id}/redeliver"),
+            Some("admin"),
+            None,
+        )
+        .await;
+    assert_eq!(status.as_u16(), 202);
+    wait_status(&instance, "accepted", 1).await;
+    assert_eq!(
+        attempts(&world).await,
+        ["accepted", "ambiguous", "duplicate"]
+    );
+    assert_eq!(
+        world
+            .text("SELECT coalesce(provider_message_id, 'none') FROM merezha_notify.deliveries")
+            .await,
+        ["none"]
+    );
+    // N1: a late bounce about the first message is stored, moves nothing.
+    assert_eq!(
+        callback(&instance, &fake.event("hard_bounce", &first))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(delivery(&world, "gen2@example.org").await, "accepted:");
+    // N2: without a message id, a failure report moves nothing...
+    let bare = |event: &str| {
+        let mut payload = fake.event(event, &first);
+        payload.as_object_mut().unwrap().remove("message-id");
+        payload.as_object_mut().unwrap().remove("messageId");
+        payload
+    };
+    assert_eq!(callback(&instance, &bare("blocked")).await.0, 200);
+    assert_eq!(delivery(&world, "gen2@example.org").await, "accepted:");
+    // ... and a `delivered` still applies.
+    assert_eq!(callback(&instance, &bare("delivered")).await.0, 200);
+    assert_eq!(delivery(&world, "gen2@example.org").await, "delivered:");
+    assert_eq!(
+        world
+            .scalar(&format!(
+                "SELECT count(*) FROM merezha_notify.provider_events WHERE delivery_id = '{id}'"
+            ))
+            .await,
+        4,
+        "every report is stored"
+    );
+    instance.stop().await;
+}

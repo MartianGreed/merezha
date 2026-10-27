@@ -17,9 +17,17 @@
 //! (`provider_account`) is logged at error level and counted, a rate limit
 //! at warn. An accepted SMS counts its segments.
 //!
+//! Tx A also fences the job chain (issue #63): a job whose key names
+//! another attempt than the generation's last `provider_account` attempt
+//! (a generation's first job names none) was handed over and finishes
+//! without a send.
+//!
 //! Push (NT-N6) runs the same steps: Tx A also reads the delivery's
-//! subscription (gone, moved to another user, made with an old VAPID key,
-//! expired or out of the tenant scope: `skipped` / `no_subscription`), the
+//! subscription (gone, moved to another user, expired or out of the
+//! tenant scope: `skipped` / `no_subscription`; made with another VAPID key
+//! than this instance's: retried `vapid_key_mismatch` without an attempt,
+//! so an instance holding that key sends it, issue #66, and skipped on the
+//! job's last attempt), the
 //! request goes through [`crate::push::PushSender`], and Tx B refreshes the
 //! subscription, counts a failure, or deletes it on 404 or 410
 //! (`subscription_gone`). An ambiguous push is resent: the payload carries
@@ -128,7 +136,12 @@ async fn deliver(
     payload: DeliverPayload,
 ) -> Outcome {
     let id = payload.delivery_id;
-    let prepared = match prepare(core, channel, deadline, id, payload.generation).await {
+    let job = JobRun {
+        generation: payload.generation,
+        after_attempt: keyed_attempt(&ctx.idempotency_key).or(payload.after_attempt),
+        last: ctx.attempt >= ctx.max_attempts,
+    };
+    let prepared = match prepare(core, channel, deadline, id, job).await {
         Ok(prepared) => prepared,
         Err(failure) => return Outcome::retry(&failure.code),
     };
@@ -322,14 +335,42 @@ fn unsubscribe_link(core: &Core, channel: Channel, locked: &Locked) -> Option<St
     Some(format!("{base}/v1/notifications/unsubscribe?token={token}"))
 }
 
+/// What Tx A needs of the job: the generation it sends, the attempt its
+/// chain continues after (issue #63), and whether it is the job's last
+/// attempt.
+#[derive(Clone, Copy, Debug)]
+struct JobRun {
+    generation: i32,
+    after_attempt: Option<i32>,
+    last: bool,
+}
+
+/// The attempt a continuation job names in its key
+/// (`notifications:deliver:{id}:g{generation}:a{attempt}`): the fence of
+/// its chain (issue #63). A generation's first job has no `:a` part. The
+/// key carries it, not the payload, so a continuation queued by any
+/// version is fenced and no older binary refuses its payload.
+fn keyed_attempt(key: &str) -> Option<i32> {
+    let (_, attempt) = key.rsplit_once(":a")?;
+    attempt.parse().ok().filter(|attempt| *attempt > 0)
+}
+
+/// The transient code of a push job that leased a delivery whose
+/// subscription was made with another VAPID key than this instance's
+/// (issue #66): during a rolling key rotation an instance holding that key
+/// sends it. Tx A starts no attempt for it; on the job's last attempt the
+/// delivery is `skipped` / `no_subscription`.
+pub const VAPID_KEY_MISMATCH: &str = "vapid_key_mismatch";
+
 /// Tx A.
 async fn prepare(
     core: &Core,
     channel: Channel,
     deadline: Instant,
     id: Uuid,
-    generation: i32,
+    job: JobRun,
 ) -> Result<Prepared, Failure> {
+    let generation = job.generation;
     let db = core.database.clone();
     let now = core.now();
     let settings = core.settings.clone();
@@ -356,9 +397,46 @@ async fn prepare(
                 {
                     return Ok((Prepared::Finished(Outcome::Done), None));
                 }
+                // Another job carries the generation on: this one ran again
+                // after handing the delivery over (issue #63).
+                let chain: Option<i32> = db
+                    .query_one(tx, &sql::ATTEMPT_CHAIN, &[&id, &generation])
+                    .await
+                    .map_err(|e| classify(&e))?
+                    .get(0);
+                if chain != job.after_attempt {
+                    return Ok((Prepared::Finished(Outcome::Done), None));
+                }
                 let user: Option<String> = row.get(4);
                 let address: Option<String> = row.get(5);
                 let topic: String = row.get(9);
+                // A deleted organization's deliveries are cancelled before
+                // the purge reaches them (issue #63).
+                if let Some(tenant) = row.get::<_, Option<String>>(18)
+                    && crate::tenants::guard(&db, tx, &tenant).await?
+                {
+                    let why = reason::TENANT_DELETED;
+                    db.execute(
+                        tx,
+                        &sql::DELIVERY_SET,
+                        &[
+                            &id,
+                            &generation,
+                            &"cancelled",
+                            &why,
+                            &now,
+                            &None::<jiff::Timestamp>,
+                            &None::<i32>,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| classify(&e))?;
+                    events::apply_pending(&db, tx, id, now).await?;
+                    return Ok((
+                        Prepared::Finished(Outcome::Done),
+                        Some(("cancelled", why, topic)),
+                    ));
+                }
                 let category_text: String = row.get(11);
                 let data: Option<Value> = row.get(12);
                 let expires_at: Option<jiff::Timestamp> = row.get(14);
@@ -421,9 +499,23 @@ async fn prepare(
                 if decided.is_none()
                     && let Some(key_id) = &push_key
                 {
-                    match crate::push::load_target(&db, tx, id, key_id, now).await? {
-                        Some(target) => push = Some(target),
-                        None => decided = Some(set("skipped", reason::NO_SUBSCRIPTION)),
+                    match crate::push::load_target(&db, tx, id, now).await? {
+                        Some(target) if target.key_id == *key_id => push = Some(target),
+                        // Made with another VAPID key: during a rolling
+                        // rotation an instance holding it sends the push
+                        // (issue #66); no attempt is started.
+                        Some(_) if !job.last => {
+                            // The chain is alive: `reclaim_stuck` must not
+                            // take it for a lost one.
+                            db.execute(tx, &sql::DELIVERY_TOUCH, &[&id, &now])
+                                .await
+                                .map_err(|e| classify(&e))?;
+                            return Ok((
+                                Prepared::Finished(Outcome::retry(VAPID_KEY_MISMATCH)),
+                                Some(("retrying", VAPID_KEY_MISMATCH, topic)),
+                            ));
+                        }
+                        _ => decided = Some(set("skipped", reason::NO_SUBSCRIPTION)),
                     }
                 }
                 if let Some((status, why)) = decided {
@@ -577,8 +669,17 @@ async fn prepare(
             })
         })
         .await?;
-    if let Some((status, why, topic)) = logged {
-        log_settled(core, channel, id, &topic, status, why, None);
+    match logged {
+        Some(("retrying", why, topic)) => merezha_telemetry::event!(
+            WARN,
+            "notification.retry_scheduled",
+            channel = channel.as_str(),
+            topic = topic.as_str(),
+            delivery_id = id.to_string().as_str(),
+            code = why
+        ),
+        Some((status, why, topic)) => log_settled(core, channel, id, &topic, status, why, None),
+        None => {}
     }
     Ok(prepared)
 }
@@ -882,6 +983,11 @@ async fn record(
                     payload: DeliverPayload {
                         delivery_id: id,
                         generation: locked.generation,
+                        // The fence is the attempt in the record's key
+                        // (`…:a{attempt}`), never the payload: a payload
+                        // field would be refused by older binaries
+                        // during a rollout (issue #63).
+                        after_attempt: None,
                         secret_data: secret.cloned(),
                     }
                     .to_value(),
@@ -963,6 +1069,11 @@ async fn record(
                     )
                     .await
                     .map_err(|e| classify(&e))?;
+                    if message_id.is_some() {
+                        db.execute(tx, &sql::ATTEMPT_MESSAGE_ID, &[&id, &attempt, &message_id])
+                            .await
+                            .map_err(|e| classify(&e))?;
+                    }
                     if let Some(subscription) = subscription {
                         gone =
                             crate::push::after_attempt(&db, tx, subscription, &sent, now).await?;
@@ -1099,5 +1210,26 @@ impl Step {
             job: Outcome::Done,
             continue_at: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keyed_attempt;
+
+    #[test]
+    fn a_continuation_key_names_the_attempt_it_continues_after() {
+        let id = "0c7d1a2e-3b4f-5a6b-8c9d-aaaaaaaaaaaa";
+        assert_eq!(
+            keyed_attempt(&format!("notifications:deliver:{id}:g2:a7")),
+            Some(7)
+        );
+        assert_eq!(
+            keyed_attempt(&format!("notifications:deliver:{id}:g0")),
+            None
+        );
+        assert_eq!(keyed_attempt(""), None);
+        assert_eq!(keyed_attempt("notifications:deliver:x:g0:a0"), None);
+        assert_eq!(keyed_attempt("notifications:deliver:x:g0:ab"), None);
     }
 }

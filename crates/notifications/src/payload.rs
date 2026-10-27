@@ -166,12 +166,20 @@ impl ExpandPayload {
 }
 
 /// The `notify.deliver.<channel>` payload. `Debug` shows ids only.
+///
+/// The job chain of a generation is fenced on the attempt a continuation
+/// names in its key (`deliver:{id}:g{n}:a{attempt}`, issue #63), not on
+/// the payload. `after_attempt` is accepted when read, as a fallback for
+/// a job without the key part, and never written, so that a binary that
+/// refuses unknown fields never dead-letters a continuation.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeliverPayload {
     #[serde(with = "uuid_text")]
     pub delivery_id: Uuid,
     pub generation: i32,
+    #[serde(default, skip_serializing)]
+    pub after_attempt: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_data: Option<Map<String, Value>>,
 }
@@ -180,6 +188,7 @@ impl std::fmt::Debug for DeliverPayload {
         f.debug_struct("DeliverPayload")
             .field("delivery_id", &self.delivery_id)
             .field("generation", &self.generation)
+            .field("after_attempt", &self.after_attempt)
             .finish_non_exhaustive()
     }
 }

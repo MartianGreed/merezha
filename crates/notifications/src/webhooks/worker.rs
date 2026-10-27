@@ -367,6 +367,15 @@ async fn prepare(
                 {
                     return Ok((Prepared::Finished(Outcome::Done), None));
                 }
+                // A deleted organization's deliveries go no further, even
+                // before the purge reaches them (issue #63).
+                if let Some(tenant) = row.get::<_, Option<String>>(13)
+                    && crate::tenants::guard(&db, tx, &tenant).await?
+                {
+                    let code = crate::policy::reason::TENANT_DELETED;
+                    settle_open(&db, tx, id, generation, "cancelled", code, now).await?;
+                    return Ok((Prepared::Finished(Outcome::Done), Some("cancelled")));
+                }
                 let endpoint_status: String = row.get(2);
                 if endpoint_status != "active" {
                     let code = super::code::ENDPOINT_DISABLED;

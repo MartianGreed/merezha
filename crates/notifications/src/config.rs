@@ -31,6 +31,11 @@ const PROVIDER_RETRY_CAP: Duration = Duration::from_secs(3600);
 /// The shortest `notify.email` `backoff_max_ms` with the Brevo driver: an
 /// account problem is retried no sooner than five minutes (NT §5.2).
 pub const MIN_BREVO_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// The default and largest `webhooks.max_payload_bytes`: the outbox's
+/// record cap. An `emit_webhook` job payload or a module's event envelope
+/// carries the event data through the outbox, so no larger envelope can
+/// ever reach the fan-out (issue #76).
+pub const MAX_WEBHOOK_PAYLOAD: u64 = merezha_platform::ports::MAX_PAYLOAD_BYTES as u64;
 /// Most declared topics, built-ins included.
 pub const MAX_TOPICS: usize = 256;
 /// Most entries in a list setting such as `templates.locales`.
@@ -61,7 +66,8 @@ pub struct HostFacts {
 }
 
 /// The queue settings the cross checks read.
-const CHECKED_QUEUE_KEYS: [(&str, &str); 5] = [
+const CHECKED_QUEUE_KEYS: [(&str, &str); 6] = [
+    ("notify.maintenance", "timeout_ms"),
     ("notify.email", "lease_ms"),
     ("notify.email", "backoff_max_ms"),
     ("notify.sms", "lease_ms"),
@@ -1309,7 +1315,14 @@ fn parse_into(
             let s = Duration::from_secs;
             let max_endpoints_per_tenant =
                 l.integer("max_endpoints_per_tenant", 20, 1, 1000) as u32;
-            let max_payload_bytes = l.integer("max_payload_bytes", 262_144, 1024, 1_048_576) as u32;
+            // An envelope travels through the outbox, whose records are
+            // capped (issue #76): anything larger could never be sent.
+            let max_payload_bytes = l.integer(
+                "max_payload_bytes",
+                MAX_WEBHOOK_PAYLOAD,
+                1024,
+                MAX_WEBHOOK_PAYLOAD,
+            ) as u32;
             let timeout = l.duration("timeout", s(10), s(1), s(60));
             let connect_timeout =
                 l.duration("connect_timeout", s(5), Duration::from_millis(100), s(30));
@@ -1580,6 +1593,16 @@ fn cross_checks(
                     ));
                 }
             }
+        }
+        // A `retention` batch never starts within its margin of the job
+        // deadline: a shorter timeout leaves no room for work (issue #63).
+        let (maintenance, _) = queue_settings(jobs, crate::maintenance::QUEUE);
+        if maintenance.timeout < crate::maintenance::MIN_TIMEOUT {
+            issues.push(queue_issue(
+                crate::maintenance::QUEUE,
+                "timeout_ms",
+                "timeout_too_short",
+            ));
         }
         if let Some(webhooks) = &settings.webhooks {
             let (effective, _) = queue_settings(jobs, "notify.webhook");
