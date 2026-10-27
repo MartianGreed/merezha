@@ -42,8 +42,8 @@ The requirements other designs already placed on the scaffold:
 | SC-D10 | Example | `teamboard`, a team task board: organizations, invitations, roles, API keys, tenant streams, a partitioned projection, a reactor with notify, webhook and command effects, help articles and organization briefs in the CMS, inbox with SSE, email, push and OTLP telemetry. |
 | SC-D11 | Example location and sync | `examples/teamboard/` holds the committed output of `merezha new teamboard --template teamboard --merezha-path . --no-secrets`. CI regenerates it and fails on any difference, then builds it and runs the end-to-end test against it. |
 | SC-D12 | End-to-end test | `crates/cli/tests/teamboard.rs` runs the real `merezha run` binary on the example's Wasm components and real PostgreSQL, with `FakeBrevo` for email, `FakePushService` for push and `WebhookReceiver` for webhooks, across two organizations. |
-| SC-D14 | Front end origin | Development: the front end's dev server proxies `/v1` to the host, so the browser sees one origin and CORS stays off. Production: `[http.cors]` with the front end's exact origin and `allow_credentials = true`. |
 | SC-D13 | Telemetry ownership | TE-T7 keeps `deploy/telemetry/` and `merezha telemetry export`. The scaffold's copy into `ops/telemetry/`, the example's Contremaitre manifest and its verification profile move from TE-T7 to SC-S4. |
+| SC-D14 | Front end origin | Development: the front end's dev server proxies `/v1` to the host, so the browser sees one origin and CORS stays off. Production: `[http.cors]` with the front end's exact origin and `allow_credentials = true`. |
 
 ## 1. Language
 
@@ -233,22 +233,35 @@ unless = ["identity"]
 `crates/scaffold/build.rs` records the revision the binary is built from, in this order:
 
 1. `MEREZHA_SOURCE_REV` from the build environment, which the release and CI builds set.
-2. Else `git rev-parse HEAD` in the crate's directory, kept only when `git status --porcelain
-   --untracked-files=no` prints nothing. Untracked files are ignored on purpose: Cargo leaves an
+2. Else `git rev-parse HEAD` in the crate's directory, kept only when `git --no-optional-locks
+   status --porcelain --untracked-files=no` prints nothing. `--no-optional-locks` stops `git
+   status` from refreshing `.git/index` as a side effect; a refreshed index would be newer than
+   the script's last run, and Cargo would rerun the script, rebuild `merezha-scaffold` and relink
+   `merezha` on every build. Untracked files are ignored on purpose: Cargo leaves an
    untracked `.cargo-ok` in every git checkout it builds, so counting untracked files would mark
    every `cargo install --git ... --rev` build dirty. A modified tracked file still counts.
 3. Else none. A dirty or unknown tree gives none, so `merezha new` asks for `--merezha-rev` or
    `--merezha-path` (`source_rev_unknown`) rather than pinning a revision that is not the source.
 
-So that the recorded revision follows the tree, the script prints
-`cargo::rerun-if-env-changed=MEREZHA_SOURCE_REV` and `cargo::rerun-if-changed` for the git
-directory's `HEAD`, the ref `HEAD` points to, `packed-refs` and `index`. It finds them with
-`git rev-parse --git-dir` and `--git-common-dir`, so linked worktrees work. A commit, a branch
-switch or staging an edit reruns the script; an unstaged edit to a tracked file changes neither
-`HEAD` nor the index, which is why step 2 checks the status at every run rather than caching
-cleanliness. SC-S2 checks that `cargo install --git file://<checkout> --rev <sha> merezha-cli`
-records `<sha>` despite `.cargo-ok`, that a commit in a development checkout changes the recorded
-revision on the next build, and that a modified tracked file makes it none.
+The script prints `cargo::rerun-if-env-changed=MEREZHA_SOURCE_REV` and
+`cargo::rerun-if-changed` for the git directory's `HEAD`, the loose ref `HEAD` points to,
+`packed-refs` and `index`, each only when the file exists: Cargo treats a missing path as always
+changed, and a branch whose ref `git gc` or `git pack-refs` moved into `packed-refs` has no loose
+file (`packed-refs` then covers it). It finds them with `git rev-parse --git-dir` and
+`--git-common-dir`, so linked worktrees work. A commit, a branch switch or staging an edit reruns
+the script.
+
+**Which revisions are authoritative.** Only two kinds of build record a revision that can be
+trusted: one with `MEREZHA_SOURCE_REV` set (release and CI builds), and a fresh build of a clean
+checkout, which is what `cargo install --git ... --rev` always is. In a development checkout the
+recorded revision is advisory: an unstaged edit to a source file, say under `crates/runtime/src`,
+touches neither `HEAD` nor the index, so the script does not rerun and the binary keeps
+reporting the clean revision it saw last. Rerunning the script on every source change would
+rebuild and relink on every edit, which is worse. Development builds pin with `--merezha-path`
+anyway (SC-Q10). SC-S2's tests therefore use fresh builds: `cargo install --git
+file://<checkout> --rev <sha> merezha-cli` records `<sha>` despite `.cargo-ok`; a fresh build
+(empty target directory) of a checkout with a modified tracked file records none; and building
+twice in a row without changes does not rerun the script.
 
 `%%merezha_dependency%%` renders as one of:
 
@@ -441,6 +454,13 @@ and the README configures the front end's dev server to proxy `/v1` to `http://1
 `http://localhost:5173`, which is `app_origin`: the loopback development cookie, the `Origin`
 check and the CSRF header work as they will in production, and nothing about CORS has to be
 learned twice. Scripts and `curl` call `127.0.0.1:8080` directly with bearer sessions.
+
+The README warns not to add the dev server to `http.trusted_proxies`, tempting as it looks for a
+proxy. With any trusted proxy the listener is no longer private (`!behind_proxy` is part of the
+private loopback test in `crates/identity/src/config.rs`), so the loopback development cookie
+and `dev_print_links` are no longer allowed and identity's `http://localhost:5173` origin fails
+`insecure_origin` at startup. Nothing is gained either: the client
+address only feeds rate limits, which in development can share one address.
 
 ### 3.3 `merezha.production.toml`
 
@@ -798,7 +818,8 @@ does two things:
       warnings`; `cargo clippy --locked --target wasm32-unknown-unknown -p domain -p view -p
       notifier -- -D warnings`; `cargo test --locked --workspace`.
    2. `merezha build`.
-   3. Throwaway secrets for this run (`openssl rand`; the workflow masks them), then `merezha
+   3. Throwaway secrets for this run (`openssl rand`), each printed as `::add-mask::<value>`
+      before use so GitHub masks it in the log (outside Actions the line is inert), then `merezha
       notifications check --config merezha.toml` and `--config merezha.production.toml` with
       throwaway Brevo values. These checks run with `MEREZHA_NOTIFY_NO_EGRESS` unset: the
       production file's Brevo `base_url` is the default `https://api.brevo.com`, which that
@@ -1121,20 +1142,24 @@ depends on speed.
    Bob, and `FakePushService` received one push that decrypts to a payload with topic
    `tasks.assigned` under a valid VAPID token for the generated key.
 5. Tenant isolation. Acme's `ListTasks` does not contain Dave's Globex task, and `GetTask` on
-   its id from Acme answers `task_not_found` (the id names Acme's stream `{acme}:Task/{id}`,
-   which is empty). Dave's `ListTasks` in Globex shows only his task. Bob, with Globex named in
+   its id from Acme answers `task_not_found`: a tenant query reads only Acme's partition of the
+   `board` projection, which never saw Globex's events. Dave's `ListTasks` in Globex shows only his task. Bob, with Globex named in
    `Merezha-Organization`, gets `404 not_found`, since he is not a member.
 6. Alice assigns an Acme task to Dave. `GET /v1/application/reactors/notifier/rejections` lists
    `recipient_not_in_tenant` for it, and the next assignment to Bob still reaches his stream.
-7. Alice registers an Acme webhook endpoint on a `WebhookReceiver`. Bob completes his task: the
+7. Alice, Acme's `owner`, registers an Acme webhook endpoint on a `WebhookReceiver`; `owner`'s
+   `*` expands over the whole catalog, which includes `notifications.webhooks.manage` once the
+   notifications block adds its permissions (`crates/cli/src/lib.rs`). Bob completes his task: the
    receiver verifies one `tasks.task_completed` signature, Alice's inbox holds `tasks.completed`,
    and `GET /v1/jobs/admin/queues` shows one delayed job on queue `application`.
 8. Alice creates the Acme service account `ci-bot` with the `member` role and two keys: one
    listing only `tasks.read`, one listing `tasks.read` and `tasks.create`. The first lists Acme's
    tasks and gets `403 unauthorized` on `CreateTask`, since a key's power is its list; the second
    creates a task.
-9. Alice, as the operator, registers an application-level endpoint (`POST
-   /v1/notifications/webhooks`, `event_types = ["content.*"]`) on a second `WebhookReceiver`.
+9. Alice registers an application-level endpoint (`POST
+   /v1/notifications/webhooks`, `event_types = ["content.*"]`) on a second `WebhookReceiver`. She
+   passes as `platform_admin` (break-glass, audited), not as `operator`, whose permissions hold
+   no webhook permission; the `integrations` role is the everyday route.
    She gives Carol the `editor` role. Carol creates and publishes a help article: anonymous
    `GET /v1/content/help_article/by-slug/{slug}` answers 200, and the application-level endpoint
    receives one signed `content.entry_published`. Alice publishes an Acme brief: Bob reads it
@@ -1225,15 +1250,16 @@ notification templates validate. Each refusal of 2.3 has a test that also proves
 written, including a target filled between the checks and the rename, `--dir` under a symbolic
 link parent (`/tmp` on macOS, accepted) and the current directory (`target_is_working_directory`).
 `.env` is 0600 and `git check-ignore .env` succeeds in the generated tree after `git init`. No
-generated file outside `.env` contains a generated secret. Source pin: `cargo install --git
-file://<checkout> --rev <sha> merezha-cli` produces a binary whose `merezha new` pins `<sha>`
-although the checkout holds Cargo's untracked `.cargo-ok`; a commit in a development checkout
-changes the recorded revision on the next `cargo build`; a modified tracked file makes it none
-and `merezha new` refuses with `source_rev_unknown`. Rendering with an unknown `%%name%%` fails
+generated file outside `.env` contains a generated secret. Source pin, on fresh builds only
+(2.9): `cargo install --git file://<checkout> --rev <sha> merezha-cli` produces a binary whose
+`merezha new` pins `<sha>` although the checkout holds Cargo's untracked `.cargo-ok`; a fresh
+build of a checkout with a modified tracked file records none and `merezha new` refuses with
+`source_rev_unknown`; a second `cargo build` with nothing changed does not rerun the build
+script (its `rerun-if-changed` paths all exist and `git status` leaves the index alone). Rendering with an unknown `%%name%%` fails
 the build. No file under `crates/scaffold/templates/` is named `Cargo.toml`.
 *Tests:* `crates/scaffold/tests/render.rs` (the matrix, the index rules, placeholder failures,
 build-time path checks), `crates/scaffold/tests/source_rev.rs` (the three source pin cases on a
-temporary git repository), `crates/cli/tests/new.rs` (process tests of the command, its JSON
+temporary git repository, each in an empty target directory), `crates/cli/tests/new.rs` (process tests of the command, its JSON
 report and its refusals).
 
 **SC-S3 acceptance.** For the starter with all blocks, with `identity,notifications` and with
@@ -1241,8 +1267,8 @@ report and its refusals).
 `--merezha-path .` and runs the project's own `scripts/ci.sh` in it with `MEREZHA_BIN` pointing at
 the host just built: formatting, both Clippy runs, `cargo test`, `merezha build`, both
 `notifications check` runs and `scripts/smoke.sh` against the workflow's PostgreSQL all pass. A
-fresh project pinned by git `rev` to a pushed commit builds without Cargo's "skipping duplicate
-package" warning, proving the `Cargo.toml.tmpl` rule. `actionlint` passes on the generated
+fresh project pinned with `git = "file://<checkout>"` and the checkout's `rev` builds offline
+without Cargo's "skipping duplicate package" warning, proving the `Cargo.toml.tmpl` rule. `actionlint` passes on the generated
 workflow.
 *Tests:* the guest crates' native tests; the `scaffold` workflow itself.
 
@@ -1376,7 +1402,7 @@ Each has a recommended answer; the slices assume it until the owner decides.
 | SC-Q6 | Is GitHub Actions the only generated CI? | Yes for v1, matching this repository. A `--ci none` flag can come with a second provider. |
 | SC-Q7 | Should the starter turn on Web Push and webhooks, which a first project may not need? | Yes. The VAPID key is generated, neither section does work until a client subscribes or an endpoint is registered, and both give the reactor and the README something to show. Turning one on later is cheap too, since `database.migrate = true` applies the block's tables at the next start; the reason to start with them on is that the starter teaches the whole notification path. Delete the section to turn one off; with `[modules.notifications.webhooks]` gone, the notifier's `webhook` effect becomes a recorded rejection (`webhooks_disabled`) until it is removed from `effects`. |
 | SC-Q8 | Once `teamboard` lands there are three task boards: `services/task-*` with `examples/task-board`, the reactor test fixtures, and `teamboard`. Retire the old ones? | Retire `services/task-notifier` once SC-S5 merges: `teamboard`'s notifier supersedes it, and no host test runs it as a component (the reactor tests use in-process guests). Keep `services/task-domain`, `task-view`, `task-events` and `examples/task-board`: they drive `merezha serve` with memory and SQLite storage (`scripts/task-board-demo.sh`, the restart demo), a host path `teamboard` does not cover. Their docs then point to `teamboard` as the framework example. |
-| SC-Q9 | Which licence do generated projects carry? The templates are this repository's code, under MIT, which asks for its notice in substantial copies. | Put `crates/scaffold/templates/` under MIT-0 (MIT without the notice condition), stated in a `LICENSE` file in that directory, so a generated project owes nothing. Generated projects get no `LICENSE` file and no `license` key (`publish = false`); the README asks the owner to choose one. |
+| SC-Q9 | Which licence do generated projects carry? Everything `merezha new` copies is this repository's code, under MIT, which asks for its notice in substantial copies: the templates, `wit/service.wit` (embedded from the repository root) and, with telemetry, TE-T7's dashboards and rules. | Dual-license every copied file as `MIT OR MIT-0` with a per-file SPDX header where the format allows comments (Rust, TOML, YAML, shell, WIT) and a `LICENSE-MIT-0` beside the JSON dashboards, so the generated project may take MIT-0 and owes no notice. That covers `crates/scaffold/templates/`, `wit/service.wit` and `deploy/telemetry/`. `crates/scaffold` itself stays `MIT`; if it ever declares `MIT AND MIT-0`, `deny.toml`'s allow list needs `MIT-0`. Generated projects get no `LICENSE` file and no `license` key (`publish = false`); the README asks the owner to choose one. If the owner prefers not to relicense, narrow the claim: the README then says the copied files keep their MIT notice. |
 | SC-Q10 | How do `scripts/dev.sh` and CI check a `path` pin, where there is no revision to compare with `merezha version`? | As 4.3's table says: compare with `git -C <path> rev-parse HEAD` when the path is a git checkout with no modified tracked file, and only warn, on a difference or when it cannot tell. Path pins are for working on merezha itself (the golden example, local changes), where the host is built from the same checkout; in this repository's CI the host and the example come from one commit, so nothing needs to fail there. |
 
 ## Cross-block dependencies
