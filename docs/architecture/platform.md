@@ -3418,7 +3418,7 @@ path_style = true
 allow_http = false
 access_key_id = { env = "S3_ACCESS_KEY_ID" }        # or { file = "..." }
 secret_access_key = { env = "S3_SECRET_ACCESS_KEY" }
-timeout = "30s"                  # 1 s to 300 s
+timeout = "30s"                  # 1 s to 240 s
 key_prefix = ""
 ```
 
@@ -3552,14 +3552,17 @@ restores the previous state. A run whose lease expired and was taken over
 touches nothing, so it never deletes an object uploaded again meanwhile;
 one that loses its lease while the object delete runs leaves the row to
 the new holder and counts the blob lost, not deleted
-(`content.blob_cleanup` logs the count of blobs deleted under the run's
-own lease). The fence lives in the database: a host stalled for longer
-than the whole ten-minute lease between renewing it and sending the
-object delete can still delete an object uploaded again with the same
-bytes (content design section 6, issue #49). The delete is bounded by
-half the lease and each S3 request by `media.s3.timeout`; keep that
-timeout short and keep bucket versioning or soft delete on to recover
-such an object.
+(`content.blob_cleanup` logs `count`, the blobs deleted under the run's
+own lease, with `failed` and `lost`). An object delete cut by its bound
+(half the lease) may still land, so its row stays `deleting` until the
+lease expires instead of being restored; a refused one is restored at
+once. `media.s3.timeout` is capped at 240 s so an unanswered delete,
+retries included, ends before that bound. The fence lives in the
+database: a host stalled for longer than the whole ten-minute lease
+between renewing it and sending the object delete can still delete an
+object uploaded again with the same bytes (content design section 6,
+issue #49). Keep the timeout short and keep bucket versioning or soft
+delete on to recover such an object.
 
 Codes added by C7: `asset_not_found` (404), `asset_in_use` (409),
 `asset_too_large` (413), `media_type_rejected` (415), `upload_incomplete`

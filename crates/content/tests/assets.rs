@@ -16,6 +16,7 @@ use http::*;
 use merezha_content::media::{Assets, CleanupReport, Media, Swept};
 use merezha_platform::ports::{BlobKey, BlobStore};
 use merezha_postgres::TestDatabase;
+use merezha_telemetry::testing::Harness;
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
@@ -1661,11 +1662,20 @@ async fn object_delete_arrived(mock: &s3::MockS3) {
     }
 }
 
+/// The `content.blob_cleanup` events `harness` captured.
+fn cleanup_events(harness: &Harness) -> Vec<Value> {
+    harness
+        .stderr_lines()
+        .into_iter()
+        .filter(|line| line["event"] == "content.blob_cleanup")
+        .collect()
+}
+
 /// A cleanup run whose lease runs out while its object delete stalls (it
 /// succeeds, or with `fail` it is refused), and a second worker claims the
 /// row meanwhile: the run's fenced row delete, or restore, matches
-/// nothing, so it reports the blob lost, neither deleted nor failed, and
-/// leaves the row to the worker that holds it.
+/// nothing, so it reports the blob lost, neither deleted nor failed, logs
+/// it so, and leaves the row to the worker that holds it.
 async fn lose_the_lease_during_the_object_delete(fail: bool) {
     let Some(test) = TestDatabase::create() else {
         return;
@@ -1680,19 +1690,24 @@ async fn lose_the_lease_during_the_object_delete(fail: bool) {
         // Refused for good: no retry.
         mock.fail_deletes(&[403]);
     }
-    let run = tokio::spawn({
-        let assets = assets.clone();
-        async move { assets.cleanup(10).await }
+    // The run stays on this task, where the harness captures its event;
+    // the second worker takes the row over once the delete is on its way.
+    let takeover = tokio::spawn({
+        let (assets, db, mock) = (assets.clone(), fx.db.clone(), mock.clone());
+        async move {
+            object_delete_arrived(&mock).await;
+            execute(
+                &db,
+                "UPDATE merezha_content.blobs SET pending_until = now() - interval '1 second'",
+            )
+            .await;
+            assets.claim_due(10).await.unwrap()
+        }
     });
-    object_delete_arrived(&mock).await;
-    execute(
-        &fx.db,
-        "UPDATE merezha_content.blobs SET pending_until = now() - interval '1 second'",
-    )
-    .await;
-    let other = assets.claim_due(10).await.unwrap();
+    let harness = Harness::new();
+    let report = assets.cleanup(10).await.unwrap();
+    let other = takeover.await.unwrap();
     assert_eq!(other.len(), 1);
-    let report = run.await.unwrap().unwrap();
     assert_eq!(
         report,
         CleanupReport {
@@ -1701,6 +1716,18 @@ async fn lose_the_lease_during_the_object_delete(fail: bool) {
             lost: 1
         }
     );
+    let events = cleanup_events(&harness);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        (
+            &events[0]["count"],
+            &events[0]["failed"],
+            &events[0]["lost"]
+        ),
+        (&json!(0), &json!(0), &json!(1))
+    );
+    harness.assert_catalogued();
+    drop(harness);
     assert_eq!(
         strings(&fx.db, "SELECT state FROM merezha_content.blobs").await,
         ["deleting"]
@@ -1721,6 +1748,182 @@ async fn a_cleanup_that_loses_its_lease_during_the_object_delete_reports_it_lost
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cleanup_that_loses_its_lease_during_a_failed_object_delete_reports_it_lost() {
     lose_the_lease_during_the_object_delete(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_cleanup_event_counts_only_the_blobs_deleted_under_its_own_lease() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let dirs = Dirs::new();
+    let fx = start(&test, &dirs.local(""), MODEL).await;
+    aged_orphan(&fx, b"deleted under its own lease").await;
+    let harness = Harness::new();
+    let report = assets(&fx).cleanup(10).await.unwrap();
+    assert_eq!(report.deleted, 1);
+    let events = cleanup_events(&harness);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        (
+            &events[0]["count"],
+            &events[0]["failed"],
+            &events[0]["lost"]
+        ),
+        (&json!(1), &json!(0), &json!(0))
+    );
+    // A run with nothing to do logs nothing.
+    assets(&fx).cleanup(10).await.unwrap();
+    assert_eq!(cleanup_events(&harness).len(), 1);
+}
+
+/// The delete lease the bound tests run with: half of it bounds each
+/// object delete and each batch.
+const SHORT_LEASE: Duration = Duration::from_secs(4);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_cut_by_the_half_lease_bound_stays_fenced_and_an_upload_puts_the_bytes_again() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let mock = s3::MockS3::start().await;
+    let dirs = Dirs::new();
+    let fx = start(&test, &dirs.s3(&mock, ""), MODEL).await;
+    let bytes = b"deleted late, uploaded meanwhile";
+    aged_orphan(&fx, bytes).await;
+    // The delete never gets an answer, and S3 applies it three seconds
+    // after it arrived: after the bound (two seconds) cut it, before the
+    // lease (four) ends.
+    mock.late_deletes(Some(Duration::from_secs(3)));
+    let assets = assets(&fx).with_delete_lease(SHORT_LEASE);
+    let started = Instant::now();
+    let report = tokio::time::timeout(Duration::from_secs(20), assets.cleanup(10))
+        .await
+        .expect("the half-lease bound cuts the delete")
+        .unwrap();
+    assert!(started.elapsed() < SHORT_LEASE, "{:?}", started.elapsed());
+    assert_eq!(
+        report,
+        CleanupReport {
+            deleted: 0,
+            failed: 1,
+            lost: 0
+        }
+    );
+    // Not restored to `orphaned`: an upload must not take the object as
+    // there while the cut delete can still land.
+    assert_eq!(
+        strings(
+            &fx.db,
+            "SELECT state || ':' || coalesce((pending_until > now())::text, 'no lease') \
+               FROM merezha_content.blobs"
+        )
+        .await,
+        ["deleting:true"]
+    );
+    // The same bytes come back at once: the upload waits for the lease
+    // (a retry after `blob_unavailable`), takes the row over and puts.
+    let asset = loop {
+        let reply = upload(&fx, "again.txt", "text/plain", bytes).await;
+        if reply.status == StatusCode::CREATED {
+            break reply.body;
+        }
+        assert_eq!(reply.code(), "blob_unavailable");
+        assert!(started.elapsed() < Duration::from_secs(20));
+    };
+    // The late delete has landed by now and the object is still there.
+    tokio::time::sleep(Duration::from_secs(4).saturating_sub(started.elapsed())).await;
+    assert_eq!(mock.object_count(), 1);
+    assert!(assets_keep_their_blobs(&fx).await);
+    let reply = raw(
+        &fx,
+        &format!("{ASSETS}/{}/file", asset["id"].as_str().unwrap()),
+        Some("media"),
+        &[],
+    )
+    .await;
+    assert_eq!(reply.body, bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_stops_sweeping_once_half_its_lease_has_passed() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let mock = s3::MockS3::start().await;
+    let dirs = Dirs::new();
+    let fx = start(&test, &dirs.s3(&mock, ""), MODEL).await;
+    aged_orphan(&fx, b"first in the batch").await;
+    aged_orphan(&fx, b"second in the batch").await;
+    mock.late_deletes(Some(Duration::from_secs(3600)));
+    let assets = assets(&fx).with_delete_lease(SHORT_LEASE);
+    let report = tokio::time::timeout(Duration::from_secs(20), assets.cleanup(10))
+        .await
+        .expect("the half-lease bound cuts the delete")
+        .unwrap();
+    // The first delete is cut at half the lease; by then the batch takes
+    // no further blob, whose claim expires and is taken again later.
+    assert_eq!(
+        report,
+        CleanupReport {
+            deleted: 0,
+            failed: 1,
+            lost: 1
+        }
+    );
+    let deletes = mock
+        .seen()
+        .iter()
+        .filter(|seen| seen.method == Method::DELETE && seen.query.is_empty())
+        .count();
+    assert_eq!(deletes, 1);
+    assert_eq!(mock.object_count(), 2);
+}
+
+#[test]
+fn the_s3_timeout_is_capped_under_half_the_delete_lease() {
+    let issues = |timeout: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let id = dir.path().join("s3-id");
+        std::fs::write(&id, "id").unwrap();
+        let settings = format!(
+            "media = {{ driver = \"s3\", spool_dir = {:?}, s3 = {{ bucket = \"media\", \
+             region = \"eu-west-1\", timeout = \"{timeout}\", access_key_id = {{ file = {id:?} }}, \
+             secret_access_key = {{ file = {id:?} }} }} }}",
+            dir.path().join("spool"),
+        );
+        project(dir.path(), false, &settings, MODEL);
+        let input = merezha_platform::ConfigInput {
+            path: dir.path().join("merezha.toml"),
+            env: vec![(
+                "CONTENT_DATABASE_URL".into(),
+                "postgres://localhost/x".into(),
+            )],
+            overrides: Vec::new(),
+        };
+        match merezha_platform::host::configure(
+            &input,
+            vec![Box::new(merezha_content::ContentModule::new())],
+        ) {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors
+                .0
+                .iter()
+                .map(|issue| (issue.key.clone(), issue.code.to_owned()))
+                .collect(),
+        }
+    };
+    assert_eq!(
+        merezha_content::media::MAX_S3_TIMEOUT,
+        Duration::from_secs(240)
+    );
+    assert_eq!(issues("240s"), []);
+    assert_eq!(
+        issues("241s"),
+        [(
+            "modules.content.media.s3.timeout".to_owned(),
+            "out_of_range".to_owned()
+        )]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

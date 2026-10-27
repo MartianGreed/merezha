@@ -79,6 +79,9 @@ pub struct MockS3 {
     delete_delay: Mutex<Duration>,
     /// Pause before answering any `PUT` (faults included).
     put_delay: Mutex<Duration>,
+    /// Object `DELETE`s are never answered, and applied this long after
+    /// they arrive whether the client still waits or not.
+    late_deletes: Mutex<Option<Duration>>,
     /// Statuses answered to the next `PUT`s only, before normal handling.
     put_faults: Mutex<VecDeque<u16>>,
     /// Statuses answered to the next object `DELETE`s only.
@@ -99,6 +102,7 @@ impl MockS3 {
             pace: Mutex::new(None),
             delete_delay: Mutex::new(Duration::ZERO),
             put_delay: Mutex::new(Duration::ZERO),
+            late_deletes: Mutex::new(None),
             put_faults: Mutex::default(),
             delete_faults: Mutex::default(),
             requests: AtomicUsize::new(0),
@@ -140,6 +144,11 @@ impl MockS3 {
     /// Answer object deletes (a fault too) only after `delay`.
     pub fn delay_deletes(&self, delay: Duration) {
         *self.delete_delay.lock().unwrap() = delay;
+    }
+    /// Never answer object deletes, and apply each `after` it arrived: an
+    /// outcome the client never learns, landing late. `None` turns it off.
+    pub fn late_deletes(&self, after: Option<Duration>) {
+        *self.late_deletes.lock().unwrap() = after;
     }
     /// Answer every `PUT` (a fault too) only after `delay`.
     pub fn delay_puts(&self, delay: Duration) {
@@ -373,6 +382,19 @@ async fn handle(State(mock): State<Arc<MockS3>>, request: Request) -> Response {
             read_object(&parts.method, &parts.headers, &object, pace).await
         }
         (Method::DELETE, None, _) => {
+            let late = *mock.late_deletes.lock().unwrap();
+            if let Some(after) = late {
+                let late = mock.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(after).await;
+                    let removed = late.store.lock().unwrap().objects.remove(&key);
+                    if let Some(object) = removed {
+                        let _ = std::fs::remove_file(object.path);
+                    }
+                });
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                return StatusCode::NO_CONTENT.into_response();
+            }
             if let Some(object) = mock.store.lock().unwrap().objects.remove(&key) {
                 let _ = std::fs::remove_file(object.path);
             }

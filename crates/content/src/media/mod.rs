@@ -21,7 +21,8 @@ mod sql;
 mod upload;
 
 pub use cleanup::{
-    BLOB_CLEANUP, CLEANUP_BATCH, CLEANUP_LIMIT, ClaimedBlob, CleanupReport, DELETE_LEASE, Swept,
+    BLOB_CLEANUP, CLEANUP_BATCH, CLEANUP_LIMIT, ClaimedBlob, CleanupReport, DELETE_LEASE,
+    MAX_S3_TIMEOUT, Swept,
 };
 pub use settings::{
     DEFAULT_ALLOWED_TYPES, DEFAULT_ASSET_CACHE_CONTROL, DEFAULT_CLEANUP_CRON, DEFAULT_INLINE_TYPES,
@@ -55,7 +56,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fmt::Write as _,
     sync::{Arc, Mutex, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::Semaphore;
 
@@ -340,6 +341,8 @@ pub struct Assets {
     pub(crate) store: Store,
     pub(crate) media: Arc<Media>,
     pub(crate) blobs: Arc<ObjectBlobStore>,
+    /// [`DELETE_LEASE`], shorter only in tests.
+    pub(crate) delete_lease: Duration,
 }
 impl std::fmt::Debug for Assets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -384,6 +387,17 @@ impl Assets {
             store: Store::new(state, ctx, outbox),
             media,
             blobs,
+            delete_lease: DELETE_LEASE,
+        }
+    }
+    /// This service with another delete lease, which also sets the bound
+    /// on each object delete (half of it). For tests: the host always uses
+    /// [`DELETE_LEASE`], which `media.s3.timeout` is validated against.
+    #[doc(hidden)]
+    pub fn with_delete_lease(&self, lease: Duration) -> Self {
+        Self {
+            delete_lease: lease,
+            ..self.clone()
         }
     }
     pub fn settings(&self) -> &MediaSettings {
