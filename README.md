@@ -93,7 +93,9 @@ preferences and unsubscribe, and email and SMS through the capture drivers
 (listed at `GET /v1/notifications/dev/captures` on loopback); Brevo, push,
 the SSE stream and webhooks arrive in later slices.
 `merezha notifications check --config merezha.toml` validates its settings
-and templates without starting the host.
+and templates without starting the host; the
+[operations guide](docs/operations/notifications.md) covers production
+setup, retention and monitoring.
 
 PostgreSQL tests run when `MEREZHA_TEST_DATABASE_URL` points to a server
 where the role can create databases; otherwise they print a skip message.

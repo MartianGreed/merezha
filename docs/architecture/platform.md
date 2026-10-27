@@ -1040,7 +1040,14 @@ and reset mail would be dropped by the capture fallback. With
 with the default capture driver, mail lands in `merezha_notify.captures`
 and `GET /v1/notifications/dev/captures`; a plain-http development
 `app_origin` needs `templates.allow_http_links = true`, since the `url`
-filter accepts `http:` only for loopback with it). Without the block, only
+filter accepts `http:` only for loopback with it). Identity requests each
+topic on its default channels: email, plus the inbox for
+`identity.password_changed`, `identity.new_sign_in` and
+`identity.sign_in_method_added` (a project may change the channels in
+`[modules.notifications.topics."identity.…"]`); token links travel only in
+`secret_data.link`, token mail's dedupe key is `{topic}:{token or invitation id}`,
+and an invitation names its organization as the request's tenant (NT-N8).
+Without the block, only
 `dev_print_links = true` on a private loopback listener starts it, and
 every link then appears on stderr as `identity.dev_link` (stderr only,
 never exported). It also registers the
@@ -1331,7 +1338,10 @@ notifications brevo register-webhook` ([Brevo email](#brevo-email)). Slice
 NT-N4 adds Brevo SMS: the SMS driver and its signed status callback
 ([Brevo SMS](#brevo-sms)). Slice NT-N5 adds the inbox stream ([Inbox
 stream](#inbox-stream)), NT-N6 Web Push ([Web Push](#web-push)) and
-NT-N7 outgoing webhooks ([Outgoing webhooks](#outgoing-webhooks)).
+NT-N7 outgoing webhooks ([Outgoing webhooks](#outgoing-webhooks)). Slice
+NT-N8 adds content's events on webhooks through an AP subscription, the
+per-target rate cap `max_per_target_per_hour`, the rest of the `retention`
+task and the [operations guide](../operations/notifications.md).
 
 ```toml
 [modules.notifications]
@@ -1366,8 +1376,11 @@ mail to `skipped`), and exit code 0; or `status` `invalid` with
   provider events. Migration 4 (`push`, NT-N6) adds
   `push_subscriptions`. Migration 5 (`webhooks`, NT-N7) adds
   `webhook_endpoints`, `webhook_events`, `webhook_deliveries`,
-  `webhook_attempts` and `webhook_audit`. The checksums are pinned by a test; later slices
-  add migrations.
+  `webhook_attempts` and `webhook_audit`. Migration 6 (`integrations`,
+  NT-N8) adds three indexes: deliveries by `(target_key, channel,
+  created_at)` for the rate cap, settled notifications by `settled_at` and
+  provider events by `received_at` for `retention`. The checksums are
+  pinned by a test; later slices add migrations.
 - At start the block registers `notify.expand` (queue `notify.expand`),
   the delivery kinds of its capture drivers and the maintenance kinds and
   schedules with the jobs runtime.
@@ -1442,6 +1455,7 @@ get `skipped` with a reason:
 | `not_opted_in` | a marketing topic without the user's explicit `enabled = true` for the topic and channel |
 | `suppressed` | a suppression covers the address: `invalid` for every topic, the other reasons for non-security topics (topic-scoped ones for their topic only) |
 | `no_subscription` | a push target whose user has no live subscription made with the current VAPID key in the notification's tenant scope; at send, a subscription that is gone, moved to another user or expired since |
+| `target_rate_limited` | the topic sets `max_per_target_per_hour` (1 to 10,000, unset by default) and the target (one address, phone number, push subscription or user inbox, per channel) already has that many of the topic's deliveries created in the last hour that were not skipped. Checked in the expansion transaction under a transaction advisory lock per `(topic, channel, target key)` (class `ntfy`, taken in ascending key order), so concurrent expansions for one target count one after the other. A redelivery is never capped |
 
 More targets than `limits.max_targets` (or `max_marketing_targets` for a
 marketing topic) reject the notification (`status = rejected`,
@@ -1481,7 +1495,7 @@ Maintenance, each a cron schedule on queue `notify.maintenance` (UTC):
 | `purge_data` | every 5 minutes | nulls `data` (and the deliveries' recipient names) of notifications settled more than `retention.data_after_settled` ago; counts `merezha.notification.data_purged` |
 | `inbox_expire` | hourly | deletes items past `expires_at` or archived more than `inbox.archived_retention` ago, 100 users per transaction in ascending order, raising each user's `purged_through` |
 | `webhook_auto_disable` | every 5 minutes | with `[modules.notifications.webhooks]`: disables the endpoints failing for `webhooks.auto_disable_after` with at least 10 failed attempts since, and alerts ([Outgoing webhooks](#outgoing-webhooks)) |
-| `retention` | daily (03:29) | the webhook rows so far: nulls event bodies older than `retention.webhook_deliveries`, deletes events older than `retention.deliveries` with no open delivery (their deliveries and attempts with them), deletes audit rows older than 400 days, drops previous secrets whose rotation window closed, and with `secret_key_previous` set seals again under `secret_key` the secrets still under another key (by their key id), then records `merezha.webhook.secrets.previous_key` and `merezha.webhook.secrets.unreadable`; 500 rows per batch. Each step runs whatever the earlier ones did: a failing step is logged `notification.maintenance_step_failed` (`task`, `reason` = the step, `code`) and becomes the run's outcome after the others ran |
+| `retention` | daily (03:29) | deletes notifications settled more than `retention.deliveries` ago, 100 per batch, with their deliveries and attempts (inbox items keep their own `inbox.retention`); deletes provider events received before then; keeps the newest `retention.captures` captures; then the webhook rows: nulls event bodies older than `retention.webhook_deliveries`, deletes events older than `retention.deliveries` with no open delivery (their deliveries and attempts with them), deletes audit rows older than 400 days, drops previous secrets whose rotation window closed, and with `secret_key_previous` set seals again under `secret_key` the secrets still under another key (by their key id), then records `merezha.webhook.secrets.previous_key` and `merezha.webhook.secrets.unreadable`; 500 rows per batch. Each step runs whatever the earlier ones did: a failing step is logged `notification.maintenance_step_failed` (`task`, `reason` = the step, `code`) and becomes the run's outcome after the others ran |
 | `push_expire` | hourly (minute 43) | with `[modules.notifications.push]`: deletes subscriptions past `expires_at`, made with another VAPID key and unused for 7 days, or with 10 consecutive failures and no success in 30 days, 1,000 per batch; counts `merezha.notification.push_subscriptions_removed` (`expired`, `key_changed`, `failures`) |
 
 ### Brevo email
@@ -2012,6 +2026,20 @@ type of the catalog or `prefix.*`; an empty filter matches every type.
   (`notify.webhook.deliver`, key `webhook:{delivery_id}:g{generation}`). A
   tenant event reaches only that tenant's endpoints, a tenantless event only
   the application-level ones. A second run of the same job writes nothing.
+- **Module events** (NT-N8). Other modules never call `emit_webhook` for
+  their own domain events (R11). With webhooks on, the block registers
+  `notify.module_event` (queue `notify.expand`) and subscribes it to
+  `content.entry_published`, `content.entry_unpublished` and
+  `content.entry_deleted` (`merezha_jobs.subscriptions`, declared at start
+  and on every heartbeat). Each content `Event` record relays into one job
+  per subscription; the handler reads the integration event envelope and
+  fans out a webhook event of source `content`, `source_event_id` the
+  envelope's `event_id`, tenant the envelope's (none: the
+  application-level registry) and data its `payload`. An envelope whose
+  type is not its source's (`<source>.…`) or is outside that list fails
+  permanent (`invalid_job_payload`, `unknown_event_type`). Without
+  `[modules.notifications.webhooks]` nothing is subscribed and content's
+  events stay unrouted.
 - **Requests.** `POST <url>` with `content-type: application/json`,
   `user-agent: Merezha-Webhooks/1`, `webhook-id: msg_<delivery id hex>`
   (stable across retries and redeliveries: receivers deduplicate on it),

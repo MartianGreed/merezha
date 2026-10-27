@@ -240,7 +240,7 @@ CREATE TABLE preferences (
 CREATE TABLE user_settings (
   user_id uuid PRIMARY KEY,
   timezone text,                                -- IANA name, validated with jiff
-  updated_at timestamptz NOT NULL               -- N9 (migration 6) adds quiet_start, quiet_end
+  updated_at timestamptz NOT NULL               -- N9 (migration 7, after v1) adds quiet_start, quiet_end
 );
 
 CREATE TABLE suppressions (
@@ -372,6 +372,13 @@ CREATE TABLE webhook_attempts (
   response_snippet text CHECK (length(response_snippet) <= 1024),
   PRIMARY KEY (delivery_id, attempt)
 );
+
+-- Migration 6 (slice N8): the rate cap and retention indexes. N8 took the
+-- number this section first reserved for N9, which is deferred from v1;
+-- N9 is migration 7.
+CREATE INDEX deliveries_target_recent_idx ON deliveries (target_key, channel, created_at);
+CREATE INDEX notifications_settled_idx ON notifications (settled_at) WHERE settled_at IS NOT NULL;
+CREATE INDEX provider_events_received_idx ON provider_events (received_at);
 ```
 
 ### 2.5 Jobs and outbox usage
@@ -444,7 +451,12 @@ old lost its job without a recorded outcome, for example to `handler_panic`,
 and is set to `failed` / `job_lost`), `webhook_auto_disable` (every 5 min),
 `push_expire` (hourly), `inbox_expire` (hourly), `retention` (daily: delivery
 and attempt rows, provider events, webhook bodies and captures past
-retention).
+retention). As built (N8), `retention` deletes notifications settled more
+than `retention.deliveries` ago with their deliveries and attempts (inbox
+items keep `inbox.retention`; a later request with the same key then makes
+a new notification), provider events received before then, and captures
+past the newest `retention.captures`, then runs N7's webhook part.
+`reclaim_stuck` is not built yet.
 
 ## 3. The `Notifier` port
 
@@ -1246,7 +1258,14 @@ guide asks operators to switch Brevo tracking off.
 
 **Per-recipient rate limit.** A topic may set `max_per_target_per_hour` (unset
 by default). A delivery over the limit is `skipped` / `target_rate_limited`; it
-guards against application bugs that loop.
+guards against application bugs that loop. As built (N8), expansion checks it
+in its transaction: it takes a transaction advisory lock per `(topic,
+channel, target key)` of the targets it would send or deliver (class `ntfy`,
+ascending key order), counts that target's deliveries of the topic created in
+the last hour that were not skipped, and skips the target when the count has
+reached the cap. Concurrent expansions for one target therefore count one
+after the other. The cap applies at expansion only; redelivery is never
+capped.
 
 **Quiet hours** (slice N9, deferred from v1; on when
 `[modules.notifications.quiet_hours]` is present, which v1 refuses).
@@ -1783,8 +1802,28 @@ as rejected while the checkpoint advances, a malformed reply halts the reactor,
 and two reactors on one event give two notifications
 (`crates/cli/tests/reactors.rs`, `crates/application/tests/reactors.rs`). The
 end-to-end example application stays with stage 3 (`merezha new`).
+*The rest, as built:* identity already requested every R2 topic through
+the `Notifier` with token links in `secret_data.link` (ID PRs 1 to 3); N8
+makes it request the topics' default channels instead of email only, so
+`password_changed`, `new_sign_in` and `sign_in_method_added` reach the inbox
+as 3.3 says, and gives invitations their organization as `tenant`. With
+webhooks on, the block registers `notify.module_event` on `notify.expand`
+and subscribes it to content's three webhook types; the handler maps AP's
+envelope onto `webhooks::fanout::Event` (source the envelope's, which must
+own the type's prefix; `source_event_id` the envelope's `event_id`) and
+calls `fan_out`. Content events reach webhooks only, as 3.3 lists them with
+no topic: an inbox or email about an entry is an application reactor's
+`notify` effect. `max_per_target_per_hour` is enforced at expansion
+(section 6), `retention` gained its delivery, provider event and capture
+steps (2.5), migration 6 indexes both, and the operations guide is
+[`docs/operations/notifications.md`](../operations/notifications.md). The
+end-to-end test runs in process against real PostgreSQL, from a guest event
+through the reaction to an inbox item on an open SSE stream
+(`crates/cli/tests/reactors.rs`), with an in-process test guest: the wasm
+task board's `task-notifier` needs the stage 3 example application to run
+under a cargo test.
 
-**N9: quiet hours** (migration 6, after v1). *Scope:* the section, the
+**N9: quiet hours** (migration 7, after v1; N8 took migration 6). *Scope:* the section, the
 settings fields and the rule of section 6. *Acceptance:* a push moves to the
 end of the window in `Europe/Paris` across a DST change; a `high` or security
 push is not moved; a delivery expiring inside the window is `expired`.

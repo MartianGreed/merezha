@@ -36,6 +36,9 @@ pub mod reason {
     pub const IDEMPOTENCY_WINDOW: &str = "idempotency_window";
     /// Brevo refused the account until the deadline (NT-N3).
     pub const PROVIDER_ACCOUNT_UNRESOLVED: &str = "provider_account_unresolved";
+    /// The target already got the topic's `max_per_target_per_hour`
+    /// deliveries in the last hour (NT §6, NT-N8).
+    pub const TARGET_RATE_LIMITED: &str = "target_rate_limited";
 }
 
 /// Whether `channel` is on for a user target of `topic` (NT §6): security

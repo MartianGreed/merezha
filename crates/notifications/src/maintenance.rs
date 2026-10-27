@@ -2,8 +2,11 @@
 //! `notify.maintenance` with the skip missed-run policy: `settle_notifications`
 //! every minute, `purge_data` every five minutes, `inbox_expire` and
 //! (NT-N6) `push_expire` hourly, and (NT-N7) `webhook_auto_disable` every
-//! five minutes and `retention` daily, whose part so far is the webhook
-//! rows and secrets ([`crate::webhooks::tasks`]).
+//! five minutes and `retention` daily. `retention` ([`retention`]) deletes
+//! notifications settled more than `retention.deliveries` ago with their
+//! deliveries and attempts, provider events received before then, and the
+//! captures past the newest `retention.captures` (NT-N8), then runs the
+//! webhook part ([`crate::webhooks::tasks::retention`]).
 //! Each run works in bounded batches within its deadline.
 use crate::{notifier::Core, sql};
 use merezha_domain::Failure;
@@ -86,10 +89,104 @@ pub async fn run(core: &Arc<Core>, task: Task, deadline: Instant) -> Result<u64,
             None => Ok(0),
         },
         Task::WebhookAutoDisable => crate::webhooks::tasks::auto_disable(core, deadline).await,
-        // The webhook rows and secrets; delivery, attempt, provider event
-        // and capture retention join it with NT-N8's operations work.
-        Task::Retention => crate::webhooks::tasks::retention(core, deadline).await,
+        Task::Retention => retention(core, deadline).await,
     }
+}
+
+/// Notifications per retention batch: each takes its deliveries and
+/// attempts with it.
+const NOTIFICATIONS_PER_BATCH: i64 = 100;
+
+/// Run `statement` (`$1` the cutoff, `$2` the batch) until a batch comes
+/// back short or [`MAX_BATCHES`] ran; the rows deleted.
+async fn delete_before(
+    core: &Core,
+    statement: &merezha_postgres::Statement,
+    before: jiff::Timestamp,
+    batch: i64,
+    deadline: Instant,
+) -> Result<u64, Failure> {
+    let mut total = 0;
+    for _ in 0..MAX_BATCHES {
+        let client = core.database.acquire(deadline).await?;
+        let changed = core
+            .database
+            .execute(&client, statement, &[&before, &batch])
+            .await
+            .map_err(|e| classify(&e))?;
+        total += changed;
+        if changed < batch as u64 {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// The daily `retention` task: the rows it deleted or changed. Every step
+/// runs whatever the earlier ones did; the first failure is the task's
+/// outcome and each is logged `notification.maintenance_step_failed`.
+pub async fn retention(core: &Arc<Core>, deadline: Instant) -> Result<u64, Failure> {
+    let mut first_failure = None;
+    let mut total = 0;
+    let mut step = |name: &'static str, result: Result<u64, Failure>| match result {
+        Ok(rows) => total += rows,
+        Err(failure) => {
+            merezha_telemetry::event!(
+                WARN,
+                "notification.maintenance_step_failed",
+                task = "retention",
+                reason = name,
+                code = failure.code.as_str()
+            );
+            first_failure.get_or_insert(failure);
+        }
+    };
+    let before = jiff::SignedDuration::try_from(core.settings.retention.deliveries)
+        .ok()
+        .and_then(|keep| core.now().checked_sub(keep).ok())
+        .ok_or_else(|| Failure::permanent("invalid_config"));
+    let notifications = match &before {
+        Ok(at) => {
+            delete_before(
+                core,
+                &sql::RETENTION_NOTIFICATIONS,
+                *at,
+                NOTIFICATIONS_PER_BATCH,
+                deadline,
+            )
+            .await
+        }
+        Err(failure) => Err(failure.clone()),
+    };
+    step("notifications", notifications);
+    let events = match &before {
+        Ok(at) => delete_before(core, &sql::RETENTION_PROVIDER_EVENTS, *at, BATCH, deadline).await,
+        Err(failure) => Err(failure.clone()),
+    };
+    step("provider_events", events);
+    step("captures", trim_captures(core, deadline).await);
+    // The webhook part logs its own failed steps.
+    match crate::webhooks::tasks::retention(core, deadline).await {
+        Ok(rows) => total += rows,
+        Err(failure) => {
+            first_failure.get_or_insert(failure);
+        }
+    }
+    match first_failure {
+        Some(failure) => Err(failure),
+        None => Ok(total),
+    }
+}
+
+/// Keep the newest `retention.captures` captures, as the capture drivers
+/// do on every capture, for a lowered setting or a driver switched off.
+async fn trim_captures(core: &Core, deadline: Instant) -> Result<u64, Failure> {
+    let keep = i64::from(core.settings.retention.captures.max(1));
+    let client = core.database.acquire(deadline).await?;
+    core.database
+        .execute(&client, &crate::drivers::CAPTURE_TRIM, &[&keep])
+        .await
+        .map_err(|e| classify(&e))
 }
 
 /// Set `settled_at` on notifications whose deliveries all settled.

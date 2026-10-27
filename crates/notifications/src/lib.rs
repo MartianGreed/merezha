@@ -46,9 +46,17 @@
 //! alert, the `retention` task's webhook part, audit rows of endpoint
 //! changes and, with feature `testkit`, `testkit::WebhookReceiver`.
 //!
-//! Seam for NT-N8: the module-event subscription (`notify.module_event`)
-//! maps AP's envelope onto a [`webhooks::fanout::Event`] and calls
-//! [`webhooks::fanout::fan_out`].
+//! Slice NT-N8 adds the integrations and the operations side: with
+//! webhooks on, the block subscribes `notify.module_event` to content's
+//! webhook events through AP subscriptions
+//! ([`webhooks::fanout::module_event`]), so publishing an entry reaches the
+//! endpoints without content calling the `Notifier`; a topic's
+//! `max_per_target_per_hour` skips deliveries past the cap
+//! (`target_rate_limited`, [`expand`]); the `retention` task also deletes
+//! settled notifications with their deliveries and attempts, provider
+//! events past `retention.deliveries` and captures past
+//! `retention.captures`, with migration 6 indexing both. The operations
+//! guide is `docs/operations/notifications.md`.
 pub mod brevo;
 pub mod config;
 pub mod deliver;
@@ -100,9 +108,10 @@ pub const METER_SCOPE: &str = "merezha.notifications";
 
 /// Migration 1, the core tables, migration 2, the inbox (NT §2.4),
 /// migration 3, pending provider events (NT-N3), migration 4, push
-/// subscriptions (NT-N6), and migration 5, webhooks (NT-N7). Later slices
-/// append their own migrations and never edit these.
-pub const MIGRATIONS: [Migration; 5] = [
+/// subscriptions (NT-N6), migration 5, webhooks (NT-N7), and migration 6,
+/// the rate cap and retention indexes (NT-N8). Later slices append their
+/// own migrations and never edit these.
+pub const MIGRATIONS: [Migration; 6] = [
     Migration::new(1, "core", include_str!("../migrations/0001_core.sql")),
     Migration::new(2, "inbox", include_str!("../migrations/0002_inbox.sql")),
     Migration::new(
@@ -115,6 +124,11 @@ pub const MIGRATIONS: [Migration; 5] = [
         5,
         "webhooks",
         include_str!("../migrations/0005_webhooks.sql"),
+    ),
+    Migration::new(
+        6,
+        "integrations",
+        include_str!("../migrations/0006_integrations.sql"),
     ),
 ];
 
@@ -392,8 +406,20 @@ impl Module for Notifications {
     fn extra_sources(&self) -> &[&'static str] {
         &EXTRA_SOURCES
     }
+    /// With webhooks on, the block consumes content's webhook events
+    /// (NT §5.5, NT-N8).
     fn events(&self) -> ModuleEvents {
-        ModuleEvents::default()
+        let webhooks = self
+            .checked()
+            .is_some_and(|checked| checked.settings.webhooks.is_some());
+        ModuleEvents {
+            publishes: &[],
+            consumes: if webhooks {
+                &webhooks::fanout::SUBSCRIBED_EVENT_TYPES
+            } else {
+                &[]
+            },
+        }
     }
     /// The unsubscribe routes take no session: a mail client or a browser
     /// holding a (possibly stale) session cookie must get through, and the
@@ -567,6 +593,18 @@ impl Module for Notifications {
                     Arc::new(webhooks::worker::Handler(self.core.clone())),
                     KindOptions::default(),
                 )?;
+                // Other modules' domain events reach webhooks through AP
+                // subscriptions, never through their own `emit_webhook`
+                // calls (R11, NT-N8).
+                jobs.register(
+                    webhooks::fanout::MODULE_EVENT_KIND,
+                    notifier::EXPAND_QUEUE,
+                    Arc::new(webhooks::fanout::ModuleEventHandler(self.core.clone())),
+                    KindOptions::default(),
+                )?;
+                for topic in webhooks::fanout::SUBSCRIBED_EVENT_TYPES {
+                    jobs.subscribe(topic, webhooks::fanout::MODULE_EVENT_KIND)?;
+                }
             }
             for task in maintenance::Task::ALL {
                 let kind = task.kind();

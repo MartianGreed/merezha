@@ -17,8 +17,8 @@ use merezha_platform::{
     AppContext, BoxFuture, Database, Tx,
     errors::FieldError,
     ports::{
-        Address, Channel, ChannelSelection, Correlation, DedupeKey, EmailAddress, Locale,
-        MessageContext, NewEvent, NotificationRequest, Notifier, Recipient, SourceOutbox,
+        Address, ChannelSelection, Correlation, DedupeKey, EmailAddress, Locale, MessageContext,
+        NewEvent, NotificationRequest, Notifier, Recipient, SourceOutbox,
     },
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -905,9 +905,12 @@ impl Core {
         SecretString::from(format!("{base}#token={}", token.encode().expose_secret()))
     }
 
-    /// Request `topic` for `recipient` inside the caller's transaction.
-    /// Raw links travel only in `secret_data`; with `dev_print_links` on
-    /// loopback the link also goes to stderr as `identity.dev_link`.
+    /// Request `topic` for `recipient` inside the caller's transaction, on
+    /// the topic's default channels (NT §3.3: email, plus the inbox for
+    /// `password_changed`, `new_sign_in` and `sign_in_method_added`; a
+    /// project may change them). Raw links travel only in `secret_data`;
+    /// with `dev_print_links` on loopback the link also goes to stderr as
+    /// `identity.dev_link`.
     #[allow(clippy::too_many_arguments)]
     pub async fn notify(
         &self,
@@ -920,6 +923,26 @@ impl Core {
         expires_at: Option<Timestamp>,
         client: &Client,
     ) -> Result<(), Failure> {
+        self.notify_in(
+            tx, topic, recipient, data, link, dedupe, expires_at, None, client,
+        )
+        .await
+    }
+    /// [`Core::notify`] in the context of `tenant`, the organization an
+    /// invitation is for (NT §3.3).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn notify_in(
+        &self,
+        tx: &mut Tx<'_>,
+        topic: &'static str,
+        recipient: Recipient,
+        data: Map<String, Value>,
+        link: Option<(SecretString, &'static str)>,
+        dedupe: Uuid,
+        expires_at: Option<Timestamp>,
+        tenant: Option<Uuid>,
+        client: &Client,
+    ) -> Result<(), Failure> {
         let mut secret_data = Map::new();
         if let Some((link, _)) = &link {
             secret_data.insert(
@@ -930,13 +953,13 @@ impl Core {
         let request = NotificationRequest {
             topic: Identity::new(topic)?,
             recipients: vec![recipient],
-            channels: ChannelSelection::Only(vec![Channel::Email]),
+            channels: ChannelSelection::TopicDefault,
             template: None,
             data,
             secret_data,
             locale: None,
             dedupe_key: DedupeKey::new(format!("{topic}:{}", dedupe.simple()))?,
-            tenant: None,
+            tenant: tenant.map(|t| ids::identity(ids::ORGANIZATION, t)),
             members: Vec::new(),
             not_before: None,
             expires_at,

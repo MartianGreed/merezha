@@ -49,6 +49,33 @@ pub const NOTIFICATION_INSERT: Statement = s(
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
      $19, $20, $21, $22, $23) ON CONFLICT DO NOTHING RETURNING id",
 );
+/// The class of the rate cap's two-key advisory locks (`"ntfy"`), the
+/// `$1` of [`TARGET_LOCKS`]: it keeps them apart from other modules'
+/// two-key locks.
+pub const TARGET_LOCK_CLASS: i32 = i32::from_be_bytes(*b"ntfy");
+/// Lock the `(topic $2, channel, target key)` of each `($3, $4)` pair for
+/// the transaction, in ascending key order so two expansions never wait on
+/// each other crosswise; a `hashtext` collision only serializes two
+/// targets.
+pub const TARGET_LOCKS: Statement = s(
+    "notify.delivery.target_locks",
+    "SELECT pg_advisory_xact_lock()",
+    "SELECT pg_advisory_xact_lock($1::int4, k.key) FROM \
+     (SELECT DISTINCT hashtext($2::text || chr(10) || t.channel || chr(10) || t.target_key) AS key \
+        FROM unnest($3::text[], $4::text[]) AS t(channel, target_key) ORDER BY 1) AS k",
+);
+/// Per `($1 channel, $2 target key)` pair, the deliveries of topic `$4`
+/// created after `$3` that were not skipped (the rate cap, NT §6).
+pub const TARGET_RECENT: Statement = s(
+    "notify.delivery.target_recent",
+    "SELECT merezha_notify.deliveries",
+    "SELECT d.channel, d.target_key, count(*) FROM merezha_notify.deliveries d \
+       JOIN merezha_notify.notifications n ON n.id = d.notification_id \
+      WHERE (d.target_key, d.channel) IN \
+            (SELECT t.target_key, t.channel FROM unnest($1::text[], $2::text[]) AS t(channel, target_key)) \
+        AND d.created_at > $3 AND n.topic = $4 AND d.status <> 'skipped' \
+      GROUP BY d.channel, d.target_key",
+);
 /// Deliveries of notification `$1`, one per array position; `$14` is the
 /// push subscription of each push target (NT-N6).
 pub const DELIVERIES_INSERT: Statement = s(
@@ -482,8 +509,30 @@ pub const EVENTS_TAKE_PENDING: Statement = s(
      coalesce(e.provider_message_id <> d.provider_message_id, false)",
 );
 
+/// Delete at most `$2` notifications settled before `$1`, oldest first;
+/// their deliveries and attempts cascade (the `retention` task, NT §2.5).
+pub const RETENTION_NOTIFICATIONS: Statement = s(
+    "notify.notification.retention",
+    "DELETE merezha_notify.notifications",
+    "DELETE FROM merezha_notify.notifications WHERE id IN \
+     (SELECT id FROM merezha_notify.notifications WHERE settled_at < $1 \
+      ORDER BY settled_at LIMIT $2)",
+);
+/// Delete at most `$2` provider events received before `$1`, oldest first.
+pub const RETENTION_PROVIDER_EVENTS: Statement = s(
+    "notify.provider_event.retention",
+    "DELETE merezha_notify.provider_events",
+    "DELETE FROM merezha_notify.provider_events WHERE id IN \
+     (SELECT id FROM merezha_notify.provider_events WHERE received_at < $1 \
+      ORDER BY received_at LIMIT $2)",
+);
+
 /// Every statement of this module.
 pub const STATEMENTS: &[Statement] = &[
+    TARGET_LOCKS,
+    TARGET_RECENT,
+    RETENTION_NOTIFICATIONS,
+    RETENTION_PROVIDER_EVENTS,
     NOTIFICATION_EXISTS,
     PREFERENCES_FOR_USERS,
     SUPPRESSIONS_FOR_ADDRESSES,

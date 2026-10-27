@@ -548,11 +548,12 @@ impl Instance {
             let open: i64 = client
                 .query_one(
                     "SELECT (SELECT count(*) FROM merezha_jobs.outbox \
-                       WHERE source IN ('notifications') AND relayed_at IS NULL \
+                       WHERE source IN ('notifications', 'content') AND relayed_at IS NULL \
                        AND quarantined_at IS NULL AND (run_at IS NULL OR run_at <= now())) \
                      + (SELECT count(*) FROM merezha_jobs.jobs WHERE kind IN \
                        ('notify.expand', 'notify.deliver.email', 'notify.deliver.sms', \
-                        'notify.deliver.push', 'notify.webhook_event', 'notify.webhook.deliver') \
+                        'notify.deliver.push', 'notify.webhook_event', 'notify.webhook.deliver', \
+                        'notify.module_event') \
                        AND state IN ('available', 'running') AND run_at <= now())",
                     &[],
                 )
