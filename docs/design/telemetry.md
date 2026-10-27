@@ -1277,8 +1277,9 @@ signals land.
   sample before it, so `increase()` misses a new series' first event (the
   first dead letter per instance, queue and kind after a start). The
   dead-letter, pool-timeout and telemetry-drop alerts add an arm for a
-  series that did not exist one window earlier
-  (`x unless x offset <window>`). The instance-absent alert looks back 24
+  series with no sample in the hour before the window
+  (`x unless last_over_time(x[1h] offset <window>)`), so an export gap
+  under an hour does not make an old series look new. The instance-absent alert looks back 24
   hours, so it keeps firing while a service stays down, for up to a day.
 - Health routes are matched as `/health(/.*)?`.
 - CI: the `Telemetry artifacts` workflow runs `promtool check rules`,

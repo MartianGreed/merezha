@@ -252,6 +252,17 @@ when three days of errors exceed the budget.
 | `MerezhaTelemetryDropped` | ticket | telemetry items were dropped in the last 15 min | `telemetry.export_failed` on stderr, the collector, `max_queue` |
 | `MerezhaMetricOverflow` | ticket | a series with `otel_metric_overflow="true"` exists | which instrument overflowed: `{otel_metric_overflow="true"}` |
 
+`MerezhaJobsDeadLettered`, `MerezhaDatabasePoolTimeouts` and
+`MerezhaTelemetryDropped` also fire on the first value of a new series
+(counters reach Prometheus at their first value, with no 0 before it). A
+series counts as new when it had no sample in the hour before the alert's
+window, so a collector outage under an hour raises nothing by itself. The
+trade-off: an instance that restarts within the hour under the same
+`app.instance_id` continues its old series, and a first event whose sample
+lands outside the `increase` window after the restart can be missed. The
+default instance id (hostname plus pid) changes on every restart, which
+avoids this.
+
 `MerezhaInstanceAbsent` only knows services it has seen in the last 24
 hours: it fires 10 minutes after the last export and keeps firing until the
 service exports again or 24 hours have passed, then resolves although the

@@ -219,6 +219,7 @@ fn cli_binds_ephemeral_loopback_serves_real_http_and_logs_metadata_only() {
     let mut rest = String::new();
     logs.read_to_string(&mut rest).unwrap();
     assert!(!rest.contains("s3cr3t"));
+    assert_catalogued(&format!("{first}{rest}"));
     let events: Vec<serde_json::Value> = rest
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
@@ -252,9 +253,15 @@ fn cli_refuses_public_listener_before_opening_manifest() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("invalid_arguments")
-    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("invalid_arguments"));
+    assert_catalogued(&stderr);
+}
+
+/// Every JSON line a `merezha` process wrote to stderr is a catalog event at
+/// a catalog level (TE §8).
+fn assert_catalogued(stderr: &str) {
+    if let Err(problems) = merezha_telemetry::testing::check_stderr_catalogued(stderr) {
+        panic!("event catalog: {problems}");
+    }
 }

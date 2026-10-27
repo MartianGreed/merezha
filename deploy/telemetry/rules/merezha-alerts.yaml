@@ -112,12 +112,14 @@ groups:
       # Synchronous counters reach Prometheus at their first value, with no
       # 0 sample before it, so increase() misses the first event of a series
       # (the first dead letter per instance, queue and kind after a start).
-      # The second arm catches a series that did not exist 15 minutes ago.
+      # The second arm catches a series with no sample in the hour before
+      # the window, so a gap in exports of under an hour does not make an
+      # old series look new.
       - alert: MerezhaJobsDeadLettered
         expr: |
           sum by (job, job_queue) (increase(merezha_job_dead_lettered_total[15m])) > 0
           or
-          sum by (job, job_queue) (merezha_job_dead_lettered_total unless merezha_job_dead_lettered_total offset 15m) > 0
+          sum by (job, job_queue) (merezha_job_dead_lettered_total unless last_over_time(merezha_job_dead_lettered_total[1h] offset 15m)) > 0
         labels:
           severity: ticket
         annotations:
@@ -156,7 +158,7 @@ groups:
         expr: |
           sum by (job, instance, db_client_connection_pool_name) (increase(db_client_connection_timeouts_total[5m])) > 0
           or
-          sum by (job, instance, db_client_connection_pool_name) (db_client_connection_timeouts_total unless db_client_connection_timeouts_total offset 5m) > 0
+          sum by (job, instance, db_client_connection_pool_name) (db_client_connection_timeouts_total unless last_over_time(db_client_connection_timeouts_total[1h] offset 5m)) > 0
         labels:
           severity: ticket
         annotations:
@@ -194,7 +196,7 @@ groups:
         expr: |
           sum by (job, merezha_telemetry_signal, merezha_reason) (increase(merezha_telemetry_dropped_total[15m])) > 0
           or
-          sum by (job, merezha_telemetry_signal, merezha_reason) (merezha_telemetry_dropped_total unless merezha_telemetry_dropped_total offset 15m) > 0
+          sum by (job, merezha_telemetry_signal, merezha_reason) (merezha_telemetry_dropped_total unless last_over_time(merezha_telemetry_dropped_total[1h] offset 15m)) > 0
         labels:
           severity: ticket
         annotations:

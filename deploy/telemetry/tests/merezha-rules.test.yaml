@@ -419,3 +419,50 @@ tests:
             exp_annotations:
               summary: 'tasks is burning its HTTP latency budget fast'
               description: '20% of the requests of tasks take longer than 500 ms; the objective is 1%.'
+
+  # A 10-minute gap in exports (a collector outage) with no new event: the
+  # series is not new when it returns, so nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'merezha_job_dead_lettered_total{job="tasks", instance="a", job_queue="notify.email", job_kind="notify.email"}'
+        values: '3x100 _x10 3x30'
+      - series: 'db_client_connection_timeouts_total{job="tasks", instance="a", db_client_connection_pool_name="merezha"}'
+        values: '3x100 _x10 3x30'
+      - series: 'merezha_telemetry_dropped_total{job="tasks", instance="a", merezha_telemetry_signal="traces", merezha_reason="queue_full"}'
+        values: '3x100 _x10 3x30'
+    alert_rule_test:
+      - alertname: MerezhaJobsDeadLettered
+        eval_time: 112m
+        exp_alerts: []
+      - alertname: MerezhaJobsDeadLettered
+        eval_time: 125m
+        exp_alerts: []
+      - alertname: MerezhaDatabasePoolTimeouts
+        eval_time: 112m
+        exp_alerts: []
+      - alertname: MerezhaDatabasePoolTimeouts
+        eval_time: 117m
+        exp_alerts: []
+      - alertname: MerezhaTelemetryDropped
+        eval_time: 112m
+        exp_alerts: []
+      - alertname: MerezhaTelemetryDropped
+        eval_time: 125m
+        exp_alerts: []
+
+  # An existing pool-timeout series increments: the increase arm fires.
+  - interval: 1m
+    input_series:
+      - series: 'db_client_connection_timeouts_total{job="tasks", instance="a", db_client_connection_pool_name="merezha"}'
+        values: '0x10 1x10'
+    alert_rule_test:
+      - alertname: MerezhaDatabasePoolTimeouts
+        eval_time: 8m
+        exp_alerts: []
+      - alertname: MerezhaDatabasePoolTimeouts
+        eval_time: 13m
+        exp_alerts:
+          - exp_labels: {job: tasks, instance: a, db_client_connection_pool_name: merezha, severity: ticket}
+            exp_annotations:
+              summary: 'Database connection waits time out on a (tasks)'
+              description: 'Callers gave up waiting for a merezha connection (db.pool_timeout).'

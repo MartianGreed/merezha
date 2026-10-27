@@ -780,7 +780,11 @@ field = …)`, whose name and fields must appear in the catalog
 (`crates/telemetry/src/names.rs`, TE §4); `testing::Harness::assert_catalogued`
 fails a suite that emits anything else; the process tests' `Host`
 fixtures (`crates/cli/tests/support`, `telemetry_process.rs`) check every
-stderr line with `testing::check_stderr_catalogued` when they drop; and
+stderr line with `testing::check_stderr_catalogued` when they drop, as do
+`application_http.rs`, `http.rs` and `content_diff.rs` on the stderr they
+capture (the other one-off spawns, mostly CLI subcommands such as
+`merezha identity` and `merezha notifications`, are left to the source
+scan); and
 `crates/telemetry/tests/event_catalog.rs` reads every `event!(…, "name", …)`
 call in `crates/*/src` outside comments (the level too unless it is a
 macro variable), so a name missing from the catalog fails even when no
