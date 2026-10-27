@@ -23,9 +23,3 @@ webhook_allowed_cidrs = ["1.179.112.0/20", "172.246.240.0/20"]   # Brevo's webho
 [modules.notifications.sms]
 driver = "disabled"                    # no phone numbers on users in v1 (ID10)
 
-[modules.notifications.push]
-vapid_private_key = { env = "MEREZHA_VAPID_PRIVATE_KEY" }
-vapid_subject = "mailto:ops@example.invalid"
-
-[modules.notifications.webhooks]
-alert_roles = []                       # no organizations in the starter

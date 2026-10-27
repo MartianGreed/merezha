@@ -364,6 +364,26 @@ fn refusals(root: &Path) -> Vec<Refusal> {
             s(&["acme", "--merezha-rev", "main"]),
             at_root,
         ),
+        // A SHA-256 id: GitHub's SHA-1 repository could never resolve it.
+        r(
+            "invalid_rev",
+            vec![
+                "acme".into(),
+                "--merezha-rev".into(),
+                "0123456789abcdef".repeat(4),
+            ],
+            at_root,
+        ),
+        // A quote in the pinned path would have to be escaped in every file
+        // that names it.
+        r(
+            "invalid_merezha_path",
+            vec!["acme".into(), "--merezha-path".into(), "we\"ird".into()],
+            |root| {
+                checkout(&root.join("we\"ird"), "merezha-domain");
+                root.to_owned()
+            },
+        ),
         r(
             "invalid_merezha_path",
             vec![
@@ -620,7 +640,6 @@ fn the_generated_configuration_loads_like_merezha_run_for_every_selection() {
         );
         assert_eq!(code, 0, "{label}: {report}");
         let dir = root.path().join(&name);
-        let env = environment(&dir);
         let has = |block: &str| blocks.contains(&block);
         // Only blocks with secrets get a `.env` (identity implies
         // notifications).
@@ -636,55 +655,223 @@ fn the_generated_configuration_loads_like_merezha_run_for_every_selection() {
         let ids: Vec<&str> = manifest.services.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["domain", "view", "notifier"]);
 
-        for file in ["merezha.toml", "merezha.production.toml"] {
-            let input = ConfigInput {
-                path: dir.join(file),
-                env: env.clone(),
-                overrides: Vec::new(),
-            };
-            let (modules, _) = merezha_cli::host_blocks(&input);
-            let (config, enabled) = host::configure(&input, modules)
-                .unwrap_or_else(|errors| panic!("{label}: {file}: {errors:?}"));
-            let enabled: BTreeSet<&str> = enabled.iter().map(|m| m.name()).collect();
-            let expected: BTreeSet<&str> = ["identity", "notifications", "content"]
-                .into_iter()
-                .filter(|block| has(block))
-                .collect();
-            assert_eq!(enabled, expected, "{label}: {file}");
-            assert_eq!(config.app.id, name);
-            assert_eq!(config.http.public, file == "merezha.production.toml");
-            // OTLP export is on only with an endpoint (R12).
-            assert_eq!(
-                !config.telemetry.signals.is_empty(),
-                has("telemetry") && file == "merezha.production.toml",
-                "{label}: {file}"
-            );
+        loads_like_merezha_run(&dir, &name, blocks, (true, true), &label);
+    }
+}
 
-            let section = config.application.as_ref().unwrap();
-            let application = merezha_cli::read_application_config(&section.path)
-                .unwrap_or_else(|f| panic!("{label}: {f:?}"));
-            merezha_cli::run::check_application(&config, &application, has("identity"))
-                .unwrap_or_else(|code| panic!("{label}: {file}: {code}"));
+/// Both configuration files of the project in `dir` load as `merezha run`
+/// loads them, with `features` = (push, webhooks).
+fn loads_like_merezha_run(
+    dir: &Path,
+    name: &str,
+    blocks: &[&str],
+    features: (bool, bool),
+    label: &str,
+) {
+    let env = environment(dir);
+    let has = |block: &str| blocks.contains(&block);
+    for file in ["merezha.toml", "merezha.production.toml"] {
+        let input = ConfigInput {
+            path: dir.join(file),
+            env: env.clone(),
+            overrides: Vec::new(),
+        };
+        let (modules, _) = merezha_cli::host_blocks(&input);
+        let (config, enabled) = host::configure(&input, modules)
+            .unwrap_or_else(|errors| panic!("{label}: {file}: {errors:?}"));
+        let enabled: BTreeSet<&str> = enabled.iter().map(|m| m.name()).collect();
+        let expected: BTreeSet<&str> = ["identity", "notifications", "content"]
+            .into_iter()
+            .filter(|block| has(block))
+            .collect();
+        assert_eq!(enabled, expected, "{label}: {file}");
+        assert_eq!(config.app.id, name);
+        assert_eq!(config.http.public, file == "merezha.production.toml");
+        // OTLP export is on only with an endpoint (R12).
+        assert_eq!(
+            !config.telemetry.signals.is_empty(),
+            has("telemetry") && file == "merezha.production.toml",
+            "{label}: {file}"
+        );
 
-            if has("notifications") {
-                let (report, _) = merezha_cli::notifications::check(&input);
-                assert_eq!(report["status"], "ok", "{label}: {file}: {report}");
-                assert_eq!(report["push"], true);
-                assert_eq!(report["webhooks"], true);
-                // The process, as the generated CI runs it: without
-                // MEREZHA_NOTIFY_NO_EGRESS, which the production file's
-                // Brevo base_url would fail.
-                let output = Command::new(env!("CARGO_BIN_EXE_merezha"))
-                    .args(["notifications", "check", "--config"])
-                    .arg(dir.join(file))
-                    .env_clear()
-                    .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-                    .output()
-                    .unwrap();
-                let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-                assert_eq!(report["status"], "ok", "{label}: {file}: {report}");
-                assert!(output.status.success());
+        let section = config.application.as_ref().unwrap();
+        let application = merezha_cli::read_application_config(&section.path)
+            .unwrap_or_else(|f| panic!("{label}: {f:?}"));
+        merezha_cli::run::check_application(&config, &application, has("identity"))
+            .unwrap_or_else(|code| panic!("{label}: {file}: {code}"));
+
+        if has("notifications") {
+            let (report, _) = merezha_cli::notifications::check(&input);
+            assert_eq!(report["status"], "ok", "{label}: {file}: {report}");
+            assert_eq!(report["push"], features.0, "{label}: {file}");
+            assert_eq!(report["webhooks"], features.1, "{label}: {file}");
+            // The process, as the generated CI runs it: without
+            // MEREZHA_NOTIFY_NO_EGRESS, which the production file's
+            // Brevo base_url would fail.
+            let output = Command::new(env!("CARGO_BIN_EXE_merezha"))
+                .args(["notifications", "check", "--config"])
+                .arg(dir.join(file))
+                .env_clear()
+                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .output()
+                .unwrap();
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["status"], "ok", "{label}: {file}: {report}");
+            assert!(output.status.success());
+        }
+    }
+}
+
+#[test]
+fn an_empty_target_keeps_its_mode_and_next_is_quoted() {
+    let root = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(root.path()).unwrap();
+    let private = root.join("my private");
+    fs::create_dir(&private).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+    let (code, report) = new(
+        &root,
+        &["acme", "--dir", "my private", "--merezha-rev", REV],
+    );
+    assert_eq!(code, 0, "{report}");
+    assert_eq!(
+        mode(&private),
+        0o700,
+        "an owner-only target stays owner-only"
+    );
+    assert_eq!(mode(&private.join(".env")), 0o600);
+    assert_eq!(
+        report["next"],
+        json!([format!("cd '{}'", private.display())]),
+        "the directory is one shell word"
+    );
+}
+
+#[test]
+fn a_signal_mid_write_removes_the_staging_directory() {
+    for signal in ["INT", "TERM", "HUP"] {
+        let root = tempfile::tempdir().unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_merezha"))
+            .args(["new", "acme", "--merezha-rev", REV])
+            .current_dir(root.path())
+            .env("MEREZHA_NEW_TEST_PAUSE_MS", "200")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Wait until the staging directory holds its first file.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let staged = loop {
+            let found = fs::read_dir(root.path()).unwrap().find_map(|entry| {
+                let path = entry.unwrap().path();
+                path.join("project")
+                    .read_dir()
+                    .ok()
+                    .and_then(|mut files| files.next())
+                    .map(|_| path)
+            });
+            if let Some(path) = found {
+                break path;
             }
+            assert!(std::time::Instant::now() < deadline, "no staging directory");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            staged
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(".acme.merezha-new-")
+        );
+        let killed = Command::new("kill")
+            .args([format!("-{signal}"), child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        let output = child.wait_with_output().unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|_| panic!("{signal}: {output:?}"));
+        assert_eq!(
+            report,
+            json!({"status": "failed", "error": {"code": "interrupted"}}),
+            "{signal}"
+        );
+        assert_eq!(output.status.code(), Some(1), "{signal}");
+        assert!(
+            tree(root.path()).is_empty(),
+            "{signal}: {:?}",
+            tree(root.path())
+        );
+    }
+}
+
+/// The embedded starter with its SC-Q7 switches set.
+fn starter_with(push: bool, webhooks: bool) -> merezha_scaffold::Catalog {
+    let files = merezha_scaffold::catalog::embedded_files()
+        .iter()
+        .map(|(path, bytes)| {
+            if *path == "starter/template.toml" {
+                let text = std::str::from_utf8(bytes)
+                    .unwrap()
+                    .replace("push = true", &format!("push = {push}"))
+                    .replace("webhooks = true", &format!("webhooks = {webhooks}"));
+                let leaked: &'static [u8] = Box::leak(text.into_bytes().into_boxed_slice());
+                (*path, leaked)
+            } else {
+                (*path, *bytes)
+            }
+        });
+    merezha_scaffold::Catalog::from_files(files).unwrap()
+}
+
+#[test]
+fn the_starter_without_push_or_webhooks_still_loads() {
+    for (push, webhooks) in [(false, true), (true, false), (false, false)] {
+        let catalog = starter_with(push, webhooks);
+        let root = tempfile::tempdir().unwrap();
+        for blocks in [
+            &["notifications"][..],
+            &["identity", "notifications", "content"][..],
+        ] {
+            let label = format!("push={push} webhooks={webhooks} {}", blocks.join(","));
+            let name = format!("app{}", blocks.len());
+            let args = [
+                name.as_str(),
+                "--merezha-rev",
+                REV,
+                "--blocks",
+                &blocks.join(","),
+            ];
+            let merezha_scaffold::Command::New(request) =
+                merezha_scaffold::Command::parse(args.iter().map(Into::into)).unwrap()
+            else {
+                panic!("help");
+            };
+            let context = merezha_scaffold::Context {
+                catalog: &catalog,
+                cwd: root.path(),
+                built_from: Some(REV),
+                merezha_version: "0.1.0",
+            };
+            let created =
+                merezha_scaffold::prepare(&request, &context, &mut merezha_cli::new::OsSecrets)
+                    .and_then(|plan| plan.write())
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(
+                created
+                    .secrets
+                    .iter()
+                    .any(|s| s == "MEREZHA_VAPID_PRIVATE_KEY"),
+                push,
+                "{label}"
+            );
+            loads_like_merezha_run(
+                &root.path().join(&name),
+                &name,
+                blocks,
+                (push, webhooks),
+                &label,
+            );
         }
     }
 }

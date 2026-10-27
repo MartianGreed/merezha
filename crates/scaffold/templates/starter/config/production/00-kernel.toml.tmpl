@@ -8,7 +8,10 @@ name = "%%app_name%%"
 [http]
 listen = "0.0.0.0:8080"
 public = true
-trusted_proxies = ["10.0.0.0/8"]       # replace with your reverse proxy's addresses
+# TEST-NET-1 placeholder: set your reverse proxy's exact addresses. Every
+# peer listed here may set the client address that rate limits and Brevo's
+# webhook_allowed_cidrs check, so never list a whole private network.
+trusted_proxies = ["192.0.2.0/24"]
 
 [http.cors]
 # The front end at app. calls the API at api.: another origin of the same

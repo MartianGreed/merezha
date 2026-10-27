@@ -2,6 +2,7 @@
 use crate::Error;
 use std::{
     io,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -11,6 +12,9 @@ use std::{
 pub struct Target {
     pub dir: PathBuf,
     pub parent: PathBuf,
+    /// The permission bits of an existing empty directory, which the
+    /// project keeps (narrowed, never widened); `None` for a new one.
+    pub mode: Option<u32>,
 }
 
 /// Resolves `dir` (relative to `cwd`) and refuses a target that is a
@@ -39,7 +43,11 @@ pub fn resolve(dir: &Path, cwd: &Path) -> Result<Target, Error> {
     if let Some(target) = existing(&dir, cwd)? {
         return Ok(target);
     }
-    Ok(Target { dir, parent })
+    Ok(Target {
+        dir,
+        parent,
+        mode: None,
+    })
 }
 
 /// The checked target when something exists at `path`, `None` when nothing
@@ -73,5 +81,9 @@ fn existing(path: &Path, cwd: &Path) -> Result<Option<Target>, Error> {
         .parent()
         .ok_or_else(|| Error::invalid("target_not_empty"))?
         .to_owned();
-    Ok(Some(Target { dir, parent }))
+    Ok(Some(Target {
+        dir,
+        parent,
+        mode: Some(metadata.permissions().mode() & 0o7777),
+    }))
 }

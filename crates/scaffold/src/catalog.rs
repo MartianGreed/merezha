@@ -26,6 +26,11 @@ pub struct Index {
     pub blocks: Vec<String>,
     #[serde(default)]
     pub fixed: bool,
+    /// Parts of the template switched on or off as a whole, by name: a
+    /// `when` or `unless` may name one as it names a block. The starter's
+    /// `push` and `webhooks` (SC-Q7) are such switches.
+    #[serde(default)]
+    pub features: BTreeMap<String, bool>,
     /// Commands the report suggests after `cd` into the project.
     #[serde(default)]
     pub next: Vec<String>,
@@ -44,11 +49,35 @@ pub struct Index {
 pub struct FileEntry {
     pub path: String,
     pub source: Option<String>,
-    pub fragments: Option<Vec<String>>,
+    pub fragments: Option<Vec<Fragment>>,
     #[serde(default)]
     pub when: Vec<String>,
     #[serde(default)]
     pub unless: Vec<String>,
+}
+
+/// One part of a `fragments` list: a path whose file name `NN-<block>.*`
+/// says when it applies (`NN-kernel.*` always does), or a table whose
+/// `when` and `unless` do.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum Fragment {
+    Named(String),
+    Conditional {
+        source: String,
+        #[serde(default)]
+        when: Vec<String>,
+        #[serde(default)]
+        unless: Vec<String>,
+    },
+}
+
+impl Fragment {
+    pub fn source(&self) -> &str {
+        match self {
+            Fragment::Named(source) | Fragment::Conditional { source, .. } => source,
+        }
+    }
 }
 
 /// A directory copied only with (`when`) or without (`unless`) blocks.
@@ -103,6 +132,32 @@ impl Template {
             .iter()
             .map(|name| Block::parse(name).ok_or_else(|| index_error(&self.index.name, name)))
             .collect()
+    }
+}
+
+impl Template {
+    /// Whether every name in `when` holds and none in `unless` does, for
+    /// `selection`. A name is a block the template knows or one of its
+    /// features; anything else is a template defect.
+    pub fn applies(
+        &self,
+        selection: &crate::Selection,
+        when: &[String],
+        unless: &[String],
+    ) -> Result<bool, Error> {
+        let known = self.blocks()?;
+        let mut keep = true;
+        for (names, wanted) in [(when, true), (unless, false)] {
+            for name in names {
+                let on = match (Block::parse(name), self.index.features.get(name)) {
+                    (Some(block), None) if known.contains(&block) => selection.contains(block),
+                    (None, Some(on)) => *on,
+                    _ => return Err(index_error(&self.index.name, name)),
+                };
+                keep &= on == wanted;
+            }
+        }
+        Ok(keep)
     }
 }
 

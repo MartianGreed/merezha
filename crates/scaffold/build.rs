@@ -12,6 +12,12 @@
 //! - any file named `Cargo.toml`: template manifests are stored as
 //!   `Cargo.toml.tmpl`, so Cargo never takes a template for a package.
 //!
+//! It skips, with a `cargo::warning`, what is not meant to ship: names
+//! starting with `.` (files and directories) other than [`ALLOWED_DOT_NAMES`],
+//! and editor and system leftovers (`*~`, `*.swp`, `*.swo`, `#*#`, `.#*`,
+//! `.DS_Store`, `Thumbs.db`). Store a generated dotfile without its dot
+//! (`gitignore`) and name it in the index.
+//!
 //! `cargo::rerun-if-changed=templates` makes Cargo rescan the directory, so
 //! an edited template rebuilds the crate.
 //!
@@ -32,6 +38,9 @@ const PLACEHOLDERS: [&str; 5] = [
     "merezha_rev",
     "merezha_version",
 ];
+/// Dotted names that are embedded: directories and files the generated
+/// projects keep under their own name.
+const ALLOWED_DOT_NAMES: [&str; 2] = [".github", ".contremaitre.yaml"];
 /// Largest embedded file.
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 /// Bounds on the walk.
@@ -78,6 +87,10 @@ fn walk(directory: &Path, prefix: &str, depth: usize, files: &mut Vec<(String, P
             "templates: {prefix}{name} is not a plain name"
         );
         let relative = format!("{prefix}{name}");
+        if skipped(name) {
+            println!("cargo::warning=templates: skipping {relative}");
+            continue;
+        }
         let path = entry.path();
         // `symlink_metadata` never follows a link.
         let metadata = fs::symlink_metadata(&path)
@@ -137,4 +150,14 @@ fn check_placeholders(relative: &str, text: &str) {
             }
         }
     }
+}
+
+/// Hidden names and editor or system leftovers, which never ship.
+fn skipped(name: &str) -> bool {
+    let editor = name.ends_with('~')
+        || name.ends_with(".swp")
+        || name.ends_with(".swo")
+        || (name.starts_with('#') && name.ends_with('#'))
+        || name == "Thumbs.db";
+    editor || (name.starts_with('.') && !ALLOWED_DOT_NAMES.contains(&name))
 }

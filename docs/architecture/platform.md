@@ -257,8 +257,11 @@ merezha new --help
 - `NAME` is the application id (`[app] id`, `[storage] application`):
   `^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$`, at most 40 bytes, and not `merezha`.
 - `--dir` defaults to `./NAME`. The target must not exist or must be an
-  empty directory; its parent must exist and is canonicalized, so a parent
-  reached through a symbolic link works. There is no `--force`.
+  empty directory; its parent must exist, be writable, and is
+  canonicalized, so a parent reached through a symbolic link works. An empty
+  target directory is replaced by the project: its permission bits are
+  kept (narrowed, never widened, so `mkdir -m 700` stays owner-only), but
+  not its ACLs, extended attributes or ownership. There is no `--force`.
 - `--blocks` takes a comma-separated list of `identity`, `notifications`,
   `content` and `telemetry` (default: all four), or `none`. `identity`
   needs `notifications` and `content` needs `identity`, which is what the
@@ -267,14 +270,17 @@ merezha new --help
   it is the revision this binary was built from (`merezha version`'s `rev`):
   a binary that does not know it (a dirty or unknown tree) refuses with
   `source_rev_unknown` instead of pinning something that is not its source.
-  `--merezha-rev` names a full commit instead, and `--merezha-path` a merezha
-  checkout, written as a path relative to the project.
+  `--merezha-rev` names a full 40-hex commit instead (a SHA-256 id is
+  refused: the GitHub repository the dependency fetches from serves SHA-1
+  only), and `--merezha-path` a merezha checkout, written as a path relative
+  to the project, which may not contain a quote, a backslash or a control
+  character.
 - `--no-secrets` writes no `.env`.
 
 The `starter` template (a small notes application) writes, today:
 `merezha.toml` (local development: loopback listener, capture mail driver,
 the development-only switches), `merezha.production.toml` (public listener
-behind a proxy, Brevo, TLS to the database, `.invalid` hosts to replace),
+behind a proxy, Brevo, TLS to the database, `.invalid` hosts and a TEST-NET-1 `trusted_proxies` to replace),
 `runtime.toml`, `application.toml` (route permissions with identity, public
 routes without), `content.toml` with content, the `notes.shared`
 notification templates with notifications, `.env.example` (every variable
@@ -293,8 +299,11 @@ that ignores it, with mode 0600. Brevo values are never generated.
 The project is written whole or not at all: every file is created with
 `O_EXCL` inside a staging directory `.NAME.merezha-new-<16 hex>` (mode
 0700) beside the target, then renamed onto it. Files get `0644` (`0755`
-under `scripts/`) minus the umask. On any failure the staging directory is
-removed.
+under `scripts/`) minus the umask. When the command fails, and when it is
+interrupted by SIGINT, SIGTERM or SIGHUP (it then stops at the next file with
+`interrupted`), the staging directory is removed. A process killed outright
+(SIGKILL, a crash, a power loss) can leave it behind with `.env` inside; it
+stays owner-only (0700) and can be deleted.
 
 It prints one JSON object on stdout and exits 0:
 
@@ -316,8 +325,9 @@ exits 2: `invalid_arguments` (with `usage`), `invalid_name`,
 `target_not_empty`, `target_not_directory`, `target_is_symlink`,
 `target_is_working_directory` (run it from the parent instead) and
 `parent_missing`. A failed write prints `{"status":"failed","error":{"code"}}`
-and exits 1: `write_failed`, `rename_failed` (the target was filled after
-the checks), `random_unavailable`, `secret_generation_failed`, and
+and exits 1: `write_failed`, `parent_not_writable`, `rename_failed` (the
+target was filled after the checks), `interrupted`, `random_unavailable`,
+`secret_generation_failed`, and
 `secret_invalid` or `template_invalid` for a defect in the binary.
 
 ## Building guests

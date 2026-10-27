@@ -4,7 +4,7 @@
 //! the fragments whose block is selected. There is no template engine.
 use crate::{
     Block, Error, Selection,
-    catalog::{Template, index_error},
+    catalog::{Fragment, Template, index_error},
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -157,18 +157,7 @@ pub fn render(
 ) -> Result<Vec<Rendered>, Error> {
     let name = template.index.name.as_str();
     let known: BTreeSet<Block> = template.blocks()?.into_iter().collect();
-    let applies = |when: &[String], unless: &[String]| -> Result<bool, Error> {
-        let mut keep = true;
-        for (names, wanted) in [(when, true), (unless, false)] {
-            for block in names {
-                let block = Block::parse(block)
-                    .filter(|block| known.contains(block))
-                    .ok_or_else(|| index_error(name, block))?;
-                keep &= selection.contains(block) == wanted;
-            }
-        }
-        Ok(keep)
-    };
+    let applies = |when: &[String], unless: &[String]| template.applies(selection, when, unless);
     let source = |path: &str| -> Result<String, Error> {
         let bytes = template
             .files
@@ -195,29 +184,35 @@ pub fn render(
     };
 
     for entry in &template.index.files {
-        let parts: Vec<&String> = match (&entry.source, &entry.fragments) {
-            (Some(source), None) => vec![source],
-            (None, Some(fragments)) => fragments.iter().collect(),
+        let parts: Vec<&str> = match (&entry.source, &entry.fragments) {
+            (Some(source), None) => vec![source.as_str()],
+            (None, Some(fragments)) => fragments.iter().map(Fragment::source).collect(),
             _ => return Err(index_error(name, &entry.path)),
         };
-        consumed.extend(parts.iter().map(|part| part.as_str()));
+        consumed.extend(parts.iter().copied());
         if !applies(&entry.when, &entry.unless)? {
             continue;
         }
         let mut text = String::new();
-        for part in parts {
-            if entry.fragments.is_some() {
-                let owner = fragment_block(part).ok_or_else(|| index_error(name, part))?;
-                if let Some(owner) = owner {
-                    if !known.contains(&owner) {
-                        return Err(index_error(name, part));
-                    }
-                    if !selection.contains(owner) {
-                        continue;
+        match &entry.fragments {
+            None => text.push_str(&source(parts[0])?),
+            Some(fragments) => {
+                for fragment in fragments {
+                    let keep = match fragment {
+                        Fragment::Named(part) => {
+                            match fragment_block(part).ok_or_else(|| index_error(name, part))? {
+                                None => true,
+                                Some(owner) if known.contains(&owner) => selection.contains(owner),
+                                Some(_) => return Err(index_error(name, part)),
+                            }
+                        }
+                        Fragment::Conditional { when, unless, .. } => applies(when, unless)?,
+                    };
+                    if keep {
+                        text.push_str(&source(fragment.source())?);
                     }
                 }
             }
-            text.push_str(&source(part)?);
         }
         let contents = stamp(&entry.path, text);
         insert(entry.path.clone(), contents.into_bytes())?;

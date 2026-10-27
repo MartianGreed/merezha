@@ -1,12 +1,25 @@
 # The starter template's index (scaffold §2.8). Files not listed here are
 # copied under the same relative path; a `.tmpl` suffix is dropped after the
 # substitutions. A fragment named NN-<block>.* belongs to that block and
-# NN-kernel.* always applies; `when` keeps an entry only with every listed
-# block, `unless` drops it with any of them.
+# NN-kernel.* always applies; a `{ source, when, unless }` fragment applies by
+# its conditions. `when` keeps an entry only when every name holds, `unless`
+# drops it when any does; a name is a block or a [features] switch. Every
+# fragment that can be left out starts with its own table header, so no key
+# can fall into the table before it. The 01-04 queue lines follow the
+# [jobs.queues] header of 00-kernel directly.
 name = "starter"
 description = "A small notes application"
 blocks = ["identity", "notifications", "content", "telemetry"]
 next = []
+
+# SC-Q7: the starter turns on Web Push and outgoing webhooks. Set either to
+# false to generate a project without that section, its topic channel, its
+# .env.example line and its secret. With webhooks off the notifier's
+# `webhook` effect is recorded as a `webhooks_disabled` rejection until it
+# is removed from application.toml's `effects`.
+[features]
+push = true
+webhooks = true
 
 [[file]]
 path = "merezha.toml"
@@ -18,8 +31,11 @@ fragments = [
   "config/shared/04-content.toml",
   "config/development/10-identity.toml",
   "config/development/20-notifications.toml.tmpl",
-  "config/shared/21-identity.toml",
-  "config/shared/22-notifications.toml",
+  { source = "config/development/23-push.toml", when = ["notifications", "push"] },
+  { source = "config/development/24-webhooks.toml", when = ["notifications", "webhooks"], unless = ["identity"] },
+  { source = "config/development/24-webhooks-identity.toml", when = ["identity", "webhooks"] },
+  { source = "config/shared/25-topic.toml", when = ["notifications"], unless = ["push"] },
+  { source = "config/shared/25-topic-push.toml", when = ["notifications", "push"] },
   "config/shared/30-content.toml",
   "config/shared/40-kernel.toml",
   "config/development/41-telemetry.toml",
@@ -35,8 +51,11 @@ fragments = [
   "config/shared/04-content.toml",
   "config/production/10-identity.toml",
   "config/production/20-notifications.toml.tmpl",
-  "config/shared/21-identity.toml",
-  "config/shared/22-notifications.toml",
+  { source = "config/production/23-push.toml", when = ["notifications", "push"] },
+  { source = "config/production/24-webhooks.toml", when = ["notifications", "webhooks"], unless = ["identity"] },
+  { source = "config/production/24-webhooks-identity.toml", when = ["identity", "webhooks"] },
+  { source = "config/shared/25-topic.toml", when = ["notifications"], unless = ["push"] },
+  { source = "config/shared/25-topic-push.toml", when = ["notifications", "push"] },
   "config/shared/30-content.toml",
   "config/shared/40-kernel.toml",
   "config/production/41-telemetry.toml",
@@ -67,6 +86,7 @@ fragments = [
   "env/00-kernel.example",
   "env/10-identity.example",
   "env/20-notifications.example",
+  { source = "env/21-push.example", when = ["notifications", "push"] },
 ]
 
 [[tree]]
@@ -87,4 +107,4 @@ when = ["notifications"]
 [[secret]]
 name = "MEREZHA_VAPID_PRIVATE_KEY"
 kind = "vapid_private_key"
-when = ["notifications"]
+when = ["notifications", "push"]

@@ -316,6 +316,79 @@ fn brevo_register_webhook_creates_the_bearer_webhook() {
     drop(fake);
 }
 
+/// `brevo register-webhook` loads the project with every block, as `merezha
+/// run` does: identity and content sections are validated, not refused as
+/// `unknown_module` (scaffold SC-S2, the generated starter has both).
+#[test]
+fn brevo_register_webhook_accepts_a_project_with_identity_and_content() {
+    use merezha_notifications::testkit::FakeBrevo;
+    let key = "xkeysib-cli-0123456789abcdef";
+    let token = "cli-webhook-token-0123456789abcdef-0123";
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let fake = runtime.block_on(FakeBrevo::start(key)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("content.toml"),
+        "version = 1\nlocales = [{ code = \"en\", default = true }]\n\
+         [types.page]\nkind = \"collection\"\naccess = \"public\"\ntitle_field = \"title\"\n\
+         fields = [{ name = \"title\", type = \"string\", required = true }]\n",
+    )
+    .unwrap();
+    let config = project(
+        dir.path(),
+        &format!(
+            "[modules.identity]\napp_origin = \"http://localhost:5173\"\n\
+             secret_key = {{ env = \"IDENTITY_KEY\" }}\n\
+             [modules.identity.password]\n\
+             [modules.content]\nmodel = \"content.toml\"\n\
+             [modules.notifications]\nsecret_key = {{ env = \"NOTIFY_KEY\" }}\n\
+             public_base_url = \"https://api.acme.test\"\n\
+             [modules.notifications.email]\ndriver = \"brevo\"\nfrom = \"Acme <no-reply@acme.test>\"\n\
+             [modules.notifications.brevo]\napi_key = {{ env = \"CLI_BREVO_KEY\" }}\n\
+             webhook_token = {{ env = \"CLI_BREVO_TOKEN\" }}\nbase_url = \"{}\"\n",
+            fake.base_url()
+        ),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_merezha"))
+        .args(["notifications", "brevo", "register-webhook", "--config"])
+        .arg(&config)
+        .env("NOTIFY_TEST_DATABASE_URL", "postgres://app@127.0.0.1:1/app")
+        .env("NOTIFY_KEY", KEY)
+        .env(
+            "IDENTITY_KEY",
+            "0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .env("CLI_BREVO_KEY", key)
+        .env("CLI_BREVO_TOKEN", token)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    let report: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(report["status"], "registered", "{report}");
+    assert_eq!(fake.requests_to("/v3/webhooks").len(), 1);
+    // `check` loads the same project.
+    let (code, report) = check(
+        &config,
+        &[
+            ("NOTIFY_KEY", KEY),
+            (
+                "IDENTITY_KEY",
+                "0123456789abcdef0123456789abcdef0123456789abcdef",
+            ),
+            ("CLI_BREVO_KEY", key),
+            ("CLI_BREVO_TOKEN", token),
+        ],
+    );
+    assert_eq!(code, Some(0), "{report}");
+    assert_eq!(report["status"], "ok");
+    drop(fake);
+}
+
 /// NT-N6: `vapid generate` prints a key pair that `check` accepts as
 /// `push.vapid_private_key`, and `merezha run` serves its public half at
 /// `GET /v1/notifications/push/vapid-public-key` without logging the key.

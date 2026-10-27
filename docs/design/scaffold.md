@@ -121,8 +121,17 @@ Every check runs before anything is written. Invalid input prints
 3. Set the staging directory to `0755 & !umask` and `rename` it onto the target. POSIX `rename`
    replaces an empty directory and fails on a non-empty one, so a target someone filled after the
    checks makes the command fail instead of mixing files.
-4. On any failure the staging directory is removed and the report is
-   `{"status":"failed","error":{"code"}}` with exit 1 (`write_failed`, `rename_failed`).
+4. When the command fails, and when SIGINT, SIGTERM or SIGHUP interrupts it (handlers installed
+   before the staging directory exists stop the writer at its next file), the staging directory
+   is removed and the report is `{"status":"failed","error":{"code"}}` with exit 1
+   (`write_failed`, `parent_not_writable`, `rename_failed`, `interrupted`). A process killed
+   outright (SIGKILL, a crash) can leave the staging directory, `.env` included; it stays
+   owner-only (0700).
+
+A replaced empty target keeps its permission bits, narrowed and never widened: the project
+directory is set to `0755 & !umask & <target mode>` before the rename. Its ACLs, extended
+attributes and ownership are not kept, and the parent must be writable for the staging
+directory and the rename.
 
 The project appears whole or not at all. Windows is not supported in v1, like Contremaitre and
 the CI matrix.
@@ -473,7 +482,7 @@ The same file with these differences, and nothing a public listener refuses:
 
 | Key | Development | Production |
 | --- | --- | --- |
-| `http.listen`, `http.public`, `http.trusted_proxies` | `127.0.0.1:8080`, absent, absent | `0.0.0.0:8080`, `true`, `["10.0.0.0/8"]` (replace with the proxy's addresses) |
+| `http.listen`, `http.public`, `http.trusted_proxies` | `127.0.0.1:8080`, absent, absent | `0.0.0.0:8080`, `true`, `["192.0.2.0/24"]`, a TEST-NET-1 placeholder (set the proxy's exact addresses: every listed peer may set the client address that rate limits and `webhook_allowed_cidrs` check) |
 | `database.tls` | absent (`disable`) | `"require"` |
 | `[http.cors]` | absent (off) | `allowed_origins = ["https://app.example.invalid"]`, `allow_credentials = true`: the front end at `app.` calls the API at `api.`, a different origin of the same site, so the `SameSite=Lax` cookie goes along and only CORS is needed |
 | `modules.identity.app_origin` | `http://localhost:5173` | `https://app.example.invalid` |
@@ -1289,6 +1298,17 @@ in each template. `wit/service.wit` is embedded with SC-S3, which renders it.
 `merezha notifications check` now registers every block, as `merezha run`
 does: before, any project with identity or content failed it with
 `unknown_module`.
+After the security review: fragments that can be left out are listed as
+`{ source, when, unless }` and start with their own table header; the
+index's `[features]` (`push`, `webhooks`) switch SC-Q7 as a whole (the
+section, the topic channel, the `.env.example` line and the VAPID secret);
+the build script skips dotted names other than `.github` and
+`.contremaitre.yaml`, and editor and system leftovers; `next` quotes the
+directory for the shell; a `--merezha-path` whose relative path holds a
+quote, a backslash or a control character is `invalid_merezha_path`; and the
+production `trusted_proxies` is the TEST-NET-1 placeholder `192.0.2.0/24`,
+since every listed peer may set the client address `webhook_allowed_cidrs`
+checks.
 
 **SC-S3 acceptance.** For the starter with all blocks, with `identity,notifications` and with
 `none`, `scripts/check-scaffold.sh` renders the project into `.scaffold-check/<case>` with

@@ -26,10 +26,3 @@ from = "%%app_name%% <no-reply@example.com>"
 [modules.notifications.sms]
 driver = "disabled"                    # no phone numbers on users in v1 (ID10)
 
-[modules.notifications.push]
-vapid_private_key = { env = "MEREZHA_VAPID_PRIVATE_KEY" }
-vapid_subject = "mailto:ops@example.com"
-
-[modules.notifications.webhooks]
-allow_http = true                      # local receivers; refused with http.public
-alert_roles = []                       # no organizations in the starter

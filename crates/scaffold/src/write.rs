@@ -9,14 +9,22 @@
 //! that lists it, at exactly 0600. Then `project` is renamed onto the
 //! target: POSIX `rename` replaces an empty directory and fails on a
 //! non-empty one, so a target filled after the checks fails the command
-//! instead of mixing files. On any failure the staging directory is
-//! removed.
+//! instead of mixing files. A replaced empty directory's permission bits
+//! are kept, never widened: the project directory is narrowed to them before
+//! the rename. Its ACLs, extended attributes and ownership are not kept,
+//! and the parent must be writable (`parent_not_writable` otherwise).
+//!
+//! When the command fails, or is cancelled through the flag the CLI sets on
+//! SIGINT, SIGTERM or SIGHUP (`interrupted`), the staging directory is
+//! removed. A process killed outright (SIGKILL, a power loss) can leave it
+//! behind, `.env` included; it stays owner-only (0700) and can be deleted.
 use crate::{Error, render::Rendered};
 use std::{
     fs::{self, DirBuilder, OpenOptions},
     io::Write,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 /// Mode of the staging directory and of `.env`.
@@ -38,14 +46,25 @@ pub(crate) struct Entry {
 }
 
 /// Writes `entries` in order into a fresh staging directory under `parent`
-/// and renames the result onto `target`.
+/// and renames the result onto `target`, narrowed to `keep_mode` when it
+/// replaces an existing directory. Stops with `interrupted` once `cancel`
+/// is set, before the rename.
 pub(crate) fn write(
     parent: &Path,
     staging: &str,
     target: &Path,
+    keep_mode: Option<u32>,
     entries: &[Entry],
+    cancel: &AtomicBool,
 ) -> Result<(), Error> {
-    stage(parent, staging, entries)?.commit(target)
+    stage(parent, staging, entries, cancel)?.commit(target, keep_mode, cancel)
+}
+
+fn interrupted(cancel: &AtomicBool) -> Result<(), Error> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(Error::failed("interrupted"));
+    }
+    Ok(())
 }
 
 /// A project written into its staging directory, removed on drop unless
@@ -57,8 +76,27 @@ pub(crate) struct Staged {
 }
 
 impl Staged {
-    /// Renames the project onto `target` (`rename_failed`).
-    pub(crate) fn commit(mut self, target: &Path) -> Result<(), Error> {
+    /// Narrows the project directory to `keep_mode`'s permission bits, then
+    /// renames it onto `target` (`rename_failed`).
+    pub(crate) fn commit(
+        mut self,
+        target: &Path,
+        keep_mode: Option<u32>,
+        cancel: &AtomicBool,
+    ) -> Result<(), Error> {
+        if let Some(keep) = keep_mode {
+            let failed = || Error::failed("write_failed");
+            let mode = fs::symlink_metadata(&self.project)
+                .map_err(|_| failed())?
+                .permissions()
+                .mode();
+            fs::set_permissions(
+                &self.project,
+                fs::Permissions::from_mode(mode & keep & 0o777),
+            )
+            .map_err(|_| failed())?;
+        }
+        interrupted(cancel)?;
         fs::rename(&self.project, target).map_err(|_| Error::failed("rename_failed"))?;
         self.committed = true;
         // Empty now; a leftover empty directory is harmless.
@@ -82,23 +120,33 @@ impl Drop for Staged {
 
 /// Creates `parent/staging` (0700, failing if it exists) and writes every
 /// entry into its `project` directory (`write_failed`, nothing left).
-pub(crate) fn stage(parent: &Path, staging: &str, entries: &[Entry]) -> Result<Staged, Error> {
+pub(crate) fn stage(
+    parent: &Path,
+    staging: &str,
+    entries: &[Entry],
+    cancel: &AtomicBool,
+) -> Result<Staged, Error> {
     let staging = parent.join(staging);
     DirBuilder::new()
         .mode(STAGING_MODE)
         .create(&staging)
-        .map_err(|_| Error::failed("write_failed"))?;
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem => {
+                Error::failed("parent_not_writable")
+            }
+            _ => Error::failed("write_failed"),
+        })?;
     let mut staged = Staged {
         project: staging.join("project"),
         staging,
         committed: false,
     };
-    staged.project = fill(&staged.staging, entries)?;
+    staged.project = fill(&staged.staging, entries, cancel)?;
     Ok(staged)
 }
 
 /// Writes every entry into `staging/project`; returns that directory.
-fn fill(staging: &Path, entries: &[Entry]) -> Result<PathBuf, Error> {
+fn fill(staging: &Path, entries: &[Entry], cancel: &AtomicBool) -> Result<PathBuf, Error> {
     let failed = || Error::failed("write_failed");
     // The umask cannot add bits, but it can remove the owner's: set 0700
     // exactly, then check.
@@ -116,6 +164,7 @@ fn fill(staging: &Path, entries: &[Entry]) -> Result<PathBuf, Error> {
         .create(&project)
         .map_err(|_| failed())?;
     for entry in entries {
+        interrupted(cancel)?;
         let path = project.join(&entry.file.path);
         if let Some(directory) = path.parent() {
             DirBuilder::new()
@@ -147,14 +196,32 @@ fn fill(staging: &Path, entries: &[Entry]) -> Result<PathBuf, Error> {
         if entry.secret {
             file.sync_all().map_err(|_| failed())?;
         }
+        test_pause();
     }
     Ok(project)
 }
+
+/// The process-test hook (feature `test-hooks`): `MEREZHA_NEW_TEST_PAUSE_MS`
+/// milliseconds after each staged file.
+#[cfg(feature = "test-hooks")]
+fn test_pause() {
+    if let Some(ms) = std::env::var("MEREZHA_NEW_TEST_PAUSE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms.min(10_000)));
+    }
+}
+#[cfg(not(feature = "test-hooks"))]
+fn test_pause() {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Never set: the run is not cancelled.
+    static GO: AtomicBool = AtomicBool::new(false);
 
     fn entry(path: &str, mode: u32, secret: bool) -> Entry {
         Entry {
@@ -204,7 +271,7 @@ mod tests {
             entry("scripts/dev.sh", 0o755, false),
             entry(".env", SECRETS_MODE, true),
         ];
-        let staged = stage(root.path(), ".acme.merezha-new-0", &entries).unwrap();
+        let staged = stage(root.path(), ".acme.merezha-new-0", &entries, &GO).unwrap();
         let (staging, project) = staged.paths();
         assert_eq!(mode(staging), STAGING_MODE);
         assert_eq!(mode(project), 0o755 & allowed);
@@ -216,7 +283,7 @@ mod tests {
         assert_eq!(mode(&project.join("scripts/dev.sh")), 0o755 & allowed);
         assert_eq!(mode(&project.join(".env")), SECRETS_MODE);
         let target = root.path().join("acme");
-        staged.commit(&target).unwrap();
+        staged.commit(&target, None, &GO).unwrap();
         assert_eq!(listing(root.path()), ["acme"]);
         assert_eq!(fs::read_to_string(target.join(".env")).unwrap(), ".env\n");
         assert_eq!(mode(&target), 0o755 & allowed);
@@ -233,7 +300,15 @@ mod tests {
             entry("a", 0o644, false),
         ];
         let target = root.path().join("acme");
-        let error = write(root.path(), ".acme.merezha-new-1", &target, &entries).unwrap_err();
+        let error = write(
+            root.path(),
+            ".acme.merezha-new-1",
+            &target,
+            None,
+            &entries,
+            &GO,
+        )
+        .unwrap_err();
         assert_eq!(error.code, "write_failed");
         assert!(
             listing(root.path()).is_empty(),
@@ -242,7 +317,15 @@ mod tests {
         );
         // A file where a directory must go fails the same way.
         let entries = [entry("a", 0o644, false), entry("a/b", 0o644, false)];
-        let error = write(root.path(), ".acme.merezha-new-2", &target, &entries).unwrap_err();
+        let error = write(
+            root.path(),
+            ".acme.merezha-new-2",
+            &target,
+            None,
+            &entries,
+            &GO,
+        )
+        .unwrap_err();
         assert_eq!(error.code, "write_failed");
         assert!(listing(root.path()).is_empty());
     }
@@ -257,7 +340,9 @@ mod tests {
             root.path(),
             ".acme.merezha-new-3",
             &target,
+            None,
             &[entry("a", 0o644, false)],
+            &GO,
         )
         .unwrap_err();
         assert_eq!(error.code, "write_failed");
@@ -273,11 +358,15 @@ mod tests {
             root.path(),
             ".acme.merezha-new-4",
             &[entry("a", 0o644, false)],
+            &GO,
         )
         .unwrap();
         fs::create_dir(&target).unwrap();
         fs::write(target.join("theirs"), "x").unwrap();
-        assert_eq!(staged.commit(&target).unwrap_err().code, "rename_failed");
+        assert_eq!(
+            staged.commit(&target, None, &GO).unwrap_err().code,
+            "rename_failed"
+        );
         assert_eq!(listing(root.path()), ["acme"]);
         assert_eq!(listing(&target), ["theirs"]);
         // An empty directory is replaced.
@@ -286,10 +375,95 @@ mod tests {
             root.path(),
             ".acme.merezha-new-5",
             &[entry("a", 0o644, false)],
+            &GO,
         )
         .unwrap();
-        staged.commit(&target).unwrap();
+        staged.commit(&target, None, &GO).unwrap();
         assert_eq!(listing(&target), ["a"]);
         assert_eq!(listing(root.path()), ["acme"]);
+    }
+
+    #[test]
+    fn a_replaced_directory_keeps_its_mode_and_is_never_widened() {
+        let root = tempfile::tempdir().unwrap();
+        let allowed = allowed(root.path());
+        for (existing, expected) in [
+            (0o700, 0o700 & allowed),
+            (0o750, 0o750 & allowed),
+            (0o777, 0o755 & allowed),
+        ] {
+            let target = root.path().join(format!("t{existing:o}"));
+            fs::create_dir(&target).unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(existing)).unwrap();
+            let entries = [entry("a", 0o644, false), entry(".env", SECRETS_MODE, true)];
+            write(
+                root.path(),
+                &format!(".t.merezha-new-{existing:o}"),
+                &target,
+                Some(existing),
+                &entries,
+                &GO,
+            )
+            .unwrap();
+            assert_eq!(mode(&target), expected, "{existing:o}");
+            assert_eq!(mode(&target.join(".env")), SECRETS_MODE);
+        }
+    }
+
+    #[test]
+    fn a_cancelled_run_stops_before_the_rename_and_leaves_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("acme");
+        let cancel = AtomicBool::new(false);
+        let staged = stage(
+            root.path(),
+            ".acme.merezha-new-6",
+            &[entry("a", 0o644, false)],
+            &cancel,
+        )
+        .unwrap();
+        cancel.store(true, Ordering::SeqCst);
+        assert_eq!(
+            staged.commit(&target, None, &cancel).unwrap_err().code,
+            "interrupted"
+        );
+        assert!(listing(root.path()).is_empty());
+        // Set before the first file: nothing is written either.
+        let error = write(
+            root.path(),
+            ".acme.merezha-new-7",
+            &target,
+            None,
+            &[entry("a", 0o644, false)],
+            &cancel,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "interrupted");
+        assert!(listing(root.path()).is_empty());
+    }
+
+    #[test]
+    fn a_parent_that_is_not_writable_is_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("locked");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555)).unwrap();
+        // Root (some CI containers) writes anyway; nothing to check then.
+        if fs::write(parent.join("probe"), "").is_ok() {
+            eprintln!("skipping: this user writes into read-only directories");
+            return;
+        }
+        let error = write(
+            &parent,
+            ".acme.merezha-new-8",
+            &parent.join("acme"),
+            None,
+            &[entry("a", 0o644, false)],
+            &GO,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "parent_not_writable");
+        assert!(listing(&parent).is_empty());
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

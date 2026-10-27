@@ -31,6 +31,7 @@ use std::{
     fmt,
     io::Read,
     path::{Component, Path, PathBuf},
+    sync::atomic::AtomicBool,
 };
 
 /// The template used without `--template`.
@@ -45,6 +46,9 @@ pub const RESERVED_NAMES: [&str; 1] = ["merezha"];
 /// reason than randomness (`random_unavailable`), such as encoding a VAPID
 /// key. A report code of the command, never an HTTP error.
 pub const SECRET_GENERATION_FAILED: &str = "secret_generation_failed";
+/// The failed code of a write that could not complete: the CLI uses it when
+/// it cannot run the writer at all. A report code, never an HTTP error.
+pub const WRITE_FAILED: &str = "write_failed";
 /// Bound on the arguments after `new`.
 const MAX_ARGUMENTS: usize = 64;
 /// Largest value a [`SecretSource`] may return.
@@ -211,7 +215,9 @@ pub fn help(catalog: &Catalog) -> String {
     }
     out.push_str(
         "\nblocks: identity needs notifications, content needs identity; telemetry stands alone.\n\
-         The target must not exist or must be an empty directory. Without --merezha-rev or\n\
+         The target must not exist or must be an empty directory, in a writable parent. An\n\
+         empty directory is replaced: its permission bits are kept (never widened), its ACLs,\n\
+         extended attributes and owner are not. Without --merezha-rev (a 40-hex commit) or\n\
          --merezha-path the project pins the revision this binary was built from.\n",
     );
     out
@@ -340,6 +346,7 @@ pub fn prepare(
         (Some(rev), _) => Pin::Rev(rev),
         (None, Some(checkout)) => Pin::Path(
             relative(&target.dir, &checkout)
+                .filter(|path| plain_path(path))
                 .ok_or_else(|| Error::invalid("invalid_merezha_path"))?,
         ),
         (None, None) => return Err(Error::invalid("source_rev_unknown")),
@@ -372,12 +379,7 @@ pub fn prepare(
              # .gitignore: never commit this file. .env.example lists every variable.\n",
         );
         for entry in &template.index.secrets {
-            let wanted = entry.when.iter().try_fold(true, |keep, block| {
-                Block::parse(block)
-                    .map(|block| keep && selection.contains(block))
-                    .ok_or_else(|| catalog::index_error(template_name, block))
-            })?;
-            if !wanted {
+            if !template.applies(&selection, &entry.when, &[])? {
                 continue;
             }
             let value = secrets.generate(entry.kind)?;
@@ -423,17 +425,27 @@ impl Plan {
         self.entries.iter().map(|entry| entry.file.path.as_str())
     }
 
-    /// Writes the project (§2.4): `write_failed` or `rename_failed` leave
-    /// nothing behind.
+    /// Writes the project (§2.4): `write_failed`, `parent_not_writable` or
+    /// `rename_failed` leave nothing behind.
     pub fn write(self) -> Result<Created, Error> {
+        self.write_cancellable(&AtomicBool::new(false))
+    }
+
+    /// [`Plan::write`], stopping with `interrupted` and removing the staging
+    /// directory once `cancel` is set (the CLI sets it on SIGINT, SIGTERM
+    /// and SIGHUP). Once the project is renamed into place it is complete
+    /// and the call succeeds.
+    pub fn write_cancellable(self, cancel: &AtomicBool) -> Result<Created, Error> {
         write::write(
             &self.target.parent,
             &self.staging,
             &self.target.dir,
+            self.target.mode,
             &self.entries,
+            cancel,
         )?;
         let dir = self.target.dir;
-        let mut next = vec![format!("cd {}", dir.display())];
+        let mut next = vec![format!("cd {}", shell_quote(&dir.to_string_lossy()))];
         next.extend(self.next);
         Ok(Created {
             blocks: self.selection.names(),
@@ -444,6 +456,24 @@ impl Plan {
             next,
             dir,
         })
+    }
+}
+
+/// `text` as one POSIX shell word: as is when it holds only characters no
+/// shell interprets, else single-quoted.
+pub fn shell_quote(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'/' | b'.' | b'_' | b'-' | b'+' | b',' | b'@' | b'%' | b':' | b'='
+                )
+        });
+    if plain {
+        text.to_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
     }
 }
 
@@ -481,6 +511,15 @@ fn merezha_checkout(path: &Path) -> Result<PathBuf, Error> {
         return Err(invalid());
     }
     Ok(checkout)
+}
+
+/// Whether a relative pin path can be written into `Cargo.toml` and
+/// `.merezha-version` and read back by line-oriented scripts: no quote,
+/// backslash or control character.
+fn plain_path(path: &str) -> bool {
+    !path
+        .chars()
+        .any(|c| matches!(c, '"' | '\'' | '\\') || c.is_control())
 }
 
 /// `to` relative to `from`, both absolute and free of `.` and `..`, as a
@@ -547,6 +586,19 @@ mod tests {
             &"a".repeat(41),
         ] {
             assert!(!valid_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn quoted_for_the_shell() {
+        assert_eq!(shell_quote("/home/ada/acme"), "/home/ada/acme");
+        assert_eq!(shell_quote("/tmp/my app"), "'/tmp/my app'");
+        assert_eq!(shell_quote("/tmp/it's"), "'/tmp/it'\\''s'");
+        assert_eq!(shell_quote("/tmp/$(id)"), "'/tmp/$(id)'");
+        assert_eq!(shell_quote(""), "''");
+        assert!(plain_path("../../merezha") && plain_path("../my merezha"));
+        for bad in ["../we\"ird", "../a\nb", "../a\\b", "../it's"] {
+            assert!(!plain_path(bad), "{bad:?}");
         }
     }
 

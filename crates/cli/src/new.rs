@@ -9,9 +9,10 @@
 //! and exit 0, `{"status":"invalid","error":{"code"}}` and exit 2 before
 //! anything is written (§2.3), or `{"status":"failed","error":{"code"}}` and
 //! exit 1 when writing failed and nothing was left behind (`write_failed`,
-//! `rename_failed`, `random_unavailable`, `secret_generation_failed`). `secrets` names the variables
-//! written to `.env`, never a value. `--help` prints the templates and
-//! blocks as text. See [`merezha_scaffold`].
+//! `parent_not_writable`, `rename_failed`, `interrupted` after SIGINT,
+//! SIGTERM or SIGHUP, `random_unavailable`, `secret_generation_failed`).
+//! `secrets` names the variables written to `.env`, never a value. `--help`
+//! prints the templates and blocks as text. See [`merezha_scaffold`].
 use base64::{Engine, engine::general_purpose::STANDARD};
 use merezha_platform::{OsRandom, Random, context::random_token};
 use merezha_scaffold::{Catalog, Command, Context, Created, Error, Pin, SecretKind, SecretSource};
@@ -100,10 +101,60 @@ pub fn run(
         built_from: crate::guest::source_rev(),
         merezha_version: env!("CARGO_PKG_VERSION"),
     };
-    match merezha_scaffold::prepare(&request, &context, secrets).and_then(|plan| plan.write()) {
+    match merezha_scaffold::prepare(&request, &context, secrets).and_then(write_until_signalled) {
         Ok(created) => (created_report(&created), ExitCode::SUCCESS),
         Err(error) => fail(error),
     }
+}
+
+/// Writes `plan`, removing the staging directory if SIGINT, SIGTERM or
+/// SIGHUP arrives first: the handlers are installed before the staging
+/// directory exists, the signal sets the cancel flag, and the writer stops
+/// at its next file with `interrupted` (exit 1) and cleans up. A project
+/// already renamed into place is complete and reported as created. SIGKILL
+/// cannot be caught: it can leave the owner-only staging directory, `.env`
+/// included.
+fn write_until_signalled(plan: merezha_scaffold::Plan) -> Result<Created, Error> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::signal::unix::{SignalKind, signal};
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return Err(Error::failed(merezha_scaffold::WRITE_FAILED));
+    };
+    runtime.block_on(async move {
+        let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            return Err(Error::failed(merezha_scaffold::WRITE_FAILED));
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let mut writer =
+            merezha_telemetry::spawn_blocking_in_span(move || plan.write_cancellable(&flag));
+        let result = tokio::select! {
+            result = &mut writer => result,
+            _ = interrupt.recv() => {
+                cancel.store(true, Ordering::SeqCst);
+                writer.await
+            }
+            _ = terminate.recv() => {
+                cancel.store(true, Ordering::SeqCst);
+                writer.await
+            }
+            _ = hangup.recv() => {
+                cancel.store(true, Ordering::SeqCst);
+                writer.await
+            }
+        };
+        result.unwrap_or_else(|_| Err(Error::failed(merezha_scaffold::WRITE_FAILED)))
+    })
 }
 
 /// Entry point for `merezha new`.

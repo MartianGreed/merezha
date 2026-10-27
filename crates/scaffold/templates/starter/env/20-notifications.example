@@ -1,7 +1,5 @@
 # Base64 of 32 to 1024 bytes: openssl rand -base64 32
 MEREZHA_NOTIFY_SECRET_KEY=
-# merezha notifications vapid generate, the "private_key" field
-MEREZHA_VAPID_PRIVATE_KEY=
 # merezha.production.toml only
 BREVO_API_KEY=
 # At least 32 characters: openssl rand -base64 48

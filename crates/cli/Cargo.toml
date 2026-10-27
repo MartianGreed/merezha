@@ -40,6 +40,8 @@ merezha-jobs = { path = "../jobs", features = ["test-hooks"] }
 merezha-notifications = { path = "../notifications", features = ["testkit"] }
 merezha-telemetry = { path = "../telemetry", features = ["testing"] }
 tempfile.workspace = true
+# tests/new.rs signals `merezha new` mid-write through MEREZHA_NEW_TEST_PAUSE_MS.
+merezha-scaffold = { path = "../scaffold", features = ["test-hooks"] }
 # tests/new.rs reads the generated TOML.
 toml.workspace = true
 wat.workspace = true

@@ -147,6 +147,12 @@ fn development_switches_stay_out_of_the_production_file() {
     let production: toml::Table = files["merezha.production.toml"].parse().unwrap();
     assert_eq!(production["http"]["public"].as_bool(), Some(true));
     assert_eq!(production["database"]["tls"].as_str(), Some("require"));
+    // A documentation range: a real private network would let any of its
+    // peers set the client address `webhook_allowed_cidrs` checks.
+    assert_eq!(
+        production["http"]["trusted_proxies"],
+        toml::Value::Array(vec!["192.0.2.0/24".into()])
+    );
     let notifications = &production["modules"]["notifications"];
     assert!(notifications.get("egress").is_none());
     assert_eq!(notifications["email"]["driver"].as_str(), Some("brevo"));
@@ -208,6 +214,16 @@ fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
         let entry = entry.unwrap();
         let name = entry.file_name().into_string().unwrap();
         let path = entry.path();
+        // What the build script skips (local editor and system leftovers).
+        let leftover = name.ends_with('~')
+            || name.ends_with(".swp")
+            || name.ends_with(".swo")
+            || (name.starts_with('#') && name.ends_with('#'))
+            || name == "Thumbs.db"
+            || (name.starts_with('.') && name != ".github" && name != ".contremaitre.yaml");
+        if leftover {
+            continue;
+        }
         if path.is_dir() {
             walk(&path, &format!("{prefix}{name}/"), out);
         } else {
@@ -528,11 +544,37 @@ fn the_build_script_refuses_unsafe_or_mistyped_templates() {
         .unwrap();
         fs::write(t.join("a.txt"), "50%% plain files are not checked\n").unwrap();
         fs::write(t.join("Cargo.toml.tmpl"), "[package]\n").unwrap();
+        // Leftovers that must never ship, and the dotted names that do.
+        for junk in [
+            ".DS_Store",
+            "a.txt.swp",
+            "a.txt.swo",
+            "a.txt~",
+            "#a.txt#",
+            ".#a.txt",
+            "Thumbs.db",
+        ] {
+            fs::write(t.join(junk), "junk %%nope%%\n").unwrap();
+        }
+        fs::create_dir(t.join(".idea")).unwrap();
+        fs::write(t.join(".idea/workspace.xml"), "<x/>\n").unwrap();
+        fs::write(t.join("nested/.secret.tmpl"), "%%nope%%\n").unwrap();
+        fs::create_dir_all(t.join(".github/workflows")).unwrap();
+        fs::write(t.join(".github/workflows/ci.yml"), "on: push\n").unwrap();
+        fs::write(t.join(".contremaitre.yaml"), "version: 1\n").unwrap();
     });
     assert!(ok, "{out}");
+    let listed: Vec<&str> = out.lines().filter(|l| l.starts_with("starter/")).collect();
     assert_eq!(
-        out, "starter/Cargo.toml.tmpl 10\nstarter/a.txt 33\nstarter/nested/b.toml.tmpl 36\n",
-        "sorted, every file"
+        listed,
+        [
+            "starter/.contremaitre.yaml 11",
+            "starter/.github/workflows/ci.yml 9",
+            "starter/Cargo.toml.tmpl 10",
+            "starter/a.txt 33",
+            "starter/nested/b.toml.tmpl 36",
+        ],
+        "sorted, every file but the leftovers"
     );
 
     let cases: [(&str, &str, Setup); 6] = [
@@ -660,4 +702,95 @@ fn prepare_writes_env_last_with_only_the_selected_secrets() {
         merezha_scaffold::prepare(&request(&["shell"]), &context, &mut unsafe_source).unwrap_err();
     assert_eq!(error.code, "secret_invalid");
     assert!(!root.path().join("shell").exists());
+}
+
+/// The embedded starter with `template.toml` edited by `edit`.
+fn edited_starter(edit: impl Fn(&str) -> String) -> Catalog {
+    let files = catalog::embedded_files().iter().map(|(path, bytes)| {
+        if *path == "starter/template.toml" {
+            let text = edit(std::str::from_utf8(bytes).unwrap());
+            let leaked: &'static [u8] = Box::leak(text.into_bytes().into_boxed_slice());
+            (*path, leaked)
+        } else {
+            (*path, *bytes)
+        }
+    });
+    Catalog::from_files(files).unwrap()
+}
+
+#[test]
+fn the_sc_q7_switches_turn_push_and_webhooks_off_as_a_whole() {
+    for (push, webhooks) in [(false, true), (true, false), (false, false)] {
+        let catalog = edited_starter(|text| {
+            text.replace("push = true", &format!("push = {push}"))
+                .replace("webhooks = true", &format!("webhooks = {webhooks}"))
+        });
+        let template = catalog.get("starter").unwrap();
+        for selection in Selection::allowed() {
+            let label = format!("push={push} webhooks={webhooks} {:?}", selection.names());
+            let files: BTreeMap<String, String> = render::render(template, &selection, &values())
+                .unwrap()
+                .into_iter()
+                .map(|f| (f.path, String::from_utf8(f.contents).unwrap()))
+                .collect();
+            for config in ["merezha.toml", "merezha.production.toml"] {
+                let table: toml::Table = files[config].parse().unwrap();
+                let Some(notifications) = table.get("modules").and_then(|m| m.get("notifications"))
+                else {
+                    continue;
+                };
+                assert_eq!(notifications.get("push").is_some(), push, "{label}");
+                assert_eq!(notifications.get("webhooks").is_some(), webhooks, "{label}");
+                let channels = notifications["topics"]["notes.shared"]["channels"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(
+                    channels.iter().any(|c| c.as_str() == Some("push")),
+                    push,
+                    "{label}"
+                );
+                // No key landed in another table.
+                assert!(
+                    notifications["sms"].as_table().unwrap().len() == 1,
+                    "{label}"
+                );
+                if !webhooks {
+                    assert!(!files[config].contains("event_types"), "{label}");
+                }
+            }
+            if selection.contains(Block::Notifications) {
+                assert_eq!(
+                    files[".env.example"].contains("MEREZHA_VAPID_PRIVATE_KEY="),
+                    push,
+                    "{label}"
+                );
+            }
+        }
+        // The VAPID secret is generated only with push.
+        let root = tempfile::tempdir().unwrap();
+        let context = Context {
+            catalog: &catalog,
+            cwd: root.path(),
+            built_from: Some(REV),
+            merezha_version: "0.1.0",
+        };
+        let Command::New(request) = Command::parse(["acme".into()]).unwrap() else {
+            panic!("help");
+        };
+        let mut source = Counting {
+            value: "c2VjcmV0",
+            calls: Vec::new(),
+        };
+        merezha_scaffold::prepare(&request, &context, &mut source).unwrap();
+        assert_eq!(source.calls.contains(&SecretKind::VapidPrivateKey), push);
+    }
+    // A switch the index does not declare is a template defect.
+    let catalog = edited_starter(|text| text.replace("push = true\n", ""));
+    let error = render::render(
+        catalog.get("starter").unwrap(),
+        &Selection::all(),
+        &values(),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "template_invalid");
 }
