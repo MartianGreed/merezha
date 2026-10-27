@@ -785,6 +785,28 @@ async fn a_referenced_asset_deletes_only_with_force() {
     assert_eq!(reply.status, StatusCode::NO_CONTENT);
 }
 
+/// One cleanup pass, run again once after `database_unavailable`: the
+/// session a test killed stays in the host pool, which recycles without a
+/// check query, so one later statement may land on it and fail. With
+/// `expire`, every blob lease ends before the second pass, since the first
+/// may have failed after claiming its blob.
+async fn cleanup_past_a_dead_session(fx: &Fixture, assets: &Assets, expire: bool) -> CleanupReport {
+    match assets.cleanup(1000).await {
+        Ok(report) => report,
+        Err(rejection) if rejection.failure.code == "database_unavailable" => {
+            if expire {
+                execute(
+                    &fx.db,
+                    "UPDATE merezha_content.blobs SET pending_until = now() - interval '1 second'",
+                )
+                .await;
+            }
+            assets.cleanup(1000).await.unwrap()
+        }
+        Err(rejection) => panic!("{:?}", rejection.failure),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_after_the_put_is_cleaned_after_the_lease() {
     let Some(test) = TestDatabase::create() else {
@@ -829,14 +851,24 @@ async fn a_crash_after_the_put_is_cleaned_after_the_lease() {
     assert!(dirs.spooled().is_empty());
     // Not before the lease expires.
     let cleanup = assets(&fx);
-    assert_eq!(cleanup.cleanup(1000).await.unwrap().deleted, 0);
+    assert_eq!(
+        cleanup_past_a_dead_session(&fx, &cleanup, false)
+            .await
+            .deleted,
+        0
+    );
     assert_eq!(blob_rows(&fx).await.len(), 1);
     execute(
         &fx.db,
         "UPDATE merezha_content.blobs SET pending_until = now() - interval '1 second'",
     )
     .await;
-    assert_eq!(cleanup.cleanup(1000).await.unwrap().deleted, 1);
+    assert_eq!(
+        cleanup_past_a_dead_session(&fx, &cleanup, true)
+            .await
+            .deleted,
+        1
+    );
     assert!(blob_rows(&fx).await.is_empty());
     assert_eq!(dirs.objects(), 0);
     assert_eq!(
