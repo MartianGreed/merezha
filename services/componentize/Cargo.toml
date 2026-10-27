@@ -7,9 +7,6 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-anyhow = "1.0.58"
-wit-component = "0.262.0"
-wit-parser = "0.262.0"
-
-[dev-dependencies]
-wit-component = { version = "0.262.0", features = ["dummy-module"] }
+# The componentizer and its contract checks live in the host workspace
+# (scaffold SC-S1), shared with `merezha componentize` and `merezha build`.
+merezha-guest-build = { path = "../../crates/guest-build" }

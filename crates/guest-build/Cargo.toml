@@ -1,0 +1,19 @@
+[package]
+name = "merezha-guest-build"
+description = "Builds Merezha guest crates into import-free service components and checks them against the canonical WIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wit-component.workspace = true
+wit-parser.workspace = true
+
+[dev-dependencies]
+# `dummy_module` builds core modules from WIT worlds for the guard tests.
+wit-component = { workspace = true, features = ["dummy-module"] }
+tempfile.workspace = true

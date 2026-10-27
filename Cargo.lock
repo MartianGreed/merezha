@@ -2467,6 +2467,7 @@ dependencies = [
  "merezha-application",
  "merezha-content",
  "merezha-domain",
+ "merezha-guest-build",
  "merezha-identity",
  "merezha-jobs",
  "merezha-notifications",
@@ -2523,6 +2524,18 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "merezha-guest-build"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "wit-component",
+ "wit-parser",
 ]
 
 [[package]]
@@ -5969,6 +5982,7 @@ dependencies = [
  "wasm-encoder 0.258.3",
  "wasm-metadata",
  "wasmparser 0.258.3",
+ "wat",
  "wit-parser",
 ]
 

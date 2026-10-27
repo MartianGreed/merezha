@@ -13,6 +13,7 @@ on:
       - 'crates/application/**'
       - 'crates/cli/**'
       - 'crates/runtime/**'
+      - 'crates/guest-build/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/services.yml'
@@ -24,6 +25,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # The revision `merezha version` reports (scaffold §2.9). On
+      # pull_request events github.sha is the test merge commit, which exists
+      # only in this run: never reuse a binary built here as a release.
+      MEREZHA_SOURCE_REV: ${{ github.sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install Rust 1.98.0 with the core Wasm target
@@ -31,6 +37,12 @@ jobs:
           rustup toolchain install 1.98.0 --profile minimal --component clippy --component rustfmt --target wasm32-unknown-unknown
           rustup default 1.98.0
       - run: scripts/check-services.sh
+      # `merezha build` on the generated fixture workspace and the source
+      # revision cases; the host workflow has no wasm target and skips them.
+      - name: Guest build process tests
+        run: cargo test --locked -p merezha-cli --test build --test source_rev
+        env:
+          MEREZHA_TEST_REQUIRE_WASM_TARGET: '1'
       - name: Build the host once for both demos
         run: cargo build --locked --release -p merezha-cli
       - run: scripts/demo.sh

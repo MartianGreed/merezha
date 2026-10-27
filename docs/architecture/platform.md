@@ -239,6 +239,74 @@ assignment on one fails `422 resource_kind_tenant_only`. With the identity block
 `identity.user_grant_tenant_route` (warn, `permission`, `route`): `user`
 grants hold in every organization, so tenant permissions belong in `member`.
 
+## Building guests
+
+Three commands build and identify what `merezha run` loads ([scaffold
+§4](../design/scaffold.md#4-build-and-run), SC-S1). They read no
+configuration, start nothing, emit no telemetry and print one JSON report on
+stdout; the code is in `crates/cli/src/guest.rs` over the library
+`merezha-guest-build` (`crates/guest-build`).
+
+```sh
+merezha build [--manifest runtime.toml] [--workspace Cargo.toml]
+merezha componentize CORE.wasm COMPONENT.wasm
+merezha version
+```
+
+`merezha build` builds every service of the runtime manifest. Each service
+path must be `components/<id>.wasm` (relative to the manifest), and the id
+names the workspace package that builds it. In order:
+
+1. The manifest is parsed by the runtime's parser without loading
+   components (`invalid_manifest`, `unsupported_component_path`).
+2. `rustc --print target-libdir --target wasm32-unknown-unknown`, run from
+   the workspace's directory so `rust-toolchain.toml` applies, must name an
+   existing directory (`missing_wasm_target`, before Cargo runs).
+3. `cargo metadata --format-version 1 --no-deps` must list a package named
+   after each service (`unknown_package`) with a `cdylib` library target
+   (`no_cdylib`; a `cdylib` example does not count). The target's name gives the artifact,
+   `<name with - as _>.wasm`, so `[lib] name = "task_domain"` works.
+4. `cargo build --release --target wasm32-unknown-unknown -p <id>...` runs
+   with `--locked` when the workspace has a `Cargo.lock`; without one Cargo
+   writes it and the report says `"lockfile":"created"`. Cargo's output goes
+   to stderr. Artifacts are read from the metadata's `target_directory`, so
+   `CARGO_TARGET_DIR` and Cargo configuration apply. `$CARGO` and `$RUSTC`
+   choose the programs when set.
+5. Every artifact is componentized into `<id>.wasm.partial`; only when all
+   are accepted are they renamed into place, so a refused service leaves no
+   new file in `components/`. Partials are created exclusively after any
+   leftover one is unlinked, so a planted `.partial` link is never written
+   through. A component must import nothing, export exactly
+   `merezha:service/handler@0.1.0` with the types of `wit/service.wit` and
+   no further function or resource in that interface, and fit 16 MiB, input
+   and output (`component_rejected`).
+
+Success prints `{"status":"built","components":[{"id","bytes"}],"lockfile":"locked"|"created"}`
+and exits 0. A failure prints
+`{"status":"failed","error":{"code","service"?,"reason"}}` and exits 2 for the
+codes of steps 1 to 3, or 1 for `cargo_failed`, `component_source_missing`,
+`component_rejected` and `component_write_failed`. `reason` names paths,
+packages and WIT items. Feature builds (such as the services workspace's
+`task-view-faulty`) are out of scope: build them with Cargo, then run
+`merezha componentize`.
+
+`merezha componentize` is step 5 for one file: `{"status":"componentized","bytes":N}`
+and exit 0, or the failed report and exit 1. The services workspace's
+`merezha-componentize` binary (`scripts/build-services.sh`) runs the same
+library code.
+
+`merezha version` prints `{"version":"0.1.0","rev":"<commit>"}` and exits 0.
+`rev` is the merezha revision the binary was built from, recorded by
+`crates/cli/build.rs`: `MEREZHA_SOURCE_REV` at build time (CI sets it to the
+commit; it must be a full lowercase commit id or the build fails), else the
+checkout's `HEAD` when the repository is merezha's (the crate at
+`crates/cli/` with `build.rs` tracked, so a copy inside another repository
+records nothing) and `git status --porcelain --untracked-files=no` is empty,
+else `null`. A fresh build of a clean checkout, which `cargo install --git
+... --rev` always is, records its commit. In a development checkout the value
+is advisory: the build script reruns on a commit, a branch switch or a staged
+edit, not on an unstaged edit, so it keeps the last clean revision it saw.
+
 ## Configuration reference
 
 Layers, lowest to highest precedence: code defaults, the file,
@@ -3752,8 +3820,8 @@ still deleting the scope's rows.
 
 ## Dependencies
 
-Checked with `cargo info` on 2026-10-23 (K), 2026-10-24 (K2) and 2026-10-26
-(`syn`, `proc-macro2`). All support Rust 1.98.0.
+Checked with `cargo info` on 2026-10-23 (K), 2026-10-24 (K2), 2026-10-26
+(`syn`, `proc-macro2`) and 2026-10-27 (`wit-component`, `wit-parser`). All support Rust 1.98.0.
 
 | Crate | Version | MSRV | License | Features | Used by |
 | --- | --- | --- | --- | --- | --- |
@@ -3777,6 +3845,8 @@ Checked with `cargo info` on 2026-10-23 (K), 2026-10-24 (K2) and 2026-10-26
 | `imagesize` | 0.15.0 | unset (compiled and tested on 1.98.0) | MIT | `png`, `jpeg`, `gif`, `webp`, `heif` only | content: raster dimensions |
 | `syn` | 3.0.9 | 1.71 | MIT OR Apache-2.0 | `full`, `parsing`, `visit` only; dev only | postgres: the statement scan parses the workspace and the locked driver sources; cli: the registry test reads each crate's statement constants |
 | `proc-macro2` | 1.0.107 | 1.71 | MIT OR Apache-2.0 | `span-locations` only; dev only | postgres: line numbers of the statement scan's findings |
+| `wit-component` | =0.258.3 | 1.85.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | default (none); `dummy-module` dev only | guest-build: encoding and the import and export checks (the version Wasmtime 49 already locks) |
+| `wit-parser` | =0.258.3 | 1.85.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | default | guest-build: the canonical WIT |
 | `croner` | =4.0.2 | unset (edition 2021) | MIT | `jiff` only, no default `chrono` (R14); pulls `derive_builder` 0.20.2 (MIT OR Apache-2.0) and `strum` 0.27.2 (MIT, MSRV 1.66.1) with their proc-macro crates | platform: `cron`, used by config validation and the scheduler |
 
 The aws-lc-rs provider is shared by the database TLS connector and reqwest,
