@@ -357,6 +357,8 @@ spans.
 | `merezha.webhook.deliveries` | C `{delivery}` | `notify.outcome` (`succeeded`, `failed`, `cancelled`) |
 | `merezha.webhook.attempts` | C `{attempt}` | `notify.class` (`2xx`, `3xx`, `4xx`, `410`, `5xx`, `timeout`, `network`, `blocked`) |
 | `merezha.webhook.endpoints_disabled` | C `{endpoint}` | `notify.reason` (`manual`, `gone`, `failing`) |
+| `merezha.webhook.secrets.previous_key` | G `{endpoint}` | none: endpoints whose signing secret is still sealed under another key than `secret_key`, as the last `retention` run counted them (NT-N7); `secret_key_previous` may go once it is 0 |
+| `merezha.webhook.secrets.unreadable` | G `{endpoint}` | none: endpoints whose signing secret neither `secret_key` nor `secret_key_previous` opens, as the last `retention` run found them (NT-N7) |
 
 **Content** (content's §9 rows, in this catalog's spelling)
 
@@ -813,6 +815,7 @@ Block events (AP's former `jobs.*` events are `job.*`):
 | `notification.provider_rate_limited` / `notification.provider_account_error` | warn / error | `provider`, `channel`, `code` |
 | `notification.provider_event_applied` / `notification.provider_event_uncorrelated` / `notification.provider_event_rejected` | debug / info / warn | `provider`, `channel`, `event`, `code` |
 | `notification.webhook_endpoint_disabled` / `notification.egress_blocked` / `notification.push_subscription_removed` | warn / warn / info | `endpoint_id`, `target`, `reason` |
+| `notification.maintenance_step_failed` | warn | `task` (the maintenance task), `reason` (its failed step), `code`: one step of a task failed and the next ones still ran (NT-N7) |
 | `notification.sse_listen_lost` / `notification.sse_listen_restored` / `notification.template_reload_failed` | warn / info / warn | `code` |
 | `content.model_loaded` / `content.model_activated` / `content.model_tightened` / `content.model_breaking` | info / info / warn / error | `version`, `fingerprint`, `types`, `locales` / `previous_version`, `change_classes` / `content_type`, `counts`, `truncated` / `path`, `change`, `code` |
 | `content.migration_batch` / `content.index_created` / `content.index_dropped` | info | `type`, `rows` / `index`, `content_type`, `field`, `table`, `purpose` / `index`, `reason` |

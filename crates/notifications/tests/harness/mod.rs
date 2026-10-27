@@ -359,6 +359,8 @@ pub struct Options {
     pub files: Vec<(String, String)>,
     /// The resolver of push hosts under the egress guard.
     pub push_lookup: Option<Arc<dyn merezha_notifications::egress::Lookup>>,
+    /// Webhook busy hand-off delays (first, longest) in place of 1 s / 30 s.
+    pub webhook_busy_delays: Option<(Duration, Duration)>,
 }
 impl Options {
     pub fn new(section: &str, directory: Arc<dyn Directory>) -> Self {
@@ -376,6 +378,7 @@ impl Options {
             clock: None,
             files: Vec::new(),
             push_lookup: None,
+            webhook_busy_delays: None,
         }
     }
 }
@@ -420,6 +423,9 @@ impl Instance {
         }
         if let Some(lookup) = options.push_lookup.clone() {
             module = module.with_push_lookup(lookup);
+        }
+        if let Some((first, longest)) = options.webhook_busy_delays {
+            module = module.with_webhook_busy_delays(first, longest);
         }
         module
             .configure(&config.modules["notifications"])
@@ -546,7 +552,7 @@ impl Instance {
                        AND quarantined_at IS NULL AND (run_at IS NULL OR run_at <= now())) \
                      + (SELECT count(*) FROM merezha_jobs.jobs WHERE kind IN \
                        ('notify.expand', 'notify.deliver.email', 'notify.deliver.sms', \
-                        'notify.deliver.push') \
+                        'notify.deliver.push', 'notify.webhook_event', 'notify.webhook.deliver') \
                        AND state IN ('available', 'running') AND run_at <= now())",
                     &[],
                 )

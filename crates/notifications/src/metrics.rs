@@ -1,8 +1,9 @@
 //! The notification rows of TE §1.3 this slice records (NT §9, TE-T6):
 //! requests, deliveries, attempts, attempt duration, latency, render
 //! failures, purged data, (NT-N3) provider events and provider account
-//! errors, (NT-N4) SMS segments, and (NT-N6) removed push subscriptions
-//! and egress refusals. Attribute values come from closed sets
+//! errors, (NT-N4) SMS segments, (NT-N6) removed push subscriptions
+//! and egress refusals, and (NT-N7) webhook deliveries, attempts and
+//! disabled endpoints. Attribute values come from closed sets
 //! (sources and topics are declared, channels, statuses, reasons, providers
 //! and outcomes are enums); ids, addresses and templates never become
 //! attributes.
@@ -10,9 +11,19 @@ use merezha_platform::ports::Channel;
 use merezha_telemetry::{instruments, names::metric};
 use opentelemetry::{
     KeyValue,
-    metrics::{Counter, Histogram, Meter},
+    metrics::{Counter, Histogram, Meter, ObservableGauge},
 };
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+/// A secret gauge before its first count.
+const UNCOUNTED: u64 = u64::MAX;
 
 /// The `notify.topic` value of a topic the configuration does not declare.
 pub const UNKNOWN_TOPIC: &str = "unknown";
@@ -30,6 +41,14 @@ struct Instruments {
     push_subscriptions_removed: Counter<u64>,
     egress_blocked: Counter<u64>,
     sms_segments: Counter<u64>,
+    webhook_deliveries: Counter<u64>,
+    webhook_attempts: Counter<u64>,
+    webhook_endpoints_disabled: Counter<u64>,
+    /// What the last `retention` run counted; the gauge reads it.
+    previous_key_secrets: Arc<AtomicU64>,
+    _previous_key_gauge: ObservableGauge<u64>,
+    unreadable_secrets: Arc<AtomicU64>,
+    _unreadable_gauge: ObservableGauge<u64>,
     /// Declared topics; any other is labelled [`UNKNOWN_TOPIC`].
     topics: BTreeSet<String>,
 }
@@ -61,6 +80,32 @@ impl Metrics {
     /// The instruments on `meter`; only `topics` become `notify.topic`
     /// values, so a caller's undeclared topic cannot grow the label set.
     pub fn new(meter: &Meter, topics: impl IntoIterator<Item = String>) -> Self {
+        // `UNCOUNTED` until the first count: the gauges report nothing
+        // rather than a 0 nobody measured.
+        let previous_key_secrets = Arc::new(AtomicU64::new(UNCOUNTED));
+        let read = previous_key_secrets.clone();
+        let previous_key_gauge = instruments::u64_gauge(
+            meter,
+            &metric::WEBHOOK_SECRETS_PREVIOUS_KEY,
+            move |observer| {
+                let value = read.load(Ordering::Relaxed);
+                if value != UNCOUNTED {
+                    observer.observe(value, &[]);
+                }
+            },
+        );
+        let unreadable_secrets = Arc::new(AtomicU64::new(UNCOUNTED));
+        let read = unreadable_secrets.clone();
+        let unreadable_gauge = instruments::u64_gauge(
+            meter,
+            &metric::WEBHOOK_SECRETS_UNREADABLE,
+            move |observer| {
+                let value = read.load(Ordering::Relaxed);
+                if value != UNCOUNTED {
+                    observer.observe(value, &[]);
+                }
+            },
+        );
         Self(Some(Arc::new(Instruments {
             requests: instruments::counter(meter, &metric::NOTIFICATION_REQUESTS),
             deliveries: instruments::counter(meter, &metric::NOTIFICATION_DELIVERIES),
@@ -80,6 +125,16 @@ impl Metrics {
             ),
             egress_blocked: instruments::counter(meter, &metric::NOTIFICATION_EGRESS_BLOCKED),
             sms_segments: instruments::counter(meter, &metric::NOTIFICATION_SMS_SEGMENTS),
+            webhook_deliveries: instruments::counter(meter, &metric::WEBHOOK_DELIVERIES),
+            webhook_attempts: instruments::counter(meter, &metric::WEBHOOK_ATTEMPTS),
+            webhook_endpoints_disabled: instruments::counter(
+                meter,
+                &metric::WEBHOOK_ENDPOINTS_DISABLED,
+            ),
+            previous_key_secrets,
+            _previous_key_gauge: previous_key_gauge,
+            unreadable_secrets,
+            _unreadable_gauge: unreadable_gauge,
             topics: topics.into_iter().collect(),
         })))
     }
@@ -205,6 +260,41 @@ impl Metrics {
                 u64::from(segments),
                 &[KeyValue::new("notify.encoding", encoding)],
             );
+        }
+    }
+    /// `count` webhook deliveries settled as `outcome` (`succeeded`,
+    /// `failed`, `cancelled`).
+    pub fn webhook_delivery(&self, outcome: &'static str, count: u64) {
+        if let Some(i) = &self.0
+            && count > 0
+        {
+            i.webhook_deliveries
+                .add(count, &[KeyValue::new("notify.outcome", outcome)]);
+        }
+    }
+    /// One webhook attempt of `class` (`2xx`, `3xx`, `4xx`, `410`, `5xx`,
+    /// `timeout`, `network`, `blocked`).
+    pub fn webhook_attempt(&self, class: &'static str) {
+        if let Some(i) = &self.0 {
+            i.webhook_attempts
+                .add(1, &[KeyValue::new("notify.class", class)]);
+        }
+    }
+    /// An endpoint disabled for `reason` (`manual`, `gone`, `failing`).
+    pub fn webhook_endpoint_disabled(&self, reason: &'static str) {
+        if let Some(i) = &self.0 {
+            i.webhook_endpoints_disabled
+                .add(1, &[KeyValue::new("notify.reason", reason)]);
+        }
+    }
+    /// Endpoints whose secret is still sealed under another key than
+    /// `secret_key`, and those neither key opens, as `retention` counted
+    /// them.
+    pub fn webhook_secrets(&self, previous_key: u64, unreadable: u64) {
+        if let Some(i) = &self.0 {
+            i.previous_key_secrets
+                .store(previous_key, Ordering::Relaxed);
+            i.unreadable_secrets.store(unreadable, Ordering::Relaxed);
         }
     }
     pub fn data_purged(&self, rows: u64) {

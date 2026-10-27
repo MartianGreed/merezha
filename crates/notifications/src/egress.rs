@@ -1,6 +1,6 @@
 //! The egress guard (NT §5.6, invariant 10): requests to URLs a browser or a
-//! tenant supplied (push endpoints here, webhook URLs with NT-N7) go only to
-//! addresses that passed the guard, with redirects and proxies disabled.
+//! tenant supplied (push endpoints, NT-N6, and webhook URLs, NT-N7) go only
+//! to addresses that passed the guard, with redirects and proxies disabled.
 //!
 //! The guard sits in the client's DNS resolver ([`GuardedResolver`]):
 //! reqwest dials only the addresses the resolver returned, so the checked
@@ -68,13 +68,15 @@ fn in_v6(address: u128, (network, prefix): (u128, u8)) -> bool {
 }
 
 /// The IPv4 address an IPv6 address carries, for the ranges NT §5.6 checks
-/// by their embedded address: IPv4-mapped `::ffff:0:0/96`, IPv4-compatible
+/// by their embedded address: IPv4-mapped `::ffff:0:0/96`, IPv4-translated
+/// `::ffff:0:0:0/96` (RFC 2765, `::ffff:0:a.b.c.d`), IPv4-compatible
 /// `::/96`, NAT64 `64:ff9b::/96`, and 6to4 `2002::/16`. The local-use
 /// NAT64 prefix `64:ff9b:1::/48` is in [`BLOCKED_V6`] instead.
 fn embedded_v4(address: Ipv6Addr) -> Option<Ipv4Addr> {
     let bits = u128::from(address);
     let low = Ipv4Addr::from((bits & 0xffff_ffff) as u32);
     if in_v6(bits, (0xffff_0000_0000, 96))
+        || in_v6(bits, (0xffff_0000_0000_0000, 96))
         || in_v6(bits, (0, 96))
         || in_v6(bits, (0x0064_ff9b_0000_0000_0000_0000_0000_0000, 96))
     {
@@ -264,11 +266,20 @@ pub fn client(
     policy: Arc<EgressPolicy>,
     lookup: Arc<dyn Lookup>,
 ) -> Result<reqwest::Client, Failure> {
+    client_with(policy, lookup, CONNECT_TIMEOUT)
+}
+
+/// [`client`] with another connect timeout (`webhooks.connect_timeout`).
+pub fn client_with(
+    policy: Arc<EgressPolicy>,
+    lookup: Arc<dyn Lookup>,
+    connect_timeout: Duration,
+) -> Result<reqwest::Client, Failure> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .dns_resolver(Arc::new(GuardedResolver::new(policy, lookup)))
-        .connect_timeout(CONNECT_TIMEOUT)
+        .connect_timeout(connect_timeout)
         .pool_max_idle_per_host(2)
         .retry(reqwest::retry::never())
         .user_agent(concat!("merezha/", env!("CARGO_PKG_VERSION")))
@@ -316,6 +327,8 @@ mod tests {
             "ff02::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.5",
+            "::ffff:0:7f00:1",
+            "::ffff:0:10.0.0.5",
             "::127.0.0.1",
             "64:ff9b::a00:5",
             "64:ff9b:1::a00:5",
@@ -330,6 +343,7 @@ mod tests {
             "172.32.0.1",
             "2606:4700::1111",
             "::ffff:8.8.8.8",
+            "::ffff:0:8.8.8.8",
             "64:ff9b::808:808",
             "2002:808:808::1",
         ] {
@@ -357,6 +371,7 @@ mod tests {
         for url in [
             "https://127.0.0.1/",
             "https://[::ffff:127.0.0.1]/",
+            "https://[::ffff:0:7f00:1]/",
             "https://0x7f000001/",
         ] {
             let parsed = literal(url);
@@ -385,6 +400,7 @@ mod tests {
         for address in [
             "8.8.8.8",
             "::ffff:8.8.8.8",
+            "::ffff:0:8.8.8.8",
             "::8.8.8.8",
             "64:ff9b::808:808",
             "2002:808:808::1",

@@ -41,6 +41,8 @@ const INBOX_CHECKSUM: &str = "1198acd9b4ea2b7011fde9c174ec04e77b9d0d9a8aeeecc1b3
 const EVENTS_CHECKSUM: &str = "f9e8fc57df4863cf4602682ada9bbe6f1fbf48932479852c3eecab93ea6e76ab";
 /// SHA-256 of migration 4 (NT-N6, push subscriptions), frozen the same way.
 const PUSH_CHECKSUM: &str = "fac9a5a50789e1802a393c392d339db2923e1b8a82cd08740ba1ec364900d896";
+/// SHA-256 of migration 5 (NT-N7, webhooks), frozen the same way.
+const WEBHOOKS_CHECKSUM: &str = "7f8334e2762321989fc267c422d14623b71f0cfc78a39fbeba01a632e692be46";
 
 /// A distinct id per call.
 fn fresh() -> Uuid {
@@ -59,7 +61,7 @@ fn soon() -> Instant {
 
 #[test]
 fn migration_checksum_is_pinned() {
-    assert_eq!(MIGRATIONS.len(), 4);
+    assert_eq!(MIGRATIONS.len(), 5);
     assert_eq!((MIGRATIONS[0].version, MIGRATIONS[0].name), (1, "core"));
     assert_eq!(checksum(MIGRATIONS[0].sql), CORE_CHECKSUM);
     assert_eq!((MIGRATIONS[1].version, MIGRATIONS[1].name), (2, "inbox"));
@@ -71,6 +73,8 @@ fn migration_checksum_is_pinned() {
     assert_eq!(checksum(MIGRATIONS[2].sql), EVENTS_CHECKSUM);
     assert_eq!((MIGRATIONS[3].version, MIGRATIONS[3].name), (4, "push"));
     assert_eq!(checksum(MIGRATIONS[3].sql), PUSH_CHECKSUM);
+    assert_eq!((MIGRATIONS[4].version, MIGRATIONS[4].name), (5, "webhooks"));
+    assert_eq!(checksum(MIGRATIONS[4].sql), WEBHOOKS_CHECKSUM);
 }
 
 async fn migrated() -> Option<(TestDatabase, Database)> {
@@ -83,12 +87,12 @@ async fn migrated() -> Option<(TestDatabase, Database)> {
     let report = run_migrations(&db, &declared, MigrationMode::Apply, soon())
         .await
         .unwrap();
-    assert_eq!(report.applied.len(), 4);
+    assert_eq!(report.applied.len(), 5);
     Some((test, db))
 }
 
 #[tokio::test]
-async fn migrations_create_the_core_inbox_and_push_tables() {
+async fn migrations_create_the_core_inbox_push_and_webhook_tables() {
     let Some((_test, db)) = migrated().await else {
         return;
     };
@@ -123,7 +127,12 @@ async fn migrations_create_the_core_inbox_and_push_tables() {
             "provider_events",
             "push_subscriptions",
             "suppressions",
-            "user_settings"
+            "user_settings",
+            "webhook_attempts",
+            "webhook_audit",
+            "webhook_deliveries",
+            "webhook_endpoints",
+            "webhook_events"
         ]
     );
     // The schema enforces the closed sets of NT §2.4.

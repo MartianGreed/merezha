@@ -323,6 +323,8 @@ metrics! {
     WEBHOOK_ATTEMPTS = "merezha.webhook.attempts", Counter, "{attempt}", NONE, ["notify.class"], "8 classes";
     WEBHOOK_ENDPOINTS_DISABLED = "merezha.webhook.endpoints_disabled", Counter, "{endpoint}", NONE,
         ["notify.reason"], "3 reasons";
+    WEBHOOK_SECRETS_PREVIOUS_KEY = "merezha.webhook.secrets.previous_key", Gauge, "{endpoint}", NONE, [], "1";
+    WEBHOOK_SECRETS_UNREADABLE = "merezha.webhook.secrets.unreadable", Gauge, "{endpoint}", NONE, [], "1";
     // Content
     CONTENT_DELIVERY_NOT_MODIFIED = "merezha.content.delivery.not_modified", Counter, "{response}", NONE,
         ["content.type"], "types";
@@ -645,6 +647,7 @@ pub const ATTRIBUTES: &[Attribute] = &[
     row("notify.encoding", true, true, true),
     row("notify.target", true, true, true),
     row("notify.class", true, true, true),
+    row("notify.task", true, true, true),
     row("notify.notification_id", true, false, true),
     row("notify.delivery_id", true, false, true),
     row("notify.webhook_delivery_id", true, false, true),
@@ -1482,6 +1485,11 @@ pub const EVENTS: &[Event] = &[
             f("target", "notify.target"),
             f("reason", "notify.reason"),
         ],
+    ),
+    ev(
+        "notification.maintenance_step_failed",
+        WARN,
+        &[f("task", "notify.task"), f("reason", "notify.reason"), CODE],
     ),
     ev(
         "notification.push_subscription_removed",

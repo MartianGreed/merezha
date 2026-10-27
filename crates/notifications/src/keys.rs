@@ -39,6 +39,10 @@ impl std::fmt::Debug for Key {
     }
 }
 impl Key {
+    /// The key bytes, for the webhook secret cipher (NT-N7).
+    pub(crate) fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
     fn mac(&self, message: &[u8]) -> [u8; 32] {
         let mut mac = HmacSha256::new_from_slice(&self.0)
             .unwrap_or_else(|_| unreachable!("HMAC takes keys of any length"));
