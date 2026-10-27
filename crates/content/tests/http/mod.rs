@@ -353,15 +353,14 @@ pub struct Fixture {
 pub const POOL: usize = 4;
 /// The pool size of a [`Fixture::db`], the test's own queries.
 pub const CHECK_POOL: usize = 3;
-/// Tests that start more than two hosts at once, against one server with
-/// the default `max_connections = 100`.
+/// Rebuild tests (up to five hosts each) running at once, against one
+/// server with the default `max_connections = 100`.
 pub const HOST_SLOTS: usize = 3;
 static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(HOST_SLOTS);
 
-/// One of [`HOST_SLOTS`], held for the whole test by tests that start
-/// more than two hosts (about twenty connections each), so a suite of them
-/// stays well under `max_connections = 100` with any number of test
-/// threads.
+/// One of [`HOST_SLOTS`], held for the whole test by the rebuild tests
+/// (about twenty connections each), so their suite stays well under
+/// `max_connections = 100` with any number of test threads.
 pub async fn host_slot() -> tokio::sync::SemaphorePermit<'static> {
     SLOTS.acquire().await.unwrap()
 }
@@ -895,7 +894,8 @@ pub async fn blocked_by(db: &Database, pid: i32) -> Vec<i32> {
     let client = db.acquire(soon()).await.unwrap();
     client
         .query(
-            "SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+            "SELECT pid FROM pg_stat_activity \
+              WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))",
             &[&pid],
         )
         .await
@@ -930,7 +930,8 @@ pub async fn wait_blocked_running(db: &Database, pid: i32, query: &str) -> i32 {
         let found: Option<i32> = client
             .query_opt(
                 "SELECT pid FROM pg_stat_activity \
-                  WHERE $1 = ANY(pg_blocking_pids(pid)) AND query LIKE $2 LIMIT 1",
+                  WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid)) \
+                    AND query LIKE $2 LIMIT 1",
                 &[&pid, &query],
             )
             .await

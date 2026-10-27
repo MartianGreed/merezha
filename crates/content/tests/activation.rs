@@ -661,10 +661,16 @@ async fn a_build_killed_mid_way_leaves_the_host_not_ready_and_the_next_start_rep
     // client_connection_check_interval ends the backend, and with it the
     // activation lock, within about half a second. The bound is forty
     // check intervals, so only a backend that never ends fails, however
-    // loaded the server is.
+    // loaded the server is. It stays below the statement timeout, which
+    // would end the waiting build without the check interval.
     host.abort();
     let _ = host.await;
     let bound = merezha_postgres::CONNECTION_CHECK_INTERVAL * 40;
+    assert!(
+        bound < db.statement_timeout(),
+        "{bound:?} must stay below the statement timeout {:?}",
+        db.statement_timeout()
+    );
     let gone = std::time::Instant::now();
     loop {
         let alive = scalar_i64(
