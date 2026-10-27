@@ -21,13 +21,14 @@ pub use build::{BuildReport, Built, Lockfile, Service, Toolchain, WASM_TARGET, b
 
 use anyhow::{Context, bail, ensure};
 use std::{
+    collections::BTreeSet,
     fmt,
     fs::{self, File},
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
 };
 use wit_component::{ComponentEncoder, DecodedWasm};
-use wit_parser::Resolve;
+use wit_parser::{Resolve, WorldItem};
 
 /// The only interface a service component may export.
 pub const HANDLER: &str = "merezha:service/handler@0.1.0";
@@ -171,8 +172,10 @@ pub fn componentize(module: &[u8]) -> anyhow::Result<Vec<u8>> {
     Ok(component)
 }
 
-/// Checks that `component` imports nothing, exports only [`HANDLER`], and
-/// that its export has exactly the canonical types.
+/// Checks that `component` imports nothing, exports only [`HANDLER`], that
+/// the export's types are the canonical ones (`wit_component::targets`, a
+/// subtype check) and that it has exactly the canonical functions and
+/// types, no extra function or resource.
 ///
 /// # Errors
 ///
@@ -209,7 +212,35 @@ pub fn check(component: &[u8]) -> anyhow::Result<()> {
         .context("cannot parse the canonical wit/service.wit")?;
     let service = canonical.select_world(&[package], Some("service"))?;
     wit_component::targets(&canonical, service, component)
-        .with_context(|| format!("its {HANDLER} export does not have the canonical types"))
+        .with_context(|| format!("its {HANDLER} export does not have the canonical types"))?;
+
+    // `targets` is a subtype check: it accepts an export with more than the
+    // canonical items. The export must name exactly the canonical
+    // functions and types, nothing more.
+    let members = |resolve: &Resolve, world: &wit_parser::World| {
+        world.exports.values().find_map(|item| match item {
+            WorldItem::Interface { id, .. } => {
+                let interface = &resolve.interfaces[*id];
+                Some((
+                    interface.functions.keys().cloned().collect::<BTreeSet<_>>(),
+                    interface.types.keys().cloned().collect::<BTreeSet<_>>(),
+                ))
+            }
+            _ => None,
+        })
+    };
+    let expected = members(&canonical, &canonical.worlds[service])
+        .context("the canonical world exports no interface")?;
+    let found = members(&resolve, world).context("its export is not an interface")?;
+    ensure!(
+        found == expected,
+        "its {HANDLER} export has functions [{}] and types [{}]; services export exactly [{}] and [{}]",
+        found.0.iter().cloned().collect::<Vec<_>>().join(", "),
+        found.1.iter().cloned().collect::<Vec<_>>().join(", "),
+        expected.0.iter().cloned().collect::<Vec<_>>().join(", "),
+        expected.1.iter().cloned().collect::<Vec<_>>().join(", "),
+    );
+    Ok(())
 }
 
 /// Componentizes the core module at `input` into `output` and returns the
@@ -271,17 +302,33 @@ fn stage(input: &Path, output: &Path) -> Result<Staged, Error> {
     let mut partial = output.as_os_str().to_owned();
     partial.push(".partial");
     let partial = PathBuf::from(partial);
+    let failed = |error: io::Error| {
+        Error::new(
+            ErrorKind::ComponentWriteFailed,
+            format!("cannot write {}: {error}", partial.display()),
+        )
+    };
+    // A leftover partial, or one a repository committed (possibly a
+    // symbolic link to a file elsewhere), is unlinked, never written
+    // through; the new one is created exclusively (`O_EXCL`).
+    match fs::remove_file(&partial) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(failed(error)),
+        _ => {}
+    }
+    let mut file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&partial)
+        .map_err(failed)?;
+    // From here on the partial is ours: dropping `staged` removes it.
     let staged = Staged {
         partial: Some(partial.clone()),
         output: output.to_owned(),
         bytes: component.len(),
     };
-    fs::write(&partial, &component).map_err(|error| {
-        Error::new(
-            ErrorKind::ComponentWriteFailed,
-            format!("cannot write {}: {error}", partial.display()),
-        )
-    })?;
+    file.write_all(&component)
+        .and_then(|()| file.sync_all())
+        .map_err(failed)?;
     Ok(staged)
 }
 

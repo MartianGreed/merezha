@@ -4,8 +4,9 @@
 //! 1. `MEREZHA_SOURCE_REV` from the build environment (release and CI
 //!    builds), which must be a full commit id;
 //! 2. else `git rev-parse HEAD` in this crate's directory, kept only when
-//!    `git --no-optional-locks status --porcelain --untracked-files=no`
-//!    prints nothing. `--no-optional-locks` keeps `git status` from
+//!    the repository is merezha's (`git rev-parse --show-prefix` is
+//!    `crates/cli/` and `build.rs` is tracked) and `git --no-optional-locks
+//!    status --porcelain --untracked-files=no` prints nothing. `--no-optional-locks` keeps `git status` from
 //!    refreshing the index, which would make Cargo rerun this script on
 //!    every build. Untracked files do not count: Cargo leaves an untracked
 //!    `.cargo-ok` in every git checkout it builds;
@@ -27,7 +28,7 @@
 //! clean checkout (`cargo install --git ... --rev`) are authoritative.
 //!
 //! This file has no dependencies beyond `std`: the source revision tests
-//! copy it into a temporary repository.
+//! copy it into `crates/cli/` of a temporary repository.
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -52,9 +53,24 @@ fn main() {
     println!("cargo::rustc-env={OUTPUT}={}", rev.unwrap_or_default());
 }
 
-/// The clean checkout's `HEAD`, after registering the files to watch.
+/// Where this crate sits in a merezha checkout.
+const PREFIX: &str = "crates/cli/";
+
+/// The clean checkout's `HEAD`, after registering the files to watch. The
+/// repository must be merezha's own: this crate at [`PREFIX`] with this
+/// script tracked. A copy inside another repository (untracked, vendored or
+/// a subtree elsewhere) records nothing rather than that repository's
+/// commit, which does not exist in merezha.
 fn from_git(directory: &Path) -> Option<String> {
     watch_git_files(directory);
+    let prefix = git(directory, &["rev-parse", "--show-prefix"])?;
+    if prefix.trim_end_matches(['\n', '\r']) != PREFIX {
+        return None;
+    }
+    git(
+        directory,
+        &["ls-files", "--error-unmatch", "--", "build.rs"],
+    )?;
     let head = git(directory, &["rev-parse", "--verify", "HEAD"])?;
     let head = head.trim();
     if !is_commit_id(head) {

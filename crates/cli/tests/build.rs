@@ -1,6 +1,7 @@
 //! `merezha build` and `merezha componentize` as processes (scaffold §4.1,
 //! SC-S1) on a fixture workspace the test generates: `domain`, `renamed`
-//! (`[lib] name = "renamed_lib"`), `plain` (no `cdylib`) and three guests
+//! (`[lib] name = "renamed_lib"`), `plain` (no `cdylib`), `example-only`
+//! (an rlib library and a `cdylib` example) and three guests
 //! that break the contract: `importer` (a WASI import), `exporter` (a second
 //! export) and `oversized` (a core module over 16 MiB).
 //!
@@ -87,6 +88,19 @@ fn workspace(root: &Path) -> PathBuf {
         &guest_source(&canonical, ""),
     );
     package(root, "plain", "", "pub fn nothing() {}\n");
+    // An rlib library and a cdylib example: the example is not the library.
+    package(
+        root,
+        "example-only",
+        "[[example]]\nname = \"component\"\ncrate-type = [\"cdylib\"]",
+        "pub fn nothing() {}\n",
+    );
+    fs::create_dir_all(root.join("example-only/examples")).unwrap();
+    fs::write(
+        root.join("example-only/examples/component.rs"),
+        "pub fn x() {}\n",
+    )
+    .unwrap();
     let importer = format!(
         r##"{{ inline: r#"
 package merezha:service@0.1.0;
@@ -132,7 +146,7 @@ world service {{ export handler; export admin; }}
     );
     fs::write(
         root.join("Cargo.toml"),
-        "[workspace]\nresolver = \"3\"\nmembers = [\"domain\", \"renamed\", \"plain\", \"importer\", \"exporter\", \"oversized\"]\n",
+        "[workspace]\nresolver = \"3\"\nmembers = [\"domain\", \"renamed\", \"plain\", \"example-only\", \"importer\", \"exporter\", \"oversized\"]\n",
     )
     .unwrap();
     root.join("Cargo.toml")
@@ -360,7 +374,11 @@ fn refuses_unknown_packages_and_libraries_without_cdylib_before_building() {
     let root = tempfile::tempdir().unwrap();
     let workspace = workspace(&root.path().join("workspace"));
     let target = root.path().join("target");
-    for (id, code) in [("ghost", "unknown_package"), ("plain", "no_cdylib")] {
+    for (id, code) in [
+        ("ghost", "unknown_package"),
+        ("plain", "no_cdylib"),
+        ("example-only", "no_cdylib"),
+    ] {
         let dir = root.path().join(id);
         let (exit, report) = build(&manifest(&dir, &["domain", id]), &workspace, &target);
         assert_eq!(exit, Some(2), "{report}");

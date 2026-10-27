@@ -120,7 +120,10 @@ pub fn build(
         let library = package
             .targets
             .iter()
-            .find(|target| target.crate_types.iter().any(|t| t == "cdylib"))
+            // The library target: its `kind` lists the crate types. An
+            // example or test with `crate-type = ["cdylib"]` has kind
+            // `example` and is not the package's library.
+            .find(|target| target.kind.iter().any(|t| t == "cdylib"))
             .ok_or_else(|| {
                 Error::new(
                     ErrorKind::NoCdylib,
@@ -256,7 +259,7 @@ struct Package {
 #[derive(Debug, Deserialize)]
 struct Target {
     name: String,
-    crate_types: Vec<String>,
+    kind: Vec<String>,
 }
 
 /// `cargo metadata --format-version 1 --no-deps`, read up to

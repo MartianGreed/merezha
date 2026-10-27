@@ -54,30 +54,44 @@ fn git_available() -> bool {
     found
 }
 
-/// A committed repository with the probe crate: `build.rs` is the cli's,
-/// `main` prints what it recorded.
-fn repository(root: &Path) -> (PathBuf, String) {
-    let repo = root.join("repo");
-    fs::create_dir_all(repo.join("src")).unwrap();
+/// Writes the probe crate into `dir`: `build.rs` is the cli's, `main`
+/// prints what it recorded.
+fn probe(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
     fs::write(
-        repo.join("Cargo.toml"),
+        dir.join("Cargo.toml"),
         "[package]\nname = \"rev-probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
     )
     .unwrap();
-    fs::write(repo.join("build.rs"), BUILD_SCRIPT).unwrap();
+    fs::write(dir.join("build.rs"), BUILD_SCRIPT).unwrap();
     fs::write(
-        repo.join("src/main.rs"),
+        dir.join("src/main.rs"),
         "fn main() { print!(\"{}\", env!(\"MEREZHA_BUILD_SOURCE_REV\")); }\n",
     )
     .unwrap();
+}
+
+/// A fresh repository with one commit of `README` and `.gitignore`.
+fn init(repo: &Path) -> String {
+    fs::create_dir_all(repo).unwrap();
     fs::write(repo.join("README"), "probe\n").unwrap();
     fs::write(repo.join(".gitignore"), "/target/\n").unwrap();
-    git(&repo, &["init", "--quiet", "--initial-branch=main"]);
-    git(&repo, &["add", "."]);
-    git(&repo, &["commit", "--quiet", "-m", "probe"]);
-    let head = git(&repo, &["rev-parse", "HEAD"]);
+    git(repo, &["init", "--quiet", "--initial-branch=main"]);
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "--quiet", "-m", "probe"]);
+    git(repo, &["rev-parse", "HEAD"])
+}
+
+/// A committed repository shaped like merezha's: the probe crate at
+/// `crates/cli`, as the build script requires.
+fn repository(root: &Path) -> (PathBuf, String) {
+    let repo = root.join("repo");
+    probe(&repo.join(CRATE));
+    let head = init(&repo);
     (repo, head)
 }
+
+const CRATE: &str = "crates/cli";
 
 /// `cargo build -v` of the probe in `repo` into `target`; the build's
 /// stderr and what the binary prints.
@@ -85,7 +99,7 @@ fn build(repo: &Path, target: &Path, env: &[(&str, &str)]) -> (String, String) {
     let mut command = cargo();
     command
         .args(["build", "-v", "--manifest-path"])
-        .arg(repo.join("Cargo.toml"))
+        .arg(repo.join(CRATE).join("Cargo.toml"))
         .env("CARGO_TARGET_DIR", target)
         .envs(env.iter().copied());
     let output = command.output().unwrap();
@@ -171,18 +185,70 @@ fn a_malformed_merezha_source_rev_fails_the_build() {
     }
     let root = tempfile::tempdir().unwrap();
     let (repo, _) = repository(root.path());
-    let output = cargo()
+    for given in [
+        "main\"; injected = \"",
+        // Short and uppercase hex: only full lowercase ids are pinned.
+        "0123456789abcdef",
+        "0123456789abcdef0123456789abcdef0123456",
+        "0123456789ABCDEF0123456789ABCDEF01234567",
+    ] {
+        let output = cargo()
+            .args(["build", "--manifest-path"])
+            .arg(repo.join(CRATE).join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", root.path().join("target"))
+            .env("MEREZHA_SOURCE_REV", given)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{given} was accepted");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("full lowercase commit id"),
+            "{given}: {output:?}"
+        );
+    }
+    // A 64-digit (SHA-256 repository) id is accepted.
+    let sha256 = "0123456789abcdef".repeat(4);
+    let (_, recorded) = build(
+        &repo,
+        &root.path().join("sha256"),
+        &[("MEREZHA_SOURCE_REV", &sha256)],
+    );
+    assert_eq!(recorded, sha256);
+}
+
+#[test]
+fn a_copy_inside_another_repository_records_none() {
+    if !git_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    // Untracked at the right place inside an unrelated clean repository:
+    // `git status --untracked-files=no` is empty, but `build.rs` is not
+    // tracked there.
+    let other = root.path().join("other");
+    init(&other);
+    probe(&other.join(CRATE));
+    let (_, recorded) = build(&other, &root.path().join("untracked"), &[]);
+    assert_eq!(
+        recorded, "",
+        "an untracked copy recorded the other repository's HEAD"
+    );
+
+    // Vendored and committed elsewhere in a monorepo: tracked, clean, but
+    // not at `crates/cli`.
+    let monorepo = root.path().join("monorepo");
+    init(&monorepo);
+    probe(&monorepo.join("vendor/merezha-cli"));
+    git(&monorepo, &["add", "."]);
+    git(&monorepo, &["commit", "--quiet", "-m", "vendor"]);
+    let mut command = cargo();
+    let output = command
         .args(["build", "--manifest-path"])
-        .arg(repo.join("Cargo.toml"))
-        .env("CARGO_TARGET_DIR", root.path().join("target"))
-        .env("MEREZHA_SOURCE_REV", "main\"; injected = \"")
+        .arg(monorepo.join("vendor/merezha-cli/Cargo.toml"))
+        .env("CARGO_TARGET_DIR", root.path().join("vendored"))
         .output()
         .unwrap();
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("full lowercase commit id"),
-        "{output:?}"
-    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(run(&root.path().join("vendored/debug/rev-probe")), "");
 }
 
 #[test]

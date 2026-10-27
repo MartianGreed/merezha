@@ -26,7 +26,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     env:
-      # The revision `merezha version` reports (scaffold §2.9).
+      # The revision `merezha version` reports (scaffold §2.9). On
+      # pull_request events github.sha is the test merge commit, which exists
+      # only in this run: never reuse a binary built here as a release.
       MEREZHA_SOURCE_REV: ${{ github.sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

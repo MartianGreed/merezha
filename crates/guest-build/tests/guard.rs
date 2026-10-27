@@ -204,3 +204,82 @@ fn componentize_file_classifies_its_failures_and_writes_nothing() {
         "{names:?}"
     );
 }
+
+#[test]
+fn rejects_extra_functions_or_resources_inside_the_handler_interface() {
+    // `targets` alone accepts these: they are subtypes of the canonical
+    // interface.
+    for (extra, what) in [
+        ("reset: func();", "functions [handle, reset]"),
+        ("resource session { close: func(); }", "types [session]"),
+    ] {
+        let message = rejection(&format!(
+            "package merezha:service@0.1.0;
+             interface handler {{
+                 handle: func(input: string) -> result<string, string>;
+                 {extra}
+             }}
+             world service {{ export handler; }}"
+        ));
+        assert!(message.contains(what), "{extra}: {message}");
+        assert!(
+            message.contains("services export exactly [handle]"),
+            "{message}"
+        );
+    }
+}
+
+/// Appends a custom section so `module` is exactly `total` bytes.
+fn pad(mut module: Vec<u8>, total: usize) -> Vec<u8> {
+    fn leb(mut value: usize, out: &mut Vec<u8>) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+    // id, 4-byte size (the sizes here are between 2^21 and 2^28), then
+    // the name `pad` and the payload.
+    let size = total - module.len() - 1 - 4;
+    module.push(0);
+    let mut encoded = Vec::new();
+    leb(size, &mut encoded);
+    assert_eq!(encoded.len(), 4);
+    module.extend(encoded);
+    module.extend([3, b'p', b'a', b'd']);
+    module.resize(total, 0);
+    module
+}
+
+#[test]
+fn rejects_a_component_over_the_limit_from_a_module_under_it() {
+    let module = pad(core_module(CANONICAL), 16_777_115);
+    assert!(module.len() <= MAX_COMPONENT_BYTES);
+    let message = format!("{:#}", componentize(&module).unwrap_err());
+    assert!(
+        message.contains("the component is")
+            && message.contains("the host accepts at most 16777216"),
+        "{message}"
+    );
+    // A smaller pad still fits.
+    componentize(&pad(core_module(CANONICAL), 1 << 22)).expect("a 4 MiB module fits");
+}
+
+#[cfg(unix)]
+#[test]
+fn componentize_file_never_writes_through_a_planted_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let (input, output) = (dir.path().join("core.wasm"), dir.path().join("out.wasm"));
+    std::fs::write(&input, core_module(CANONICAL)).unwrap();
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, "keep me").unwrap();
+    std::os::unix::fs::symlink(&victim, dir.path().join("out.wasm.partial")).unwrap();
+    componentize_file(&input, &output).expect("componentizes");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+    assert!(std::fs::read(&output).unwrap().starts_with(b"\0asm"));
+    assert!(!dir.path().join("out.wasm.partial").exists());
+}

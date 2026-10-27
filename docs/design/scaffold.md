@@ -235,7 +235,9 @@ unless = ["identity"]
 reads it through `merezha_cli::guest::source_rev`, or moves the script into `crates/scaffold`):
 
 1. `MEREZHA_SOURCE_REV` from the build environment, which the release and CI builds set.
-2. Else `git rev-parse HEAD` in the crate's directory, kept only when `git --no-optional-locks
+2. Else `git rev-parse HEAD` in the crate's directory, kept only when the repository is merezha's
+   (`git rev-parse --show-prefix` is the crate's place, `crates/cli/`, and the build script is
+   tracked, so a copy inside another repository records nothing) and `git --no-optional-locks
    status --porcelain --untracked-files=no` prints nothing. `--no-optional-locks` stops `git
    status` from refreshing `.git/index` as a side effect; a refreshed index would be newer than
    the script's last run, and Cargo would rerun the script, rebuild `merezha-scaffold` and relink
@@ -662,7 +664,7 @@ merezha-domain = { git = "https://github.com/MartianGreed/merezha", rev = "01234
 events = { path = "guests/events" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.154"
-wit-bindgen = { version = "0.63.0", default-features = false, features = ["macros", "realloc"] }
+wit-bindgen = { version = "=0.63.0", default-features = false, features = ["macros", "realloc"] }
 
 [profile.release]
 opt-level = "s"
@@ -673,7 +675,9 @@ strip = true
 ```
 
 The versions match the services workspace's (`serde_json` there also enables `raw_value`, which
-the generated guests do not need); the first build's `Cargo.lock` fixes the exact ones. Each
+the generated guests do not need); the first build's `Cargo.lock` fixes the exact ones.
+`wit-bindgen` is pinned exactly (`=0.63.0`, as SC-S1's `merezha build` fixture does) because it
+decides the component type embedded in every guest, which `merezha build` checks. Each
 component crate follows
 `services/task-notifier/Cargo.toml`: `crate-type = ["cdylib", "rlib"]`, `wit-bindgen` only
 under `[target.'cfg(target_arch = "wasm32")'.dependencies]`, and a `#[cfg(target_arch =

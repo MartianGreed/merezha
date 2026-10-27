@@ -264,7 +264,7 @@ names the workspace package that builds it. In order:
    existing directory (`missing_wasm_target`, before Cargo runs).
 3. `cargo metadata --format-version 1 --no-deps` must list a package named
    after each service (`unknown_package`) with a `cdylib` library target
-   (`no_cdylib`). The target's name gives the artifact,
+   (`no_cdylib`; a `cdylib` example does not count). The target's name gives the artifact,
    `<name with - as _>.wasm`, so `[lib] name = "task_domain"` works.
 4. `cargo build --release --target wasm32-unknown-unknown -p <id>...` runs
    with `--locked` when the workspace has a `Cargo.lock`; without one Cargo
@@ -274,9 +274,12 @@ names the workspace package that builds it. In order:
    choose the programs when set.
 5. Every artifact is componentized into `<id>.wasm.partial`; only when all
    are accepted are they renamed into place, so a refused service leaves no
-   new file in `components/`. A component must import nothing, export
-   exactly `merezha:service/handler@0.1.0` with the types of
-   `wit/service.wit`, and fit 16 MiB, input and output (`component_rejected`).
+   new file in `components/`. Partials are created exclusively after any
+   leftover one is unlinked, so a planted `.partial` link is never written
+   through. A component must import nothing, export exactly
+   `merezha:service/handler@0.1.0` with the types of `wit/service.wit` and
+   no further function or resource in that interface, and fit 16 MiB, input
+   and output (`component_rejected`).
 
 Success prints `{"status":"built","components":[{"id","bytes"}],"lockfile":"locked"|"created"}`
 and exits 0. A failure prints
@@ -296,7 +299,9 @@ library code.
 `rev` is the merezha revision the binary was built from, recorded by
 `crates/cli/build.rs`: `MEREZHA_SOURCE_REV` at build time (CI sets it to the
 commit; it must be a full lowercase commit id or the build fails), else the
-checkout's `HEAD` when `git status --porcelain --untracked-files=no` is empty,
+checkout's `HEAD` when the repository is merezha's (the crate at
+`crates/cli/` with `build.rs` tracked, so a copy inside another repository
+records nothing) and `git status --porcelain --untracked-files=no` is empty,
 else `null`. A fresh build of a clean checkout, which `cargo install --git
 ... --rev` always is, records its commit. In a development checkout the value
 is advisory: the build script reruns on a commit, a branch switch or a staged
