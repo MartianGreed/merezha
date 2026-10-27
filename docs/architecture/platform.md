@@ -778,11 +778,13 @@ Every field is a code, a count, a configured name or a timestamp:
 Events are emitted with `merezha_telemetry::event!(LEVEL, "area.noun_verb",
 field = …)`, whose name and fields must appear in the catalog
 (`crates/telemetry/src/names.rs`, TE §4); `testing::Harness::assert_catalogued`
-fails a suite that emits anything else, the process tests check every
-stderr line with `testing::check_stderr_catalogued`, and
-`crates/telemetry/tests/event_catalog.rs` reads every `event!(LEVEL, "name", …)`
-call in `crates/*/src`, so a name missing from the catalog fails even when
-no test reaches it. The `merezha` binary installs one
+fails a suite that emits anything else; the process tests' `Host`
+fixtures (`crates/cli/tests/support`, `telemetry_process.rs`) check every
+stderr line with `testing::check_stderr_catalogued` when they drop; and
+`crates/telemetry/tests/event_catalog.rs` reads every `event!(…, "name", …)`
+call in `crates/*/src` outside comments (the level too unless it is a
+macro variable), so a name missing from the catalog fails even when no
+test reaches it. The `merezha` binary installs one
 `tracing` registry with three layers:
 
 1. stderr, at `log_level` for Merezha targets and never more verbose than
@@ -932,13 +934,15 @@ merezha telemetry export --out DIR
 ```
 
 writes them below `DIR` (created if missing), each file through a
-temporary sibling renamed over the target, replacing the files of the same
-names and leaving others. It prints one JSON line on stdout:
+temporary sibling that is synced and renamed over the target, replacing
+the files of the same names and leaving others. `DIR` may be a symbolic
+link; `DIR/dashboards` and `DIR/rules` may not (`not_a_directory`). It
+prints one JSON line on stdout:
 `{"status":"exported","out":…,"host_version":…,"files":[…]}` and exits 0;
-`{"status":"failed","error":{"code":"export_failed","file":…,"reason":…}}`
+`{"status":"failed","error":{"code":"export_failed","file":…,"reason":…},"files":[…]}`
 and exits 1 when a file (or, with `file: null`, `DIR` itself) cannot be
 written, `reason` being the I/O error kind (`permission_denied`,
-`not_a_directory`, …); `{"status":"invalid","error":{"code":"invalid_arguments"},"usage":…}`
+`not_a_directory`, …) and `files` the files already replaced; `{"status":"invalid","error":{"code":"invalid_arguments"},"usage":…}`
 and exits 2 otherwise. It reads no configuration and emits no log event.
 
 `crates/telemetry/tests/artifacts.rs` lints them: the dashboard structure

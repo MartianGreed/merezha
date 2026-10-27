@@ -8,7 +8,9 @@
 //! that read stderr without the check, so it shipped without a catalog row.
 //! This scan reads every `event!(LEVEL, "name", …)` call in `crates/*/src`
 //! instead, so a name missing from `names.rs` fails whether or not a test
-//! reaches it.
+//! reaches it. A call whose level is a macro metavariable has its name
+//! checked and its level left to the runtime checks; comment lines, doc
+//! examples included, are not calls.
 use merezha_telemetry::names;
 use std::{
     fs,
@@ -26,10 +28,22 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// `(level, name)` of each `event!(` call written with a level identifier
-/// and a string literal name, `parent: …` allowed first. Other shapes (the
-/// macro's own definition) are not calls and are skipped.
-fn calls(text: &str) -> Vec<(String, String)> {
+/// Source text without comment lines, so the examples in doc comments
+/// (which name catalog events too) are not counted as calls.
+fn code(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `(level, name)` of each `event!(` call written with a level and a string
+/// literal name, `parent: …` allowed first. The level is `None` when it is
+/// a macro metavariable (`event!($level, "http.request.completed", …)`):
+/// the name is still checked. Other shapes (the macro's own definition)
+/// are not calls and are skipped.
+fn calls(text: &str) -> Vec<(Option<String>, String)> {
+    let text = code(text);
     let mut found = Vec::new();
     for (at, _) in text.match_indices("event!(") {
         let mut rest = text[at + "event!(".len()..].trim_start();
@@ -39,14 +53,18 @@ fn calls(text: &str) -> Vec<(String, String)> {
             };
             rest = after[comma + 1..].trim_start();
         }
-        let level: String = rest
+        let word: String = rest
             .chars()
-            .take_while(|c| c.is_ascii_uppercase())
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
             .collect();
-        if !["ERROR", "WARN", "INFO", "DEBUG", "TRACE"].contains(&level.as_str()) {
+        let level = if ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"].contains(&word.as_str()) {
+            Some(word.clone())
+        } else if word.len() > 1 && word.starts_with('$') && !word[1..].contains('$') {
+            None
+        } else {
             continue;
-        }
-        let Some(rest) = rest[level.len()..].trim_start().strip_prefix(',') else {
+        };
+        let Some(rest) = rest[word.len()..].trim_start().strip_prefix(',') else {
             continue;
         };
         let Some(rest) = rest.trim_start().strip_prefix('"') else {
@@ -78,8 +96,12 @@ fn every_event_call_in_the_sources_is_catalogued_at_its_level() {
             let at = file.strip_prefix(&crates).unwrap_or(file).display();
             match names::event(&name) {
                 None => problems.push(format!("{at}: {name} is not in names::EVENTS")),
-                Some(row) if !row.levels.iter().any(|l| l.as_str() == level) => {
-                    problems.push(format!("{at}: {name} at {level} is not a catalog level"));
+                Some(row)
+                    if level
+                        .as_ref()
+                        .is_some_and(|level| !row.levels.iter().any(|l| l.as_str() == level)) =>
+                {
+                    problems.push(format!("{at}: {name} at {level:?} is not a catalog level"));
                 }
                 Some(_) => {}
             }
@@ -98,14 +120,19 @@ fn the_scan_reads_levels_names_and_parents() {
             INFO,
             "listener.draining"
         );
+        merezha_telemetry::event!($level, "http.request.completed", method);
+        /// merezha_telemetry::event!(INFO, "doc.example_only");
+        // merezha_telemetry::event!(INFO, "comment.example_only");
         $crate::__private::tracing::event!(name: $name, target: $crate::TARGET);
     "#;
+    let level = |l: &str| Some(l.to_owned());
     assert_eq!(
         calls(text),
         [
-            ("WARN".to_owned(), "db.pool_undersized".to_owned()),
-            ("ERROR".to_owned(), "startup.failed".to_owned()),
-            ("INFO".to_owned(), "listener.draining".to_owned()),
+            (level("WARN"), "db.pool_undersized".to_owned()),
+            (level("ERROR"), "startup.failed".to_owned()),
+            (level("INFO"), "listener.draining".to_owned()),
+            (None, "http.request.completed".to_owned()),
         ]
     );
 }

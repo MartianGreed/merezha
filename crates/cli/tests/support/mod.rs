@@ -164,9 +164,19 @@ impl Host {
     }
 }
 impl Drop for Host {
+    /// Kill the host, then check everything it logged against the event
+    /// catalog, so a test that never reads the events is checked too.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if std::thread::panicking() {
+            return;
+        }
+        if let Ok(text) = fs::read_to_string(&self.log)
+            && let Err(problems) = merezha_telemetry::testing::check_stderr_catalogued(&text)
+        {
+            panic!("event catalog: {problems}");
+        }
     }
 }
 

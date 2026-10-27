@@ -109,8 +109,15 @@ groups:
         annotations:
           summary: 'Queue {{ $labels.job_queue }} of {{ $labels.job }} is {{ $value | humanizeDuration }} behind'
           description: 'The oldest due job has waited more than 5 minutes. Raise the queue concurrency or look for slow handlers (merezha.job.duration).'
+      # Synchronous counters reach Prometheus at their first value, with no
+      # 0 sample before it, so increase() misses the first event of a series
+      # (the first dead letter per instance, queue and kind after a start).
+      # The second arm catches a series that did not exist 15 minutes ago.
       - alert: MerezhaJobsDeadLettered
-        expr: sum by (job, job_queue) (increase(merezha_job_dead_lettered_total[15m])) > 0
+        expr: |
+          sum by (job, job_queue) (increase(merezha_job_dead_lettered_total[15m])) > 0
+          or
+          sum by (job, job_queue) (merezha_job_dead_lettered_total unless merezha_job_dead_lettered_total offset 15m) > 0
         labels:
           severity: ticket
         annotations:
@@ -144,8 +151,12 @@ groups:
         annotations:
           summary: 'Requests wait for database connections on {{ $labels.instance }} ({{ $labels.job }})'
           description: 'The {{ $labels.db_client_connection_pool_name }} pool has had waiters for 5 minutes. Raise database.pool_size within the server''s connection limit, or look for long transactions.'
+      # A new series' first value counts too (see MerezhaJobsDeadLettered).
       - alert: MerezhaDatabasePoolTimeouts
-        expr: sum by (job, instance, db_client_connection_pool_name) (increase(db_client_connection_timeouts_total[5m])) > 0
+        expr: |
+          sum by (job, instance, db_client_connection_pool_name) (increase(db_client_connection_timeouts_total[5m])) > 0
+          or
+          sum by (job, instance, db_client_connection_pool_name) (db_client_connection_timeouts_total unless db_client_connection_timeouts_total offset 5m) > 0
         labels:
           severity: ticket
         annotations:
@@ -162,21 +173,28 @@ groups:
   - name: merezha-telemetry
     rules:
       # Every exporting instance reports merezha.telemetry.exported. A
-      # service that reported within the last hour and stopped has gone
-      # away. For a service that must always run, add
-      # `absent_over_time(merezha_telemetry_exported_total{job="<service>"}[10m])`.
+      # service that reported within the last 24 hours and stopped has gone
+      # away; the alert keeps firing until the service returns or for 24
+      # hours. For a service that must always run, add
+      # `absent_over_time(merezha_telemetry_exported_total{job="<service>"}[10m])`,
+      # which has no such limit.
       - alert: MerezhaInstanceAbsent
         expr: |
-          group by (job) (last_over_time(merezha_telemetry_exported_total[1h]))
+          group by (job) (last_over_time(merezha_telemetry_exported_total[24h]))
           unless
           group by (job) (last_over_time(merezha_telemetry_exported_total[10m]))
         labels:
           severity: page
         annotations:
           summary: '{{ $labels.job }} has reported no telemetry for 10 minutes'
-          description: 'No instance of {{ $labels.job }} exported metrics for 10 minutes: every instance is down or cannot reach the collector.'
+          description: 'No instance of {{ $labels.job }} exported metrics for 10 minutes: every instance is down or cannot reach the collector. The alert stops 24 hours after the last export.'
+      # The drop counters start at 0, but a new series' first value counts
+      # too, as for MerezhaJobsDeadLettered.
       - alert: MerezhaTelemetryDropped
-        expr: sum by (job, merezha_telemetry_signal, merezha_reason) (increase(merezha_telemetry_dropped_total[15m])) > 0
+        expr: |
+          sum by (job, merezha_telemetry_signal, merezha_reason) (increase(merezha_telemetry_dropped_total[15m])) > 0
+          or
+          sum by (job, merezha_telemetry_signal, merezha_reason) (merezha_telemetry_dropped_total unless merezha_telemetry_dropped_total offset 15m) > 0
         labels:
           severity: ticket
         annotations:

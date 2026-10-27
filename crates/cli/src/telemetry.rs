@@ -17,7 +17,13 @@ pub fn arguments(args: impl IntoIterator<Item = String>) -> Option<PathBuf> {
     let mut out = None;
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--out" if out.is_none() => out = Some(PathBuf::from(args.next()?)),
+            "--out" if out.is_none() => {
+                let value = args.next()?;
+                if value.starts_with("--") {
+                    return None;
+                }
+                out = Some(PathBuf::from(value));
+            }
             _ => return None,
         }
     }
@@ -25,7 +31,8 @@ pub fn arguments(args: impl IntoIterator<Item = String>) -> Option<PathBuf> {
 }
 
 /// Export into `out`: exit 0 with the files written, 1 when a file cannot be
-/// written (the report names it and the I/O error kind, never the OS text).
+/// written (the report names it, the I/O error kind, never the OS text, and
+/// the files already replaced).
 pub fn export(out: &std::path::Path) -> (Value, ExitCode) {
     match artifacts::export(out) {
         Ok(files) => (
@@ -37,10 +44,15 @@ pub fn export(out: &std::path::Path) -> (Value, ExitCode) {
             }),
             ExitCode::SUCCESS,
         ),
-        Err(ExportError { path, kind }) => (
+        Err(ExportError {
+            path,
+            kind,
+            written,
+        }) => (
             json!({
                 "status": "failed",
                 "error": {"code": "export_failed", "reason": reason(kind), "file": path},
+                "files": written,
             }),
             ExitCode::from(1),
         ),
@@ -99,6 +111,8 @@ mod tests {
             &["export", "--out", ""][..],
             &["export", "--out", "a", "--out", "b"][..],
             &["export", "--out", "a", "--force"][..],
+            &["export", "--out", "--force"][..],
+            &["export", "--out", "--out", "a"][..],
             &["import", "--out", "a"][..],
         ] {
             assert_eq!(parse(bad), None, "{bad:?}");

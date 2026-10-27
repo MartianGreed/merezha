@@ -1030,7 +1030,7 @@ SLOs and alerts. Multi-window burn rates follow the SRE workbook, over a
 
 | SLO / alert | Definition (recording rule) | Fire |
 | --- | --- | --- |
-| HTTP availability 99.9% | good = `http_server_request_duration_seconds_count{http_response_status_code!~"5.."}`; total excludes `http_route=~"/health.*"` | page: burn > 14.4 over 1h and 5m, or > 6 over 6h and 30m; ticket: > 1 over 3d and 6h |
+| HTTP availability 99.9% | good = `http_server_request_duration_seconds_count{http_response_status_code!~"5.."}`; total excludes `http_route=~"/health(/.*)?"` | page: burn > 14.4 over 1h and 5m, or > 6 over 6h and 30m; ticket: > 1 over 3d and 6h |
 | HTTP latency 99% under 500 ms | good = bucket `le="0.5"` over count, same exclusions | same burn windows |
 | Command failure rate | `failed / all` of `merezha_command_duration_seconds_count`; rejections and conflicts excluded | page > 1% over 10m; the rejection rate is a dashboard panel, alerting only at > 50% over 30m (ticket, likely a client bug) |
 | Projection lag | `max by (merezha_projection_name) (merezha_projection_lag_age_seconds)` | ticket > 60 s for 10m; page > 300 s for 10m |
@@ -1041,7 +1041,7 @@ SLOs and alerts. Multi-window burn rates follow the SRE workbook, over a
 | Delivery failures | `notify_status=~"failed\|bounced\|expired"` over all terminal statuses of `merezha_notification_deliveries_total`, per channel | ticket > 5% over 30m; page > 25% over 15m |
 | DB pool saturation | `db_client_connection_pending_requests > 0` for 5m, or timeouts increase | ticket |
 | Guest limits | `fuel_exhausted`, `memory_limit` or `timeout` outcomes > 1% of invocations over 15m | ticket |
-| Instance absent | a job seen in `merezha_telemetry_exported_total` within 1h with no sample in the last 10m; `absent_over_time(merezha_telemetry_exported_total{job="…"}[10m])` per expected job is the operator's addition (the self-metric exists whenever export is on) | page |
+| Instance absent | a job seen in `merezha_telemetry_exported_total` within 24h with no sample in the last 10m; `absent_over_time(merezha_telemetry_exported_total{job="…"}[10m])` per expected job is the operator's addition (the self-metric exists whenever export is on) | page |
 | Telemetry loss | `increase(merezha_telemetry_dropped_total[15m]) > 0` or an `otel_metric_overflow="true"` series exists | ticket |
 
 ## 8. Test plan
@@ -1273,6 +1273,14 @@ signals land.
   rule files.
 - The ticket burn-rate alerts pair the 3-day window with a 6-hour one, as
   the SRE workbook does, so they resolve once the errors stop.
+- Synchronous counters reach Prometheus at their first value, with no 0
+  sample before it, so `increase()` misses a new series' first event (the
+  first dead letter per instance, queue and kind after a start). The
+  dead-letter, pool-timeout and telemetry-drop alerts add an arm for a
+  series that did not exist one window earlier
+  (`x unless x offset <window>`). The instance-absent alert looks back 24
+  hours, so it keeps firing while a service stays down, for up to a day.
+- Health routes are matched as `/health(/.*)?`.
 - CI: the `Telemetry artifacts` workflow runs `promtool check rules`,
   `promtool test rules` and a parse of every dashboard query
   (`scripts/check-telemetry-artifacts.sh`, `prom/prometheus:v3.15.0` pinned

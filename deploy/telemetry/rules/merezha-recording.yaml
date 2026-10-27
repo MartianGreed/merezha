@@ -16,29 +16,29 @@ groups:
     rules:
       - record: job:merezha_http_errors:ratio_rate5m
         expr: |
-          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*", http_response_status_code=~"5.."}[5m]))
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?", http_response_status_code=~"5.."}[5m]))
           /
-          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*"}[5m]))
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[5m]))
       - record: job:merezha_http_errors:ratio_rate30m
         expr: |
-          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*", http_response_status_code=~"5.."}[30m]))
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?", http_response_status_code=~"5.."}[30m]))
           /
-          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*"}[30m]))
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[30m]))
       - record: job:merezha_http_errors:ratio_rate1h
         expr: |
-          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*", http_response_status_code=~"5.."}[1h]))
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?", http_response_status_code=~"5.."}[1h]))
           /
-          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*"}[1h]))
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[1h]))
       - record: job:merezha_http_errors:ratio_rate6h
         expr: |
-          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*", http_response_status_code=~"5.."}[6h]))
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?", http_response_status_code=~"5.."}[6h]))
           /
-          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*"}[6h]))
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[6h]))
       - record: job:merezha_http_errors:ratio_rate3d
         expr: |
-          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*", http_response_status_code=~"5.."}[3d]))
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?", http_response_status_code=~"5.."}[3d]))
           /
-          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*"}[3d]))
+          sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[3d]))
 
   # HTTP latency, 99% under 500 ms: the share of requests slower than the
   # `le="0.5"` bucket. Error budget 0.01.
@@ -47,37 +47,37 @@ groups:
       - record: job:merezha_http_slow:ratio_rate5m
         expr: |
           1 - (
-            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health.*", le="0.5"}[5m]))
+            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health(/.*)?", le="0.5"}[5m]))
             /
-            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*"}[5m]))
+            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[5m]))
           )
       - record: job:merezha_http_slow:ratio_rate30m
         expr: |
           1 - (
-            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health.*", le="0.5"}[30m]))
+            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health(/.*)?", le="0.5"}[30m]))
             /
-            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*"}[30m]))
+            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[30m]))
           )
       - record: job:merezha_http_slow:ratio_rate1h
         expr: |
           1 - (
-            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health.*", le="0.5"}[1h]))
+            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health(/.*)?", le="0.5"}[1h]))
             /
-            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*"}[1h]))
+            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[1h]))
           )
       - record: job:merezha_http_slow:ratio_rate6h
         expr: |
           1 - (
-            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health.*", le="0.5"}[6h]))
+            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health(/.*)?", le="0.5"}[6h]))
             /
-            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*"}[6h]))
+            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[6h]))
           )
       - record: job:merezha_http_slow:ratio_rate3d
         expr: |
           1 - (
-            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health.*", le="0.5"}[3d]))
+            sum by (job) (rate(http_server_request_duration_seconds_bucket{http_route!~"/health(/.*)?", le="0.5"}[3d]))
             /
-            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health.*"}[3d]))
+            sum by (job) (rate(http_server_request_duration_seconds_count{http_route!~"/health(/.*)?"}[3d]))
           )
 
   # Command outcomes: `failed` counts against the SLO; `rejected` (client

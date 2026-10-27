@@ -1029,6 +1029,16 @@ fn export_writes_every_file_and_replaces_its_own() {
     fs::write(blocked.join("rules"), "not a directory").unwrap();
     let error = artifacts::export(&blocked).unwrap_err();
     assert_eq!(error.path, Some("rules/merezha-recording.yaml"));
+    assert_eq!(error.kind, std::io::ErrorKind::NotADirectory);
+    // The files replaced before the failure are reported.
+    assert_eq!(
+        error.written,
+        ARTIFACTS
+            .iter()
+            .map(|a| a.path)
+            .take_while(|p| !p.starts_with("rules/"))
+            .collect::<Vec<_>>()
+    );
     fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -1049,5 +1059,31 @@ fn export_replaces_a_symbolic_link_instead_of_following_it() {
             .file_type()
             .is_symlink()
     );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn export_refuses_a_symbolic_link_for_a_subdirectory() {
+    let dir = std::env::temp_dir().join(format!("merezha-artifacts-subdir-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let elsewhere = dir.join("elsewhere");
+    let out = dir.join("out");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::create_dir_all(&out).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, out.join("dashboards")).unwrap();
+    let error = artifacts::export(&out).unwrap_err();
+    assert_eq!(error.path, Some("dashboards/merezha-overview.json"));
+    assert_eq!(error.kind, std::io::ErrorKind::NotADirectory);
+    assert_eq!(error.written, ["dashboards.yaml"]);
+    // Nothing was written through the link.
+    assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+    // The export directory itself may be a link.
+    let linked = dir.join("linked");
+    let real = dir.join("real");
+    fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    artifacts::export(&linked).unwrap();
+    assert!(real.join("rules/merezha-alerts.yaml").is_file());
     fs::remove_dir_all(&dir).unwrap();
 }

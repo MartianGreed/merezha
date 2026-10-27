@@ -91,6 +91,8 @@ fn export_refuses_bad_arguments_with_the_usage() {
         &["export"][..],
         &["export", "--out"][..],
         &["export", "--dir", "x"][..],
+        &["export", "--out", "a", "--out", "b"][..],
+        &["export", "--out", "--help"][..],
         &["import"][..],
         &[][..],
     ] {
@@ -112,7 +114,13 @@ fn export_reports_the_file_it_cannot_write() {
     assert_eq!(report["status"], "failed");
     assert_eq!(report["error"]["code"], "export_failed");
     assert_eq!(report["error"]["file"], "rules/merezha-recording.yaml");
-    assert!(report["error"]["reason"].is_string());
+    assert_eq!(report["error"]["reason"], "not_a_directory");
+    let replaced: Vec<&str> = ARTIFACTS
+        .iter()
+        .map(|a| a.path)
+        .take_while(|p| !p.starts_with("rules/"))
+        .collect();
+    assert_eq!(report["files"], serde_json::json!(replaced));
     // The export directory itself cannot be created below a file.
     let (code, report, _) = export(&[
         "export",

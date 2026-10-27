@@ -223,11 +223,14 @@ tests:
   - interval: 1m
     input_series:
       - series: 'merezha_telemetry_exported_total{job="tasks", instance="a", merezha_telemetry_signal="metrics", merezha_outcome="ok"}'
-        values: '0+10x20 _x40'
+        values: '0+10x20 _x100'
       - series: 'merezha_telemetry_exported_total{job="billing", instance="b", merezha_telemetry_signal="metrics", merezha_outcome="ok"}'
-        values: '0+10x60'
+        values: '0+10x120'
       - series: 'merezha_telemetry_dropped_total{job="billing", instance="b", merezha_telemetry_signal="traces", merezha_reason="queue_full"}'
         values: '0x30 5x30'
+      # A new series whose first sample is already above 0.
+      - series: 'merezha_telemetry_dropped_total{job="billing", instance="b", merezha_telemetry_signal="logs", merezha_reason="export_failed"}'
+        values: '_x30 3x30'
       - series: 'merezha_command_duration_seconds_count{job="billing", instance="b", otel_metric_overflow="true"}'
         values: '1x60'
     alert_rule_test:
@@ -240,13 +243,25 @@ tests:
           - exp_labels: {job: tasks, severity: page}
             exp_annotations:
               summary: 'tasks has reported no telemetry for 10 minutes'
-              description: 'No instance of tasks exported metrics for 10 minutes: every instance is down or cannot reach the collector.'
+              description: 'No instance of tasks exported metrics for 10 minutes: every instance is down or cannot reach the collector. The alert stops 24 hours after the last export.'
+      # Still down 70 minutes after the last export: still firing.
+      - alertname: MerezhaInstanceAbsent
+        eval_time: 90m
+        exp_alerts:
+          - exp_labels: {job: tasks, severity: page}
+            exp_annotations:
+              summary: 'tasks has reported no telemetry for 10 minutes'
+              description: 'No instance of tasks exported metrics for 10 minutes: every instance is down or cannot reach the collector. The alert stops 24 hours after the last export.'
       - alertname: MerezhaTelemetryDropped
         eval_time: 35m
         exp_alerts:
           - exp_labels: {job: billing, merezha_telemetry_signal: traces, merezha_reason: queue_full, severity: ticket}
             exp_annotations:
               summary: 'billing dropped traces (queue_full)'
+              description: 'Telemetry items were lost: queue_full means the collector is slow or the queue too small, export_failed that the collector refuses or is unreachable (telemetry.export_failed on stderr).'
+          - exp_labels: {job: billing, merezha_telemetry_signal: logs, merezha_reason: export_failed, severity: ticket}
+            exp_annotations:
+              summary: 'billing dropped logs (export_failed)'
               description: 'Telemetry items were lost: queue_full means the collector is slow or the queue too small, export_failed that the collector refuses or is unreachable (telemetry.export_failed on stderr).'
       - alertname: MerezhaMetricOverflow
         eval_time: 35m
@@ -255,3 +270,152 @@ tests:
             exp_annotations:
               summary: 'A metric of billing overflowed its cardinality limit'
               description: '1 series of billing carry otel_metric_overflow="true": an instrument exceeded 2000 attribute sets, so an attribute value is not from a closed set. Query {otel_metric_overflow="true"} to find the instrument.'
+
+  # Fast pair only (1h and 5m): 2% of requests fail during the last 70 of
+  # 400 minutes. The 6-hour ratio stays under 6 x 0.1%, so only the 14.4
+  # factor pages. Heavy health traffic dilutes the ratio if it is counted.
+  - interval: 1m
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/v1/application/commands", http_response_status_code="200"}'
+        values: '0+98x400'
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/v1/application/commands", http_response_status_code="500"}'
+        values: '0x330 2+2x69'
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/health/ready", http_response_status_code="200"}'
+        values: '0+200x400'
+    alert_rule_test:
+      - alertname: MerezhaHttpAvailabilityBudgetBurn
+        eval_time: 300m
+        exp_alerts: []
+      - alertname: MerezhaHttpAvailabilityBudgetBurn
+        eval_time: 400m
+        exp_alerts:
+          - exp_labels: {job: tasks, severity: page, slo: http-availability}
+            exp_annotations:
+              summary: 'tasks is burning its 99.9% HTTP availability budget fast'
+              description: 'tasks answers 5xx to 2% of its requests (health routes excluded). At this rate the 30-day error budget is gone within days.'
+
+  # Slow pair only (6h and 30m): 1% of requests fail for 400 minutes, under
+  # the 14.4 x 0.1% of the fast pair and over the 6 x 0.1% of the slow one.
+  - interval: 1m
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/v1/application/commands", http_response_status_code="200"}'
+        values: '0+99x400'
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/v1/application/commands", http_response_status_code="500"}'
+        values: '0+1x400'
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/health", http_response_status_code="200"}'
+        values: '0+300x400'
+    alert_rule_test:
+      - alertname: MerezhaHttpAvailabilityBudgetBurn
+        eval_time: 400m
+        exp_alerts:
+          - exp_labels: {job: tasks, severity: page, slo: http-availability}
+            exp_annotations:
+              summary: 'tasks is burning its 99.9% HTTP availability budget fast'
+              description: 'tasks answers 5xx to 1% of its requests (health routes excluded). At this rate the 30-day error budget is gone within days.'
+
+  # 2% of requests are slow for 400 minutes: the latency ticket fires (over
+  # 1% on 3 days and 6 hours), the page does not (under 6 x and 14.4 x 1%).
+  - interval: 1m
+    input_series:
+      - series: 'http_server_request_duration_seconds_bucket{job="tasks", instance="a", http_route="/v1/application/queries", le="0.5"}'
+        values: '0+98x400'
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/v1/application/queries"}'
+        values: '0+100x400'
+    alert_rule_test:
+      - alertname: MerezhaHttpLatencyBudgetBurnSlow
+        eval_time: 400m
+        exp_alerts:
+          - exp_labels: {job: tasks, severity: ticket, slo: http-latency}
+            exp_annotations:
+              summary: 'tasks is spending its HTTP latency budget faster than it accrues'
+              description: '2% of the requests of tasks took longer than 500 ms over 3 days; the objective is 1%.'
+      - alertname: MerezhaHttpLatencyBudgetBurn
+        eval_time: 400m
+        exp_alerts: []
+
+  # 30% of email deliveries fail: the page fires. `accepted` (non-terminal)
+  # would dilute the ratio to 5% if it were counted.
+  - interval: 1m
+    input_series:
+      - series: 'merezha_notification_deliveries_total{job="tasks", instance="a", notify_channel="email", notify_topic="tasks.completed", notify_status="accepted", notify_reason="none"}'
+        values: '0+500x30'
+      - series: 'merezha_notification_deliveries_total{job="tasks", instance="a", notify_channel="email", notify_topic="tasks.completed", notify_status="delivered", notify_reason="none"}'
+        values: '0+70x30'
+      - series: 'merezha_notification_deliveries_total{job="tasks", instance="a", notify_channel="email", notify_topic="tasks.completed", notify_status="failed", notify_reason="provider"}'
+        values: '0+30x30'
+    alert_rule_test:
+      - alertname: MerezhaNotificationDeliveryFailuresHigh
+        eval_time: 20m
+        exp_alerts:
+          - exp_labels: {job: tasks, notify_channel: email, severity: page}
+            exp_annotations:
+              summary: '30% of email deliveries of tasks fail'
+              description: 'A quarter of the deliveries fail: the provider or its credentials are likely broken. Check notification.provider_account_error and notification.failed logs.'
+
+  # A projection 400 s behind for 10 minutes pages.
+  - interval: 1m
+    input_series:
+      - series: 'merezha_projection_lag_age_seconds{job="tasks", instance="a", merezha_projection_name="tasks.board"}'
+        values: '400x30'
+    alert_rule_test:
+      - alertname: MerezhaProjectionStalled
+        eval_time: 5m
+        exp_alerts: []
+      - alertname: MerezhaProjectionStalled
+        eval_time: 15m
+        exp_alerts:
+          - exp_labels: {job: tasks, merezha_projection_name: tasks.board, severity: page}
+            exp_annotations:
+              summary: 'Projection tasks.board of tasks is 6m 40s behind'
+              description: 'Queries on this projection serve data more than 5 minutes old. Check projection.failed logs and GET /v1/application/projections.'
+
+  # Over OTLP a counter series appears at its first value, with no 0
+  # before it: the first dead letter and the first pool timeout of a new
+  # series still alert, and the alerts end once the window passes.
+  - interval: 1m
+    input_series:
+      - series: 'merezha_job_dead_lettered_total{job="tasks", instance="a", job_queue="notify.email", job_kind="notify.email"}'
+        values: '_x5 1x40'
+      - series: 'db_client_connection_timeouts_total{job="tasks", instance="a", db_client_connection_pool_name="merezha"}'
+        values: '_x3 1x40'
+    alert_rule_test:
+      - alertname: MerezhaJobsDeadLettered
+        eval_time: 8m
+        exp_alerts:
+          - exp_labels: {job: tasks, job_queue: notify.email, severity: ticket}
+            exp_annotations:
+              summary: 'Jobs of queue notify.email of tasks were dead-lettered'
+              description: 'A job exhausted its attempts or failed permanently (job.dead_lettered). Inspect it with the jobs admin API and replay it once fixed.'
+      - alertname: MerezhaJobsDeadLettered
+        eval_time: 25m
+        exp_alerts: []
+      - alertname: MerezhaDatabasePoolTimeouts
+        eval_time: 5m
+        exp_alerts:
+          - exp_labels: {job: tasks, instance: a, db_client_connection_pool_name: merezha, severity: ticket}
+            exp_annotations:
+              summary: 'Database connection waits time out on a (tasks)'
+              description: 'Callers gave up waiting for a merezha connection (db.pool_timeout).'
+      - alertname: MerezhaDatabasePoolTimeouts
+        eval_time: 15m
+        exp_alerts: []
+
+  # Latency fast pair only: 20% of requests are slow during the last 70 of
+  # 400 minutes; the 6-hour ratio stays under 6 x 1%.
+  - interval: 1m
+    input_series:
+      - series: 'http_server_request_duration_seconds_bucket{job="tasks", instance="a", http_route="/v1/application/queries", le="0.5"}'
+        values: '0+100x330 33100+80x70'
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/v1/application/queries"}'
+        values: '0+100x400'
+    alert_rule_test:
+      - alertname: MerezhaHttpLatencyBudgetBurn
+        eval_time: 300m
+        exp_alerts: []
+      - alertname: MerezhaHttpLatencyBudgetBurn
+        eval_time: 400m
+        exp_alerts:
+          - exp_labels: {job: tasks, severity: page, slo: http-latency}
+            exp_annotations:
+              summary: 'tasks is burning its HTTP latency budget fast'
+              description: '20% of the requests of tasks take longer than 500 ms; the objective is 1%.'

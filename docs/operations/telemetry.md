@@ -158,7 +158,9 @@ merezha telemetry export --out ops/telemetry
 ```
 
 It writes, and on a second run replaces, these files and leaves any other
-file in the directory alone:
+file in the directory alone. The directory may be a symbolic link, but
+`dashboards` and `rules` inside it may not: the export refuses to write
+through them (`not_a_directory`).
 
 | File | What it is |
 | --- | --- |
@@ -172,7 +174,8 @@ file in the directory alone:
 
 The output is one JSON report on stdout: `{"status":"exported", "files":
 [...]}` with exit 0, `{"status":"failed","error":{"code":"export_failed",
-"file":...,"reason":...}}` with exit 1, or `invalid_arguments` with exit 2.
+"file":...,"reason":...},"files":[...]}` with exit 1 (`files` lists what
+it had already replaced), or `invalid_arguments` with exit 2.
 Run it again after upgrading the host, so the queries match the new
 catalog.
 
@@ -233,7 +236,7 @@ when three days of errors exceed the budget.
 | --- | --- | --- | --- |
 | `MerezhaHttpAvailabilityBudgetBurn` | page | 5xx ratio above 14.4 × 0.1% over 1 h and 5 min, or 6 × over 6 h and 30 min | the 5xx panel per route, `http.request.completed` errors, the database and guest panels |
 | `MerezhaHttpAvailabilityBudgetBurnSlow` | ticket | 5xx ratio above 0.1% over 3 days and 6 h | same |
-| `MerezhaHttpLatencyBudgetBurn` / `...Slow` | page / ticket | requests over 500 ms above 14.4 × 1% (or 6 ×), or above 1% over 3 days | latency per route, statement latency, pool waiters, guest latency |
+| `MerezhaHttpLatencyBudgetBurn` / `...Slow` | page / ticket | requests over 500 ms above 14.4 × 1% over 1 h and 5 min, or 6 × over 6 h and 30 min / above 1% over 3 days and 6 h | latency per route, statement latency, pool waiters, guest latency |
 | `MerezhaCommandFailures` | page | more than 1% of commands `failed` over 10 min | `command.completed` warnings and their `code`, guests, database |
 | `MerezhaCommandRejections` | ticket | more than 50% of commands `rejected` over 30 min | the client sending them |
 | `MerezhaProjectionLagging` / `MerezhaProjectionStalled` | ticket / page | a projection's oldest unprocessed event is older than 60 s / 300 s for 10 min | `projection.failed`, `GET /v1/application/projections` |
@@ -245,12 +248,16 @@ when three days of errors exceed the budget.
 | `MerezhaDatabasePoolSaturated` | ticket | requests waited for a connection for 5 min | `database.pool_size`, long transactions, `db.pool_undersized` at startup |
 | `MerezhaDatabasePoolTimeouts` | ticket | a connection wait timed out | same, `db.pool_timeout` |
 | `MerezhaGuestLimits` | ticket | more than 1% of a service's invocations hit fuel, memory or time limits over 15 min | the runtime manifest's `[limits]`, expensive inputs |
-| `MerezhaInstanceAbsent` | page | a service that exported within the last hour has exported nothing for 10 min | the instances, the collector |
+| `MerezhaInstanceAbsent` | page | a service that exported within the last 24 hours has exported nothing for 10 min | the instances, the collector |
 | `MerezhaTelemetryDropped` | ticket | telemetry items were dropped in the last 15 min | `telemetry.export_failed` on stderr, the collector, `max_queue` |
 | `MerezhaMetricOverflow` | ticket | a series with `otel_metric_overflow="true"` exists | which instrument overflowed: `{otel_metric_overflow="true"}` |
 
-`MerezhaInstanceAbsent` only knows services it has seen in the last hour.
-For a service that must always run, add a rule of your own:
+`MerezhaInstanceAbsent` only knows services it has seen in the last 24
+hours: it fires 10 minutes after the last export and keeps firing until the
+service exports again or 24 hours have passed, then resolves although the
+service may still be down. A service that has not exported within those 24
+hours is not known at all. For a service that must always run, add a rule
+of your own, which has neither limit:
 
 ```yaml
 - alert: TasksAbsent
