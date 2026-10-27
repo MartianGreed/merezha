@@ -353,6 +353,19 @@ impl From<String> for Stop {
 /// own, `unknown_permission` against this binary's catalog and, with the
 /// identity block, `route_access_undeclared`. The first issue is the code;
 /// any other validation failure stops startup as before.
+/// The application checks `merezha run` makes before it opens `application`
+/// (route access, permissions against this binary's catalog, block resource
+/// kinds; AP §C.4), with `identity` when the identity block is configured.
+/// Fails with the first issue's code. `merezha new`'s tests run it on every
+/// generated project.
+pub fn check_application(
+    config: &merezha_platform::ProjectConfig,
+    application: &merezha_application::config::Config,
+    identity: bool,
+) -> Result<(), String> {
+    check_access(config, application, identity).map_err(|stop| stop.code)
+}
+
 fn check_access(
     config: &merezha_platform::ProjectConfig,
     application: &merezha_application::config::Config,

@@ -1,6 +1,7 @@
 //! `merezha notifications check --config merezha.toml`: the notifications
 //! block's startup validation (NT §4, §7.2) without starting anything. It
-//! loads the project like `merezha run`, kernel sections included, and
+//! loads the project like `merezha run`, kernel sections and every block of
+//! this binary included (so the other blocks' sections validate too), and
 //! prints one JSON report on stdout: `{"status":"ok",...}` and exit 0, or
 //! `{"status":"invalid","issues":[{"key","code","origin"}]}` and exit 2.
 //! An ok report lists `warnings` (`[{key, code}]`), such as
@@ -44,7 +45,7 @@
 //! `operator`; exit 2 means bad arguments, configuration or database
 //! (`notification.purge_failed`).
 use merezha_notifications::{HostFacts, Notifications};
-use merezha_platform::{ConfigInput, Module, host};
+use merezha_platform::{ConfigInput, host};
 use serde_json::{Value, json};
 use std::process::ExitCode;
 
@@ -65,8 +66,7 @@ const REGISTER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30
 pub fn check(input: &ConfigInput) -> (Value, ExitCode) {
     let module = Notifications::new(HostFacts::load(input));
     let handle = module.handle();
-    let modules: Vec<Box<dyn Module>> = vec![Box::new(module)];
-    match host::configure(input, modules) {
+    match host::configure(input, crate::blocks_with_notifications(input, module)) {
         Ok(_) => match handle.checked() {
             Some(checked) => {
                 let settings = &checked.settings;
@@ -173,7 +173,7 @@ pub fn register_webhook(
     let failed = |code: &str| (json!({"status": "failed", "code": code}), ExitCode::from(1));
     let module = Notifications::new(HostFacts::load(input));
     let handle = module.handle();
-    if let Err(errors) = host::configure(input, vec![Box::new(module) as Box<dyn Module>]) {
+    if let Err(errors) = host::configure(input, crate::blocks_with_notifications(input, module)) {
         let issues: Vec<Value> = errors
             .0
             .iter()

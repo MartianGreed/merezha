@@ -1,0 +1,6 @@
+description = "A note was shared with you"
+required = ["note_id", "title"]
+
+[preview]
+note_id = "0192f5c4-7a1e-7b3d-9c2a-5e8f1d6b4a00"
+title = "Groceries"

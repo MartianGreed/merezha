@@ -1,0 +1,22 @@
+
+[modules.identity]
+app_origin = "https://app.example.invalid"     # your front end's origin
+api_base_url = "https://api.example.invalid"   # this host's own origin; OAuth callbacks derive from it
+secret_key = { env = "MEREZHA_IDENTITY_SECRET_KEY" }
+registration = "open"                          # owner answer ID8; "invite_only" or "closed"
+
+[modules.identity.password]
+
+[modules.identity.magic_links]
+
+[modules.identity.organizations]
+user_can_create = false                        # the starter is an application without organizations
+
+[modules.identity.rbac.builtin_grants]
+user = ["notes.read", "notes.write"]           # every signed-in user may keep notes
+
+[modules.identity.rbac.application_roles.operator]
+name = "Operator"
+description = "Runs the application: status, jobs, application and webhooks"
+permissions = ["system.status.read", "jobs.admin.read", "application.admin.read",
+               "notifications.webhooks.read", "notifications.webhooks.manage"]

@@ -2463,6 +2463,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.23.1",
  "jiff",
  "merezha-application",
  "merezha-content",
@@ -2474,12 +2475,14 @@ dependencies = [
  "merezha-platform",
  "merezha-postgres",
  "merezha-runtime",
+ "merezha-scaffold",
  "merezha-telemetry",
  "rustls",
  "serde_json",
  "syn 3.0.9",
  "tempfile",
  "tokio",
+ "toml",
  "tower",
  "tracing",
  "wat",
@@ -2703,6 +2706,16 @@ dependencies = [
  "wasmparser 0.258.3",
  "wasmtime",
  "wat",
+]
+
+[[package]]
+name = "merezha-scaffold"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "serde",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

@@ -49,13 +49,16 @@ fn main() -> std::process::ExitCode {
     // One process-level crypto provider, so no TLS path (database, OTLP,
     // outbound) can fail for want of one.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    // The guest build commands read no configuration and start nothing.
+    // The guest build commands and `new` read no configuration and start
+    // nothing.
     match std::env::args().nth(1).as_deref() {
         Some("build") => return merezha_cli::guest::build_main(std::env::args().skip(2)),
         Some("componentize") => {
             return merezha_cli::guest::componentize_main(std::env::args().skip(2));
         }
         Some("version") => return merezha_cli::guest::version_main(std::env::args().skip(2)),
+        // `merezha new` takes paths, which need not be UTF-8.
+        Some("new") => return merezha_cli::new::main(std::env::args_os().skip(2)),
         _ => {}
     }
     if std::env::args().nth(1).as_deref() == Some("notifications") {

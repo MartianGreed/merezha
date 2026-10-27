@@ -1,0 +1,6 @@
+/target/
+/components/
+/.env
+/.env.*
+!/.env.example
+/.merezha/

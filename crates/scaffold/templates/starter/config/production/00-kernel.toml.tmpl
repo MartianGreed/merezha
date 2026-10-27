@@ -1,0 +1,36 @@
+# Production starting point. Replace every .invalid host before deploying;
+# top-level module keys can also be set with MEREZHA_MODULES__<MODULE>__<KEY>.
+# Secrets come from the environment of the deployment.
+[app]
+id = "%%app_id%%"
+name = "%%app_name%%"
+
+[http]
+listen = "0.0.0.0:8080"
+public = true
+trusted_proxies = ["10.0.0.0/8"]       # replace with your reverse proxy's addresses
+
+[http.cors]
+# The front end at app. calls the API at api.: another origin of the same
+# site, so the SameSite=Lax session cookie goes along and only CORS is
+# needed. Delete this table when one origin serves both.
+allowed_origins = ["https://app.example.invalid"]
+allow_credentials = true
+
+[database]
+url = { env = "DATABASE_URL" }
+tls = "require"
+migrate = true
+pool_size = 24                         # above the host's recommendation for every block selection (23 with all of them)
+
+[runtime]
+manifest = "runtime.toml"
+
+[application]
+path = "application.toml"
+
+[application.background]
+max_concurrent = 2
+
+# Queue settings live only here (R1).
+[jobs.queues]

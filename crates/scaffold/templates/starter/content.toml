@@ -1,0 +1,14 @@
+# The content model (content §3). Site types are public (CT1); add
+# access rules to every other type.
+version = 1
+locales = [{ code = "en", default = true }]
+
+[types.page]
+kind = "collection"
+access = "public"
+title_field = "title"
+fields = [
+  { name = "title", type = "string", required = true, max_length = 200, sortable = true },
+  { name = "slug", type = "slug", from = "title", required = true },
+  { name = "body", type = "rich_text", styles = ["normal", "h2", "h3"], marks = ["strong", "em", "code"], annotations = ["link"], lists = ["bullet", "number"] },
+]

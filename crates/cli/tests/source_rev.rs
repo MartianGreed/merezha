@@ -12,6 +12,9 @@ use std::{
 };
 
 const BUILD_SCRIPT: &str = include_str!("../build.rs");
+/// How `merezha new` picks the revision to pin from what the build script
+/// recorded (scaffold §2.9); std-only, so the probe can carry it.
+const PIN: &str = include_str!("../../scaffold/src/pin.rs");
 
 fn cargo() -> Command {
     let mut command = Command::new(env!("CARGO"));
@@ -55,9 +58,20 @@ fn git_available() -> bool {
 }
 
 /// Writes the probe crate into `dir`: `build.rs` is the cli's, `main`
-/// prints what it recorded.
+/// prints what it recorded, and `pin-probe` prints what `merezha new`
+/// would pin without `--merezha-rev`: the revision, or the refusal code.
 fn probe(dir: &Path) {
-    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::create_dir_all(dir.join("src/bin")).unwrap();
+    fs::write(dir.join("src/pin.rs"), PIN).unwrap();
+    fs::write(
+        dir.join("src/bin/pin-probe.rs"),
+        "#[path = \"../pin.rs\"]\nmod pin;\n\
+         fn main() {\n\
+             let built = Some(env!(\"MEREZHA_BUILD_SOURCE_REV\")).filter(|r| !r.is_empty());\n\
+             match pin::select_rev(None, built) { Ok(rev) => print!(\"{rev}\"), Err(code) => print!(\"{code}\") }\n\
+         }\n",
+    )
+    .unwrap();
     fs::write(
         dir.join("Cargo.toml"),
         "[package]\nname = \"rev-probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
@@ -151,6 +165,8 @@ fn cargo_install_from_a_git_checkout_records_the_commit_despite_cargo_ok() {
     }
     assert!(marked, "no git checkout with .cargo-ok under {checkouts:?}");
     assert_eq!(run(&install.join("bin/rev-probe")), head);
+    // `merezha new` from such a binary pins that commit.
+    assert_eq!(run(&install.join("bin/pin-probe")), head);
 }
 
 #[test]
@@ -164,9 +180,16 @@ fn a_fresh_build_records_none_with_a_modified_tracked_file_and_ignores_untracked
     let (_, recorded) = build(&repo, &root.path().join("untracked"), &[]);
     assert_eq!(recorded, head, "an untracked file must not count");
 
+    assert_eq!(run(&root.path().join("untracked/debug/pin-probe")), head);
+
     fs::write(repo.join("README"), "edited\n").unwrap();
     let (_, recorded) = build(&repo, &root.path().join("modified"), &[]);
     assert_eq!(recorded, "", "a modified tracked file records none");
+    // ... and `merezha new` refuses to pin without a flag.
+    assert_eq!(
+        run(&root.path().join("modified/debug/pin-probe")),
+        "source_rev_unknown"
+    );
 
     // MEREZHA_SOURCE_REV wins over the tree, dirty or not.
     let given = "0123456789abcdef0123456789abcdef01234567";
@@ -276,6 +299,7 @@ fn a_second_build_without_changes_does_not_rerun_the_script() {
     assert!(!reran(&stderr), "{stderr}");
     assert!(stderr.contains("Fresh rev-probe"), "{stderr}");
     assert_eq!(recorded, head);
+    assert_eq!(run(&target.join("debug/pin-probe")), head);
     assert_eq!(fs::metadata(&index).unwrap().modified().unwrap(), indexed);
 
     // Packed refs: the loose ref is gone and must not be watched as a

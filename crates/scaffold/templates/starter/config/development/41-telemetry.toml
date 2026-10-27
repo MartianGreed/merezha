@@ -1,0 +1,5 @@
+# OTLP stays off unless an endpoint is set (R12). scripts/dev.sh sets
+# MEREZHA_TELEMETRY__ENDPOINT when the otel companion runs.
+
+[telemetry.resource]
+environment = "local"

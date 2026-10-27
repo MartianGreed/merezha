@@ -1,0 +1,6 @@
+{% extends "_layouts/email.html" %}
+{% block content %}
+<p>Hello{% if recipient.name %} {{ recipient.name }}{% endif %},</p>
+<p>The note &ldquo;{{ title }}&rdquo; was shared with you.</p>
+{% if links.app %}<p><a href="{{ links.app }}/notes/{{ note_id }}">Open the note</a></p>{% endif %}
+{% endblock %}

@@ -1,0 +1,67 @@
+# Routes, projections and reactors. Every route is application-scoped and
+# checks a permission; the guests check ownership.
+version = 2
+
+[storage]
+backend = "postgres"
+application = "%%app_id%%"
+
+[limits]
+max_stream_events = 4096
+max_state_bytes = 262144          # the notes projection is one state document
+max_concurrent = 8
+
+[[permissions]]
+name = "notes.read"
+description = "Read your notes and the notes shared with you"
+
+[[permissions]]
+name = "notes.write"
+description = "Create, edit, share and archive your notes"
+
+[[commands]]
+tag = "CreateNote"
+service = "domain"
+aggregate = "Note"
+permission = "notes.write"
+
+[[commands]]
+tag = "EditNote"
+service = "domain"
+aggregate = "Note"
+permission = "notes.write"
+
+[[commands]]
+tag = "ShareNote"
+service = "domain"
+aggregate = "Note"
+permission = "notes.write"
+
+[[commands]]
+tag = "ArchiveNote"
+service = "domain"
+aggregate = "Note"
+permission = "notes.write"
+
+[[queries]]
+tag = "ListNotes"
+service = "view"
+projection = "notes"
+permission = "notes.read"
+
+[[queries]]
+tag = "GetNote"
+service = "view"
+projection = "notes"
+permission = "notes.read"
+
+[[projections]]
+name = "notes"
+service = "view"
+initial = { notes = {} }
+
+[[reactors]]
+name = "notifier"
+service = "notifier"
+events = ["NoteShared"]
+effects = ["notify", "webhook"]

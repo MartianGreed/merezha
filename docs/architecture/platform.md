@@ -239,6 +239,87 @@ assignment on one fails `422 resource_kind_tenant_only`. With the identity block
 `identity.user_grant_tenant_route` (warn, `permission`, `route`): `user`
 grants hold in every organization, so tenant permissions belong in `member`.
 
+## Starting a project
+
+`merezha new` writes a new project from a template built into the binary
+([scaffold §2](../design/scaffold.md#2-merezha-new), SC-S2). It reads no
+configuration, emits no telemetry, needs no network, no Cargo and no Git,
+and runs no subprocess. The code is in `crates/cli/src/new.rs` over the
+library `merezha-scaffold` (`crates/scaffold`, templates under
+`crates/scaffold/templates/`).
+
+```sh
+merezha new NAME [--dir PATH] [--template starter] [--blocks LIST]
+                 [--merezha-rev REV | --merezha-path PATH] [--no-secrets]
+merezha new --help
+```
+
+- `NAME` is the application id (`[app] id`, `[storage] application`):
+  `^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$`, at most 40 bytes, and not `merezha`.
+- `--dir` defaults to `./NAME`. The target must not exist or must be an
+  empty directory; its parent must exist and is canonicalized, so a parent
+  reached through a symbolic link works. There is no `--force`.
+- `--blocks` takes a comma-separated list of `identity`, `notifications`,
+  `content` and `telemetry` (default: all four), or `none`. `identity`
+  needs `notifications` and `content` needs `identity`, which is what the
+  blocks themselves refuse at startup.
+- The project pins the merezha source its guests build against. By default
+  it is the revision this binary was built from (`merezha version`'s `rev`):
+  a binary that does not know it (a dirty or unknown tree) refuses with
+  `source_rev_unknown` instead of pinning something that is not its source.
+  `--merezha-rev` names a full commit instead, and `--merezha-path` a merezha
+  checkout, written as a path relative to the project.
+- `--no-secrets` writes no `.env`.
+
+The `starter` template (a small notes application) writes, today:
+`merezha.toml` (local development: loopback listener, capture mail driver,
+the development-only switches), `merezha.production.toml` (public listener
+behind a proxy, Brevo, TLS to the database, `.invalid` hosts to replace),
+`runtime.toml`, `application.toml` (route permissions with identity, public
+routes without), `content.toml` with content, the `notes.shared`
+notification templates with notifications, `.env.example` (every variable
+both files read, without values), `.gitignore`, `.merezha-version` (the pin:
+`rev = "<commit>"` or `path = "<relative>"`) and `.env`. The guest crates,
+scripts, CI workflow and README come with SC-S3. Each file whose format has
+comments starts with `# SPDX-License-Identifier: MIT OR MIT-0`.
+
+Every secret is an `{ env = "NAME" }` reference in both configuration files.
+`.env` holds the generated development values (the identity key as 256-bit
+hex, the notifications key as base64 of 32 bytes, the VAPID private key as
+`merezha notifications vapid generate` makes it), all hex or base64 so the
+file can be sourced by a shell. It is written last, after the `.gitignore`
+that ignores it, with mode 0600. Brevo values are never generated.
+
+The project is written whole or not at all: every file is created with
+`O_EXCL` inside a staging directory `.NAME.merezha-new-<16 hex>` (mode
+0700) beside the target, then renamed onto it. Files get `0644` (`0755`
+under `scripts/`) minus the umask. On any failure the staging directory is
+removed.
+
+It prints one JSON object on stdout and exits 0:
+
+```json
+{"status":"created","dir":"/home/ada/acme","template":"starter",
+ "blocks":["identity","notifications","content","telemetry"],
+ "merezha":{"rev":"0123456789abcdef0123456789abcdef01234567"},
+ "secrets":["MEREZHA_IDENTITY_SECRET_KEY","MEREZHA_NOTIFY_SECRET_KEY","MEREZHA_VAPID_PRIVATE_KEY"],
+ "files":15,"next":["cd /home/ada/acme"]}
+```
+
+`secrets` names the variables in `.env`, never a value; with
+`--merezha-path`, `merezha` is `{"path":"<relative>"}`. Before anything is
+written, invalid input prints `{"status":"invalid","error":{"code"}}` and
+exits 2: `invalid_arguments` (with `usage`), `invalid_name`,
+`unknown_template`, `unknown_block`, `block_requires_notifications`,
+`block_requires_identity`, `blocks_fixed_by_template`, `conflicting_source`,
+`invalid_rev`, `invalid_merezha_path`, `source_rev_unknown`,
+`target_not_empty`, `target_not_directory`, `target_is_symlink`,
+`target_is_working_directory` (run it from the parent instead) and
+`parent_missing`. A failed write prints `{"status":"failed","error":{"code"}}`
+and exits 1: `write_failed`, `rename_failed` (the target was filled after
+the checks), `random_unavailable`, `secret_generation_failed`, and
+`secret_invalid` or `template_invalid` for a defect in the binary.
+
 ## Building guests
 
 Three commands build and identify what `merezha run` loads ([scaffold
@@ -1474,7 +1555,9 @@ Check a project without starting it:
 cargo run --locked -p merezha-cli -- notifications check --config merezha.toml
 ```
 
-It loads the whole configuration as `merezha run` does and prints one JSON
+It loads the whole configuration as `merezha run` does, with every block of
+the binary registered (so `[modules.identity]` and `[modules.content]` are
+validated too rather than refused as unknown), and prints one JSON
 object on stdout: `status` `ok` with the topic and template counts, the
 locales, the channel drivers and `warnings` (`[{key, code}]`, such as
 `security_mail_disabled` when `email.driver = "disabled"` drops identity's

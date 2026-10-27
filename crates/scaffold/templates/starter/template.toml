@@ -1,0 +1,90 @@
+# The starter template's index (scaffold §2.8). Files not listed here are
+# copied under the same relative path; a `.tmpl` suffix is dropped after the
+# substitutions. A fragment named NN-<block>.* belongs to that block and
+# NN-kernel.* always applies; `when` keeps an entry only with every listed
+# block, `unless` drops it with any of them.
+name = "starter"
+description = "A small notes application"
+blocks = ["identity", "notifications", "content", "telemetry"]
+next = []
+
+[[file]]
+path = "merezha.toml"
+fragments = [
+  "config/development/00-kernel.toml.tmpl",
+  "config/shared/01-notifications.toml",
+  "config/shared/02-kernel.toml",
+  "config/shared/03-identity.toml",
+  "config/shared/04-content.toml",
+  "config/development/10-identity.toml",
+  "config/development/20-notifications.toml.tmpl",
+  "config/shared/21-identity.toml",
+  "config/shared/22-notifications.toml",
+  "config/shared/30-content.toml",
+  "config/shared/40-kernel.toml",
+  "config/development/41-telemetry.toml",
+]
+
+[[file]]
+path = "merezha.production.toml"
+fragments = [
+  "config/production/00-kernel.toml.tmpl",
+  "config/shared/01-notifications.toml",
+  "config/shared/02-kernel.toml",
+  "config/shared/03-identity.toml",
+  "config/shared/04-content.toml",
+  "config/production/10-identity.toml",
+  "config/production/20-notifications.toml.tmpl",
+  "config/shared/21-identity.toml",
+  "config/shared/22-notifications.toml",
+  "config/shared/30-content.toml",
+  "config/shared/40-kernel.toml",
+  "config/production/41-telemetry.toml",
+]
+
+[[file]]
+path = "application.toml"
+source = "application.toml.tmpl"
+when = ["identity"]
+
+[[file]]
+path = "application.toml"
+source = "application.public.toml.tmpl"
+unless = ["identity"]
+
+[[file]]
+path = "content.toml"
+source = "content.toml"
+when = ["content"]
+
+[[file]]
+path = ".gitignore"
+source = "gitignore"
+
+[[file]]
+path = ".env.example"
+fragments = [
+  "env/00-kernel.example",
+  "env/10-identity.example",
+  "env/20-notifications.example",
+]
+
+[[tree]]
+source = "notifications"
+when = ["notifications"]
+
+# Development secrets written to .env (SC-D6), without values in .env.example.
+[[secret]]
+name = "MEREZHA_IDENTITY_SECRET_KEY"
+kind = "token"
+when = ["identity"]
+
+[[secret]]
+name = "MEREZHA_NOTIFY_SECRET_KEY"
+kind = "key"
+when = ["notifications"]
+
+[[secret]]
+name = "MEREZHA_VAPID_PRIVATE_KEY"
+kind = "vapid_private_key"
+when = ["notifications"]

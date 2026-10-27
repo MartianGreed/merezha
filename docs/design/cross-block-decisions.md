@@ -353,7 +353,9 @@ Slice ids are the designs' own; AP-C* and CT-C* disambiguate the two C series.
     NT-N7; ID PR 3; CT-C6, then CT-C2 to CT-C5, CT-C7; the identity and
     content parts of NT-N8. TE-T6 metric rows land inside each of these PRs.
 - **Stage 3**: AP-C1, AP-C2, AP-C3 with NT-N8's reaction part; CT-C9, TE-T7;
-  `merezha new` and the example application.
+  `merezha new` and the example application ([scaffold §7](scaffold.md#7-delivery-slices):
+  SC-S1 guest build, SC-S2 `merezha new`, SC-S3 the runnable starter, SC-S4
+  the telemetry companion, SC-S5 the example application).
 
 Ownership to avoid duplicated work: jobs gauges belong to TE-T5, not AP-B2;
 route enforcement belongs to AP-C2, not ID PR 2; TE's status endpoint reads AP's

@@ -1,0 +1,4 @@
+endpoint = "http://127.0.0.1:4318"     # a collector agent beside the host (telemetry §6)
+
+[telemetry.resource]
+environment = "production"

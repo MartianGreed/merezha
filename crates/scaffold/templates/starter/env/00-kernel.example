@@ -1,0 +1,3 @@
+# Copy to .env (chmod 600) or let `merezha new` write it. Never commit .env.
+# DATABASE_URL is filled by scripts/dev.sh from the Contremaitre environment when unset.
+DATABASE_URL=

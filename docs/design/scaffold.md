@@ -1271,6 +1271,24 @@ the build. No file under `crates/scaffold/templates/` is named `Cargo.toml`.
 build-time path checks), `crates/scaffold/tests/source_rev.rs` (the three source pin cases on a
 temporary git repository, each in an empty target directory), `crates/cli/tests/new.rs` (process tests of the command, its JSON
 report and its refusals).
+*As built (SC-S2):* the revision stays recorded by `crates/cli/build.rs`;
+the CLI hands it to `merezha-scaffold`, whose std-only `src/pin.rs` picks the
+pin, and `crates/cli/tests/source_rev.rs` carries that file in its probe
+crate for the three source pin cases. The configuration matrix is in
+`crates/cli/tests/new.rs`, which has every block registered; `render.rs`
+keeps the rendering rules. The staging directory (0700) holds a `project`
+directory created at `0755 & !umask`, which is what is renamed onto the
+target, so the umask is never read or changed. The index also has `[[tree]]`
+(a directory kept by `when`/`unless`), `[[secret]]` (the variables `.env`
+gets, by block), `fixed` and `next`; fragments are concatenated in the
+listed order and every `NN-kernel.*` applies. `.gitignore` and `.env.example`
+are stored as `gitignore` and `env/*.example`; `.env` and `.merezha-version`
+are written by the command and no template may produce them. The SPDX header
+of SC-Q9 is written by the renderer (`render::LICENSE`) rather than stored
+in each template. `wit/service.wit` is embedded with SC-S3, which renders it.
+`merezha notifications check` now registers every block, as `merezha run`
+does: before, any project with identity or content failed it with
+`unknown_module`.
 
 **SC-S3 acceptance.** For the starter with all blocks, with `identity,notifications` and with
 `none`, `scripts/check-scaffold.sh` renders the project into `.scaffold-check/<case>` with
