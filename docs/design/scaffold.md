@@ -21,9 +21,9 @@ The requirements other designs already placed on the scaffold:
 | --- | --- | --- |
 | [framework.md](../architecture/framework.md), Project shape | `merezha.toml`, runtime and application manifests and guest crates in the project repository; the prebuilt host runs it; blocks switched on in configuration | 3.1 |
 | [notifications.md §7.2](notifications.md#72-modulesnotifications) | `merezha new` writes the block's `[jobs.queues]` settings | 3.2 |
-| [notifications.md §11, N8](notifications.md#11-delivery-slices) | the end-to-end example application, from guest event to reaction to inbox item to SSE event, stays with stage 3 | 5.10, SC-S4 |
+| [notifications.md §11, N8](notifications.md#11-delivery-slices) | the end-to-end example application, from guest event to reaction to inbox item to SSE event, stays with stage 3 | 5.10, SC-S5 |
 | [content.md §12, CT1](content.md#12-decisions) | `merezha new` writes `access = "public"` on scaffolded site types | 3.6, 5.5 |
-| [telemetry.md §6](telemetry.md#6-local-development-and-production-backends) | the scaffold writes `ops/telemetry/lgtm.Dockerfile` and copies the dashboards into `ops/telemetry/` | 3.10, SC-S3 |
+| [telemetry.md §6](telemetry.md#6-local-development-and-production-backends) | the scaffold writes `ops/telemetry/lgtm.Dockerfile` and copies the dashboards into `ops/telemetry/` | 3.10, SC-S4 |
 | [platform.md, Limits and follow-ups](../architecture/platform.md#limits-and-follow-ups) | reactors get a process test with a Wasm reactor component; the example wires a reactor with an `ArchiveTask` route | 5.7, 5.10 |
 
 ## Decision summary
@@ -33,16 +33,17 @@ The requirements other designs already placed on the scaffold:
 | SC-D1 | Command | `merezha new NAME [--dir PATH] [--template starter\|teamboard] [--blocks LIST] [--merezha-rev REV \| --merezha-path PATH] [--no-secrets]`. It never overwrites: the target must not exist or must be an empty directory. It never touches the network and runs no subprocess. |
 | SC-D2 | Templates | Two templates. `starter` (default) is a small notes application whose blocks are chosen with `--blocks`. `teamboard` is the example application with every block; it takes no `--blocks`. |
 | SC-D3 | Embedding | A build script in the new crate `merezha-scaffold` walks `crates/scaffold/templates/` and emits one `include_bytes!` table. No new dependency. `include_dir` was checked and rejected (2.7). |
-| SC-D4 | Rendering | Plain files are copied as they are. Files ending `.tmpl` get a closed set of `%%name%%` substitutions. `merezha.toml` and its siblings are concatenated from per-block fragments. There is no template engine. Guest sources contain no placeholder, so each template's guest code compiles as it sits in the repository. |
+| SC-D4 | Rendering | Plain files are copied as they are. Files ending `.tmpl` get a closed set of `%%name%%` substitutions. `merezha.toml` and its siblings are concatenated from per-block fragments. There is no template engine. Template manifests are stored as `Cargo.toml.tmpl`, so Cargo never sees a template as a package; CI compiles the rendered output. |
 | SC-D5 | Two config files | `merezha.toml` is the local development configuration. `merezha.production.toml` is the production starting point. Both share the manifests, the content model and the templates. Module settings in nested tables cannot be overridden from the environment (`nested_override_unsupported`), so one file cannot serve both. |
 | SC-D6 | Secrets | Every secret is `{ env = "NAME" }` in both files. `merezha new` writes generated development secrets to `.env` (mode 0600, created after the `.gitignore` that lists it) and a committed `.env.example` without values. `--no-secrets` writes no `.env`. |
-| SC-D7 | Guest build | `merezha build` runs `cargo build --target wasm32-unknown-unknown --release` on the project workspace, then componentizes every service of the runtime manifest into `components/`. Componentizing moves from `services/componentize` into the host crate `merezha-componentize`, shared by both. |
+| SC-D7 | Guest build | `merezha build` runs `cargo build --target wasm32-unknown-unknown --release` on the project workspace, then componentizes every service of the runtime manifest into `components/`. The componentize code moves from `services/componentize` into the host library crate `merezha-guest-build`, which both use. |
 | SC-D8 | SDK pin | The project depends on `merezha-domain` by git URL and full commit `rev`, the revision the running `merezha` binary was built from. `--merezha-path` writes a path dependency instead. Publishing to crates.io is SC-Q2. |
 | SC-D9 | Local stack | `.contremaitre.yaml` declares managed PostgreSQL 17 (`db`) and, with telemetry, the LGTM container (`otel`) built from `ops/telemetry/lgtm.Dockerfile`. The host runs natively through `scripts/dev.sh`. No mail container: the capture driver is the local mail sink. |
 | SC-D10 | Example | `teamboard`, a team task board: organizations, invitations, roles, API keys, tenant streams, a partitioned projection, a reactor with notify, webhook and command effects, help articles and organization briefs in the CMS, inbox with SSE, email, push and OTLP telemetry. |
 | SC-D11 | Example location and sync | `examples/teamboard/` holds the committed output of `merezha new teamboard --template teamboard --merezha-path . --no-secrets`. CI regenerates it and fails on any difference, then builds it and runs the end-to-end test against it. |
-| SC-D12 | End-to-end test | `crates/cli/tests/teamboard.rs` runs the real `merezha run` binary on the example's Wasm components and real PostgreSQL, with `FakeBrevo` for email and `WebhookReceiver` for webhooks. |
-| SC-D13 | Telemetry ownership | TE-T7 keeps `deploy/telemetry/` and `merezha telemetry export`. The scaffold's copy into `ops/telemetry/`, the example's Contremaitre manifest and its verification profile move from TE-T7 to SC-S3. |
+| SC-D12 | End-to-end test | `crates/cli/tests/teamboard.rs` runs the real `merezha run` binary on the example's Wasm components and real PostgreSQL, with `FakeBrevo` for email, `FakePushService` for push and `WebhookReceiver` for webhooks, across two organizations. |
+| SC-D14 | Front end origin | Development: the front end's dev server proxies `/v1` to the host, so the browser sees one origin and CORS stays off. Production: `[http.cors]` with the front end's exact origin and `allow_credentials = true`. |
+| SC-D13 | Telemetry ownership | TE-T7 keeps `deploy/telemetry/` and `merezha telemetry export`. The scaffold's copy into `ops/telemetry/`, the example's Contremaitre manifest and its verification profile move from TE-T7 to SC-S4. |
 
 ## 1. Language
 
@@ -66,7 +67,7 @@ merezha new NAME [--dir PATH] [--template starter|teamboard] [--blocks LIST]
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `NAME` | required | The application id: `[app] id`, the Contremaitre `project`, `[storage] application` and the README title. `^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$`: a lowercase DNS label of at most 40 bytes, the stricter of `[app] id` (63 bytes) and a Contremaitre name (40). `merezha` is refused, since it would share the Contremaitre environments of the merezha repository. |
-| `--dir PATH` | `./NAME` | Where the project goes. Created when missing; its parent must exist. |
+| `--dir PATH` | `./NAME` | Where the project goes. Created when missing; its parent must exist and is canonicalized first, so a parent reached through a symbolic link (`/tmp` on macOS) works. |
 | `--template` | `starter` | `starter` or `teamboard` (section 5). |
 | `--blocks LIST` | `identity,notifications,content,telemetry` | Comma-separated block selection for `starter`, or `none`. Refused with `teamboard`. |
 | `--merezha-rev REV` | the binary's own revision | A 40-hex commit the guests' `merezha-domain` git dependency and `.merezha-version` name. |
@@ -82,7 +83,7 @@ The rules follow what the blocks refuse at startup, so a generated project alway
 | Rule | Why | Refusal |
 | --- | --- | --- |
 | `identity` needs `notifications` | identity stops at start with `notifications_required` unless `dev_print_links` runs on a private loopback listener, which production cannot use | `block_requires_notifications` |
-| `content` needs `identity` | content without identity starts only on a loopback listener with `AllowAll` (`identity_required` otherwise) | `block_requires_identity` |
+| `content` needs `identity` | without identity there is no principal: on a private listener the kernel's loopback allow-all policy admits every management call, and on any other listener the deny-all policy answers every management route `401 unauthenticated`, so nobody could edit content in production; `scope = "organization"` types also fail `content_model_invalid` without identity | `block_requires_identity` |
 | `telemetry` stands alone | the stderr log stream is always on; the block adds the OTLP settings, `ops/telemetry/` and the `otel` companion | none |
 | `none` | runtime, jobs and the PostgreSQL application only: routes declare `access = "public"` and the project is loopback-only | none |
 
@@ -105,7 +106,8 @@ Every check runs before anything is written. Invalid input prints
 | `invalid_merezha_path` | the path holds no `crates/domain/Cargo.toml` naming `merezha-domain` |
 | `source_rev_unknown` | the binary does not know its revision (2.9) and neither flag was given |
 | `target_not_empty`, `target_not_directory` | the target exists and holds anything, or is a file |
-| `target_is_symlink` | the target, or its parent, is a symbolic link |
+| `target_is_symlink` | the target itself is a symbolic link (the parent is canonicalized, so links above the target are fine) |
+| `target_is_working_directory` | the canonical target is the current working directory: the rename would replace it and leave the shell in a deleted directory. Run `merezha new` from the parent instead |
 | `parent_missing` | the target's parent directory does not exist |
 
 ### 2.4 Writing the project
@@ -173,12 +175,15 @@ The componentizer (SC-D7) is the one new direct dependency:
 
 | Crate | Version | MSRV | Licence | Features | Used by |
 | --- | --- | --- | --- | --- | --- |
-| `wit-component` | 0.258.3 | 1.85.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | default | componentize: encoding and the import and export checks |
-| `wit-parser` | 0.258.3 | 1.85.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | default | componentize: the canonical WIT |
+| `wit-component` | 0.258.3 | 1.85.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | default | `merezha-guest-build`: encoding and the import and export checks |
+| `wit-parser` | 0.258.3 | 1.85.0 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | default | `merezha-guest-build`: the canonical WIT |
 
-Both are already in `Cargo.lock` at these versions, pulled by Wasmtime 49's bindgen. `deny.toml`
-allows every licence. `services/componentize` moves from 0.262.0 to the same 0.258.3, so the
-host and the services workspace encode components with the version the runtime decodes.
+Both are already in `Cargo.lock` at these versions, pulled by Wasmtime 49's bindgen, so the
+lockfile gains no crate. `deny.toml` allows every licence. Wasmtime 49 decodes components with
+`wasmparser` 0.258.3, the version these encode with. `services/componentize` moves from 0.262.0
+to 0.258.3 with them, which is an API port and not a version bump: `wit_component::targets`
+takes three arguments in 0.258.3 and the current code passes four, so the call is rewritten
+and its tests rerun.
 
 ### 2.8 Rendering
 
@@ -215,17 +220,35 @@ unless = ["identity"]
   `%%merezha_version%%`. A `%%` sequence that is not one of them fails the build script, so a
   typo never reaches a user. The delimiter avoids `{{ }}`, which minijinja templates and
   Contremaitre references use.
+- Every `Cargo.toml` in a template is stored as `Cargo.toml.tmpl` and renamed when rendered.
+  Cargo therefore never treats a template as a package: not in this repository's workspace, and
+  not when a project's git dependency makes Cargo scan this repository for `merezha-domain`
+  (which would otherwise find a second `domain` and `events` package and warn about duplicates).
 - A unit test renders every template with every block selection allowed by 2.2 (eight starter
-  selections and `teamboard`) and loads each result as 3.14 describes.
+  selections and `teamboard`) and loads each result as 3.14 describes. The guest code is compiled
+  from the rendered output (SC-S3), never in place.
 
 ### 2.9 Source pin
 
 `crates/scaffold/build.rs` records the revision the binary is built from, in this order:
-`MEREZHA_SOURCE_REV` from the build environment (the release and CI builds set it); else
-`git rev-parse HEAD` in the crate's directory, kept only when `git status --porcelain` is empty;
-else none. A dirty or unknown tree gives none, so `merezha new` asks for `--merezha-rev` or
-`--merezha-path` (`source_rev_unknown`) rather than pinning a revision that is not the source.
-SC-S2 checks that `cargo install --git file://<checkout> --rev <sha> merezha-cli` records `<sha>`.
+
+1. `MEREZHA_SOURCE_REV` from the build environment, which the release and CI builds set.
+2. Else `git rev-parse HEAD` in the crate's directory, kept only when `git status --porcelain
+   --untracked-files=no` prints nothing. Untracked files are ignored on purpose: Cargo leaves an
+   untracked `.cargo-ok` in every git checkout it builds, so counting untracked files would mark
+   every `cargo install --git ... --rev` build dirty. A modified tracked file still counts.
+3. Else none. A dirty or unknown tree gives none, so `merezha new` asks for `--merezha-rev` or
+   `--merezha-path` (`source_rev_unknown`) rather than pinning a revision that is not the source.
+
+So that the recorded revision follows the tree, the script prints
+`cargo::rerun-if-env-changed=MEREZHA_SOURCE_REV` and `cargo::rerun-if-changed` for the git
+directory's `HEAD`, the ref `HEAD` points to, `packed-refs` and `index`. It finds them with
+`git rev-parse --git-dir` and `--git-common-dir`, so linked worktrees work. A commit, a branch
+switch or staging an edit reruns the script; an unstaged edit to a tracked file changes neither
+`HEAD` nor the index, which is why step 2 checks the status at every run rather than caching
+cleanliness. SC-S2 checks that `cargo install --git file://<checkout> --rev <sha> merezha-cli`
+records `<sha>` despite `.cargo-ok`, that a commit in a development checkout changes the recorded
+revision on the next build, and that a modified tracked file makes it none.
 
 `%%merezha_dependency%%` renders as one of:
 
@@ -241,6 +264,9 @@ merezha-domain = { path = "../crates/domain" }   # --merezha-path, relative to t
 rev = "0123456789abcdef0123456789abcdef01234567"
 # or: path = ".."
 ```
+
+With a `path` pin there is no revision to compare: section 4.3 says what `scripts/dev.sh` and CI
+check then, and SC-Q10 asks the owner to confirm it.
 
 ## 3. The generated project
 
@@ -274,6 +300,7 @@ acme/
   smoke/                      native scenario driver over HTTP (std and serde_json only)
   scripts/dev.sh              start the stack and the host (3.9)
   scripts/smoke.sh            build, start on an ephemeral port, run smoke, stop
+  scripts/ci.sh               every CI check; the generated workflow and this repository's both run it
   ops/telemetry/              [telemetry] lgtm.Dockerfile, dashboards.yaml, dashboards/, rules/ (3.10)
 ```
 
@@ -292,12 +319,12 @@ id = "acme"
 name = "acme"
 
 [http]
-listen = "127.0.0.1:8080"          # loopback: a private listener, so no CORS and the dev cookie
+listen = "127.0.0.1:8080"          # loopback: a private listener; the front end reaches it through its dev server proxy
 
 [database]
 url = { env = "DATABASE_URL" }
 migrate = true
-pool_size = 24                     # limits.max_concurrent 8 + background 2 + 2 + 9 queues + 2 + 1
+pool_size = 24                     # the recommended 23 (see below) plus one spare
 
 [runtime]
 manifest = "runtime.toml"
@@ -396,11 +423,24 @@ log_level = "info"
 environment = "local"
 ```
 
-The pool size follows platform.md's sizing formula ("Application storage", Connections); the queue concurrencies sum to
-55 of the 256 allowed. `notify.email` keeps `backoff_max_ms` at one hour, above the five minutes a
-Brevo driver needs, and every provider queue keeps the default 30 s lease, three times the 10 s
-provider timeouts, so switching to Brevo needs no queue change. CORS stays off: there is no
-`[http.cors]` table.
+The pool size comes from platform.md's formula ("Application storage", Connections):
+`limits.max_concurrent + background.max_concurrent + 2 + number of job queues + 2`, here
+8 + 2 + 2 + 9 + 2 = 23, which is what the host recommends. 24 keeps one connection spare. Below
+the recommendation the host logs the startup warning `db.pool_undersized`, which is emitted today
+but missing from `names.rs`; TE-T7 adds it to the catalog. The queue concurrencies sum to 55 of
+the 256 allowed. `notify.email` keeps `backoff_max_ms` at one hour, above the five minutes a Brevo
+driver needs, and every provider queue keeps the default 30 s lease, three times the 10 s provider
+timeouts, so switching to Brevo needs no queue change.
+
+**The front end in development (SC-D14).** A browser front end on `http://localhost:5173` calling
+`http://127.0.0.1:8080` is cross-origin, and CORS exists only through `[http.cors]`. Worse,
+`localhost` and `127.0.0.1` are different sites, so a `SameSite=Lax` session cookie would not go
+with a cross-site fetch even with CORS on. The development file therefore writes no `[http.cors]`,
+and the README configures the front end's dev server to proxy `/v1` to `http://127.0.0.1:8080`
+(for Vite: `server.proxy = { "/v1": "http://127.0.0.1:8080" }`). The browser then sees one origin,
+`http://localhost:5173`, which is `app_origin`: the loopback development cookie, the `Origin`
+check and the CSRF header work as they will in production, and nothing about CORS has to be
+learned twice. Scripts and `curl` call `127.0.0.1:8080` directly with bearer sessions.
 
 ### 3.3 `merezha.production.toml`
 
@@ -410,7 +450,9 @@ The same file with these differences, and nothing a public listener refuses:
 | --- | --- | --- |
 | `http.listen`, `http.public`, `http.trusted_proxies` | `127.0.0.1:8080`, absent, absent | `0.0.0.0:8080`, `true`, `["10.0.0.0/8"]` (replace with the proxy's addresses) |
 | `database.tls` | absent (`disable`) | `"require"` |
+| `[http.cors]` | absent (off) | `allowed_origins = ["https://app.example.invalid"]`, `allow_credentials = true`: the front end at `app.` calls the API at `api.`, a different origin of the same site, so the `SameSite=Lax` cookie goes along and only CORS is needed |
 | `modules.identity.app_origin` | `http://localhost:5173` | `https://app.example.invalid` |
+| `modules.identity.api_base_url` | absent (`app_origin`, through the dev proxy) | `https://api.example.invalid`, the host's own origin, from which OAuth callbacks are derived |
 | `modules.notifications.public_base_url` | `http://127.0.0.1:8080` | `https://api.example.invalid` |
 | `modules.notifications.egress` | `allow_private_networks = true` | absent |
 | `templates.app_base_url`, `templates.allow_http_links` | `http://localhost:5173`, `true` | `https://app.example.invalid`, absent |
@@ -596,7 +638,7 @@ publish = false
 merezha-domain = { git = "https://github.com/MartianGreed/merezha", rev = "0123456789abcdef0123456789abcdef01234567" }
 events = { path = "guests/events" }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde_json = "1.0.154"
 wit-bindgen = { version = "0.63.0", default-features = false, features = ["macros", "realloc"] }
 
 [profile.release]
@@ -607,12 +649,15 @@ panic = "abort"
 strip = true
 ```
 
-The versions are the host and services workspaces' own. Each component crate follows
+The versions match the services workspace's (`serde_json` there also enables `raw_value`, which
+the generated guests do not need); the first build's `Cargo.lock` fixes the exact ones. Each
+component crate follows
 `services/task-notifier/Cargo.toml`: `crate-type = ["cdylib", "rlib"]`, `wit-bindgen` only
 under `[target.'cfg(target_arch = "wasm32")'.dependencies]`, and a `#[cfg(target_arch =
 "wasm32")]` module calling `wit_bindgen::generate!({ path: "../../wit", world: "service" })`.
-No crate needs a placeholder, so the starter's guests compile and test inside the merezha
-repository as they sit in `crates/scaffold/templates/starter/` (SC-S2 adds that to CI).
+The manifests are stored as `Cargo.toml.tmpl` (2.8) and the `wit/` directory is added at render
+time, so the guests are compiled and tested from the rendered project: `scripts/check-scaffold.sh`
+renders each case and runs the project's own `scripts/ci.sh` in it (SC-S3).
 
 | Crate | Answers | Behaviour |
 | --- | --- | --- |
@@ -653,8 +698,8 @@ service, because there is no published `merezha` image yet (SC-Q1).
 `scripts/dev.sh` does, in order:
 
 1. `set -a; . ./.env; set +a` when `.env` exists.
-2. Check `merezha version` against `.merezha-version` and stop with the install command when
-   they differ.
+2. Check `merezha version` against `.merezha-version` as 4.3's table says: a different pinned
+   revision stops with the install command, an unknown one or a path pin only warns.
 3. Unless `DATABASE_URL` is already set (a throwaway server, platform.md "Local PostgreSQL"):
    `contremaitre ensure --json`, `contremaitre proxy db ${DB_PORT:-15432}:5432 &`, and
    `DATABASE_URL=postgres://app:$(contremaitre exec db -- printenv POSTGRES_PASSWORD)@127.0.0.1:${DB_PORT:-15432}/app`.
@@ -705,7 +750,8 @@ BREVO_WEBHOOK_TOKEN=
 `.env` holds the generated values: `MEREZHA_IDENTITY_SECRET_KEY` from
 `merezha_platform::context::random_token` (256 bits, hex), `MEREZHA_NOTIFY_SECRET_KEY` as base64
 of 32 bytes from the same CSPRNG, `MEREZHA_VAPID_PRIVATE_KEY` from the generator behind
-`merezha notifications vapid generate` (base64url scalar). Every value is hex or base64, so
+`merezha notifications vapid generate` (`jwt-simple`'s `ES256KeyPair::generate`, through
+`web-push-native`, written as the base64url scalar). Every value is hex or base64, so
 sourcing the file in a shell is safe. Brevo values are never generated: they come from the
 provider. Variables for absent blocks are left out of both files.
 
@@ -729,7 +775,8 @@ and Perl for the vendored OpenSSL of passkeys; Contremaitre, or any PostgreSQL 1
 `git init` and the first commit, which includes the generated `Cargo.lock` after the first build;
 `scripts/dev.sh`; a walk through the API with `curl` (register, read the verification mail from
 the captures, confirm, sign in with `"transport": "bearer"`, create, share and list notes, read
-the inbox and open `inbox/stream`); where each thing lives (3.1); tests (`cargo test`,
+the inbox and open `inbox/stream`); the front end's dev server proxy for `/v1` (3.2) and the
+production `[http.cors]` origin (3.3); where each thing lives (3.1); tests (`cargo test`,
 `scripts/smoke.sh`); Brevo sandbox in development (3.2's commented block); the production
 checklist (3.3's table, `merezha identity password-benchmark`, `merezha notifications brevo
 register-webhook`, `merezha identity platform-admin grant`); and links to platform.md and the
@@ -738,18 +785,27 @@ operations guide at the pinned revision.
 ### 3.13 CI workflow
 
 `.github/workflows/ci.yml`, one Linux job with a `postgres:17` service container, `permissions:
-contents: read`, actions pinned by commit like this repository's, `MEREZHA_NOTIFY_NO_EGRESS=1`:
+contents: read` and actions pinned by commit like this repository's. PostgreSQL 17 matches the
+Contremaitre environment and this repository's own `host.yml`; R14 names 16 for CI, the floor
+stays 14, and the generated SQL is all the blocks' own, which they keep within 14. The workflow
+does two things:
 
 1. Install the toolchain from `rust-toolchain.toml`; restore `~/.cargo/bin/merezha` from a cache
    keyed by `.merezha-version`, else `cargo install --locked --git ... --rev <rev> merezha-cli`.
-2. `cargo fmt --all --check`; `cargo clippy --locked --workspace --all-targets -- -D warnings`;
-   `cargo clippy --locked --target wasm32-unknown-unknown -p domain -p view -p notifier -- -D
-   warnings`; `cargo test --locked --workspace`.
-3. `merezha build`.
-4. Throwaway secrets for this run (`openssl rand`, masked), then `merezha notifications check
-   --config merezha.toml` and the same for `merezha.production.toml` with throwaway Brevo values;
-   a warning annotation per `.invalid` host left in the production file.
-5. `scripts/smoke.sh` against the service container's database.
+2. Run `scripts/ci.sh`, which holds every check so the same script runs here and in this
+   repository's `scaffold` workflow (SC-S3):
+   1. `cargo fmt --all --check`; `cargo clippy --locked --workspace --all-targets -- -D
+      warnings`; `cargo clippy --locked --target wasm32-unknown-unknown -p domain -p view -p
+      notifier -- -D warnings`; `cargo test --locked --workspace`.
+   2. `merezha build`.
+   3. Throwaway secrets for this run (`openssl rand`; the workflow masks them), then `merezha
+      notifications check --config merezha.toml` and `--config merezha.production.toml` with
+      throwaway Brevo values. These checks run with `MEREZHA_NOTIFY_NO_EGRESS` unset: the
+      production file's Brevo `base_url` is the default `https://api.brevo.com`, which that
+      variable refuses (`egress_not_loopback`), and as a nested key it cannot be overridden.
+      A warning annotation follows for each `.invalid` host left in the production file.
+   4. `scripts/smoke.sh` against the service container's database, with
+      `MEREZHA_NOTIFY_NO_EGRESS=1` set for the host it starts.
 
 The workflow needs no repository secret.
 
@@ -758,13 +814,14 @@ The workflow needs no repository secret.
 | Block off | Effect |
 | --- | --- |
 | `identity` (so also `content`) | no `[modules.identity]`; `application.public.toml`; no `MEREZHA_IDENTITY_SECRET_KEY`; `application_alert_roles = []`, since no `operator` role exists; the README warns that the project serves only loopback; the smoke scenario calls the routes anonymously |
-| `notifications` (so also `identity`, `content`) | no `[modules.notifications]`, no `notify.*` queues, no `notifications/`; the reactor keeps its `notify` effect, which the kernel's capture fallback logs as `notification.captured`; the `webhook` effect is dropped from `effects` |
+| `notifications` (so also `identity`, `content`) | no `[modules.notifications]`, no `notify.*` queues, no `notifications/`; the reactor keeps its `notify` effect, which the kernel's capture fallback logs as `notification.captured`; the `webhook` effect stays too, since the fallback records webhook events the same way |
 | `content` | no `[modules.content]`, no `content.toml`, no `content` queue |
 | `telemetry` | no `[telemetry.resource]` and no OTLP comment, no `ops/telemetry/`, no `otel` service; logs still go to stderr |
 
 SC-S2's unit test loads every generated configuration through `host::configure` with every block
-module registered, as `merezha run` does, with the throwaway environment of 3.13: every key
-exists and every cross-check passes. It also parses the runtime manifest and `application.toml`,
+module registered, as `merezha run` does, with throwaway secrets and without
+`MEREZHA_NOTIFY_NO_EGRESS` (which the production file's Brevo `base_url` would fail, as 3.13
+explains): every key exists and every cross-check passes. It also parses the runtime manifest and `application.toml`,
 validates `content.toml` through the content model loader and renders every template's preview
 as `merezha notifications check` does. A key this design invents would fail that test.
 
@@ -781,22 +838,33 @@ merezha componentize CORE.wasm COMPONENT.wasm
 
 1. Parses the runtime manifest (the kernel's parser, without loading components) and takes each
    service's `path`. A path must be `components/<id>.wasm`, else `unsupported_component_path`.
-2. Runs `cargo build --manifest-path <workspace> --release --target wasm32-unknown-unknown
+   The service `id` names the Cargo package that builds it.
+2. Runs `cargo metadata --format-version 1 --no-deps` on the workspace and finds, for each id,
+   the package of that name and its `cdylib` target (`unknown_package`, `no_cdylib` otherwise).
+   The target's name gives the artifact, `<target name with - as _>.wasm`, so a package that
+   renames its library (`[lib] name = "task_domain"`) works.
+3. Runs `cargo build --manifest-path <workspace> --release --target wasm32-unknown-unknown
    -p <id>...`, with `--locked` when `Cargo.lock` exists. Without one, Cargo writes it and the
-   report says `"lockfile": "created"`. Cargo's output goes to stderr. `CARGO_TARGET_DIR` is
-   honoured.
-3. Componentizes `<target>/wasm32-unknown-unknown/release/<id with - as _>.wasm` into
-   `components/<id>.wasm` through `merezha-componentize`, written to `<id>.wasm.partial` and
-   renamed, as `services/componentize` does now. A component must import nothing and export
+   report says `"lockfile": "created"`. Cargo's output goes to stderr. `CARGO_TARGET_DIR` and
+   the metadata's `target_directory` are honoured. Feature builds, such as the services
+   workspace's `task-view-faulty`, are out of scope: build them with Cargo and `merezha
+   componentize`.
+4. Componentizes each artifact into `components/<id>.wasm` through `merezha-guest-build`,
+   written to `<id>.wasm.partial` and renamed, as `services/componentize` does now. A component must import nothing and export
    exactly `merezha:service/handler@0.1.0` with the canonical types, and fit 16 MiB.
-4. Prints `{"status":"built","components":[{"id","bytes"}],"lockfile"}` and exits 0; a Cargo
+5. Prints `{"status":"built","components":[{"id","bytes"}],"lockfile"}` and exits 0; a Cargo
    failure prints `{"status":"failed","error":{"code":"cargo_failed"}}` (exit 1); a missing core
    module `component_source_missing`, a contract breach `component_rejected` with the service id
    (exit 1); an unreadable manifest or a missing wasm target `invalid_manifest` or
    `missing_wasm_target` (exit 2).
 
-`merezha componentize` is step 3 alone. `services/componentize` keeps its binary and command line
-and calls the same library, so `scripts/build-services.sh` is unchanged.
+`merezha componentize` is step 4 alone. `services/componentize` keeps its package name
+(`merezha-componentize`), binary and command line, and becomes a thin `main` over
+`merezha-guest-build`, a path dependency on `../crates/guest-build`. The host library takes a
+different name precisely so that the two never collide. `scripts/build-services.sh` keeps its
+commands (`cargo build -p merezha-componentize`, then `release/merezha-componentize`), but what
+they compile changes: the services workspace now builds the host's `crates/guest-build` and its
+`wit-component` 0.258.3, and `services/Cargo.lock` changes with it.
 
 The two underlying steps stay usable without the wrapper: `cargo build --release --target
 wasm32-unknown-unknown -p domain` and `merezha componentize
@@ -819,7 +887,14 @@ the reactor's row starts at the head. `scripts/smoke.sh` starts the host with `-
 
 `merezha version` prints `{"version":"0.1.0","rev":"<sha>"}` (`rev` is `null` when unknown) and
 exits 0. It reads no configuration. `scripts/dev.sh` and the generated CI compare it with
-`.merezha-version`.
+`.merezha-version`:
+
+| Pin | `merezha version` `rev` | Check |
+| --- | --- | --- |
+| `rev` | the same | passes |
+| `rev` | another revision | fails with the `cargo install` command for the pinned one |
+| `rev` | `null` (a host built from a dirty tree) | warns and continues: nothing to compare |
+| `path` | any | compares with `git -C <path> rev-parse HEAD` when the path is a git checkout with no modified tracked file, and warns on a difference; otherwise warns that the host cannot be checked. It never fails, since a path pin is for working on merezha itself (SC-Q10) |
 
 ### 4.4 SDK version
 
@@ -898,9 +973,9 @@ assignee, status, completed_at}}}`. Queries `ListTasks {status?}`, `GetTask {id}
 | Magic links | `[modules.identity.magic_links]` |
 | Organizations, invitations | `organizations.user_can_create = true` (default); owners invite with roles; `identity.invitation` mail |
 | Roles | built-in `owner`, `admin`, `member`, the four declared application roles, a resource grant on one task |
-| API keys, service accounts | an organization service account `ci-bot` with a key limited to `tasks.read` and `tasks.create` |
+| API keys, service accounts | an organization service account `ci-bot` holding `member`, with one key listing only `tasks.read` and one listing `tasks.read` and `tasks.create`: a key's power is its list intersected with its owner's grants |
 | Passkeys | `[modules.identity.passkeys]` on (`rp_id` defaults to `localhost` in development); exercised by identity's own suite, not by 5.10 |
-| OAuth, OIDC | a commented `[modules.identity.oauth.providers.github]` block with `client_secret = { env = "GITHUB_CLIENT_SECRET" }` |
+| OAuth, OIDC | a commented `[modules.identity.oauth.providers.github]` block with `client_id = "Iv1.replace-me"` and `client_secret = { env = "GITHUB_CLIENT_SECRET" }`. Its redirect URI is `{api_base_url}/v1/identity/oauth/github/callback`: in development `api_base_url` defaults to `app_origin`, which reaches the host through the dev server proxy (SC-D14); production sets `api_base_url` to the API origin (3.3) |
 | Break-glass | `merezha identity platform-admin grant` for the operator who reads `/v1/admin/status` |
 | `new_sign_in` | `notify_new_sign_in = true`, so security notices reach the inbox (NT-N8) |
 
@@ -1015,39 +1090,61 @@ same) and runs `diff -r --exclude Cargo.lock --exclude target --exclude componen
 `examples/teamboard` with components from `MEREZHA_TEST_EXAMPLE_COMPONENTS` (the directory
 `merezha build` wrote), a `TestDatabase`, an ephemeral loopback port and
 `MEREZHA_NOTIFY_NO_EGRESS=1`. Without the variable it prints an explicit skip, like
-`TestDatabase`; `MEREZHA_TEST_REQUIRE_EXAMPLE=1` turns the skip into a failure, and CI sets it. The
-scratch copy edits two things with the `toml` crate: the email driver becomes `brevo`, with
-`base_url` pointing at a `FakeBrevo` and throwaway `api_key` and `webhook_token`, and a fake OTLP HTTP receiver (an axum router that counts
-`POST /v1/traces`, `/v1/metrics` and `/v1/logs`) becomes the telemetry endpoint. Every wait polls
-and returns as soon as its condition holds, under a 30 s ceiling, so nothing depends on speed.
+`TestDatabase`; `MEREZHA_TEST_REQUIRE_EXAMPLE=1` turns the skip into a failure, and CI sets it.
+The scratch copy edits three things with the `toml` crate:
+
+- the email driver becomes `brevo`, with `base_url` pointing at a `FakeBrevo` and throwaway
+  `api_key` and `webhook_token`;
+- `[modules.notifications.push] allowed_hosts = ["127.0.0.1"]`, so a `FakePushService` on
+  loopback is a valid endpoint (the development file already sets
+  `egress.allow_private_networks = true`, which also lets `http` and any port through, as
+  notifications' own push tests do);
+- the telemetry endpoint points at a fake OTLP HTTP receiver, an axum router that counts
+  `POST /v1/traces`, `/v1/metrics` and `/v1/logs`.
+
+Every wait polls and returns as soon as its condition holds, under a 30 s ceiling, so nothing
+depends on speed.
 
 1. Alice registers; the verification link comes from `FakeBrevo`'s recorded request; she
    confirms and signs in with a bearer session. `merezha identity platform-admin grant` makes her
    the operator.
 2. Alice creates organization Acme and invites Bob as `member`; Bob registers, verifies and
-   accepts the invitation from the `identity.invitation` mail. Dave registers and joins nothing.
-3. Bob opens `GET /v1/notifications/inbox/stream` with his bearer and `Merezha-Organization`.
-   The stream answers `hello`.
+   accepts the invitation from the `identity.invitation` mail. Dave registers and creates his own
+   organization, Globex, and a Globex task.
+3. Bob subscribes to push with `FakePushService::subscription` (`POST
+   /v1/notifications/push/subscriptions`, Acme active) and opens `GET
+   /v1/notifications/inbox/stream` with his bearer and `Merezha-Organization`. The stream
+   answers `hello`.
 4. Alice sends `CreateTask`, then `AssignTask` to Bob. Within the ceiling Bob's stream yields an
    `item` event whose `InboxItem` has topic `tasks.assigned`, Acme as `tenant_id` and the task
    title, then `unread` with `{"unread": 1}`. `FakeBrevo` holds one `tasks.assigned` email to
-   Bob, and the push delivery is `skipped` / `no_subscription`.
-5. Alice assigns another task to Dave. `GET /v1/application/reactors/notifier/rejections` lists
+   Bob, and `FakePushService` received one push that decrypts to a payload with topic
+   `tasks.assigned` under a valid VAPID token for the generated key.
+5. Tenant isolation. Acme's `ListTasks` does not contain Dave's Globex task, and `GetTask` on
+   its id from Acme answers `task_not_found` (the id names Acme's stream `{acme}:Task/{id}`,
+   which is empty). Dave's `ListTasks` in Globex shows only his task. Bob, with Globex named in
+   `Merezha-Organization`, gets `404 not_found`, since he is not a member.
+6. Alice assigns an Acme task to Dave. `GET /v1/application/reactors/notifier/rejections` lists
    `recipient_not_in_tenant` for it, and the next assignment to Bob still reaches his stream.
-6. Alice registers an Acme webhook endpoint on a `WebhookReceiver`. Bob completes his task: the
+7. Alice registers an Acme webhook endpoint on a `WebhookReceiver`. Bob completes his task: the
    receiver verifies one `tasks.task_completed` signature, Alice's inbox holds `tasks.completed`,
    and `GET /v1/jobs/admin/queues` shows one delayed job on queue `application`.
-7. A `ci-bot` key with `tasks.read` lists Acme's tasks and gets `403 unauthorized` on
-   `CreateTask`.
-8. Carol, given the `editor` role by Alice, creates and publishes a help article. Anonymous
+8. Alice creates the Acme service account `ci-bot` with the `member` role and two keys: one
+   listing only `tasks.read`, one listing `tasks.read` and `tasks.create`. The first lists Acme's
+   tasks and gets `403 unauthorized` on `CreateTask`, since a key's power is its list; the second
+   creates a task.
+9. Alice, as the operator, registers an application-level endpoint (`POST
+   /v1/notifications/webhooks`, `event_types = ["content.*"]`) on a second `WebhookReceiver`.
+   She gives Carol the `editor` role. Carol creates and publishes a help article: anonymous
    `GET /v1/content/help_article/by-slug/{slug}` answers 200, and the application-level endpoint
-   receives `content.entry_published`. Alice publishes an Acme brief: Bob reads it under
-   `/v1/content/o/{org}`, an anonymous caller gets 401 and Dave 403.
-9. `GET /v1/admin/status` as Alice shows the reactor `active` with `lag_events` 0 and
-   `telemetry.signals.traces.exported` above 0; the fake receiver got traces, metrics and logs.
-10. Every stderr line's `event` resolves through `merezha_telemetry::names::event`, and no line
+   receives one signed `content.entry_published`. Alice publishes an Acme brief: Bob reads it
+   under `/v1/content/o/{acme}`, an anonymous caller gets 401, and Dave, whose tenant is Globex,
+   gets 403.
+10. `GET /v1/admin/status` as Alice shows the reactor `active` with `lag_events` 0 and
+    `telemetry.signals.traces.exported` above 0; the fake receiver got traces, metrics and logs.
+11. Every stderr line's `event` resolves through `merezha_telemetry::names::event`, and no line
     contains a password, a token, a session id or a verification link.
-11. SIGTERM: the stream ends with the drain, and the host exits 0.
+12. SIGTERM: the stream ends with the drain, and the host exits 0.
 
 Steps 3 and 4 are NT-N8's "Tests" line with the Wasm reactor component, which PR #77's
 in-process test could not use.
@@ -1057,23 +1154,25 @@ in-process test could not use.
 **Secrets.** Both configuration files reference every secret with `{ env }`; neither ever holds a
 literal (`secret_literal` would refuse it anyway). `.env` is the only file holding values: it is
 created with mode 0600 inside a staging directory of mode 0700, after the `.gitignore` that
-ignores it, and the report names the variables without their values. The values come from the
-operating system CSPRNG through `merezha-platform`'s `Random`. Nothing is printed, logged or
+ignores it, and the report names the variables without their values. The identity and notification
+keys come from the operating system CSPRNG through `merezha-platform`'s `Random`; the VAPID key
+from `jwt-simple`'s `ES256KeyPair::generate`, as `notifications vapid generate` does. Nothing is printed, logged or
 written to a committed file. `.env.example` has empty values only. The generated CI makes
 throwaway secrets per run, so the repository needs none. Brevo keys and OAuth client secrets are
 the provider's and never generated.
 
 **File permissions.** Project files follow the umask from 0644 (0755 for `scripts/`). The
 scaffold never widens a mode and never writes outside the target: template paths are checked at
-build time (no `..`, no absolute paths, no symbolic links), the target and its parent must not be
-symbolic links, and every file is created with `O_EXCL`.
+build time (no `..`, no absolute paths, no symbolic links), the target must not be a symbolic
+link (its parent is canonicalized), the target cannot be the working directory, and every file
+is created with `O_EXCL`.
 
 **Safe defaults in the generated configuration.**
 
 | Setting | Default written | Reason |
 | --- | --- | --- |
 | Listener | `127.0.0.1:8080`, not public | A private listener: no exposure, development cookies allowed only here |
-| CORS | off (no `[http.cors]`) | A front end on another origin must opt in with its exact origin |
+| CORS | off in development, where the front end's dev server proxies `/v1` (SC-D14); in production one exact origin with credentials, never `*` | Only the application's own front end may call with cookies |
 | Cookies | identity's defaults: `__Host-` prefix, `Secure`, `HttpOnly`, `SameSite=Lax`; the loopback development cookie drops `__Host-` and `Secure` only on the private listener (R15) | |
 | Registration | `open`, written out with a comment naming `invite_only` and `closed` | Owner answer ID8; written so it is a visible choice |
 | Email verification | required | Unverified accounts cannot sign in |
@@ -1082,7 +1181,7 @@ symbolic links, and every file is created with `O_EXCL`.
 | Reactors | `allow_addresses` off | Guests cannot send to arbitrary addresses |
 | Content | every type declares `access` (CT1); only site types are `public` | |
 
-**What the scaffold refuses.** Everything in 2.3: overwriting anything, symbolic-link targets,
+**What the scaffold refuses.** Everything in 2.3: overwriting anything, symbolic-link targets, the working directory,
 names that would collide with the merezha repository's Contremaitre project, block selections
 that would not start, and a source pin it cannot vouch for.
 
@@ -1100,37 +1199,54 @@ catalog rows.
 
 | Slice | Scope | Depends on |
 | --- | --- | --- |
-| SC-S1 Componentize in the host | crate `merezha-componentize` (`crates/componentize`, the library of `services/componentize` on `wit-component` 0.258.3), `merezha componentize`, `merezha build`, `merezha version`, `services/componentize` as a thin binary over the library | main |
-| SC-S2 `merezha new` and the starter | crate `merezha-scaffold` (build script, index, fragments, substitutions, source pin), `merezha new` with every refusal, the starter template with every block selection, `.contremaitre.yaml` with `db`, `scripts/dev.sh`, `scripts/smoke.sh`, the `smoke` crate, the generated CI, `scripts/check-scaffold.sh` and the `scaffold` workflow for the starter | SC-S1 |
-| SC-S3 Telemetry companion | `ops/telemetry/` from TE-T7's embedded export, the `otel` service, OTLP wiring in `scripts/dev.sh`, the Contremaitre `telemetry` verification profile; telemetry.md's T7 row and §6 amended for SC-D13 | SC-S2, TE-T7 |
-| SC-S4 The example application | the `teamboard` template, `examples/teamboard/` golden output, `scripts/regenerate-examples.sh`, the golden diff in `scripts/check-scaffold.sh`, `crates/cli/tests/teamboard.rs`, platform.md's AP-C3 follow-up line closed | SC-S2, NT-N8 (PR #77); SC-S3 for its `otel` service; CT relative media root if SC-Q4 is accepted |
+| SC-S1 Guest build in the host | library crate `merezha-guest-build` (`crates/guest-build`: the componentize and contract checks of `services/componentize`, ported to `wit-component` 0.258.3), `merezha componentize`, `merezha build` with the `cargo metadata` lookup, `merezha version` with the source revision of 2.9; `services/componentize` as a thin binary over the library | main |
+| SC-S2 The `merezha new` command | crate `merezha-scaffold` (build script, `template.toml` index, fragments, substitutions, the `Cargo.toml.tmpl` rule), `merezha new` with every refusal of 2.3, staging and rename, secrets into `.env`, the JSON report; the starter's configuration files only: both `merezha*.toml`, `runtime.toml`, `application.toml`, `content.toml`, the notification templates, `.env.example`, `.gitignore`, `.merezha-version` | SC-S1 |
+| SC-S3 The runnable starter | the starter's guest crates and `smoke` crate, `wit/`, `rust-toolchain.toml`, `.contremaitre.yaml` with `db`, `scripts/dev.sh`, `scripts/smoke.sh`, `scripts/ci.sh`, the generated workflow and README; this repository's `scripts/check-scaffold.sh` and `scaffold` workflow for the starter | SC-S2 |
+| SC-S4 Telemetry companion | `ops/telemetry/` from TE-T7's embedded export, the `otel` service, OTLP wiring in `scripts/dev.sh`, the Contremaitre `telemetry` verification profile; telemetry.md's T7 row and §6 amended for SC-D13 | SC-S3, TE-T7 |
+| SC-S5 The example application | the `teamboard` template, `examples/teamboard/` golden output, `scripts/regenerate-examples.sh`, the golden diff in `scripts/check-scaffold.sh`, `crates/cli/tests/teamboard.rs`, platform.md's AP-C3 follow-up line closed | SC-S3, NT-N8 (PR #77); SC-S4 for its `otel` service; CT relative media root if SC-Q4 is accepted |
 
-**SC-S1 acceptance.** `merezha build` on `services/`' task board crates (through a temporary
-runtime manifest naming them) gives components byte-identical to `scripts/build-services.sh`'s.
-A core module importing a WASI interface, exporting a second interface, or over 16 MiB fails
-`component_rejected` naming the service and leaves no file in `components/`. A missing wasm
-target fails `missing_wasm_target` before Cargo runs. `merezha version` prints the revision
-`MEREZHA_SOURCE_REV` set at build time.
-*Tests:* `crates/componentize/tests/` takes over `services/componentize/tests/guard.rs`;
-`crates/cli/tests/build.rs` builds a one-service workspace generated in a temporary directory
-(skipped with a message when the wasm target is missing; the `scaffold` workflow installs it);
-the existing `scripts/check-services.sh` passes unchanged.
+**SC-S1 acceptance.** On a fixture workspace the test generates (packages `domain`, `renamed`
+with `[lib] name = "renamed_lib"`, and a package with no `cdylib`), `merezha build` writes
+`components/domain.wasm` and `components/renamed.wasm`, and the second proves the `cargo
+metadata` lookup. The written components load in the runtime and answer the version 2
+`describe`. A package missing from the workspace fails `unknown_package`, one without a `cdylib`
+`no_cdylib`. A core module importing a WASI interface, exporting a second interface, or over
+16 MiB fails `component_rejected` naming the service and leaves no file in `components/`. A
+missing wasm target fails `missing_wasm_target` before Cargo runs. `merezha version` prints the
+revision `MEREZHA_SOURCE_REV` set at build time. `scripts/check-services.sh` passes with the
+services workspace building `merezha-guest-build`.
+*Tests:* `crates/guest-build/tests/` takes over `services/componentize/tests/guard.rs` (on the
+ported three-argument `targets`); `crates/cli/tests/build.rs` builds the fixture workspace
+(skipped with a message when the wasm target is missing; the `scaffold` workflow installs it).
 
-**SC-S2 acceptance.** For every block selection of 2.2, the generated project loads through
-`host::configure` with every module registered, for both configuration files (3.14); `cargo
-test`, both Clippy runs and `merezha build` pass in it; `scripts/smoke.sh` passes against
-PostgreSQL. Each refusal of 2.3 has a test that also proves nothing was written, including a
-target filled between the checks and the rename. `.env` is 0600 and `git check-ignore .env`
-succeeds in the generated tree after `git init`. No generated file outside `.env` contains a
-generated secret. `cargo install --git file://<checkout> --rev <sha> merezha-cli` produces a
-binary whose `merezha new` pins `<sha>`; a dirty checkout's binary refuses with
-`source_rev_unknown`. Rendering the templates with an unknown `%%name%%` fails the build.
+**SC-S2 acceptance.** For every block selection of 2.2, the generated configuration loads through
+`host::configure` with every module registered, for both files (3.14), and `content.toml` and the
+notification templates validate. Each refusal of 2.3 has a test that also proves nothing was
+written, including a target filled between the checks and the rename, `--dir` under a symbolic
+link parent (`/tmp` on macOS, accepted) and the current directory (`target_is_working_directory`).
+`.env` is 0600 and `git check-ignore .env` succeeds in the generated tree after `git init`. No
+generated file outside `.env` contains a generated secret. Source pin: `cargo install --git
+file://<checkout> --rev <sha> merezha-cli` produces a binary whose `merezha new` pins `<sha>`
+although the checkout holds Cargo's untracked `.cargo-ok`; a commit in a development checkout
+changes the recorded revision on the next `cargo build`; a modified tracked file makes it none
+and `merezha new` refuses with `source_rev_unknown`. Rendering with an unknown `%%name%%` fails
+the build. No file under `crates/scaffold/templates/` is named `Cargo.toml`.
 *Tests:* `crates/scaffold/tests/render.rs` (the matrix, the index rules, placeholder failures,
-build-time path checks), `crates/cli/tests/new.rs` (process tests of the command, its JSON report
-and its refusals), and the `scaffold` workflow running `scripts/check-scaffold.sh` for the starter
-with all blocks, with `identity,notifications` and with `none`.
+build-time path checks), `crates/scaffold/tests/source_rev.rs` (the three source pin cases on a
+temporary git repository), `crates/cli/tests/new.rs` (process tests of the command, its JSON
+report and its refusals).
 
-**SC-S3 acceptance.** `contremaitre ensure --json` builds `otel` from the generated Dockerfile;
+**SC-S3 acceptance.** For the starter with all blocks, with `identity,notifications` and with
+`none`, `scripts/check-scaffold.sh` renders the project into `.scaffold-check/<case>` with
+`--merezha-path .` and runs the project's own `scripts/ci.sh` in it with `MEREZHA_BIN` pointing at
+the host just built: formatting, both Clippy runs, `cargo test`, `merezha build`, both
+`notifications check` runs and `scripts/smoke.sh` against the workflow's PostgreSQL all pass. A
+fresh project pinned by git `rev` to a pushed commit builds without Cargo's "skipping duplicate
+package" warning, proving the `Cargo.toml.tmpl` rule. `actionlint` passes on the generated
+workflow.
+*Tests:* the guest crates' native tests; the `scaffold` workflow itself.
+
+**SC-S4 acceptance.** `contremaitre ensure --json` builds `otel` from the generated Dockerfile;
 `scripts/dev.sh` exports to it; the `telemetry` verification profile finds a trace in Tempo and
 `http.server.request.duration` in Prometheus after one request. `merezha new` writes the same
 dashboards `merezha telemetry export` does (a byte comparison test). CI cannot run Contremaitre,
@@ -1138,10 +1254,10 @@ so the profile is run by hand on macOS and its output goes in the pull request.
 *Tests:* the byte comparison in `crates/scaffold/tests/render.rs`; `promtool check rules` on the
 generated `rules/` beside TE-T7's own check.
 
-**SC-S4 acceptance.** The golden diff is empty on main and fails when a template file changes
-without regenerating. `crates/cli/tests/teamboard.rs` passes all eleven steps of 5.10. The
-example's own CI workflow passes when run in this repository's `scaffold` workflow (its
-`smoke` scenario adds the SSE and invitation steps).
+**SC-S5 acceptance.** The golden diff is empty on main and fails when a template file changes
+without regenerating. `crates/cli/tests/teamboard.rs` passes all twelve steps of 5.10.
+`scripts/check-scaffold.sh` runs `examples/teamboard/scripts/ci.sh` as it does the starter's, and
+the example's `smoke` scenario covers the invitation, the SSE item and tenant isolation.
 *Tests:* the end-to-end test; the example's guest crates' native tests (assignment rules, roles,
 partitioned projection walk, the notifier's effect lists including the self-completion case).
 
@@ -1149,18 +1265,19 @@ partitioned projection walk, the notifier's effect lists including the self-comp
 
 | File | Change | Slice |
 | --- | --- | --- |
-| `services/componentize/` | becomes a binary over `merezha-componentize` (path dependency); `services/Cargo.lock` moves `wit-component` and `wit-parser` to 0.258.3 | SC-S1 |
-| `scripts/build-services.sh`, `scripts/check-services.sh` | unchanged; they keep calling `merezha-componentize` | SC-S1 |
-| `Cargo.toml` | members gain `crates/componentize` and `crates/scaffold` | SC-S1, SC-S2 |
-| `.github/workflows/services.yml` | paths gain `crates/componentize/**` | SC-S1 |
-| `.github/workflows/scaffold.yml` (new) | Linux, Rust 1.98.0 with the wasm target, a `postgres:17` service: build the host, `scripts/check-scaffold.sh` (S2), then the golden diff, `merezha build` on `examples/teamboard` and `cargo test -p merezha-cli --test teamboard` with `MEREZHA_TEST_EXAMPLE_COMPONENTS` and `MEREZHA_TEST_REQUIRE_EXAMPLE=1` (S4). Triggered by `crates/**`, `examples/**`, `wit/**`, `scripts/check-scaffold.sh`, `Cargo.*` and itself | SC-S2, SC-S4 |
+| `services/componentize/` | keeps its package name `merezha-componentize`, its binary and its command line; its library code moves to `crates/guest-build`, and the binary becomes a thin `main` over it (path dependency). `services/Cargo.lock` moves `wit-component` and `wit-parser` from 0.262.0 to 0.258.3 | SC-S1 |
+| `scripts/build-services.sh` | its commands stay (`cargo build -p merezha-componentize`, then `release/merezha-componentize`); what they compile now includes `crates/guest-build` | SC-S1 |
+| `scripts/check-services.sh` | unchanged; it covers the moved code through the build above | SC-S1 |
+| `Cargo.toml` | members gain `crates/guest-build` and `crates/scaffold` | SC-S1, SC-S2 |
+| `.github/workflows/services.yml` | paths gain `crates/guest-build/**` | SC-S1 |
+| `.github/workflows/scaffold.yml` (new) | Linux, Rust 1.98.0 with the wasm target, a `postgres:17` service: build the host, `scripts/check-scaffold.sh` (S3), then the golden diff, `merezha build` on `examples/teamboard` and `cargo test -p merezha-cli --test teamboard` with `MEREZHA_TEST_EXAMPLE_COMPONENTS` and `MEREZHA_TEST_REQUIRE_EXAMPLE=1` (S5). Triggered by `crates/**`, `examples/**`, `wit/**`, `scripts/check-scaffold.sh`, `Cargo.*` and itself | SC-S3, SC-S5 |
 | `.github/workflows/host.yml` | unchanged; it runs the new crates' unit tests through `--workspace`, and `teamboard.rs` skips there | |
-| `scripts/check-scaffold.sh`, `scripts/regenerate-examples.sh` (new) | 5.9 | SC-S2, SC-S4 |
-| `.gitignore` | `/.scaffold-check/` | SC-S2 |
-| `README.md` | "Start a project" with `merezha new`, before "Platform host" | SC-S2 |
-| `docs/architecture/platform.md` | the four commands; "Limits and follow-ups" AP-C3 line closed | SC-S1, SC-S2, SC-S4 |
-| `docs/design/telemetry.md` | T7 row and §6: the scaffold copy, the example's manifest and the verification profile move to SC-S3 | SC-S3 |
-| `docs/design/cross-block-decisions.md` | "Delivery order", stage 3: `merezha new` and the example application name SC-S1 to SC-S4 | SC-S2 |
+| `scripts/check-scaffold.sh`, `scripts/regenerate-examples.sh` (new) | 5.9 and SC-S3 | SC-S3, SC-S5 |
+| `.gitignore` | `/.scaffold-check/` | SC-S3 |
+| `README.md` | "Start a project" with `merezha new`, before "Platform host" | SC-S3 |
+| `docs/architecture/platform.md` | the four commands; "Limits and follow-ups" AP-C3 line closed | SC-S1, SC-S2, SC-S5 |
+| `docs/design/telemetry.md` | T7 row and §6: the scaffold copy, the example's manifest and the verification profile move to SC-S4 | SC-S4 |
+| `docs/design/cross-block-decisions.md` | "Delivery order", stage 3: `merezha new` and the example application name SC-S1 to SC-S5 | SC-S2 |
 
 ## 8. Decisions
 
@@ -1200,7 +1317,8 @@ platforms inject environment variables, and the same names then work everywhere)
 
 **SC-D7, the build.** *Context:* a guest needs a core module build and a componentize step;
 today the second lives in the services workspace. *Decision:* the host gains `merezha build` and
-`merezha componentize` on a shared library. *Alternatives:* a componentize crate copied into each
+`merezha componentize` on the shared library `merezha-guest-build`, and finds each service's
+artifact through `cargo metadata` rather than a naming rule. *Alternatives:* a componentize crate copied into each
 project (rejected: two copies of the contract check drift); `cargo install merezha-componentize`
 (rejected: a second tool to pin and install for every project).
 
@@ -1225,12 +1343,24 @@ reverse-substituted).
 
 **SC-D12, the end-to-end test.** *Context:* `FakeBrevo`, `WebhookReceiver`, `TestDatabase` and the
 catalog are host test kits a generated project cannot depend on. *Decision:* the full test lives
-in `crates/cli/tests/`, and each generated project carries a dependency-free `smoke` scenario.
+in `crates/cli/tests/`, and each generated project carries a dependency-free `smoke` scenario. The
+test covers two organizations, so tenant isolation, a stage 3 guarantee, is checked on the Wasm
+components and not only in AP-C2's suites.
 
 **SC-D13, telemetry ownership.** *Context:* TE-T7 listed the scaffold's copy and the example's
 Contremaitre manifest before this design existed. *Decision:* TE-T7 keeps the artifacts, the
-export command and the operations guide section; the scaffold slices take the rest, and SC-S3
+export command and the operations guide section; the scaffold slices take the rest, and SC-S4
 amends telemetry.md.
+
+**SC-D14, the front end's origin.** *Context:* the development front end (`localhost:5173`) and
+the host (`127.0.0.1:8080`) are different sites, and production usually serves `app.` and `api.`
+as different origins of one site. *Decision:* in development, a dev server proxy for `/v1`, so
+there is one origin and the development cookie works; in production, `[http.cors]` with the exact
+front end origin and credentials. *Alternatives:* CORS in development too (rejected: the session
+cookie still would not cross from `localhost` to `127.0.0.1`, and `localhost:8080` as the listen
+address would make the cookie depend on name resolution); no CORS in production (rejected for
+the default: serving front end and API from one origin behind a proxy works too, and the README
+says to delete `[http.cors]` then, but separate origins are the common deployment).
 
 ## 9. Open questions
 
@@ -1244,7 +1374,10 @@ Each has a recommended answer; the slices assume it until the owner decides.
 | SC-Q4 | Should content accept a relative `media.local.root` (and `spool_dir`), resolved against the configuration directory like `model` and `templates.dir`? | Yes, still created 0700 and refused when it is a symbolic link or open to others. It is a content change (content.md §6, CT follow-up), not a new key; it lets committed configurations use media, and the example then gains a cover image. |
 | SC-Q5 | Should `merezha new` write `.env` with generated secrets by default? | Yes, mode 0600 and ignored, with `--no-secrets` for those who manage secrets elsewhere. |
 | SC-Q6 | Is GitHub Actions the only generated CI? | Yes for v1, matching this repository. A `--ci none` flag can come with a second provider. |
-| SC-Q7 | Should the starter turn on Web Push and webhooks, which a first project may not need? | Yes: the key is generated, both sections cost nothing until a client subscribes or registers an endpoint, and turning them on later needs migrations nobody remembers. Delete the section to turn one off. |
+| SC-Q7 | Should the starter turn on Web Push and webhooks, which a first project may not need? | Yes. The VAPID key is generated, neither section does work until a client subscribes or an endpoint is registered, and both give the reactor and the README something to show. Turning one on later is cheap too, since `database.migrate = true` applies the block's tables at the next start; the reason to start with them on is that the starter teaches the whole notification path. Delete the section to turn one off; with `[modules.notifications.webhooks]` gone, the notifier's `webhook` effect becomes a recorded rejection (`webhooks_disabled`) until it is removed from `effects`. |
+| SC-Q8 | Once `teamboard` lands there are three task boards: `services/task-*` with `examples/task-board`, the reactor test fixtures, and `teamboard`. Retire the old ones? | Retire `services/task-notifier` once SC-S5 merges: `teamboard`'s notifier supersedes it, and no host test runs it as a component (the reactor tests use in-process guests). Keep `services/task-domain`, `task-view`, `task-events` and `examples/task-board`: they drive `merezha serve` with memory and SQLite storage (`scripts/task-board-demo.sh`, the restart demo), a host path `teamboard` does not cover. Their docs then point to `teamboard` as the framework example. |
+| SC-Q9 | Which licence do generated projects carry? The templates are this repository's code, under MIT, which asks for its notice in substantial copies. | Put `crates/scaffold/templates/` under MIT-0 (MIT without the notice condition), stated in a `LICENSE` file in that directory, so a generated project owes nothing. Generated projects get no `LICENSE` file and no `license` key (`publish = false`); the README asks the owner to choose one. |
+| SC-Q10 | How do `scripts/dev.sh` and CI check a `path` pin, where there is no revision to compare with `merezha version`? | As 4.3's table says: compare with `git -C <path> rev-parse HEAD` when the path is a git checkout with no modified tracked file, and only warn, on a difference or when it cannot tell. Path pins are for working on merezha itself (the golden example, local changes), where the host is built from the same checkout; in this repository's CI the host and the example come from one commit, so nothing needs to fail there. |
 
 ## Cross-block dependencies
 
@@ -1252,7 +1385,8 @@ Each has a recommended answer; the slices assume it until the owner decides.
 | --- | --- | --- |
 | `[jobs.queues]` settings for the notification queues | NT §7.2 | 3.2 writes them verbatim |
 | Content events on webhooks through AP subscriptions | NT-N8 (PR #77) | the example's content webhooks (5.5) |
-| `deploy/telemetry/` and `merezha telemetry export` | TE-T7 | SC-S3 embeds the same export |
+| `deploy/telemetry/` and `merezha telemetry export` | TE-T7 | SC-S4 embeds the same export |
+| `db.pool_undersized` in the catalog | TE-T7 (in progress) | 3.2 names the warning; it is emitted today but not yet in `names.rs` |
 | Relative media root | CT, if SC-Q4 is accepted | the example's cover image |
 | `notifications vapid generate`'s key generator as a library call | NT-N6 | `merezha new` reuses it for `.env` |
 | `random_token` and the CSPRNG | K (`merezha-platform`) | identity and notification secrets |
