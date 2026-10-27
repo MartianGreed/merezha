@@ -2506,3 +2506,185 @@ mod timing {
         instance.stop().await;
     }
 }
+
+/// Issue #76: the unreadable mark hashes the ciphertext and the nonce. A
+/// secret whose nonce alone was damaged is marked; once the nonce is
+/// repaired the mark no longer matches, so the reseal tries the row again
+/// instead of hiding it from the reseal and the previous-key count.
+#[tokio::test]
+async fn a_repaired_nonce_clears_the_unreadable_mark() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let instance = start(&world, &section(true, "")).await;
+    let (status, _) = create(
+        &instance,
+        "ada",
+        "/tenants/org_a",
+        json!({ "url": receiver.url("n") }),
+    )
+    .await;
+    assert_eq!(status, 201);
+    instance.stop().await;
+    let nonce = world
+        .text("SELECT encode(secret_nonce, 'hex') FROM merezha_notify.webhook_endpoints")
+        .await
+        .remove(0);
+    world
+        .execute(
+            "UPDATE merezha_notify.webhook_endpoints SET secret_nonce = decode(repeat('00', 12), 'hex')",
+        )
+        .await;
+    let instance = start_with(&world, &rotated_section(true), |o| {
+        o.env.push(("NEW_KEY".into(), NEW_KEY.into()));
+    })
+    .await;
+    let core = instance.core();
+    let bounds = webhooks::tasks::ResealBounds::default();
+    let run = webhooks::tasks::reseal(&core, soon(), bounds)
+        .await
+        .unwrap();
+    assert_eq!((run.resealed, run.remaining, run.unreadable), (0, 0, 1));
+    // Only the nonce is repaired: the ciphertext never changed.
+    world
+        .execute(&format!(
+            "UPDATE merezha_notify.webhook_endpoints SET secret_nonce = decode('{nonce}', 'hex')"
+        ))
+        .await;
+    let run = webhooks::tasks::reseal(&core, soon(), bounds)
+        .await
+        .unwrap();
+    assert_eq!(
+        (run.resealed, run.remaining, run.unreadable),
+        (1, 0, 0),
+        "the repaired row is resealed, not left hidden"
+    );
+    instance.stop().await;
+}
+
+/// Issue #76: `GET …webhook-audit` reads `merezha_notify.webhook_audit` for
+/// one registry, newest first and paginated, for managers only; another
+/// tenant's rows and the application registry's stay apart.
+#[tokio::test]
+async fn the_audit_route_pages_one_registry_for_its_managers() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let instance = start(&world, &section(true, "")).await;
+    instance
+        .tokens
+        .add("reader", member("usr_bob", "org_a", &[READ]));
+    let (_, first) = create(
+        &instance,
+        "ada",
+        "/tenants/org_a",
+        json!({ "url": receiver.url("a") }),
+    )
+    .await;
+    let first = first["id"].as_str().unwrap().to_owned();
+    let (_, second) = create(
+        &instance,
+        "ada",
+        "/tenants/org_a",
+        json!({ "url": receiver.url("b") }),
+    )
+    .await;
+    let second = second["id"].as_str().unwrap().to_owned();
+    let (status, _) = instance
+        .call(
+            "DELETE",
+            &format!("/v1/notifications/tenants/org_a/webhooks/{first}"),
+            Some("ada"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 204);
+    create(
+        &instance,
+        "bea",
+        "/tenants/org_b",
+        json!({ "url": receiver.url("c") }),
+    )
+    .await;
+    create(&instance, "ops", "", json!({ "url": receiver.url("d") })).await;
+    let page = |query: &str| format!("/v1/notifications/tenants/org_a/webhook-audit{query}");
+    let row = |item: &Value| {
+        format!(
+            "{}:{}:{}:{}",
+            item["action"].as_str().unwrap(),
+            if item["endpoint_id"] == first {
+                "first"
+            } else {
+                "second"
+            },
+            item["actor"].as_str().unwrap(),
+            item["revision"]
+        )
+    };
+    let (status, body) = instance
+        .call("GET", &page("?limit=2"), Some("ada"), None)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let items: Vec<String> = body["items"].as_array().unwrap().iter().map(row).collect();
+    assert_eq!(items, ["delete:first:usr_ada:2", "create:second:usr_ada:1"]);
+    assert!(body["items"][0]["occurred_at"].is_string());
+    let cursor = body["next_cursor"].as_str().unwrap().to_owned();
+    let (_, body) = instance
+        .call(
+            "GET",
+            &page(&format!("?limit=2&cursor={cursor}")),
+            Some("ada"),
+            None,
+        )
+        .await;
+    let items: Vec<String> = body["items"].as_array().unwrap().iter().map(row).collect();
+    assert_eq!(items, ["create:first:usr_ada:1"]);
+    assert_eq!(body["next_cursor"], Value::Null);
+    let (_, body) = instance
+        .call(
+            "GET",
+            &page(&format!("?endpoint_id={second}")),
+            Some("ada"),
+            None,
+        )
+        .await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+    // Readers, other tenants and bad parameters are refused.
+    let (status, _) = instance.call("GET", &page(""), Some("reader"), None).await;
+    assert_eq!(status, 403);
+    let (status, _) = instance.call("GET", &page(""), Some("bea"), None).await;
+    assert_eq!(status, 403);
+    let (status, body) = instance
+        .call("GET", &page("?limit=101"), Some("ada"), None)
+        .await;
+    assert_eq!(
+        (status.as_u16(), body["error"]["code"].clone()),
+        (400, json!("invalid_input"))
+    );
+    let (status, body) = instance
+        .call("GET", &page("?cursor=%21"), Some("ada"), None)
+        .await;
+    assert_eq!(
+        (status.as_u16(), body["error"]["code"].clone()),
+        (400, json!("invalid_cursor"))
+    );
+    // Each registry sees its own rows only.
+    let (_, body) = instance
+        .call(
+            "GET",
+            "/v1/notifications/tenants/org_b/webhook-audit",
+            Some("bea"),
+            None,
+        )
+        .await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+    let (status, body) = instance
+        .call("GET", "/v1/notifications/webhook-audit", Some("ops"), None)
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(body["items"][0]["action"], "create");
+    instance.stop().await;
+}

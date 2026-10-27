@@ -158,6 +158,25 @@ pub const ATTEMPT_HISTORY: Statement = s(
          WHERE b.delivery_id = $1 AND b.generation = $2 \
          AND b.error_code IS DISTINCT FROM 'provider_account'), 0))",
 );
+/// The last `provider_account` attempt of delivery `$1`'s generation `$2`:
+/// the attempt the live job chain continues after (issue #63), `NULL`
+/// while the generation's first job is the live one.
+pub const ATTEMPT_CHAIN: Statement = s(
+    "notify.attempt.chain",
+    "SELECT merezha_notify.delivery_attempts",
+    "SELECT max(attempt) FROM merezha_notify.delivery_attempts \
+     WHERE delivery_id = $1 AND generation = $2 AND outcome = 'transient' \
+     AND error_code = 'provider_account'",
+);
+/// Keep the provider message id `$3` of accepted attempt `$2` of delivery
+/// `$1` (migration 7), so a late report about it is known for an earlier
+/// generation's once the delivery is redelivered (issue #68).
+pub const ATTEMPT_MESSAGE_ID: Statement = s(
+    "notify.attempt.message_id",
+    "UPDATE merezha_notify.delivery_attempts",
+    "UPDATE merezha_notify.delivery_attempts SET provider_message_id = $3 \
+     WHERE delivery_id = $1 AND attempt = $2",
+);
 pub const LAST_ATTEMPT: Statement = s(
     "notify.attempt.last",
     "SELECT merezha_notify.delivery_attempts",
@@ -465,11 +484,15 @@ pub const PURGED_THROUGH: Statement = s(
 // ----- provider events (NT-N3) -----
 
 /// The delivery an event names by id, locked, with its notification's
-/// topic and the provider message id of its current generation.
+/// topic, the provider message id of its current generation, the
+/// generation, and whether message id `$3` was an earlier generation's
+/// (issue #68).
 pub const EVENT_DELIVERY_BY_ID: Statement = s(
     "notify.event.delivery_by_id",
     "SELECT merezha_notify.deliveries",
-    "SELECT d.id, d.status, d.address, n.topic, d.provider_message_id \
+    "SELECT d.id, d.status, d.address, n.topic, d.provider_message_id, d.generation, \
+     EXISTS (SELECT 1 FROM merezha_notify.delivery_attempts a WHERE a.delivery_id = d.id \
+       AND a.generation < d.generation AND a.provider_message_id = $3::text) \
      FROM merezha_notify.deliveries d \
      JOIN merezha_notify.notifications n ON n.id = d.notification_id \
      WHERE d.id = $1 AND d.channel = $2 FOR UPDATE OF d",
@@ -508,7 +531,10 @@ pub const DELIVERY_EVENT_SET: Statement = s(
 
 /// Take the events waiting for delivery `$1` (migration 3), each with
 /// whether it names another message than the delivery's current one (a
-/// report about an earlier generation, which moves no status).
+/// report about an earlier generation, which moves no status). A report
+/// about an earlier generation's message, or one without a message id on
+/// a redelivered delivery, is judged stale when it arrives (issue #68)
+/// and never stored pending.
 pub const EVENTS_TAKE_PENDING: Statement = s(
     "notify.event.take_pending",
     "UPDATE merezha_notify.provider_events",
@@ -517,6 +543,41 @@ pub const EVENTS_TAKE_PENDING: Statement = s(
      WHERE e.delivery_id = $1 AND e.pending AND d.id = e.delivery_id \
      RETURNING e.id, e.event, e.channel, \
      coalesce(e.provider_message_id <> d.provider_message_id, false)",
+);
+
+/// At most `$2` open deliveries whose `run_at` and `updated_at` are both
+/// before `$1`, oldest first, locked: their job was lost without a
+/// recorded outcome (`reclaim_stuck`, NT §2.5). A delivery a worker holds
+/// is skipped.
+pub const RECLAIM_CANDIDATES: Statement = s(
+    "notify.delivery.reclaim_candidates",
+    "SELECT merezha_notify.deliveries",
+    "SELECT id FROM merezha_notify.deliveries \
+     WHERE status IN ('queued', 'sending', 'retrying') AND updated_at < $1 AND run_at < $1 \
+     ORDER BY updated_at LIMIT $2 FOR UPDATE SKIP LOCKED",
+);
+/// The `started` attempts of deliveries `$1`, whose run never recorded an
+/// outcome, become `ambiguous` / `lost_outcome` at `$2`; their deliveries.
+pub const RECLAIM_ATTEMPTS: Statement = s(
+    "notify.attempt.reclaim",
+    "UPDATE merezha_notify.delivery_attempts",
+    "UPDATE merezha_notify.delivery_attempts SET outcome = 'ambiguous', finished_at = $2, \
+     error_code = 'lost_outcome' WHERE delivery_id = ANY($1::uuid[]) AND outcome = 'started' \
+     RETURNING delivery_id",
+);
+/// Settle the still open deliveries `$1` as `job_lost` at `$3`: `unknown`
+/// for those in `$2` (a send may have gone out), `failed` for the others.
+/// Each with its channel, new status and topic.
+pub const RECLAIM_SET: Statement = s(
+    "notify.delivery.reclaim",
+    "UPDATE merezha_notify.deliveries",
+    "UPDATE merezha_notify.deliveries d SET \
+       status = CASE WHEN d.id = ANY($2::uuid[]) THEN 'unknown' ELSE 'failed' END, \
+       status_reason = 'job_lost', updated_at = $3, settled_at = $3 \
+     FROM merezha_notify.notifications n \
+     WHERE d.id = ANY($1::uuid[]) AND n.id = d.notification_id \
+     AND d.status IN ('queued', 'sending', 'retrying') \
+     RETURNING d.id, d.channel, d.status, n.topic",
 );
 
 /// At most `$2` notifications settled before `$1`, oldest first: the
@@ -552,10 +613,128 @@ pub const RETENTION_PROVIDER_EVENTS: Statement = s(
       ORDER BY received_at LIMIT $2) AND received_at < $1",
 );
 
+// ----- deleted tenants (issue #63) -----
+
+/// The class of the deleted-tenant gate's two-key advisory locks
+/// (`"ntdl"`), the `$1` of [`TENANT_WRITE_LOCK`] and
+/// [`TENANT_DELETE_LOCK`]: it keeps them apart from the rate cap's and
+/// other modules' two-key locks.
+pub const TENANT_LOCK_CLASS: i32 = i32::from_be_bytes(*b"ntdl");
+/// The shared transaction lock of tenant `$2`, which every writer of the
+/// tenant's rows takes before it checks the mark: the mark waits for the
+/// writers in flight, and no writer commits after it.
+pub const TENANT_WRITE_LOCK: Statement = s(
+    "notify.tenant.write_lock",
+    "SELECT pg_advisory_xact_lock_shared()",
+    "SELECT pg_advisory_xact_lock_shared($1::int4, hashtext($2::text))",
+);
+/// The exclusive transaction lock of tenant `$2`, taken by the mark.
+pub const TENANT_DELETE_LOCK: Statement = s(
+    "notify.tenant.delete_lock",
+    "SELECT pg_advisory_xact_lock()",
+    "SELECT pg_advisory_xact_lock($1::int4, hashtext($2::text))",
+);
+/// Whether tenant `$1` was deleted.
+pub const TENANT_DELETED: Statement = s(
+    "notify.tenant.deleted",
+    "SELECT merezha_notify.tenants_deleted",
+    "SELECT 1 FROM merezha_notify.tenants_deleted WHERE tenant_id = $1",
+);
+/// Mark tenant `$1` deleted at `$2`, unless it is; the row when this call
+/// marked it.
+pub const TENANT_MARK: Statement = s(
+    "notify.tenant.mark",
+    "INSERT merezha_notify.tenants_deleted",
+    "INSERT INTO merezha_notify.tenants_deleted (tenant_id, deleted_at) VALUES ($1, $2) \
+     ON CONFLICT DO NOTHING RETURNING tenant_id",
+);
+/// Record that tenant `$1`'s purge finished at `$2`; the row the first
+/// time.
+pub const TENANT_PURGED: Statement = s(
+    "notify.tenant.purged",
+    "UPDATE merezha_notify.tenants_deleted",
+    "UPDATE merezha_notify.tenants_deleted SET purged_at = $2 \
+     WHERE tenant_id = $1 AND purged_at IS NULL RETURNING tenant_id",
+);
+/// Delete at most `$2` webhook events of tenant `$1`, with their
+/// deliveries and attempts.
+pub const TENANT_PURGE_EVENTS: Statement = s(
+    "notify.tenant.purge_webhook_events",
+    "DELETE merezha_notify.webhook_events",
+    "DELETE FROM merezha_notify.webhook_events WHERE id IN \
+     (SELECT id FROM merezha_notify.webhook_events WHERE tenant_id = $1 LIMIT $2)",
+);
+/// Delete at most `$2` webhook endpoints of tenant `$1` (never the
+/// application's registry: `$1` is never empty), each with its revision.
+pub const TENANT_PURGE_ENDPOINTS: Statement = s(
+    "notify.tenant.purge_webhook_endpoints",
+    "DELETE merezha_notify.webhook_endpoints",
+    "DELETE FROM merezha_notify.webhook_endpoints WHERE id IN \
+     (SELECT id FROM merezha_notify.webhook_endpoints WHERE COALESCE(tenant_id, '') = $1 \
+      ORDER BY id LIMIT $2 FOR UPDATE) RETURNING id, revision",
+);
+/// Delete at most `$2` push subscriptions made in tenant `$1`.
+pub const TENANT_PURGE_PUSH: Statement = s(
+    "notify.tenant.purge_push",
+    "DELETE merezha_notify.push_subscriptions",
+    "DELETE FROM merezha_notify.push_subscriptions WHERE id IN \
+     (SELECT id FROM merezha_notify.push_subscriptions WHERE tenant_id = $1 LIMIT $2)",
+);
+/// At most `$2` users with inbox items of tenant `$1`, in ascending order.
+pub const TENANT_INBOX_USERS: Statement = s(
+    "notify.tenant.inbox_users",
+    "SELECT merezha_notify.inbox_items",
+    "SELECT DISTINCT user_id FROM merezha_notify.inbox_items WHERE tenant_id = $1 \
+     ORDER BY user_id LIMIT $2",
+);
+/// Delete at most `$3` inbox items of tenant `$1` held by users `$2`, each
+/// with its user and `change_seq`.
+pub const TENANT_PURGE_INBOX: Statement = s(
+    "notify.tenant.purge_inbox",
+    "DELETE merezha_notify.inbox_items",
+    "DELETE FROM merezha_notify.inbox_items WHERE id IN \
+     (SELECT id FROM merezha_notify.inbox_items WHERE tenant_id = $1 \
+      AND user_id = ANY($2::text[]) LIMIT $3) RETURNING user_id, change_seq",
+);
+/// At most `$2` notifications of tenant `$1`.
+pub const TENANT_NOTIFICATIONS: Statement = s(
+    "notify.tenant.notifications",
+    "SELECT merezha_notify.notifications",
+    "SELECT id FROM merezha_notify.notifications WHERE tenant_id = $1 ORDER BY id LIMIT $2",
+);
+/// Delete the provider events correlated to deliveries `$1`.
+pub const TENANT_PURGE_PROVIDER_EVENTS: Statement = s(
+    "notify.tenant.purge_provider_events",
+    "DELETE merezha_notify.provider_events",
+    "DELETE FROM merezha_notify.provider_events WHERE delivery_id = ANY($1::uuid[])",
+);
+/// Delete notifications `$1`; their deliveries and attempts cascade.
+pub const TENANT_PURGE_NOTIFICATIONS: Statement = s(
+    "notify.tenant.purge_notifications",
+    "DELETE merezha_notify.notifications",
+    "DELETE FROM merezha_notify.notifications WHERE id = ANY($1::uuid[])",
+);
+
 /// Every statement of this module.
 pub const STATEMENTS: &[Statement] = &[
+    TENANT_WRITE_LOCK,
+    TENANT_DELETE_LOCK,
+    TENANT_DELETED,
+    TENANT_MARK,
+    TENANT_PURGED,
+    TENANT_PURGE_EVENTS,
+    TENANT_PURGE_ENDPOINTS,
+    TENANT_PURGE_PUSH,
+    TENANT_INBOX_USERS,
+    TENANT_PURGE_INBOX,
+    TENANT_NOTIFICATIONS,
+    TENANT_PURGE_PROVIDER_EVENTS,
+    TENANT_PURGE_NOTIFICATIONS,
     TARGET_LOCKS,
     TARGET_RECENT,
+    RECLAIM_CANDIDATES,
+    RECLAIM_ATTEMPTS,
+    RECLAIM_SET,
     RETENTION_CANDIDATES,
     RETENTION_LOCK_DELIVERIES,
     RETENTION_NOTIFICATIONS,
@@ -571,6 +750,8 @@ pub const STATEMENTS: &[Statement] = &[
     INBOX_NOTIFY,
     DELIVERY_LOCK,
     LAST_ATTEMPT,
+    ATTEMPT_CHAIN,
+    ATTEMPT_MESSAGE_ID,
     ATTEMPT_HISTORY,
     ATTEMPT_START,
     ATTEMPT_FINISH,

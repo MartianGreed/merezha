@@ -712,3 +712,59 @@ fn security_topics_refuse_a_rate_cap_and_keep_their_mail() {
         Some(3)
     );
 }
+
+/// Issue #63: a `retention` batch never starts within 3 s of its job
+/// deadline, so a `notify.maintenance` timeout under 5 s is refused.
+#[test]
+fn a_maintenance_timeout_shorter_than_the_retention_margin_is_refused() {
+    let issues = Project::new(&format!(
+        "[jobs.queues.\"notify.maintenance\"]\ntimeout_ms = 3000\n{MINIMAL}"
+    ))
+    .issues();
+    assert!(
+        has(
+            &issues,
+            "jobs.queues.\"notify.maintenance\".timeout_ms",
+            "timeout_too_short"
+        ),
+        "{issues:?}"
+    );
+    let fine = Project::new(&format!(
+        "[jobs.queues.\"notify.maintenance\"]\ntimeout_ms = 5000\n{MINIMAL}"
+    ));
+    assert!(fine.configure().is_ok());
+}
+
+/// Issue #76: a webhook envelope travels through the outbox, whose records
+/// are capped at 64 KiB, so `max_payload_bytes` defaults to that cap and
+/// cannot go above it.
+#[test]
+fn the_webhook_payload_limit_fits_the_outbox() {
+    let checked = Project::new(&format!(
+        "[jobs.queues.\"notify.webhook\"]\nbackoff_max_ms = 86400000\n\
+         {MINIMAL}[modules.notifications.webhooks]\n"
+    ))
+    .configure()
+    .unwrap();
+    assert_eq!(
+        checked
+            .settings
+            .webhooks
+            .as_ref()
+            .unwrap()
+            .max_payload_bytes,
+        65_536
+    );
+    let issues = Project::new(&format!(
+        "{MINIMAL}[modules.notifications.webhooks]\nmax_payload_bytes = 262144\n"
+    ))
+    .issues();
+    assert!(
+        has(
+            &issues,
+            &format!("{N}.webhooks.max_payload_bytes"),
+            "out_of_range"
+        ),
+        "{issues:?}"
+    );
+}

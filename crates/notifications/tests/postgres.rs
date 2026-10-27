@@ -47,6 +47,9 @@ const WEBHOOKS_CHECKSUM: &str = "7f8334e2762321989fc267c422d14623b71f0cfc78a39fb
 /// frozen the same way.
 const INTEGRATIONS_CHECKSUM: &str =
     "15de39892ceb48fa016353efb6c612f6f1486fa2b98c4686ce364bf473f20318";
+/// SHA-256 of migration 7 (hardening: message ids per attempt, deleted
+/// tenants and their indexes), frozen the same way.
+const HARDENING_CHECKSUM: &str = "87aeafb542a900bebf80b32e4768fc493845b50e1606cdfffaeb89289a2d5ceb";
 
 /// A distinct id per call.
 fn fresh() -> Uuid {
@@ -65,7 +68,7 @@ fn soon() -> Instant {
 
 #[test]
 fn migration_checksum_is_pinned() {
-    assert_eq!(MIGRATIONS.len(), 6);
+    assert_eq!(MIGRATIONS.len(), 7);
     assert_eq!((MIGRATIONS[0].version, MIGRATIONS[0].name), (1, "core"));
     assert_eq!(checksum(MIGRATIONS[0].sql), CORE_CHECKSUM);
     assert_eq!((MIGRATIONS[1].version, MIGRATIONS[1].name), (2, "inbox"));
@@ -84,6 +87,11 @@ fn migration_checksum_is_pinned() {
         (6, "integrations")
     );
     assert_eq!(checksum(MIGRATIONS[5].sql), INTEGRATIONS_CHECKSUM);
+    assert_eq!(
+        (MIGRATIONS[6].version, MIGRATIONS[6].name),
+        (7, "hardening")
+    );
+    assert_eq!(checksum(MIGRATIONS[6].sql), HARDENING_CHECKSUM);
 }
 
 async fn migrated() -> Option<(TestDatabase, Database)> {
@@ -96,7 +104,7 @@ async fn migrated() -> Option<(TestDatabase, Database)> {
     let report = run_migrations(&db, &declared, MigrationMode::Apply, soon())
         .await
         .unwrap();
-    assert_eq!(report.applied.len(), 6);
+    assert_eq!(report.applied.len(), 7);
     Some((test, db))
 }
 
@@ -136,6 +144,7 @@ async fn migrations_create_the_core_inbox_push_and_webhook_tables() {
             "provider_events",
             "push_subscriptions",
             "suppressions",
+            "tenants_deleted",
             "user_settings",
             "webhook_attempts",
             "webhook_audit",
@@ -325,6 +334,9 @@ async fn the_host_starts_the_block_with_its_migration_source_and_routes() {
         "notify.maintenance.settle_notifications",
         "notify.maintenance.purge_data",
         "notify.maintenance.inbox_expire",
+        "notify.maintenance.reclaim_stuck",
+        "notify.organization_deleted",
+        "notify.organization_purge",
     ] {
         assert!(kinds.iter().any(|k| k == kind), "{kind} not in {kinds:?}");
     }

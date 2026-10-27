@@ -629,6 +629,7 @@ async fn redeliver(
                     payload: DeliverPayload {
                         delivery_id: id,
                         generation,
+                        after_attempt: None,
                         secret_data: None,
                     }
                     .to_value(),

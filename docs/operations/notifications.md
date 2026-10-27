@@ -47,8 +47,10 @@ Start from:
 ```
 
 Startup refuses a `notify.webhook` `backoff_max_ms` below 24 hours (the
-webhook schedule's last step) and a queue lease shorter than three provider
-timeouts.
+webhook schedule's last step), a queue lease shorter than three provider
+timeouts, and a `notify.maintenance` `timeout_ms` below 5 seconds
+(`timeout_too_short`): the `retention` task starts no batch but a step's
+first within 3 seconds of its deadline.
 
 ## Email through Brevo
 
@@ -69,10 +71,23 @@ timeouts.
    (`1.179.112.0/20`, `172.246.240.0/20` at the time of writing).
 4. Switch open and click tracking off in the Brevo console. The block
    stores no engagement data (NT3) and drops those events.
-5. Check idempotency on a real account before production use: the block
-   assumes Brevo answers a reused `idempotencyKey` with HTTP 400
-   `duplicate_parameter` and that a refused request does not take the key
-   (design §12, "What could not be verified").
+5. Check Brevo's behaviour on a real account before production use
+   (issue #63; it needs an account key, so it is still open). The block
+   assumes:
+   - a reused `idempotencyKey` gets HTTP 400 `duplicate_parameter`, and a
+     refused request does not take the key;
+   - the `messageId` of the send response and the `message-id` /
+     `messageId` of the status reports are written the same way (in
+     particular with or without `<>` around email message ids). The block
+     compares them exactly: a report whose id is not the current send's is
+     taken for a report about an earlier send of a redelivered message and
+     moves no status, so a format mismatch would stop every report from
+     applying (issue #68);
+   - for SMS: `recipient` without a leading `+`, the status report field
+     names (`msg_status`, `messageId`, `ts_event`), `tag` as an array, and
+     one space between `organisationPrefix` and the text.
+
+   Design §12, "What could not be verified", lists them all.
 
 Bounces, spam complaints, `invalid` and unsubscribes write suppressions.
 `GET /v1/notifications/suppressions` lists them and an operator with
@@ -109,6 +124,15 @@ are no longer targeted, and `push_expire` deletes them after 7 days unused.
 Browsers subscribe again with the new public key. Only hosts in
 `push.allowed_hosts` are accepted at subscribe.
 
+During a rolling deploy of a new key, a push for a subscription of the
+other key may be picked up by an instance that cannot sign for it. That
+instance starts no attempt and retries the job (`notification.retry_scheduled`,
+`vapid_key_mismatch`), so an instance holding the subscription's key sends
+it; on the job's last attempt the push is skipped `no_subscription`. Each
+such retry spends one of the `notify.push` queue's attempts, so keep the
+rollout short (with two instances, about 98 % of these pushes go out within
+6 attempts). The inbox keeps the durable copy either way.
+
 ## Webhooks
 
 `[modules.notifications.webhooks]` turns outgoing webhooks on. Tenants
@@ -137,6 +161,15 @@ endpoints and a publish of application content the application-level ones.
 - **Egress guard.** Webhook and push requests go only to public addresses,
   checked on the resolved IPs with redirects and proxies off. Add ranges
   with `egress.deny_cidrs`. There is no egress proxy in v1 (NT4).
+- **Envelope size.** An event's envelope travels through the outbox, whose
+  records are capped at 64 KiB, so `webhooks.max_payload_bytes` defaults
+  to 65,536 and cannot be set higher; a larger event is refused
+  `data_too_large` at `emit_webhook` (issue #76).
+- **Audit.** Endpoint changes are kept 400 days in
+  `merezha_notify.webhook_audit`. Managers read them, newest first, with
+  `GET /v1/notifications/tenants/{tenant}/webhook-audit` (or
+  `/v1/notifications/webhook-audit` for the application registry), 50 per
+  page by default.
 - **Rotating `secret_key`.** Move the old key to `secret_key_previous`,
   set the new one, deploy, and let the daily `retention` task reseal the
   webhook secrets (or trigger the `notify.maintenance.retention` schedule
@@ -144,6 +177,25 @@ endpoints and a publish of application content the application-level ones.
   `GET /v1/notifications/webhook-secrets/status` answers
   `previous_key_removable: true`. Unsubscribe tokens signed with the
   previous key keep working while it is configured.
+
+## Deleted organizations
+
+When identity deletes an organization, the block (subscribed to
+`identity.organization_deleted`) records the tenant in
+`merezha_notify.tenants_deleted` and purges, in short transactions, its
+webhook endpoints (one audit row `delete` by `sys_notifications` each) and
+webhook events with their deliveries, the push subscriptions made in it,
+its inbox items, and its notifications with their deliveries, attempts and
+provider events. Logs: `notification.organization_deleted` at the mark,
+`notification.organization_purged` when the purge finished. From the mark
+on, nothing of the tenant is written: its content events reach no
+endpoint, its notifications expand to nothing (`notification.rejected`,
+`tenant_deleted`), and creating an endpoint in its registry or a push
+subscription in it answers 404. A send already past its first transaction
+(one email, push or webhook request) may still go out. Users' preferences
+and the endpoints' audit rows are kept. A purge job that dead-letters
+leaves the rows at rest, still refused; replay it through the jobs admin
+API.
 
 ## Rate cap per target
 
@@ -178,12 +230,26 @@ max_per_target_per_hour = 20
 | Webhook audit rows | 400 days | none |
 | Inbox items | `inbox.retention` (`180d`), archived ones `inbox.archived_retention` (`30d`) | `[modules.notifications.inbox]` |
 | Captures (development) | the newest `captures` rows | `retention.captures` (`1000`) |
+| A deleted organization's rows | purged when identity deletes it; the tenant id stays in `tenants_deleted` | none |
 
 `retention` deletes in short transactions and, when a run's deadline
 comes before the backlog is gone, queues another run at once, so a large
 backlog (after raising traffic or shortening a setting) drains within
-minutes rather than over days. A repeating `notification.maintenance_step_failed`
-with `task = retention` means it is not keeping up.
+minutes rather than over days. Each step always runs its first batch, and
+a run that deleted nothing queues no other. A repeating
+`notification.maintenance_step_failed` with `task = retention` means it is
+not keeping up.
+
+A delivery whose job was lost (a handler panic, a dead letter nobody
+replayed) would stay open, and so would its notification, which
+`retention` then never deletes. `reclaim_stuck` (every 5 minutes) settles
+every delivery still `queued`, `sending` or `retrying` whose `run_at` and
+`updated_at` are both more than 24 hours old: `failed` / `job_lost`, or
+`unknown` / `job_lost` when a send may have gone out (never resent by
+itself), applying the provider events that waited for it. Webhook
+deliveries open and due for as long become `failed` / `job_lost`. A rise
+of `notify.reason = job_lost` means jobs are dying: look at the dead
+letters of the `notify.*` queues.
 
 A notification deleted by `retention` frees its `(source, dedupe_key)`: the
 same key requested again afterwards makes a new notification. Identity's

@@ -57,6 +57,15 @@
 //! events past `retention.deliveries` and captures past
 //! `retention.captures`, with migration 6 indexing both. The operations
 //! guide is `docs/operations/notifications.md`.
+//!
+//! The hardening after NT-N8 (issues #63, #66, #68, #76, migration 7)
+//! fences delivery job chains on the attempt they continue after, adds
+//! `reclaim_stuck` ([`maintenance::reclaim_stuck`]), keeps `retention`
+//! from chaining runs without progress, keeps message ids per attempt for
+//! stale provider reports, retries a push leased by an instance on another
+//! VAPID key, purges deleted organizations ([`tenants`]), caps
+//! `webhooks.max_payload_bytes` at the outbox's record limit and adds
+//! `GET …webhook-audit`.
 pub mod brevo;
 pub mod config;
 pub mod deliver;
@@ -79,6 +88,7 @@ mod routes;
 pub mod sql;
 pub mod stream;
 pub mod templates;
+pub mod tenants;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 pub mod topics;
@@ -108,10 +118,12 @@ pub const METER_SCOPE: &str = "merezha.notifications";
 
 /// Migration 1, the core tables, migration 2, the inbox (NT §2.4),
 /// migration 3, pending provider events (NT-N3), migration 4, push
-/// subscriptions (NT-N6), migration 5, webhooks (NT-N7), and migration 6,
-/// the rate cap and retention indexes (NT-N8). Later slices append their
-/// own migrations and never edit these.
-pub const MIGRATIONS: [Migration; 6] = [
+/// subscriptions (NT-N6), migration 5, webhooks (NT-N7), migration 6,
+/// the rate cap and retention indexes (NT-N8), and migration 7, message
+/// ids per attempt, deleted tenants and their indexes (hardening, issues
+/// #63, #68, #76). Later slices append their own migrations and never edit
+/// these.
+pub const MIGRATIONS: [Migration; 7] = [
     Migration::new(1, "core", include_str!("../migrations/0001_core.sql")),
     Migration::new(2, "inbox", include_str!("../migrations/0002_inbox.sql")),
     Migration::new(
@@ -129,6 +141,11 @@ pub const MIGRATIONS: [Migration; 6] = [
         6,
         "integrations",
         include_str!("../migrations/0006_integrations.sql"),
+    ),
+    Migration::new(
+        7,
+        "hardening",
+        include_str!("../migrations/0007_hardening.sql"),
     ),
 ];
 
@@ -187,6 +204,14 @@ pub const ERRORS: [ErrorCode; 41] = [
     ErrorCode::new("database_timeout", 503),
     ErrorCode::new("commit_outcome_unknown", 503),
     ErrorCode::new("overloaded", 503),
+];
+
+/// Everything the block consumes with webhooks on.
+const CONSUMED_WITH_WEBHOOKS: [&str; 4] = [
+    tenants::ORGANIZATION_DELETED_TOPIC,
+    webhooks::fanout::SUBSCRIBED_EVENT_TYPES[0],
+    webhooks::fanout::SUBSCRIBED_EVENT_TYPES[1],
+    webhooks::fanout::SUBSCRIBED_EVENT_TYPES[2],
 ];
 
 /// Kernel sources the block writes as besides its name: `api`, for the
@@ -416,8 +441,9 @@ impl Module for Notifications {
     fn extra_sources(&self) -> &[&'static str] {
         &EXTRA_SOURCES
     }
-    /// With webhooks on, the block consumes content's webhook events
-    /// (NT §5.5, NT-N8).
+    /// The block consumes identity's `identity.organization_deleted`
+    /// (issue #63) and, with webhooks on, content's webhook events (NT
+    /// §5.5, NT-N8).
     fn events(&self) -> ModuleEvents {
         let webhooks = self
             .checked()
@@ -425,9 +451,9 @@ impl Module for Notifications {
         ModuleEvents {
             publishes: &[],
             consumes: if webhooks {
-                &webhooks::fanout::SUBSCRIBED_EVENT_TYPES
+                &CONSUMED_WITH_WEBHOOKS
             } else {
-                &[]
+                &tenants::CONSUMED
             },
         }
     }
@@ -617,6 +643,23 @@ impl Module for Notifications {
                     jobs.subscribe(topic, webhooks::fanout::MODULE_EVENT_KIND)?;
                 }
             }
+            // A deleted organization's rows go (issue #63), as content's do.
+            jobs.register(
+                tenants::ORGANIZATION_DELETED_KIND,
+                notifier::EXPAND_QUEUE,
+                Arc::new(tenants::OrganizationDeleted(self.core.clone())),
+                KindOptions::default(),
+            )?;
+            jobs.subscribe(
+                tenants::ORGANIZATION_DELETED_TOPIC,
+                tenants::ORGANIZATION_DELETED_KIND,
+            )?;
+            jobs.register(
+                tenants::ORGANIZATION_PURGE_KIND,
+                notifier::EXPAND_QUEUE,
+                Arc::new(tenants::OrganizationPurge(self.core.clone())),
+                KindOptions::default(),
+            )?;
             for task in maintenance::Task::ALL {
                 let kind = task.kind();
                 jobs.register(

@@ -154,8 +154,19 @@ async fn expand(core: &Core, deadline: Instant, payload: ExpandPayload) -> Outco
     }
     let written = write(core, deadline, &payload, &topic, targets, rejected, now).await;
     match written {
-        Ok(None) => Outcome::Done,
-        Ok(Some(targets)) => {
+        Ok(Written::Existed) => Outcome::Done,
+        Ok(Written::TenantDeleted) => {
+            merezha_telemetry::event!(
+                WARN,
+                "notification.rejected",
+                topic = topic.name.as_str(),
+                source = payload.source.as_str(),
+                notification_id = payload.notification_id.to_string().as_str(),
+                code = crate::tenants::TENANT_DELETED
+            );
+            Outcome::Done
+        }
+        Ok(Written::Targets(targets)) => {
             report(core, &payload, &topic, &targets, rejected);
             core.faults.hit(faults::AFTER_EXPANSION_COMMIT).await;
             Outcome::Done
@@ -698,6 +709,7 @@ fn job_records(
         let job = DeliverPayload {
             delivery_id: target.id,
             generation: 0,
+            after_attempt: None,
             secret_data: payload.secret_data.clone(),
         };
         records.push(OutboxRecord {
@@ -788,8 +800,17 @@ async fn limit(
     Ok(())
 }
 
-/// The transaction, which returns the targets as written (the rate cap may
-/// skip some). `Ok(None)`: the notification existed, nothing written.
+/// What the expansion transaction did.
+enum Written {
+    /// The notification existed: nothing written.
+    Existed,
+    /// Its tenant was deleted (issue #63): nothing written.
+    TenantDeleted,
+    /// The targets as written (the rate cap may skip some).
+    Targets(Vec<Target>),
+}
+
+/// The expansion transaction.
 async fn write(
     core: &Core,
     deadline: Instant,
@@ -798,7 +819,7 @@ async fn write(
     targets: Vec<Target>,
     rejected: bool,
     now: jiff::Timestamp,
-) -> Result<Option<Vec<Target>>, merezha_domain::Failure> {
+) -> Result<Written, merezha_domain::Failure> {
     let db = core.database.clone();
     let has_secret = payload.secret_data.is_some();
     let (status, status_reason) = if rejected {
@@ -821,6 +842,12 @@ async fn write(
     db.clone()
         .transaction(deadline, move |tx| {
             Box::pin(async move {
+                // No row of a deleted tenant is written after its mark.
+                if let Some(tenant) = &payload.tenant
+                    && crate::tenants::guard(&db, tx, tenant).await?
+                {
+                    return Ok(Written::TenantDeleted);
+                }
                 let mut targets = targets;
                 let topic_name = topic.name.clone();
                 let category = topic.category.as_str();
@@ -877,10 +904,10 @@ async fn write(
                     .await
                     .map_err(|e| classify(&e))?;
                 if inserted.is_none() {
-                    return Ok(None);
+                    return Ok(Written::Existed);
                 }
                 if rejected {
-                    return Ok(Some(targets));
+                    return Ok(Written::Targets(targets));
                 }
                 let run_at = payload.not_before.unwrap_or(now);
                 db.execute(
@@ -954,7 +981,7 @@ async fn write(
                 for chunk in records.chunks(MAX_RECORDS_PER_APPEND) {
                     outbox.append(tx, chunk, OnDuplicate::Ignore).await?;
                 }
-                Ok(Some(targets))
+                Ok(Written::Targets(targets))
             })
         })
         .await

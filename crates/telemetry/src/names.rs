@@ -1497,6 +1497,25 @@ pub const EVENTS: &[Event] = &[
         WARN,
         &[f("task", "notify.task"), f("reason", "notify.reason"), CODE],
     ),
+    // Deleted organizations (issue #63): the tenant was marked deleted;
+    // its purge finished (the counts of the run that finished it).
+    ev(
+        "notification.organization_deleted",
+        INFO,
+        &[f("tenant", key::TENANT_ID)],
+    ),
+    ev(
+        "notification.organization_purged",
+        INFO,
+        &[
+            f("tenant", key::TENANT_ID),
+            local("webhook_events"),
+            local("webhook_endpoints"),
+            local("push_subscriptions"),
+            local("inbox_items"),
+            local("notifications"),
+        ],
+    ),
     ev(
         "notification.push_subscription_removed",
         INFO,

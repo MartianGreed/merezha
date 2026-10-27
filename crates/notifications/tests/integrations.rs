@@ -971,3 +971,252 @@ async fn retention_keeps_a_notification_a_redelivery_reopened() {
     );
     instance.stop().await;
 }
+
+/// Issue #63: with a `notify.maintenance` deadline inside the 3 s margin,
+/// a `retention` run still deletes one batch per step and chains on, so
+/// the backlog drains; once nothing is left, a run near its deadline
+/// chains nothing (before, every such run deleted nothing and queued
+/// itself again forever).
+#[tokio::test]
+async fn a_retention_run_near_its_deadline_still_makes_progress() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let mut options = Options::new(SECTION, people());
+    options.retention = Some(maintenance::RetentionBounds {
+        notifications: 100,
+        rows: 100,
+        max_batches: 5,
+    });
+    let instance = Instance::start(&world, options).await;
+    world
+        .execute(
+            "INSERT INTO merezha_notify.notifications (id, source, dedupe_key, topic, template, \
+               category, priority, channels, status, target_count, requested_at, expanded_at, \
+               settled_at) \
+             SELECT gen_random_uuid(), 'api', 'near:' || g, 'identity.password_changed', \
+               'identity.password_changed', 'security', 'normal', '{email}', 'expanded', 0, \
+               now() - interval '100 days', now() - interval '100 days', \
+               now() - interval '100 days' - g * interval '1 second' \
+             FROM generate_series(1, 300) AS g;",
+        )
+        .await;
+    let chained =
+        "SELECT count(*) FROM merezha_jobs.outbox WHERE dedupe_key LIKE 'retention:more:%'";
+    let core = instance.core();
+    let near = || std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let removed = maintenance::run(&core, Task::Retention, near())
+        .await
+        .unwrap();
+    assert_eq!(removed, 100, "one batch despite the deadline");
+    assert_eq!(
+        world.scalar(chained).await,
+        1,
+        "work left: one continuation"
+    );
+    instance
+        .until("SELECT count(*) FROM merezha_notify.notifications", 0)
+        .await;
+    instance
+        .until(
+            "SELECT count(*) FROM merezha_jobs.jobs WHERE kind = 'notify.maintenance.retention' \
+             AND state IN ('available', 'running')",
+            0,
+        )
+        .await;
+    let before = world.scalar(chained).await;
+    let removed = maintenance::run(&core, Task::Retention, near())
+        .await
+        .unwrap();
+    assert_eq!(removed, 0);
+    assert_eq!(
+        world.scalar(chained).await,
+        before,
+        "no work, no continuation"
+    );
+    instance.stop().await;
+}
+
+/// Issue #63, NT §2.5 `reclaim_stuck`: an open delivery whose `run_at` and
+/// `updated_at` are both more than a day old lost its job. It is settled
+/// `job_lost`: `failed`, or `unknown` when an attempt was still `started`
+/// (whose pending provider events then apply). Webhook deliveries open
+/// and due as long are settled `failed` / `job_lost`. Recent open rows
+/// stay. Their notifications then settle, and `retention` deletes them.
+#[tokio::test]
+async fn deliveries_whose_job_was_lost_are_reclaimed_and_retention_deletes_them() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let mut options = Options::new(SECTION, people());
+    // Delivery job records stay in the outbox: their jobs are "lost".
+    options.relay = false;
+    let instance = Instance::start(&world, options).await;
+    commit(
+        &instance,
+        vec![
+            password_changed("usr_ada", "lost"),
+            password_changed("usr_ada", "sent"),
+            password_changed("usr_ada", "fresh"),
+        ],
+    )
+    .await;
+    instance.relay_now().await;
+    instance
+        .until(
+            "SELECT count(*) FROM merezha_notify.deliveries WHERE channel = 'email' \
+             AND status = 'queued'",
+            3,
+        )
+        .await;
+    let email = |key: &str| {
+        format!(
+            "(SELECT d.id FROM merezha_notify.deliveries d JOIN merezha_notify.notifications n \
+              ON n.id = d.notification_id WHERE n.dedupe_key = '{key}' AND d.channel = 'email')"
+        )
+    };
+    let (lost, sent) = (email("lost"), email("sent"));
+    world
+        .execute(&format!(
+            "UPDATE merezha_notify.deliveries SET run_at = now() - interval '25 hours', \
+               updated_at = now() - interval '25 hours' WHERE id IN ({lost}, {sent});
+             UPDATE merezha_notify.deliveries SET status = 'sending', attempt_count = 1 \
+               WHERE id = {sent};
+             INSERT INTO merezha_notify.delivery_attempts (delivery_id, attempt, generation, \
+               started_at, outcome) SELECT {sent}, 1, 0, now() - interval '25 hours', 'started';
+             INSERT INTO merezha_notify.provider_events (provider, channel, event, event_key, \
+               delivery_id, received_at, pending) \
+               SELECT 'brevo', 'email', 'delivered', 'sent-delivered', {sent}, now(), true;
+             INSERT INTO merezha_notify.webhook_endpoints (id, url, secret_ct, secret_nonce, \
+               key_id, status, created_by, created_at, updated_at) VALUES \
+               ('00000000-0000-0000-0000-0000000000e1', 'https://hooks.example.com/a', \
+                '\\x00', '\\x000000000000000000000000', '\\x0000000000000000', 'active', \
+                'usr_ops', now(), now());
+             INSERT INTO merezha_notify.webhook_events (id, source, source_event_id, event_type, \
+               occurred_at, body, created_at) VALUES \
+               ('00000000-0000-0000-0000-0000000000f1', 'application', 'e1', \
+                'tasks.task_completed', now(), '\\x7b7d', now() - interval '3 days'), \
+               ('00000000-0000-0000-0000-0000000000f2', 'application', 'e2', \
+                'tasks.task_completed', now(), '\\x7b7d', now() - interval '3 days');
+             INSERT INTO merezha_notify.webhook_deliveries (id, event_id, endpoint_id, status, \
+               attempt_count, next_attempt_at, created_at, updated_at) VALUES \
+               ('00000000-0000-0000-0000-0000000000d1', '00000000-0000-0000-0000-0000000000f1', \
+                '00000000-0000-0000-0000-0000000000e1', 'sending', 1, NULL, \
+                now() - interval '3 days', now() - interval '25 hours'), \
+               ('00000000-0000-0000-0000-0000000000d2', '00000000-0000-0000-0000-0000000000f2', \
+                '00000000-0000-0000-0000-0000000000e1', 'retrying', 9, \
+                now() + interval '1 hour', now() - interval '3 days', now() - interval '25 hours');
+             INSERT INTO merezha_notify.webhook_attempts (delivery_id, attempt, generation, \
+               started_at, outcome) VALUES \
+               ('00000000-0000-0000-0000-0000000000d1', 1, 0, now() - interval '25 hours', \
+                'started');"
+        ))
+        .await;
+    let core = instance.core();
+    let reclaimed = maintenance::run(&core, Task::ReclaimStuck, soon())
+        .await
+        .unwrap();
+    assert_eq!(reclaimed, 3);
+    assert_eq!(of(&world, "lost").await[0], "email:failed:job_lost");
+    // `unknown` / `job_lost`, then the pending `delivered` applied.
+    assert_eq!(of(&world, "sent").await[0], "email:delivered:");
+    assert_eq!(of(&world, "fresh").await[0], "email:queued:");
+    assert_eq!(
+        world
+            .text(&format!(
+                "SELECT outcome || ':' || error_code FROM merezha_notify.delivery_attempts \
+                 WHERE delivery_id = {sent}"
+            ))
+            .await,
+        ["ambiguous:lost_outcome"]
+    );
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.provider_events WHERE pending")
+            .await,
+        0
+    );
+    assert_eq!(
+        world
+            .text(
+                "SELECT status || ':' || COALESCE(last_error_code, '') \
+                 FROM merezha_notify.webhook_deliveries ORDER BY id"
+            )
+            .await,
+        ["failed:job_lost", "retrying:"]
+    );
+    assert_eq!(
+        world
+            .text("SELECT outcome || ':' || error_code FROM merezha_notify.webhook_attempts")
+            .await,
+        ["ambiguous:lost_outcome"]
+    );
+    // A second run finds nothing more.
+    assert_eq!(
+        maintenance::run(&core, Task::ReclaimStuck, soon())
+            .await
+            .unwrap(),
+        0
+    );
+    maintenance::run(&core, Task::SettleNotifications, soon())
+        .await
+        .unwrap();
+    assert_eq!(
+        world
+            .text("SELECT dedupe_key FROM merezha_notify.notifications WHERE settled_at IS NULL")
+            .await,
+        ["fresh"]
+    );
+    world
+        .execute(
+            "UPDATE merezha_notify.notifications SET settled_at = now() - interval '100 days' \
+             WHERE settled_at IS NOT NULL",
+        )
+        .await;
+    maintenance::run(&core, Task::Retention, soon())
+        .await
+        .unwrap();
+    assert_eq!(
+        world
+            .text("SELECT dedupe_key FROM merezha_notify.notifications")
+            .await,
+        ["fresh"]
+    );
+    instance.stop().await;
+}
+
+/// Issue #63: a `retention` run that changed nothing chains no
+/// continuation, even with work left (here no step may run a batch), so
+/// it cannot keep the maintenance queue busy without progress.
+#[tokio::test]
+async fn a_retention_run_without_progress_chains_nothing() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let mut options = Options::new(SECTION, people());
+    options.retention = Some(maintenance::RetentionBounds {
+        notifications: 100,
+        rows: 100,
+        max_batches: 0,
+    });
+    let instance = Instance::start(&world, options).await;
+    world
+        .execute(
+            "INSERT INTO merezha_notify.provider_events (provider, channel, event, event_key, \
+               received_at) VALUES ('brevo', 'email', 'delivered', 'stale', now() - interval '100 days')",
+        )
+        .await;
+    let removed = maintenance::run(&instance.core(), Task::Retention, soon())
+        .await
+        .unwrap();
+    assert_eq!(removed, 0);
+    assert_eq!(
+        world
+            .scalar(
+                "SELECT count(*) FROM merezha_jobs.outbox WHERE dedupe_key LIKE 'retention:more:%'"
+            )
+            .await,
+        0
+    );
+    instance.stop().await;
+}

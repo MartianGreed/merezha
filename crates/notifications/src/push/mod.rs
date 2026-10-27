@@ -324,6 +324,8 @@ pub struct PushTarget {
     pub auth: Vec<u8>,
     pub collapse_key: Option<String>,
     pub priority: String,
+    /// The VAPID key id the subscription was made with.
+    pub key_id: String,
 }
 impl std::fmt::Debug for PushTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -334,17 +336,16 @@ impl std::fmt::Debug for PushTarget {
 }
 
 /// The target of push delivery `delivery` (Tx A), unless its subscription
-/// is gone, belongs to another user now, was made with another VAPID key,
-/// expired, or is outside the notification's tenant scope.
+/// is gone, belongs to another user now, expired, or is outside the
+/// notification's tenant scope. The caller compares its VAPID key.
 pub(crate) async fn load_target(
     db: &Database,
     session: &impl Session,
     delivery: Uuid,
-    key_id: &str,
     now: jiff::Timestamp,
 ) -> Result<Option<PushTarget>, Failure> {
     let row = db
-        .query_opt(session, &sql::TARGET, &[&delivery, &key_id, &now])
+        .query_opt(session, &sql::TARGET, &[&delivery, &now])
         .await
         .map_err(|e| classify(&e))?;
     Ok(row.map(|row| PushTarget {
@@ -354,6 +355,7 @@ pub(crate) async fn load_target(
         auth: row.get(3),
         collapse_key: row.get(4),
         priority: row.get(5),
+        key_id: row.get(6),
     }))
 }
 

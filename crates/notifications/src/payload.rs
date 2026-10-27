@@ -166,12 +166,22 @@ impl ExpandPayload {
 }
 
 /// The `notify.deliver.<channel>` payload. `Debug` shows ids only.
+///
+/// `after_attempt` fences the job chain of a generation (issue #63): a
+/// `provider_account` answer hands the delivery to a new job that carries
+/// the attempt it answered, and Tx A drops any job whose `after_attempt`
+/// is not the last such attempt of the generation (`None`: there is none
+/// yet). A job that ran again after its Tx B had handed the delivery on
+/// (a crash before the job was marked done) then finishes without a send,
+/// instead of running a second chain beside its continuation.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeliverPayload {
     #[serde(with = "uuid_text")]
     pub delivery_id: Uuid,
     pub generation: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_attempt: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_data: Option<Map<String, Value>>,
 }
@@ -180,6 +190,7 @@ impl std::fmt::Debug for DeliverPayload {
         f.debug_struct("DeliverPayload")
             .field("delivery_id", &self.delivery_id)
             .field("generation", &self.generation)
+            .field("after_attempt", &self.after_attempt)
             .finish_non_exhaustive()
     }
 }

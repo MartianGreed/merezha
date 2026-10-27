@@ -229,6 +229,12 @@ pub async fn fan_out(
         .clone()
         .transaction(deadline, move |tx| {
             Box::pin(async move {
+                // A deleted tenant's events reach no endpoint (issue #63).
+                if let Some(tenant) = &event.tenant
+                    && crate::tenants::guard(&db, tx, tenant).await?
+                {
+                    return Ok(0);
+                }
                 let inserted = db
                     .query_opt(
                         tx,

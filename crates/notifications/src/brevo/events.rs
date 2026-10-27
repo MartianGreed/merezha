@@ -40,7 +40,11 @@
 //! stored, may still suppress the delivery's own address, and moves no
 //! status, so a late report about the first send cannot settle (or fail,
 //! and so invite another redelivery of) the second. The same check runs
-//! when a `pending` event is applied.
+//! when a `pending` event is applied. Each accepted attempt keeps its
+//! message id (issue #68), so a report naming an earlier generation's
+//! message is stale also when the current generation has none, and on a
+//! redelivered delivery a report without a message id may only move it to
+//! `delivered` (`is_stale`).
 //!
 //! The SMS status callback ([`super::sms_status`], NT-N4) runs its events
 //! through the same transaction (`apply`) and source check
@@ -518,6 +522,31 @@ fn stored_transition(channel: &str, name: &str) -> Transition {
     }
 }
 
+/// Whether a correlated report is stale: about an earlier generation, so
+/// it moves no status (it may still suppress the delivery's own address).
+///
+/// Our correlation (the header or the signed path) names the delivery,
+/// which survives a redelivery. A report is about an earlier generation
+/// when its message id is not the current generation's (`current`), or
+/// was an earlier generation's (`earlier`, kept per attempt), which also
+/// holds when the current generation has no message id, as after an
+/// ambiguous send (issue #68, N1). Without a message id a report cannot
+/// say which send it is about, so once the delivery was redelivered
+/// (`generation > 0`) only a `delivered` applies (N2).
+pub(crate) fn is_stale(
+    message_id: Option<&str>,
+    current: Option<String>,
+    generation: i32,
+    earlier: bool,
+    event: &str,
+) -> bool {
+    match (message_id, current) {
+        (Some(theirs), Some(ours)) if theirs != ours => true,
+        (Some(_), _) => earlier,
+        (None, _) => generation > 0 && event != "delivered",
+    }
+}
+
 /// The one transaction of a callback on `channel`. Returns the newly
 /// stored events and whether each was correlated.
 ///
@@ -583,23 +612,25 @@ pub(crate) async fn apply<E: StatusEvent>(
                     match found {
                         Some(id) => {
                             let row = db
-                                .query_opt(tx, &sql::EVENT_DELIVERY_BY_ID, &[&id, &channel])
+                                .query_opt(
+                                    tx,
+                                    &sql::EVENT_DELIVERY_BY_ID,
+                                    &[&id, &channel, &event.message_id],
+                                )
                                 .await
                                 .map_err(|e| classify(&e))?;
                             delivery = row
                                 .as_ref()
                                 .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)));
-                            // Our correlation (the header or the signed
-                            // path) names the delivery, which survives a
-                            // redelivery; a report whose message id is not
-                            // the current generation's is about an earlier
-                            // one and moves no status (it may still
-                            // suppress the delivery's own address).
-                            let current: Option<String> = row.as_ref().and_then(|r| r.get(4));
-                            stale = matches!(
-                                (&event.message_id, &current),
-                                (Some(theirs), Some(ours)) if theirs != ours
-                            );
+                            if let Some(row) = &row {
+                                stale = is_stale(
+                                    event.message_id.as_deref(),
+                                    row.get(4),
+                                    row.get(5),
+                                    row.get(6),
+                                    event.event.name(),
+                                );
+                            }
                         }
                         None => delivery = None,
                     }

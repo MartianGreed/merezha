@@ -98,6 +98,7 @@ pub(crate) fn router(ctx: Ctx) -> Router {
                 &format!("{prefix}/webhooks/{{id}}/deliveries/{{delivery_id}}/redeliver"),
                 post(redeliver),
             )
+            .route(&format!("{prefix}/webhook-audit"), get(audit))
     };
     let router = Router::new()
         .route("/webhook-event-types", get(event_types))
@@ -433,6 +434,12 @@ async fn create(
                 db.query_one(tx, &sql::REGISTRY_LOCK, &[&key])
                     .await
                     .map_err(|e| classify(&e))?;
+                // A deleted organization's registry takes no endpoint.
+                if let Some(tenant) = &tenant
+                    && crate::tenants::guard(&db, tx, tenant).await?
+                {
+                    return Err(Failure::permanent("not_found"));
+                }
                 let count: i64 = db
                     .query_one(tx, &sql::REGISTRY_COUNT, &[&key])
                     .await
@@ -935,6 +942,12 @@ async fn test(
                 db.query_one(tx, &sql::REGISTRY_LOCK, &[&key])
                     .await
                     .map_err(|e| classify(&e))?;
+                // No test event is written for a deleted organization.
+                if let Some(tenant) = &tenant
+                    && crate::tenants::guard(&db, tx, tenant).await?
+                {
+                    return Err(Failure::permanent("not_found"));
+                }
                 let window = now
                     .checked_sub(jiff::SignedDuration::try_from(TEST_WINDOW).unwrap_or_default())
                     .unwrap_or(now);
@@ -1106,6 +1119,93 @@ async fn deliveries(
         Ok(None) => permanent("not_found"),
         Err(failure) => reply(failure),
     }
+}
+
+/// Audit rows per page of the audit route, by default and at most.
+const AUDIT_PAGE_DEFAULT: i64 = 50;
+const AUDIT_PAGE_MAX: i64 = 100;
+
+/// `GET …webhook-audit?endpoint_id=&cursor=&limit=` (manage, issue #76):
+/// the registry's audit rows (`merezha_notify.webhook_audit`), newest
+/// first, with the endpoints deleted since. Who changed what is for the
+/// registry's managers, so readers get 403 like a missing grant. `limit`
+/// is 1 to 100 (default 50); `next_cursor` is opaque.
+async fn audit(
+    State(ctx): State<Ctx>,
+    principal: Option<Extension<Authenticated>>,
+    Path(params): Path<BTreeMap<String, String>>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let call = match call(&ctx, principal.as_deref(), &params, MANAGE_PERMISSION) {
+        Ok(call) => call,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let mut endpoint: Option<Uuid> = None;
+    let mut before: Option<i64> = None;
+    let mut limit = AUDIT_PAGE_DEFAULT;
+    for (name, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        match name.as_ref() {
+            "endpoint_id" if !value.is_empty() => match Uuid::try_parse(&value) {
+                Ok(id) => endpoint = Some(id),
+                Err(_) => return field("invalid_input", "/endpoint_id", "invalid_value"),
+            },
+            "cursor" if !value.is_empty() => match decode_audit_cursor(&value) {
+                Some(id) => before = Some(id),
+                None => return permanent("invalid_cursor"),
+            },
+            "limit" if !value.is_empty() => match value.parse::<i64>() {
+                Ok(n) if (1..=AUDIT_PAGE_MAX).contains(&n) => limit = n,
+                _ => return field("invalid_input", "/limit", "out_of_range"),
+            },
+            _ => {}
+        }
+    }
+    let key = call.registry.key();
+    let result = async {
+        let db = &call.core.database;
+        let client = db.acquire(Instant::now() + DEADLINE).await?;
+        db.query(
+            &client,
+            &sql::AUDIT_PAGE,
+            &[&key, &endpoint, &before, &(limit + 1)],
+        )
+        .await
+        .map_err(|e| classify(&e))
+    }
+    .await;
+    let rows = match result {
+        Ok(rows) => rows,
+        Err(failure) => return reply(failure),
+    };
+    let more = rows.len() as i64 > limit;
+    let rows = &rows[..rows.len().min(limit as usize)];
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.get::<_, i64>(0).to_string(),
+                "endpoint_id": r.get::<_, Uuid>(1).to_string(),
+                "action": r.get::<_, String>(2),
+                "reason": r.get::<_, Option<String>>(3),
+                "actor": r.get::<_, String>(4),
+                "revision": r.get::<_, i64>(5),
+                "occurred_at": stamp(r.get(6)),
+            })
+        })
+        .collect();
+    let next = more
+        .then(|| rows.last())
+        .flatten()
+        .map(|r| URL_SAFE_NO_PAD.encode(r.get::<_, i64>(0).to_string()));
+    Json(json!({ "items": items, "next_cursor": next })).into_response()
+}
+fn decode_audit_cursor(text: &str) -> Option<i64> {
+    let bytes = URL_SAFE_NO_PAD.decode(text).ok()?;
+    std::str::from_utf8(&bytes)
+        .ok()?
+        .parse()
+        .ok()
+        .filter(|id| *id > 0)
 }
 
 /// `POST …webhooks/{id}/deliveries/{delivery_id}/redeliver` (manage): a

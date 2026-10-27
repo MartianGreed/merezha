@@ -159,6 +159,12 @@ pub(crate) async fn subscribe(
                 db.query_one(tx, &sql::USER_LOCK, &[&user])
                     .await
                     .map_err(|e| classify(&e))?;
+                // No subscription is made in a deleted organization.
+                if let Some(tenant) = &tenant
+                    && crate::tenants::guard(&db, tx, tenant).await?
+                {
+                    return Err(Failure::permanent("not_found"));
+                }
                 // Read after the lock, so this row is the most recently
                 // used of the user's when TRIM runs.
                 let now = clock.now();

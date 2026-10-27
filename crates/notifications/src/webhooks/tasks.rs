@@ -179,8 +179,8 @@ async fn batches(
     deadline: Instant,
 ) -> Result<(u64, bool), Failure> {
     let mut total = 0;
-    for _ in 0..MAX_BATCHES {
-        if Instant::now() + crate::maintenance::RETENTION_MARGIN >= deadline {
+    for batch in 0..MAX_BATCHES {
+        if !crate::maintenance::may_continue(batch, deadline) {
             return Ok((total, true));
         }
         let client = core.database.acquire(deadline).await?;
@@ -331,7 +331,7 @@ pub async fn reseal(
                     // Neither key opens it: skipped by later runs until the
                     // keys change or the secret is rotated.
                     core.database
-                        .execute(&client, &sql::MARK_UNREADABLE, &[&id, &pair, &ct])
+                        .execute(&client, &sql::MARK_UNREADABLE, &[&id, &pair, &ct, &nonce])
                         .await
                         .map_err(|e| classify(&e))?;
                     continue;
