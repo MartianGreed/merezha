@@ -1936,6 +1936,7 @@ every route answers 422 `webhooks_disabled`.
 
 | Method and path | Permission | Answer |
 | --- | --- | --- |
+| `GET webhook-secrets/status` | `notifications.admin` at `Application` | `{current_key_id, previous_key_configured, previous_key, unreadable, previous_key_removable}`, counted from the database (see Secrets below) |
 | `GET webhook-event-types` | any authenticated principal | `[{type, description}]`: the application's `event_types`, the content module's `content.entry_published`, `content.entry_unpublished`, `content.entry_deleted`, and `webhook.test` |
 | `GET …webhooks` | `notifications.webhooks.read` | `[Endpoint]`, oldest first, never the secret |
 | `POST …webhooks` | `notifications.webhooks.manage` | `{url, description?, event_types?}`: 201 `Endpoint + {secret}`. 422 `webhook_url_rejected` (`details: [{path: "/url", code}]`, `code` one of `scheme`, `userinfo`, `fragment`, `blocked_address`, `unresolvable`, `too_long`, `invalid_url`), `unknown_event_type` (`/event_types/<i>`), `validation_failed` (`/description`, `/event_types`); 409 `webhook_endpoint_limit` past `max_endpoints_per_tenant` |
@@ -1971,18 +1972,29 @@ type of the catalog or `prefix.*`; an empty filter matches every type.
   records the id of its key (`key_id`, `previous_key_id`: 8 bytes of
   SHA-256 over a label and the key), so `retention` reseals only the rows
   still under another key, 500 per page and 20 pages per run, each run
-  picking up what the last one left. After each run the gauge
-  `merezha.webhook.secrets.previous_key` holds how many endpoints still
-  have a secret under another key: remove `secret_key_previous` only once
-  it is 0 (trigger the `notify.maintenance.retention` schedule through the
-  jobs admin API to run it sooner). A secret neither key opens is marked
-  with the pair of keys it was tried with, skipped by later runs and left
-  out of that gauge; `merezha.webhook.secrets.unreadable` counts these.
+  picking up what the last one left (trigger the
+  `notify.maintenance.retention` schedule through the jobs admin API to
+  run it sooner). **Before removing `secret_key_previous`, check
+  `GET /v1/notifications/webhook-secrets/status`** (`notifications.admin`
+  at `Application`): it counts from the database on every call, whatever
+  instance answers, `{current_key_id, previous_key_configured,
+  previous_key, unreadable, previous_key_removable}`, and the previous key
+  may go only when `previous_key` is 0. The gauges
+  `merezha.webhook.secrets.previous_key` and
+  `merezha.webhook.secrets.unreadable` show the same counts: every
+  instance counts at start, every 5 minutes and after a `retention` run,
+  and reports nothing before its first count. A secret neither key opens is marked
+  with the pair of keys it was tried with and its ciphertext, skipped by
+  later runs and left out of `previous_key`; `unreadable` counts these.
   Its deliveries fail `secret_unreadable`. To recover, configure the key
-  it was sealed under as `secret_key_previous` again (the mark no longer
-  matches the new key pair, so it is retried), or rotate the endpoint's
-  secret (`rotate-secret` with `keep_previous_hours = 0`; the receiver
-  takes the new secret), or delete the endpoint. Decrypted secrets are
+  it was sealed under as `secret_key_previous` again, or repair the row's
+  ciphertext (either change makes the mark stale, so it is retried), or
+  rotate the endpoint's secret (`rotate-secret` with
+  `keep_previous_hours = 0`; the receiver takes the new secret), or
+  delete the endpoint. A row damaged while its `key_id` is already the
+  current key's is never selected or counted: it shows up only as
+  deliveries failing `secret_unreadable`, and rotating its secret repairs
+  it. Decrypted secrets are
   wiped from memory when dropped. Secrets never appear in logs, spans, metrics, errors,
   `Debug` output or other answers.
 - **Fan-out.** `notify.webhook_event` (queue `notify.expand`) stores the
@@ -2008,11 +2020,13 @@ type of the catalog or `prefix.*`; an empty filter matches every type.
   ends, so neither the schedule nor the job's attempts are spent and one
   slow receiver cannot hold the queue's workers. The hand-off's key is
   `webhook:{id}:g{generation}:b{n}`, so one replayed after a lost
-  completion starts no second chain. A chain is bounded: after 20
-  hand-offs, or 5 minutes after its first, a still-busy endpoint costs the
-  delivery a `failed` / `endpoint_busy` attempt on the schedule below (it
-  does not set `failing_since`), so the delivery backs off and eventually
-  fails like any other. The request deadline is
+  completion starts no second chain. A chain is bounded per step of the
+  schedule: after 20 hand-offs, or 5 minutes after its first, a still-busy
+  endpoint costs the delivery a `failed` / `endpoint_busy` attempt on the
+  schedule below (it does not set `failing_since` and does not count
+  toward auto-disable), so the delivery backs off and eventually fails
+  like any other; the next step starts a fresh budget. Hand-offs are due on
+  PostgreSQL's clock, which schedules jobs. The request deadline is
   `min(timeout, job deadline - 2 s)`.
 - **Outcomes.** Any 2xx succeeds and clears `failing_since`. The first
   1 KiB of the response body is kept as the attempt's `response_snippet`

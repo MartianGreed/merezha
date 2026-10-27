@@ -14,9 +14,9 @@
 -- label and the key), so the `retention` task finds and reseals the rows
 -- still under `secret_key_previous`, and counts them. A row neither key
 -- opens gets `unreadable_under` = the ids of the current and previous keys
--- it was tried with (8 zero bytes for no previous key); paging and the
--- previous-key count skip it until the keys change or the secret is
--- rotated.
+-- it was tried with (8 zero bytes for no previous key) and the first 8
+-- bytes of SHA-256 of the ciphertext; paging and the previous-key count
+-- skip it until the keys or the ciphertext change.
 CREATE TABLE merezha_notify.webhook_endpoints (
   id uuid PRIMARY KEY,
   tenant_id text CHECK (length(tenant_id) BETWEEN 1 AND 128),
@@ -30,7 +30,7 @@ CREATE TABLE merezha_notify.webhook_endpoints (
   previous_expires_at timestamptz,
   key_id bytea NOT NULL CHECK (octet_length(key_id) = 8),
   previous_key_id bytea CHECK (octet_length(previous_key_id) = 8),
-  unreadable_under bytea CHECK (octet_length(unreadable_under) = 16),
+  unreadable_under bytea CHECK (octet_length(unreadable_under) = 24),
   status text NOT NULL CHECK (status IN ('active','disabled')),
   disabled_reason text CHECK (disabled_reason IN ('manual','gone','failing')),
   disabled_at timestamptz,

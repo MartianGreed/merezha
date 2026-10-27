@@ -127,9 +127,13 @@ pub struct DeliverJob {
     /// the delivery on (0 for the first job of a generation).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub busy: u32,
-    /// Unix seconds of the chain's first hand-off.
+    /// Unix seconds of the chain's first hand-off (block clock).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub busy_since: Option<i64>,
+    /// How many attempts the generation had when the chain began: a chain
+    /// is bounded per step of the schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_step: Option<i64>,
 }
 fn is_zero(n: &u32) -> bool {
     *n == 0

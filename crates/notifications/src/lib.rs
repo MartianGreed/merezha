@@ -558,6 +558,13 @@ impl Module for Notifications {
                 })?;
             }
             let _ = self.core.set(Arc::new(core));
+            // The secret gauges report only counts this instance made:
+            // one now, then every few minutes.
+            if let Some(core) = self.core.get().filter(|c| c.webhooks.is_some()) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let _ = webhooks::tasks::count_secrets(core, deadline).await;
+                webhooks::tasks::count_secrets_periodically(core.clone());
+            }
             let streams =
                 stream::Streams::new(settings.sse.clone(), &ctx.telemetry().meter(METER_SCOPE));
             if self.streams.set(streams.clone()).is_ok() {

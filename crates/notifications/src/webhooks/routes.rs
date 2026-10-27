@@ -99,7 +99,9 @@ pub(crate) fn router(ctx: Ctx) -> Router {
                 post(redeliver),
             )
     };
-    let router = Router::new().route("/webhook-event-types", get(event_types));
+    let router = Router::new()
+        .route("/webhook-event-types", get(event_types))
+        .route("/webhook-secrets/status", get(secrets_status));
     let router = registry("", router);
     registry("/tenants/{tenant_id}", router).with_state(ctx)
 }
@@ -257,6 +259,51 @@ async fn event_types(
         .map(|(name, description)| json!({ "type": name, "description": description }))
         .collect();
     Json(Value::Array(items)).into_response()
+}
+
+/// `GET webhook-secrets/status` (`notifications.admin` at `Application`):
+/// counted from the database on every call, so it holds whatever instance
+/// answers. Remove `secret_key_previous` only once `previous_key` is 0.
+async fn secrets_status(
+    State(ctx): State<Ctx>,
+    principal: Option<Extension<Authenticated>>,
+) -> Response {
+    let permission = match Identity::new(crate::ADMIN_PERMISSION) {
+        Ok(p) => p,
+        Err(failure) => return reply(failure),
+    };
+    let principal = principal.as_deref().and_then(|a| a.0.as_deref());
+    if let Err(denied) = ctx
+        .authorizer
+        .check(principal, &permission, &ResourceScope::Application)
+    {
+        return reply(denied.failure());
+    }
+    if ctx.checked.settings.webhooks.is_none() {
+        return permanent(code::WEBHOOKS_DISABLED);
+    }
+    let core = match ctx.core() {
+        Ok(core) => core,
+        Err(refusal) => return refusal.into_response(),
+    };
+    match super::tasks::count_secrets(&core, Instant::now() + DEADLINE).await {
+        Ok(counts) => {
+            let hex: String = counts
+                .current_key_id
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            Json(json!({
+                "current_key_id": hex,
+                "previous_key_configured": counts.previous_key_configured,
+                "previous_key": counts.previous_key,
+                "unreadable": counts.unreadable,
+                "previous_key_removable": counts.previous_key == 0,
+            }))
+            .into_response()
+        }
+        Err(failure) => reply(failure),
+    }
 }
 
 /// A prefix filter `prefix.*`: one to four segments before the `*`.
@@ -1136,6 +1183,7 @@ async fn redeliver(
                     generation,
                     busy: 0,
                     busy_since: None,
+                    busy_step: None,
                 };
                 let record = fanout::job_record(&job, &correlation, tenant.as_deref())?;
                 outbox.append(tx, &[record], OnDuplicate::Ignore).await?;

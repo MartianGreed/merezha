@@ -1717,6 +1717,12 @@ async fn unreadable_secrets_are_set_aside_and_counted_apart() {
     }
     instance.stop().await;
     // The three oldest endpoints hold a secret no key opens.
+    let originals = world
+        .text(
+            "SELECT id::text || ' ' || encode(secret_ct, 'hex') FROM merezha_notify.webhook_endpoints \
+             ORDER BY id LIMIT 3",
+        )
+        .await;
     world
         .execute(
             "UPDATE merezha_notify.webhook_endpoints SET secret_ct = decode(repeat('ab', 48), 'hex') \
@@ -1744,6 +1750,21 @@ async fn unreadable_secrets_are_set_aside_and_counted_apart() {
     let gauge = |name: &str| harness.metric(name).value(&[]);
     assert_eq!(gauge("merezha.webhook.secrets.previous_key"), Some(0.0));
     assert_eq!(gauge("merezha.webhook.secrets.unreadable"), Some(3.0));
+    // A row repaired in place (its ciphertext changed) is tried again.
+    let (repaired, ciphertext) = originals[0].split_once(' ').unwrap();
+    world
+        .execute(&format!(
+            "UPDATE merezha_notify.webhook_endpoints SET secret_ct = decode('{ciphertext}', 'hex') \
+             WHERE id = '{repaired}'"
+        ))
+        .await;
+    let again = webhooks::tasks::reseal(&core, soon(), bounds)
+        .await
+        .unwrap();
+    assert_eq!(
+        (again.resealed, again.remaining, again.unreadable),
+        (1, 0, 2)
+    );
     // Rotating an unreadable endpoint's secret clears its mark.
     let id = world
         .text(
@@ -1764,7 +1785,7 @@ async fn unreadable_secrets_are_set_aside_and_counted_apart() {
     let last = webhooks::tasks::reseal(&core, soon(), bounds)
         .await
         .unwrap();
-    assert_eq!((last.remaining, last.unreadable), (0, 2));
+    assert_eq!((last.remaining, last.unreadable), (0, 1));
     instance.stop().await;
 }
 
@@ -1815,6 +1836,7 @@ async fn a_replayed_hand_off_starts_no_second_chain() {
         generation: 0,
         busy: 0,
         busy_since: None,
+        busy_step: None,
     };
     for _ in 0..2 {
         let (_cancel, cancelled) = tokio::sync::watch::channel(false);
@@ -1836,7 +1858,7 @@ async fn a_replayed_hand_off_starts_no_second_chain() {
     assert_eq!(
         world
             .scalar(&format!(
-                "SELECT count(*) FROM merezha_jobs.outbox WHERE dedupe_key = 'webhook:{delivery}:g0:b1'"
+                "SELECT count(*) FROM merezha_jobs.outbox WHERE dedupe_key = 'webhook:{delivery}:g0:s0:b1'"
             ))
             .await,
         1
@@ -1854,6 +1876,148 @@ async fn a_replayed_hand_off_starts_no_second_chain() {
         0
     );
     drop(held);
+}
+
+/// A fresh instance whose endpoints are still on the previous key reports
+/// their count from the start, never a 0 nobody measured, and the status
+/// route answers from the database.
+#[tokio::test]
+async fn a_fresh_instance_reports_the_secrets_still_on_the_previous_key() {
+    let harness = merezha_telemetry::testing::Harness::new();
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let instance = start(&world, &section(true, "")).await;
+    for n in 0..2 {
+        create(
+            &instance,
+            "ada",
+            "/tenants/org_a",
+            json!({ "url": receiver.url(&format!("p{n}")) }),
+        )
+        .await;
+    }
+    instance.stop().await;
+    let instance = start_with(&world, &rotated_section(true), |o| {
+        o.env.push(("NEW_KEY".into(), NEW_KEY.into()));
+        o.meters = Some(harness.telemetry().meters());
+    })
+    .await;
+    instance
+        .tokens
+        .add("root", user("usr_root", &["notifications.admin"], None));
+    let gauge = |name: &str| harness.metric(name).value(&[]);
+    assert_eq!(gauge("merezha.webhook.secrets.previous_key"), Some(2.0));
+    assert_eq!(gauge("merezha.webhook.secrets.unreadable"), Some(0.0));
+    let status_of = |token: &'static str| {
+        let instance = &instance;
+        async move {
+            instance
+                .call(
+                    "GET",
+                    "/v1/notifications/webhook-secrets/status",
+                    Some(token),
+                    None,
+                )
+                .await
+        }
+    };
+    let (status, body) = status_of("root").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        (
+            body["previous_key"].clone(),
+            body["unreadable"].clone(),
+            body["previous_key_configured"].clone(),
+            body["previous_key_removable"].clone()
+        ),
+        (json!(2), json!(0), json!(true), json!(false))
+    );
+    assert_eq!(body["current_key_id"].as_str().unwrap().len(), 16);
+    assert_eq!(status_of("ada").await.0, 403);
+    maintenance::run(&instance.core(), Task::Retention, soon())
+        .await
+        .unwrap();
+    let (_, body) = status_of("root").await;
+    assert_eq!(
+        (
+            body["previous_key"].clone(),
+            body["previous_key_removable"].clone()
+        ),
+        (json!(0), json!(true))
+    );
+    instance.stop().await;
+}
+
+/// Before any count the gauges report nothing rather than 0.
+#[test]
+fn the_secret_gauges_report_nothing_before_a_count() {
+    let harness = merezha_telemetry::testing::Harness::new();
+    let meter = harness
+        .telemetry()
+        .meters()
+        .meter(merezha_notifications::METER_SCOPE);
+    let metrics = merezha_notifications::metrics::Metrics::new(&meter, Vec::new());
+    let read = || {
+        harness
+            .metric("merezha.webhook.secrets.previous_key")
+            .value(&[])
+    };
+    assert_eq!(read(), None);
+    metrics.webhook_secrets(4, 1);
+    assert_eq!(read(), Some(4.0));
+}
+
+/// A busy endpoint's `endpoint_busy` attempts do not count toward
+/// auto-disable, even while a real failure set `failing_since`.
+#[tokio::test]
+async fn busy_attempts_do_not_count_toward_auto_disable() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    receiver.fail_next(1, 503, "");
+    let clock = Arc::new(Shifted::default());
+    let instance = start_with(&world, &section(true, ""), |o| {
+        o.clock = Some(clock.clone());
+    })
+    .await;
+    create(
+        &instance,
+        "ada",
+        "/tenants/org_a",
+        json!({ "url": receiver.url("a") }),
+    )
+    .await;
+    emit(
+        &instance,
+        "application",
+        Some("org_a"),
+        "tasks.task_completed",
+        "b1",
+    )
+    .await;
+    instance
+        .until(
+            "SELECT count(*) FROM merezha_notify.webhook_deliveries WHERE status = 'retrying'",
+            1,
+        )
+        .await;
+    world
+        .execute(
+            "INSERT INTO merezha_notify.webhook_attempts (delivery_id, attempt, generation, \
+             started_at, finished_at, outcome, error_code) \
+             SELECT d.id, 100 + n, 0, now(), now() + interval '1 second', 'failed', 'endpoint_busy' \
+             FROM merezha_notify.webhook_deliveries d, generate_series(1, 10) AS n",
+        )
+        .await;
+    clock.advance(Duration::from_secs(6 * 86_400));
+    let disabled = maintenance::run(&instance.core(), Task::WebhookAutoDisable, soon())
+        .await
+        .unwrap();
+    assert_eq!(disabled, 0);
+    instance.stop().await;
 }
 
 /// Crashes and retry delays race lease deadlines (issue #37): CI runs them
@@ -1994,6 +2158,32 @@ mod timing {
         assert_eq!(
             world
                 .scalar("SELECT count(*) FROM merezha_notify.webhook_endpoints WHERE failing_since IS NULL")
+                .await,
+            1
+        );
+        // The ladder retry runs the same payload: with an attempt recorded
+        // since, its budget starts again, so it hands off rather than
+        // spending another attempt at once.
+        run_now(&world).await;
+        instance
+            .until(
+                "SELECT count(*) FROM merezha_jobs.outbox WHERE dedupe_key LIKE 'webhook:%:s1:b1'",
+                1,
+            )
+            .await;
+        // Due on the database's clock (the block's runs 5 minutes ahead).
+        assert_eq!(
+            world
+                .scalar(
+                    "SELECT count(*) FROM merezha_jobs.outbox WHERE dedupe_key LIKE 'webhook:%:s1:b1' \
+                     AND run_at < now() + interval '1 minute'"
+                )
+                .await,
+            1
+        );
+        assert_eq!(
+            world
+                .scalar("SELECT count(*) FROM merezha_notify.webhook_attempts")
                 .await,
             1
         );

@@ -76,6 +76,14 @@ pub const ATTEMPT_STATE: Statement = s(
       ORDER BY attempt DESC LIMIT 1) \
      FROM merezha_notify.webhook_attempts WHERE delivery_id = $1",
 );
+/// How many attempts generation `$2` of delivery `$1` has, and the
+/// database's clock, which schedules jobs.
+pub const BUSY_STATE: Statement = s(
+    "notify.webhook.busy_state",
+    "SELECT merezha_notify.webhook_attempts",
+    "SELECT count(*), now() FROM merezha_notify.webhook_attempts \
+     WHERE delivery_id = $1 AND generation = $2",
+);
 /// A `started` attempt `$2` whose run never recorded an outcome.
 pub const ATTEMPT_LOST: Statement = s(
     "notify.webhook.attempt_lost",
@@ -300,7 +308,8 @@ pub const REDELIVER_SET: Statement = s(
 // ----- maintenance -----
 
 /// Active endpoints failing since before `$1` with at least `$2` failed
-/// attempts since then, oldest first, at most `$3`.
+/// attempts since then (a busy endpoint's `endpoint_busy` attempts left
+/// out), oldest first, at most `$3`.
 pub const AUTO_DISABLE_CANDIDATES: Statement = s(
     "notify.webhook.auto_disable_candidates",
     "SELECT merezha_notify.webhook_endpoints",
@@ -309,7 +318,8 @@ pub const AUTO_DISABLE_CANDIDATES: Statement = s(
      AND (SELECT count(*) FROM (SELECT 1 FROM merezha_notify.webhook_attempts a \
        JOIN merezha_notify.webhook_deliveries d ON d.id = a.delivery_id \
        WHERE d.endpoint_id = e.id AND a.finished_at >= e.failing_since \
-       AND a.outcome IN ('failed', 'blocked', 'ambiguous') LIMIT $2) AS f) >= $2 \
+       AND a.outcome IN ('failed', 'blocked', 'ambiguous') \
+       AND a.error_code IS DISTINCT FROM 'endpoint_busy' LIMIT $2) AS f) >= $2 \
      ORDER BY e.failing_since LIMIT $3",
 );
 /// Null the bodies of events created before `$1`, at most `$2`.
@@ -349,31 +359,36 @@ pub const PREVIOUS_EXPIRE: Statement = s(
 );
 /// After id `$1`, the endpoints with a secret sealed under another key
 /// than `$2`, at most `$3`, except those found unreadable under the key
-/// pair `$4`.
+/// pair `$4` with their current ciphertext.
 pub const STALE_SECRETS: Statement = s(
     "notify.webhook.stale_secrets",
     "SELECT merezha_notify.webhook_endpoints",
     "SELECT id, secret_ct, secret_nonce, key_id, previous_secret_ct, previous_secret_nonce, \
      previous_key_id FROM merezha_notify.webhook_endpoints \
      WHERE id > $1 AND (key_id <> $2 OR previous_key_id <> $2) \
-     AND unreadable_under IS DISTINCT FROM $4 ORDER BY id LIMIT $3",
+     AND unreadable_under IS DISTINCT FROM ($4::bytea || substring(sha256(secret_ct) FROM 1 FOR 8)) \
+     ORDER BY id LIMIT $3",
 );
 /// How many endpoints still hold a secret sealed under another key than
 /// `$1` (readable ones), and how many were found unreadable under it.
 pub const SECRET_COUNTS: Statement = s(
     "notify.webhook.secret_counts",
     "SELECT merezha_notify.webhook_endpoints",
-    "SELECT count(*) FILTER (WHERE (key_id <> $1 OR previous_key_id <> $1) \
-       AND (unreadable_under IS NULL OR substring(unreadable_under FROM 1 FOR 8) <> $1)), \
-     count(*) FILTER (WHERE substring(unreadable_under FROM 1 FOR 8) = $1) \
-     FROM merezha_notify.webhook_endpoints",
+    "SELECT count(*) FILTER (WHERE (key_id <> $1 OR previous_key_id <> $1) AND NOT unreadable), \
+     count(*) FILTER (WHERE unreadable) \
+     FROM (SELECT key_id, previous_key_id, \
+       COALESCE(substring(unreadable_under FROM 1 FOR 8) = $1 \
+         AND substring(unreadable_under FROM 17 FOR 8) = substring(sha256(secret_ct) FROM 1 FOR 8), \
+         false) AS unreadable \
+       FROM merezha_notify.webhook_endpoints) AS e",
 );
-/// Mark endpoint `$1` unreadable under key pair `$2`, unless its secret
-/// changed since it was read (`$3`).
+/// Mark endpoint `$1` unreadable under key pair `$2` and its ciphertext,
+/// unless its secret changed since it was read (`$3`).
 pub const MARK_UNREADABLE: Statement = s(
     "notify.webhook.mark_unreadable",
     "UPDATE merezha_notify.webhook_endpoints",
-    "UPDATE merezha_notify.webhook_endpoints SET unreadable_under = $2 \
+    "UPDATE merezha_notify.webhook_endpoints \
+     SET unreadable_under = $2::bytea || substring(sha256(secret_ct) FROM 1 FOR 8) \
      WHERE id = $1 AND secret_ct = $3",
 );
 /// Store secrets re-sealed under key `$7`, unless the endpoint's secret
@@ -394,6 +409,7 @@ pub const STATEMENTS: &[Statement] = &[
     DELIVERIES_INSERT,
     DELIVERY_LOCK,
     ATTEMPT_STATE,
+    BUSY_STATE,
     ATTEMPT_LOST,
     ATTEMPT_START,
     DELIVERY_SENDING,

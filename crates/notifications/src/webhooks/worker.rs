@@ -161,8 +161,18 @@ async fn settle_exhausted(core: &Core, job: &DeliverJob, code: &str) -> Outcome 
 /// delay: its endpoint has no free slot on this instance. No attempt is
 /// recorded and this job ends, so neither the schedule nor the job's
 /// attempts are spent and no queue worker waits.
-async fn reschedule(core: &Core, ctx: &JobContext, job: &DeliverJob, since: i64) -> Outcome {
-    let doublings = job.busy.min(5);
+/// `busy` hand-offs since `since` (block clock) at schedule step `step`;
+/// the follow-up runs on the database clock (`db_now`), as AP schedules.
+async fn reschedule(
+    core: &Core,
+    ctx: &JobContext,
+    job: &DeliverJob,
+    busy: u32,
+    since: i64,
+    step: i64,
+    db_now: jiff::Timestamp,
+) -> Outcome {
+    let doublings = busy.min(5);
     let base = (BUSY_DELAY * 2u32.pow(doublings)).min(BUSY_MAX_DELAY);
     let mut bytes = [0u8; 8];
     let share = match core.random.fill(&mut bytes) {
@@ -171,20 +181,20 @@ async fn reschedule(core: &Core, ctx: &JobContext, job: &DeliverJob, since: i64)
     };
     let delay = base.mul_f64(0.5 + share);
     let next = DeliverJob {
-        busy: job.busy.saturating_add(1),
+        busy: busy.saturating_add(1),
         busy_since: Some(since),
+        busy_step: Some(step),
         ..job.clone()
     };
-    let at = core
-        .now()
+    let at = db_now
         .checked_add(jiff::SignedDuration::try_from(delay).unwrap_or_default())
         .ok();
     let record = super::fanout::job_record(&next, &ctx.correlation_id, None).map(|mut record| {
         // Deterministic, so a hand-off replayed after a lost completion
         // dedupes instead of starting a second chain.
         if let Ok(key) = merezha_platform::ports::DedupeKey::new(format!(
-            "webhook:{}:g{}:b{}",
-            job.webhook_delivery_id, job.generation, next.busy
+            "webhook:{}:g{}:s{}:b{}",
+            job.webhook_delivery_id, job.generation, step, next.busy
         )) {
             record.dedupe_key = key;
         }
@@ -224,11 +234,34 @@ async fn deliver(core: &Core, ctx: &JobContext, job: &DeliverJob) -> Outcome {
     // Never wait for a slot: a queue worker stays free for other endpoints.
     let permit = sender.limiter.try_acquire(job.endpoint_id);
     if permit.is_none() {
-        let now = core.now().as_second();
-        let since = job.busy_since.unwrap_or(now);
+        // Where the schedule stands, and the database's clock, which runs
+        // the jobs.
+        let state = match core.database.acquire(deadline).await {
+            Ok(client) => core
+                .database
+                .query_one(
+                    &client,
+                    &sql::BUSY_STATE,
+                    &[&job.webhook_delivery_id, &job.generation],
+                )
+                .await
+                .map_err(|e| classify(&e)),
+            Err(failure) => Err(failure),
+        };
+        let (step, db_now): (i64, jiff::Timestamp) = match state {
+            Ok(row) => (row.get(0), row.get(1)),
+            Err(failure) => return Outcome::retry(&failure.code),
+        };
+        // A chain belongs to one step of the schedule: once an attempt was
+        // recorded since it began (a ladder retry runs the same payload),
+        // the budget starts again.
+        let (busy, since) = match (job.busy_step, job.busy_since) {
+            (Some(chain_step), Some(since)) if chain_step == step => (job.busy, since),
+            _ => (0, core.now().as_second()),
+        };
         let window = i64::try_from(BUSY_WINDOW.as_secs()).unwrap_or(i64::MAX);
-        if job.busy < MAX_HANDOFFS && now.saturating_sub(since) < window {
-            return reschedule(core, ctx, job, since).await;
+        if busy < MAX_HANDOFFS && core.now().as_second().saturating_sub(since) < window {
+            return reschedule(core, ctx, job, busy, since, step, db_now).await;
         }
     }
     let id = job.webhook_delivery_id;

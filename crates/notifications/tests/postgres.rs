@@ -42,7 +42,7 @@ const EVENTS_CHECKSUM: &str = "f9e8fc57df4863cf4602682ada9bbe6f1fbf48932479852c3
 /// SHA-256 of migration 4 (NT-N6, push subscriptions), frozen the same way.
 const PUSH_CHECKSUM: &str = "fac9a5a50789e1802a393c392d339db2923e1b8a82cd08740ba1ec364900d896";
 /// SHA-256 of migration 5 (NT-N7, webhooks), frozen the same way.
-const WEBHOOKS_CHECKSUM: &str = "2060de7ddb7e410935c9c30c9a32935507f557ed4b87ecba8deef10f7ba7b34b";
+const WEBHOOKS_CHECKSUM: &str = "7f8334e2762321989fc267c422d14623b71f0cfc78a39fbeba01a632e692be46";
 
 /// A distinct id per call.
 fn fresh() -> Uuid {

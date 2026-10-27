@@ -22,6 +22,9 @@ use std::{
     time::Duration,
 };
 
+/// A secret gauge before its first count.
+const UNCOUNTED: u64 = u64::MAX;
+
 /// The `notify.topic` value of a topic the configuration does not declare.
 pub const UNKNOWN_TOPIC: &str = "unknown";
 
@@ -77,19 +80,31 @@ impl Metrics {
     /// The instruments on `meter`; only `topics` become `notify.topic`
     /// values, so a caller's undeclared topic cannot grow the label set.
     pub fn new(meter: &Meter, topics: impl IntoIterator<Item = String>) -> Self {
-        let previous_key_secrets = Arc::new(AtomicU64::new(0));
+        // `UNCOUNTED` until the first count: the gauges report nothing
+        // rather than a 0 nobody measured.
+        let previous_key_secrets = Arc::new(AtomicU64::new(UNCOUNTED));
         let read = previous_key_secrets.clone();
         let previous_key_gauge = instruments::u64_gauge(
             meter,
             &metric::WEBHOOK_SECRETS_PREVIOUS_KEY,
-            move |observer| observer.observe(read.load(Ordering::Relaxed), &[]),
+            move |observer| {
+                let value = read.load(Ordering::Relaxed);
+                if value != UNCOUNTED {
+                    observer.observe(value, &[]);
+                }
+            },
         );
-        let unreadable_secrets = Arc::new(AtomicU64::new(0));
+        let unreadable_secrets = Arc::new(AtomicU64::new(UNCOUNTED));
         let read = unreadable_secrets.clone();
         let unreadable_gauge = instruments::u64_gauge(
             meter,
             &metric::WEBHOOK_SECRETS_UNREADABLE,
-            move |observer| observer.observe(read.load(Ordering::Relaxed), &[]),
+            move |observer| {
+                let value = read.load(Ordering::Relaxed);
+                if value != UNCOUNTED {
+                    observer.observe(value, &[]);
+                }
+            },
         );
         Self(Some(Arc::new(Instruments {
             requests: instruments::counter(meter, &metric::NOTIFICATION_REQUESTS),

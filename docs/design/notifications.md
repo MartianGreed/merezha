@@ -1754,7 +1754,12 @@ delivery `failed` with the code, and redeliver also accepts an open
 delivery untouched for an hour. After the re-review a hand-off chain is bounded (20
 hand-offs or 5 minutes, then a `failed` / `endpoint_busy` attempt on the
 schedule), its keys are deterministic, retention steps run independently,
-and secrets neither key opens are marked and counted apart.
+and secrets neither key opens are marked and counted apart. After the third look the secret
+gauges report nothing before their first count and every instance counts
+at start and every 5 minutes, `GET webhook-secrets/status` counts live, the
+hand-off budget is per schedule step and due on PostgreSQL's clock,
+`endpoint_busy` attempts stay out of auto-disable, and the unreadable mark
+includes the ciphertext.
 
 **N8: integrations, operations.** *Scope:* the identity topics of
 R2, which can merge right after N3; the AP subscriptions to content events;

@@ -364,21 +364,68 @@ pub async fn reseal(
             }
         }
     }
-    let (remaining, unreadable): (i64, i64) = {
-        let client = core.database.acquire(deadline).await?;
-        let row = core
-            .database
-            .query_one(&client, &sql::SECRET_COUNTS, &[&current])
-            .await
-            .map_err(|e| classify(&e))?;
-        (row.get(0), row.get(1))
-    };
-    let remaining = u64::try_from(remaining).unwrap_or(0);
-    let unreadable = u64::try_from(unreadable).unwrap_or(0);
-    core.metrics.webhook_secrets(remaining, unreadable);
+    let counts = count_secrets(core, deadline).await?;
+    let (remaining, unreadable) = (counts.previous_key, counts.unreadable);
     Ok(Resealed {
         resealed,
         remaining,
         unreadable,
     })
+}
+
+/// Where the webhook signing secrets stand: what `GET
+/// webhook-secrets/status` answers and the two gauges show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SecretCounts {
+    /// The id of the current key (`secret_key`).
+    pub current_key_id: [u8; 8],
+    pub previous_key_configured: bool,
+    /// Endpoints with a secret still sealed under another key, unreadable
+    /// ones left out: `secret_key_previous` may go only once this is 0.
+    pub previous_key: u64,
+    /// Endpoints whose secret neither key opened.
+    pub unreadable: u64,
+}
+
+/// Count the endpoints still on another key and the unreadable ones,
+/// straight from the database, and record both gauges.
+pub async fn count_secrets(core: &Core, deadline: Instant) -> Result<SecretCounts, Failure> {
+    let secrets = SecretBox::new(
+        &core.settings.secret_key,
+        core.settings.secret_key_previous.as_ref(),
+    );
+    let current = secrets.key_id();
+    let row = {
+        let client = core.database.acquire(deadline).await?;
+        core.database
+            .query_one(&client, &sql::SECRET_COUNTS, &[&current.to_vec()])
+            .await
+            .map_err(|e| classify(&e))?
+    };
+    let (previous_key, unreadable): (i64, i64) = (row.get(0), row.get(1));
+    let counts = SecretCounts {
+        current_key_id: current,
+        previous_key_configured: secrets.has_previous(),
+        previous_key: u64::try_from(previous_key).unwrap_or(0),
+        unreadable: u64::try_from(unreadable).unwrap_or(0),
+    };
+    core.metrics
+        .webhook_secrets(counts.previous_key, counts.unreadable);
+    Ok(counts)
+}
+
+/// How often every instance counts the secrets again for the gauges.
+pub const SECRET_COUNT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// Count the secrets again every [`SECRET_COUNT_INTERVAL`] on this
+/// instance (the block counts once at start), so every instance's gauges
+/// show a count it made; a failed count keeps the last one.
+pub(crate) fn count_secrets_periodically(core: Arc<Core>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(SECRET_COUNT_INTERVAL).await;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let _ = count_secrets(&core, deadline).await;
+        }
+    });
 }
