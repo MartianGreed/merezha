@@ -181,7 +181,8 @@ The componentizer (SC-D7) is the one new direct dependency:
 Both are already in `Cargo.lock` at these versions, pulled by Wasmtime 49's bindgen, so the
 lockfile gains no crate. `deny.toml` allows every licence. Wasmtime 49 decodes components with
 `wasmparser` 0.258.3, the version these encode with. `services/componentize` moves from 0.262.0
-to 0.258.3 with them, which is an API port and not a version bump: `wit_component::targets`
+to 0.258.3 with them (`services/Cargo.lock` keeps 0.262.0 for `wit-bindgen` 0.63 on the wasm32
+target), which is an API port and not a version bump: `wit_component::targets`
 takes three arguments in 0.258.3 and the current code passes four, so the call is rewritten
 and its tests rerun.
 
@@ -230,7 +231,8 @@ unless = ["identity"]
 
 ### 2.9 Source pin
 
-`crates/scaffold/build.rs` records the revision the binary is built from, in this order:
+`crates/cli/build.rs` (SC-S1) records the revision the binary is built from, in this order (SC-S2
+reads it through `merezha_cli::guest::source_rev`, or moves the script into `crates/scaffold`):
 
 1. `MEREZHA_SOURCE_REV` from the build environment, which the release and CI builds set.
 2. Else `git rev-parse HEAD` in the crate's directory, kept only when `git --no-optional-locks
@@ -247,9 +249,10 @@ The script prints `cargo::rerun-if-env-changed=MEREZHA_SOURCE_REV` and
 `cargo::rerun-if-changed` for the git directory's `HEAD`, the loose ref `HEAD` points to,
 `packed-refs` and `index`, each only when the file exists: Cargo treats a missing path as always
 changed, and a branch whose ref `git gc` or `git pack-refs` moved into `packed-refs` has no loose
-file (`packed-refs` then covers it). It finds them with `git rev-parse --git-dir` and
-`--git-common-dir`, so linked worktrees work. A commit, a branch switch or staging an edit reruns
-the script.
+file (`packed-refs` then covers it). For such a branch it also watches the loose ref's nearest
+existing parent directory under `refs/`, since the next commit writes the loose file there without
+touching `packed-refs`. It finds them with `git rev-parse --git-path`, so linked worktrees work. A
+commit, a branch switch or staging an edit reruns the script.
 
 **Which revisions are authoritative.** Only two kinds of build record a revision that can be
 trusted: one with `MEREZHA_SOURCE_REV` set (release and CI builds), and a fresh build of a clean
@@ -881,7 +884,7 @@ merezha componentize CORE.wasm COMPONENT.wasm
 
 `merezha componentize` is step 4 alone. `services/componentize` keeps its package name
 (`merezha-componentize`), binary and command line, and becomes a thin `main` over
-`merezha-guest-build`, a path dependency on `../crates/guest-build`. The host library takes a
+`merezha-guest-build`, a path dependency on `../../crates/guest-build`. The host library takes a
 different name precisely so that the two never collide. `scripts/build-services.sh` keeps its
 commands (`cargo build -p merezha-componentize`, then `release/merezha-componentize`), but what
 they compile changes: the services workspace now builds the host's `crates/guest-build` and its
@@ -1242,7 +1245,10 @@ revision `MEREZHA_SOURCE_REV` set at build time. `scripts/check-services.sh` pas
 services workspace building `merezha-guest-build`.
 *Tests:* `crates/guest-build/tests/` takes over `services/componentize/tests/guard.rs` (on the
 ported three-argument `targets`); `crates/cli/tests/build.rs` builds the fixture workspace
-(skipped with a message when the wasm target is missing; the `scaffold` workflow installs it).
+(skipped with a message when the wasm target is missing; the `services` workflow installs it and
+runs it with `MEREZHA_TEST_REQUIRE_WASM_TARGET=1`, as the `scaffold` workflow will);
+`crates/cli/tests/source_rev.rs` runs 2.9's fresh-build cases on a probe crate carrying
+`crates/cli/build.rs`, which SC-S2's `source_rev.rs` then only extends to `merezha new`.
 
 **SC-S2 acceptance.** For every block selection of 2.2, the generated configuration loads through
 `host::configure` with every module registered, for both files (3.14), and `content.toml` and the
@@ -1291,13 +1297,13 @@ partitioned projection walk, the notifier's effect lists including the self-comp
 
 | File | Change | Slice |
 | --- | --- | --- |
-| `services/componentize/` | keeps its package name `merezha-componentize`, its binary and its command line; its library code moves to `crates/guest-build`, and the binary becomes a thin `main` over it (path dependency). `services/Cargo.lock` moves `wit-component` and `wit-parser` from 0.262.0 to 0.258.3 | SC-S1 |
+| `services/componentize/` | keeps its package name `merezha-componentize`, its binary and its command line; its library code moves to `crates/guest-build`, and the binary becomes a thin `main` over it (path dependency). `services/Cargo.lock` gains `wit-component` and `wit-parser` 0.258.3 for it (0.262.0 stays for `wit-bindgen`) and drops the old dev-only `wat` | SC-S1 |
 | `scripts/build-services.sh` | its commands stay (`cargo build -p merezha-componentize`, then `release/merezha-componentize`); what they compile now includes `crates/guest-build` | SC-S1 |
 | `scripts/check-services.sh` | unchanged; it covers the moved code through the build above | SC-S1 |
 | `Cargo.toml` | members gain `crates/guest-build` and `crates/scaffold` | SC-S1, SC-S2 |
-| `.github/workflows/services.yml` | paths gain `crates/guest-build/**` | SC-S1 |
+| `.github/workflows/services.yml` | paths gain `crates/guest-build/**`; a step runs `crates/cli/tests/build.rs` and `source_rev.rs` with the wasm target required; `MEREZHA_SOURCE_REV` is the commit (also in `host.yml`) | SC-S1 |
 | `.github/workflows/scaffold.yml` (new) | Linux, Rust 1.98.0 with the wasm target, a `postgres:17` service: build the host, `scripts/check-scaffold.sh` (S3), then the golden diff, `merezha build` on `examples/teamboard` and `cargo test -p merezha-cli --test teamboard` with `MEREZHA_TEST_EXAMPLE_COMPONENTS` and `MEREZHA_TEST_REQUIRE_EXAMPLE=1` (S5). Triggered by `crates/**`, `examples/**`, `wit/**`, `scripts/check-scaffold.sh`, `Cargo.*` and itself | SC-S3, SC-S5 |
-| `.github/workflows/host.yml` | unchanged; it runs the new crates' unit tests through `--workspace`, and `teamboard.rs` skips there | |
+| `.github/workflows/host.yml` | sets `MEREZHA_SOURCE_REV` (SC-S1); it runs the new crates' unit tests through `--workspace`, and `teamboard.rs` skips there | |
 | `scripts/check-scaffold.sh`, `scripts/regenerate-examples.sh` (new) | 5.9 and SC-S3 | SC-S3, SC-S5 |
 | `.gitignore` | `/.scaffold-check/` | SC-S3 |
 | `README.md` | "Start a project" with `merezha new`, before "Platform host" | SC-S3 |

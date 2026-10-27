@@ -12,6 +12,7 @@ members = [
     "crates/blob",
     "crates/telemetry",
     "crates/identity",
+    "crates/guest-build",
 ]
 resolver = "3"
 
@@ -32,6 +33,10 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "toki
 tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "net", "signal", "time", "sync"] }
 tempfile = "3.27.0"
 wat = "1.258.3"
+# The componentizer (scaffold §2.7): the versions Wasmtime 49 already locks,
+# so components are encoded with the wasmparser the host decodes them with.
+wit-component = "=0.258.3"
+wit-parser = "=0.258.3"
 tower = { version = "0.5.3", features = ["util"] }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "hooks", "limits", "fallible_uint"] }
 tokio-postgres = { version = "0.7.18", default-features = false, features = ["runtime"] }

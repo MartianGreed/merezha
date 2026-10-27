@@ -21,11 +21,13 @@ using the application protocol of `merezha-domain`; see
 | `task-notifier.wasm` | `services/task-notifier` | Task board reactor (protocol 2): on `TaskCompleted`, notifies the owner on `tasks.completed` and asks for `ArchiveTask` seven days later ([reactors](../architecture/application.md#reactors-version-2-postgresql)) |
 
 The services live in their own Cargo workspace, `services/`, with its own
-`Cargo.lock`. Host and service dependencies never mix, with one deliberate
-exception: the application components use the host workspace's guest SDK,
-`crates/domain` (`merezha-domain`), by path. It depends only on Serde and
-Serde JSON, never on the host runtime, and its versions resolve through the
-services lock.
+`Cargo.lock`. Host and service dependencies never mix, with two deliberate
+exceptions, both by path and both resolved through the services lock: the
+application components use the host workspace's guest SDK, `crates/domain`
+(`merezha-domain`), which depends only on Serde and Serde JSON, and
+`merezha-componentize` uses the componentizer `crates/guest-build`
+(`merezha-guest-build`, `wit-component` 0.258.3). Neither depends on the host
+runtime.
 
 ## Prerequisites
 
@@ -34,7 +36,10 @@ services lock.
 - `curl` and `bash` for the demo.
 
 No other tool is installed globally. The componentization step uses the
-`merezha-componentize` tool from the services workspace, pinned by its lock.
+`merezha-componentize` tool from the services workspace, pinned by its lock:
+a thin binary over the host workspace's `merezha-guest-build`
+(`crates/guest-build`), the code `merezha componentize` and `merezha build`
+run too.
 
 ## Build
 

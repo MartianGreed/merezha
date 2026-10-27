@@ -1,8 +1,10 @@
 //! Negative and positive cases for the service contract guard, built from
 //! WIT worlds with dummy core modules, as `wasm-tools component embed
-//! --dummy` does. Regression coverage for verifier finding V1-F2.
+//! --dummy` does. Regression coverage for verifier finding V1-F2, moved from
+//! `services/componentize` with the guard (scaffold SC-S1) and run on
+//! `wit-component` 0.258.3's three-argument `targets`.
 
-use merezha_componentize::{MAX_COMPONENT_BYTES, componentize};
+use merezha_guest_build::{ErrorKind, MAX_COMPONENT_BYTES, componentize, componentize_file};
 use wit_component::{DecodedWasm, StringEncoding, dummy_module, embed_component_metadata};
 use wit_parser::{LiftLowerAbi, ManglingAndAbi, Resolve};
 
@@ -18,7 +20,7 @@ fn core_module(wit: &str) -> Vec<u8> {
         .select_world(&[package], Some("service"))
         .expect("fixture has world `service`");
     let mut module = dummy_module(&resolve, world, ManglingAndAbi::Legacy(LiftLowerAbi::Sync));
-    embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8, false)
+    embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
         .expect("metadata embeds");
     module
 }
@@ -127,4 +129,78 @@ fn rejects_an_oversized_module_before_encoding() {
         componentize(&vec![0; MAX_COMPONENT_BYTES + 1]).unwrap_err()
     );
     assert!(message.contains("at most 16777216"), "{message}");
+}
+
+#[test]
+fn rejects_a_wasi_import() {
+    let message = rejection(
+        "package merezha:service@0.1.0;
+         interface handler { handle: func(input: string) -> result<string, string>; }
+         world service {
+             import wasi:clocks/wall-clock@0.2.0;
+             export handler;
+         }
+         package wasi:clocks@0.2.0 {
+             interface wall-clock { now: func() -> u64; }
+         }",
+    );
+    assert!(
+        message.contains("it imports wasi:clocks/wall-clock@0.2.0"),
+        "{message}"
+    );
+}
+
+#[test]
+fn componentize_file_writes_the_component_and_no_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let (input, output) = (dir.path().join("core.wasm"), dir.path().join("out.wasm"));
+    std::fs::write(&input, core_module(CANONICAL)).unwrap();
+    let bytes = componentize_file(&input, &output).expect("canonical module componentizes");
+    assert_eq!(std::fs::read(&output).unwrap().len(), bytes);
+    assert!(!dir.path().join("out.wasm.partial").exists());
+}
+
+#[test]
+fn componentize_file_classifies_its_failures_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out.wasm");
+
+    let missing = componentize_file(&dir.path().join("absent.wasm"), &output).unwrap_err();
+    assert_eq!(missing.kind, ErrorKind::ComponentSourceMissing);
+    assert_eq!(missing.code(), "component_source_missing");
+
+    let importer = dir.path().join("importer.wasm");
+    std::fs::write(
+        &importer,
+        core_module(
+            "package merezha:service@0.1.0;
+             interface handler { handle: func(input: string) -> result<string, string>; }
+             interface clock { now: func() -> u64; }
+             world service { import clock; export handler; }",
+        ),
+    )
+    .unwrap();
+    let rejected = componentize_file(&importer, &output).unwrap_err();
+    assert_eq!(rejected.code(), "component_rejected");
+    assert!(
+        rejected.reason.contains("services must import nothing"),
+        "{rejected}"
+    );
+
+    let oversized = dir.path().join("oversized.wasm");
+    std::fs::write(&oversized, vec![0; MAX_COMPONENT_BYTES + 1]).unwrap();
+    let rejected = componentize_file(&oversized, &output).unwrap_err();
+    assert_eq!(rejected.kind, ErrorKind::ComponentRejected);
+    assert!(rejected.reason.contains("at most 16777216"), "{rejected}");
+
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.to_string_lossy().starts_with("out.wasm")),
+        "{names:?}"
+    );
 }

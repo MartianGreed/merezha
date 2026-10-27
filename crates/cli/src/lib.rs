@@ -58,6 +58,7 @@ pub mod application_cli;
 pub mod application_http;
 pub mod application_module;
 pub mod content;
+pub mod guest;
 pub mod identity;
 pub mod notifications;
 pub mod reactions;
