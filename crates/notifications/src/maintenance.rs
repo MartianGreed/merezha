@@ -9,7 +9,8 @@
 //! webhook part ([`crate::webhooks::tasks::retention`]).
 //! Each run works in bounded batches within its deadline.
 use crate::{notifier::Core, sql};
-use merezha_domain::Failure;
+use merezha_domain::{Failure, Identity};
+use merezha_platform::ports::{DedupeKey, MessageContext, OnDuplicate, OutboxRecord, OutboxTarget};
 use merezha_postgres::classify;
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 use uuid::Uuid;
@@ -93,43 +94,137 @@ pub async fn run(core: &Arc<Core>, task: Task, deadline: Instant) -> Result<u64,
     }
 }
 
-/// Notifications per retention batch: each takes its deliveries and
-/// attempts with it.
-const NOTIFICATIONS_PER_BATCH: i64 = 100;
-
-/// Run `statement` (`$1` the cutoff, `$2` the batch) until a batch comes
-/// back short or [`MAX_BATCHES`] ran; the rows deleted.
-async fn delete_before(
-    core: &Core,
-    statement: &merezha_postgres::Statement,
-    before: jiff::Timestamp,
-    batch: i64,
-    deadline: Instant,
-) -> Result<u64, Failure> {
-    let mut total = 0;
-    for _ in 0..MAX_BATCHES {
-        let client = core.database.acquire(deadline).await?;
-        let changed = core
-            .database
-            .execute(&client, statement, &[&before, &batch])
-            .await
-            .map_err(|e| classify(&e))?;
-        total += changed;
-        if changed < batch as u64 {
-            break;
+/// How much one `retention` run does: batches of `notifications`
+/// notifications (each with its deliveries and attempts) and of `rows`
+/// provider events, one short transaction each, until a batch comes back
+/// short, `max_batches` ran, or the job's deadline is
+/// [`RETENTION_MARGIN`] away. Work left over is handed to a continuation
+/// job ([`retention`]), so a backlog drains run after run instead of once
+/// a day.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetentionBounds {
+    pub notifications: i64,
+    pub rows: i64,
+    pub max_batches: usize,
+}
+impl Default for RetentionBounds {
+    fn default() -> Self {
+        Self {
+            notifications: 100,
+            rows: BATCH,
+            max_batches: usize::MAX,
         }
     }
-    Ok(total)
+}
+/// No retention batch starts closer than this to the job's deadline.
+pub const RETENTION_MARGIN: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn time_left(deadline: Instant) -> bool {
+    Instant::now() + RETENTION_MARGIN < deadline
 }
 
-/// The daily `retention` task: the rows it deleted or changed. Every step
-/// runs whatever the earlier ones did; the first failure is the task's
-/// outcome and each is logged `notification.maintenance_step_failed`.
+/// Delete notifications settled before `before`, batch by batch (see
+/// [`RetentionBounds`]). Each batch locks the candidates' deliveries in id
+/// order first, as `redeliver` does before it reopens a notification, then
+/// deletes the candidates still settled before `before`: a notification
+/// reopened meanwhile is kept, and the two never wait on each other
+/// crosswise. The rows deleted, and whether work remains.
+async fn delete_notifications(
+    core: &Core,
+    before: jiff::Timestamp,
+    bounds: RetentionBounds,
+    deadline: Instant,
+) -> Result<(u64, bool), Failure> {
+    let mut total = 0;
+    let mut batches = 0;
+    loop {
+        if batches >= bounds.max_batches || !time_left(deadline) {
+            return Ok((total, true));
+        }
+        batches += 1;
+        let db = core.database.clone();
+        let limit = bounds.notifications;
+        let (found, deleted): (usize, u64) = db
+            .clone()
+            .transaction(deadline, move |tx| {
+                Box::pin(async move {
+                    let ids: Vec<Uuid> = db
+                        .query(tx, &sql::RETENTION_CANDIDATES, &[&before, &limit])
+                        .await
+                        .map_err(|e| classify(&e))?
+                        .iter()
+                        .map(|row| row.get(0))
+                        .collect();
+                    if ids.is_empty() {
+                        return Ok((0, 0));
+                    }
+                    db.query(tx, &sql::RETENTION_LOCK_DELIVERIES, &[&ids])
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    let deleted = db
+                        .execute(tx, &sql::RETENTION_NOTIFICATIONS, &[&ids, &before])
+                        .await
+                        .map_err(|e| classify(&e))?;
+                    Ok((ids.len(), deleted))
+                })
+            })
+            .await?;
+        total += deleted;
+        if (found as i64) < limit {
+            return Ok((total, false));
+        }
+    }
+}
+
+/// Delete provider events received before `before`, batch by batch; the
+/// rows deleted, and whether work remains.
+async fn delete_provider_events(
+    core: &Core,
+    before: jiff::Timestamp,
+    bounds: RetentionBounds,
+    deadline: Instant,
+) -> Result<(u64, bool), Failure> {
+    let mut total = 0;
+    let mut batches = 0;
+    loop {
+        if batches >= bounds.max_batches || !time_left(deadline) {
+            return Ok((total, true));
+        }
+        batches += 1;
+        let client = core.database.acquire(deadline).await?;
+        let deleted = core
+            .database
+            .execute(
+                &client,
+                &sql::RETENTION_PROVIDER_EVENTS,
+                &[&before, &bounds.rows],
+            )
+            .await
+            .map_err(|e| classify(&e))?;
+        total += deleted;
+        if (deleted as i64) < bounds.rows {
+            return Ok((total, false));
+        }
+    }
+}
+
+/// The `retention` task (daily, and again through continuation jobs while
+/// a backlog remains): the rows it deleted or changed. Every step runs
+/// whatever the earlier ones did; the first failure is the task's outcome
+/// and each is logged `notification.maintenance_step_failed`. When a step
+/// stopped with work left, the run appends one more
+/// `notify.maintenance.retention` job (outbox key `retention:more:{ms}`),
+/// which runs as soon as a worker is free.
 pub async fn retention(core: &Arc<Core>, deadline: Instant) -> Result<u64, Failure> {
+    let bounds = core.retention;
     let mut first_failure = None;
     let mut total = 0;
-    let mut step = |name: &'static str, result: Result<u64, Failure>| match result {
-        Ok(rows) => total += rows,
+    let mut more = false;
+    let mut step = |name: &'static str, result: Result<(u64, bool), Failure>| match result {
+        Ok((rows, left)) => {
+            total += rows;
+            more |= left;
+        }
         Err(failure) => {
             merezha_telemetry::event!(
                 WARN,
@@ -146,36 +241,74 @@ pub async fn retention(core: &Arc<Core>, deadline: Instant) -> Result<u64, Failu
         .and_then(|keep| core.now().checked_sub(keep).ok())
         .ok_or_else(|| Failure::permanent("invalid_config"));
     let notifications = match &before {
-        Ok(at) => {
-            delete_before(
-                core,
-                &sql::RETENTION_NOTIFICATIONS,
-                *at,
-                NOTIFICATIONS_PER_BATCH,
-                deadline,
-            )
-            .await
-        }
+        Ok(at) => delete_notifications(core, *at, bounds, deadline).await,
         Err(failure) => Err(failure.clone()),
     };
     step("notifications", notifications);
     let events = match &before {
-        Ok(at) => delete_before(core, &sql::RETENTION_PROVIDER_EVENTS, *at, BATCH, deadline).await,
+        Ok(at) => delete_provider_events(core, *at, bounds, deadline).await,
         Err(failure) => Err(failure.clone()),
     };
     step("provider_events", events);
-    step("captures", trim_captures(core, deadline).await);
+    step(
+        "captures",
+        trim_captures(core, deadline)
+            .await
+            .map(|rows| (rows, false)),
+    );
     // The webhook part logs its own failed steps.
     match crate::webhooks::tasks::retention(core, deadline).await {
-        Ok(rows) => total += rows,
+        Ok((rows, left)) => {
+            total += rows;
+            more |= left;
+        }
         Err(failure) => {
             first_failure.get_or_insert(failure);
         }
+    }
+    if more && let Err(failure) = continue_retention(core, deadline).await {
+        merezha_telemetry::event!(
+            WARN,
+            "notification.maintenance_step_failed",
+            task = "retention",
+            reason = "continuation",
+            code = failure.code.as_str()
+        );
+        first_failure.get_or_insert(failure);
     }
     match first_failure {
         Some(failure) => Err(failure),
         None => Ok(total),
     }
+}
+
+/// Append one more `notify.maintenance.retention` job.
+async fn continue_retention(core: &Core, deadline: Instant) -> Result<(), Failure> {
+    let record = OutboxRecord {
+        dedupe_key: DedupeKey::new(format!("retention:more:{}", core.now().as_millisecond()))?,
+        target: OutboxTarget::Job {
+            queue: Identity::new(QUEUE)?,
+            kind: Identity::new(Task::Retention.kind())?,
+        },
+        payload: serde_json::json!({}),
+        contains_secret: false,
+        run_at: None,
+        priority: 0,
+        context: MessageContext {
+            correlation_id: Identity::new("notify-retention")?,
+            causation_id: None,
+            tenant: None,
+        },
+    };
+    let outbox = core.outbox.clone();
+    core.database
+        .transaction(deadline, move |tx| {
+            Box::pin(async move {
+                outbox.append(tx, &[record], OnDuplicate::Ignore).await?;
+                Ok(())
+            })
+        })
+        .await
 }
 
 /// Keep the newest `retention.captures` captures, as the capture drivers

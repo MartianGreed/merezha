@@ -254,6 +254,9 @@ pub struct Notifications {
     /// Busy hand-off delays in place of the production ones (feature
     /// `testkit`).
     busy_delays: Option<(std::time::Duration, std::time::Duration)>,
+    /// Retention batch bounds in place of the production ones (feature
+    /// `testkit`).
+    retention: Option<maintenance::RetentionBounds>,
 }
 /// A resolver a test installs under the egress guard (feature `testkit`).
 #[derive(Clone, Default)]
@@ -310,6 +313,13 @@ impl Notifications {
         longest: std::time::Duration,
     ) -> Self {
         self.busy_delays = Some((first, longest));
+        self
+    }
+    /// The block with other `retention` batch bounds (feature `testkit`),
+    /// to drain a backlog through continuation jobs in a test.
+    #[cfg(feature = "testkit")]
+    pub fn with_retention_bounds(mut self, bounds: maintenance::RetentionBounds) -> Self {
+        self.retention = Some(bounds);
         self
     }
     /// Whether the periodic count of webhook secrets runs (it starts with
@@ -558,6 +568,7 @@ impl Module for Notifications {
                 sms,
                 push,
                 webhooks: webhooks.clone(),
+                retention: self.retention.unwrap_or_default(),
             };
             let jobs = ctx.jobs(NAME)?;
             jobs.register(

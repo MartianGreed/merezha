@@ -53,15 +53,25 @@ pub const NOTIFICATION_INSERT: Statement = s(
 /// `$1` of [`TARGET_LOCKS`]: it keeps them apart from other modules'
 /// two-key locks.
 pub const TARGET_LOCK_CLASS: i32 = i32::from_be_bytes(*b"ntfy");
-/// Lock the `(topic $2, channel, target key)` of each `($3, $4)` pair for
-/// the transaction, in ascending key order so two expansions never wait on
-/// each other crosswise; a `hashtext` collision only serializes two
-/// targets.
+/// Buckets the targets of one `(topic, channel)` are hashed into for the
+/// rate cap's locks: an expansion takes at most this many locks per
+/// channel, whatever its target count, so capped expansions cannot
+/// exhaust PostgreSQL's shared lock table (NT-N8 review).
+pub const TARGET_LOCK_BUCKETS: i32 = 64;
+/// Lock, for the transaction, the bucket of each `($3 channel, $4 target
+/// key)` pair under topic `$2`: `hashtext(target key)` modulo `$5` buckets
+/// per `(topic, channel)`, one lock per distinct bucket, taken in
+/// ascending key order so two expansions never wait on each other
+/// crosswise. A target always falls in the same bucket, so expansions for
+/// one target count one after the other; targets sharing a bucket (or a
+/// `hashtext` collision) only serialize. Returns the keys in the order
+/// they were locked.
 pub const TARGET_LOCKS: Statement = s(
     "notify.delivery.target_locks",
     "SELECT pg_advisory_xact_lock()",
-    "SELECT pg_advisory_xact_lock($1::int4, k.key) FROM \
-     (SELECT DISTINCT hashtext($2::text || chr(10) || t.channel || chr(10) || t.target_key) AS key \
+    "SELECT k.key, pg_advisory_xact_lock($1::int4, k.key) FROM \
+     (SELECT DISTINCT hashtext($2::text || chr(10) || t.channel || chr(10) || \
+              (abs(hashtext(t.target_key)::bigint) % $5::int4)::text) AS key \
         FROM unnest($3::text[], $4::text[]) AS t(channel, target_key) ORDER BY 1) AS k",
 );
 /// Per `($1 channel, $2 target key)` pair, the deliveries of topic `$4`
@@ -509,14 +519,29 @@ pub const EVENTS_TAKE_PENDING: Statement = s(
      coalesce(e.provider_message_id <> d.provider_message_id, false)",
 );
 
-/// Delete at most `$2` notifications settled before `$1`, oldest first;
-/// their deliveries and attempts cascade (the `retention` task, NT §2.5).
+/// At most `$2` notifications settled before `$1`, oldest first: the
+/// candidates of one `retention` batch (NT §2.5).
+pub const RETENTION_CANDIDATES: Statement = s(
+    "notify.notification.retention_candidates",
+    "SELECT merezha_notify.notifications",
+    "SELECT id FROM merezha_notify.notifications WHERE settled_at < $1 \
+     ORDER BY settled_at LIMIT $2",
+);
+/// Lock the deliveries of notifications `$1` in id order, before their
+/// notifications, as `redeliver` takes a delivery before its notification.
+pub const RETENTION_LOCK_DELIVERIES: Statement = s(
+    "notify.delivery.retention_lock",
+    "SELECT merezha_notify.deliveries",
+    "SELECT id FROM merezha_notify.deliveries WHERE notification_id = ANY($1::uuid[]) \
+     ORDER BY id FOR UPDATE",
+);
+/// Delete notifications `$1` still settled before `$2`; their deliveries
+/// and attempts cascade. A notification reopened since it was picked is
+/// kept.
 pub const RETENTION_NOTIFICATIONS: Statement = s(
     "notify.notification.retention",
     "DELETE merezha_notify.notifications",
-    "DELETE FROM merezha_notify.notifications WHERE id IN \
-     (SELECT id FROM merezha_notify.notifications WHERE settled_at < $1 \
-      ORDER BY settled_at LIMIT $2)",
+    "DELETE FROM merezha_notify.notifications WHERE id = ANY($1::uuid[]) AND settled_at < $2",
 );
 /// Delete at most `$2` provider events received before `$1`, oldest first.
 pub const RETENTION_PROVIDER_EVENTS: Statement = s(
@@ -524,13 +549,15 @@ pub const RETENTION_PROVIDER_EVENTS: Statement = s(
     "DELETE merezha_notify.provider_events",
     "DELETE FROM merezha_notify.provider_events WHERE id IN \
      (SELECT id FROM merezha_notify.provider_events WHERE received_at < $1 \
-      ORDER BY received_at LIMIT $2)",
+      ORDER BY received_at LIMIT $2) AND received_at < $1",
 );
 
 /// Every statement of this module.
 pub const STATEMENTS: &[Statement] = &[
     TARGET_LOCKS,
     TARGET_RECENT,
+    RETENTION_CANDIDATES,
+    RETENTION_LOCK_DELIVERIES,
     RETENTION_NOTIFICATIONS,
     RETENTION_PROVIDER_EVENTS,
     NOTIFICATION_EXISTS,

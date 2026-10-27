@@ -260,12 +260,13 @@ async fn fan_out_keeps_tenants_and_the_application_registry_apart() {
         names
     };
     assert_eq!(names(&receiver), ["a"]);
-    emit(
+    // Content's events arrive through the subscription (R11, NT-N8).
+    content_event(
         &instance,
-        "content",
-        None,
+        &world,
         "content.entry_published",
         "entry-1",
+        None,
     )
     .await;
     instance.settle().await;

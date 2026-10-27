@@ -12,8 +12,8 @@
 //! deliveries (R1), at most 256 per append.
 //!
 //! A topic with `max_per_target_per_hour` (NT §6, NT-N8) caps each
-//! target: inside the transaction, under a lock per `(topic, channel,
-//! target key)`, a target that already got that many of the topic's
+//! target: inside the transaction, under a lock on the target's bucket of
+//! its `(topic, channel)` (at most 64 per channel), a target that already got that many of the topic's
 //! deliveries in the last hour is `skipped` / `target_rate_limited`.
 //!
 //! A push target is one subscription (NT-N6): a user gets one push delivery
@@ -727,8 +727,9 @@ fn counted(target: &Target) -> bool {
 }
 
 /// Apply `cap`, the topic's `max_per_target_per_hour` (NT §6), in the
-/// expansion transaction: lock every counted target's `(topic, channel,
-/// target key)` in ascending key order, so concurrent expansions for one
+/// expansion transaction: lock the bucket of every counted target's
+/// `(topic, channel, target key)` (at most [`sql::TARGET_LOCK_BUCKETS`] per
+/// channel) in ascending key order, so concurrent expansions for one
 /// target count one after the other, then skip (`target_rate_limited`)
 /// each target that already has `cap` deliveries of the topic created in
 /// the last hour that were not skipped.
@@ -748,10 +749,16 @@ async fn limit(
     if keys.is_empty() {
         return Ok(());
     }
-    db.execute(
+    db.query(
         tx,
         &sql::TARGET_LOCKS,
-        &[&sql::TARGET_LOCK_CLASS, &topic, &channels, &keys],
+        &[
+            &sql::TARGET_LOCK_CLASS,
+            &topic,
+            &channels,
+            &keys,
+            &sql::TARGET_LOCK_BUCKETS,
+        ],
     )
     .await
     .map_err(|e| classify(&e))?;

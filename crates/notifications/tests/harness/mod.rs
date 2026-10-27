@@ -361,6 +361,8 @@ pub struct Options {
     pub push_lookup: Option<Arc<dyn merezha_notifications::egress::Lookup>>,
     /// Webhook busy hand-off delays (first, longest) in place of 1 s / 30 s.
     pub webhook_busy_delays: Option<(Duration, Duration)>,
+    /// `retention` batch bounds in place of the production ones.
+    pub retention: Option<merezha_notifications::maintenance::RetentionBounds>,
 }
 impl Options {
     pub fn new(section: &str, directory: Arc<dyn Directory>) -> Self {
@@ -379,6 +381,7 @@ impl Options {
             files: Vec::new(),
             push_lookup: None,
             webhook_busy_delays: None,
+            retention: None,
         }
     }
 }
@@ -426,6 +429,9 @@ impl Instance {
         }
         if let Some((first, longest)) = options.webhook_busy_delays {
             module = module.with_webhook_busy_delays(first, longest);
+        }
+        if let Some(bounds) = options.retention {
+            module = module.with_retention_bounds(bounds);
         }
         module
             .configure(&config.modules["notifications"])
@@ -606,4 +612,47 @@ impl merezha_platform::Clock for Shifted {
     fn monotonic(&self) -> Instant {
         Instant::now()
     }
+}
+
+/// Append one content event as content does (an `Event` record from
+/// source `content`, in its own committed transaction): content never
+/// calls the `Notifier`.
+pub async fn content_event(
+    instance: &Instance,
+    world: &World,
+    topic: &str,
+    key: &str,
+    tenant: Option<&str>,
+) {
+    let outbox = merezha_platform::ports::SourceOutbox::new(
+        merezha_platform::ports::Source::new("content").unwrap(),
+        merezha_platform::JobsRuntime::ports(&instance.jobs, &world.db).outbox,
+    );
+    let record = outbox.event(
+        id(topic),
+        merezha_platform::ports::NewEvent {
+            dedupe_key: merezha_platform::ports::DedupeKey::new(key).unwrap(),
+            version: 1,
+            occurred_at: jiff::Timestamp::from_second(1_800_000_000).unwrap(),
+            payload: serde_json::json!({"scope": tenant.unwrap_or("application"), "type": "page", "id": key,
+                            "locale": "en", "revision": 1}),
+            context: merezha_platform::ports::MessageContext {
+                correlation_id: id("corr-content"),
+                causation_id: None,
+                tenant: tenant.map(id),
+            },
+        },
+    );
+    world
+        .db
+        .transaction(soon(), move |tx| {
+            Box::pin(async move {
+                outbox
+                    .append(tx, &[record], merezha_platform::ports::OnDuplicate::Fail)
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
 }

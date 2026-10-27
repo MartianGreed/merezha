@@ -328,6 +328,30 @@ fn identity_mail_and_content_webhooks_go_through_the_notifications_block() {
         .as_str()
         .unwrap()
         .to_owned();
+    // An invitation is requested in its organization's context (NT §3.3):
+    // the notification carries the organization as its tenant.
+    let invited = call(
+        address,
+        "POST",
+        &format!("/v1/identity/organizations/{org}/invitations"),
+        &[auth[0], ("Merezha-Organization", org.as_str())],
+        // identity's built-in `member` role.
+        &json!({"email": "bob@example.com", "role_ids": ["rol_00000000000070008000000000000003"]}),
+    );
+    assert_eq!(invited.status, 201, "{}", invited.body);
+    let invitations = captures(address, "identity.invitation", 1);
+    assert_eq!(invitations[0]["target"], "bob@example.com");
+    assert_eq!(
+        count(
+            &runtime,
+            &db,
+            &format!(
+                "SELECT count(*) FROM merezha_notify.notifications \
+                 WHERE topic = 'identity.invitation' AND tenant_id = '{org}'"
+            )
+        ),
+        1
+    );
     // The owner acts in the organization it made active.
     let endpoint = call(
         address,

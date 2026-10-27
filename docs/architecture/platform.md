@@ -1424,8 +1424,10 @@ no Directory call and takes no other connection, so it completes on a pool
 whose only connection the caller holds. The notification id is
 `UUIDv5(source, dedupe_key)`, so the same key twice names one notification
 (`duplicate: true` while the outbox row is retained). `emit_webhook`
-appends a `notify.webhook_event` record for a declared event type
-(`[modules.notifications.webhooks]` present, else `webhooks_disabled`),
+appends a `notify.webhook_event` record for an event type of
+`webhooks.event_types` or `webhook.test` (`[modules.notifications.webhooks]`
+present, else `webhooks_disabled`; content's types are refused
+`unknown_event_type`, since they arrive only through the subscription),
 which the webhook fan-out handles ([Outgoing webhooks](#outgoing-webhooks)).
 The whole record, envelope and metadata, is at most
 `webhooks.max_payload_bytes` and the outbox's 64 KiB payload limit
@@ -1455,7 +1457,7 @@ get `skipped` with a reason:
 | `not_opted_in` | a marketing topic without the user's explicit `enabled = true` for the topic and channel |
 | `suppressed` | a suppression covers the address: `invalid` for every topic, the other reasons for non-security topics (topic-scoped ones for their topic only) |
 | `no_subscription` | a push target whose user has no live subscription made with the current VAPID key in the notification's tenant scope; at send, a subscription that is gone, moved to another user or expired since |
-| `target_rate_limited` | the topic sets `max_per_target_per_hour` (1 to 10,000, unset by default) and the target (one address, phone number, push subscription or user inbox, per channel) already has that many of the topic's deliveries created in the last hour that were not skipped. Checked in the expansion transaction under a transaction advisory lock per `(topic, channel, target key)` (class `ntfy`, taken in ascending key order), so concurrent expansions for one target count one after the other. A redelivery is never capped |
+| `target_rate_limited` | the topic (transactional or marketing; security topics refuse a cap) sets `max_per_target_per_hour` (1 to 10,000, unset by default) and the target (one address, phone number, push subscription or user inbox, per channel) already has that many of the topic's deliveries created in the last hour that were not skipped. Checked in the expansion transaction under transaction advisory locks (class `ntfy`) on the target's bucket, one of 64 per `(topic, channel)`, taken in ascending key order: concurrent expansions for one target count one after the other, and an expansion holds at most 64 locks per channel whatever its target count. A redelivery is never capped |
 
 More targets than `limits.max_targets` (or `max_marketing_targets` for a
 marketing topic) reject the notification (`status = rejected`,
@@ -1495,7 +1497,7 @@ Maintenance, each a cron schedule on queue `notify.maintenance` (UTC):
 | `purge_data` | every 5 minutes | nulls `data` (and the deliveries' recipient names) of notifications settled more than `retention.data_after_settled` ago; counts `merezha.notification.data_purged` |
 | `inbox_expire` | hourly | deletes items past `expires_at` or archived more than `inbox.archived_retention` ago, 100 users per transaction in ascending order, raising each user's `purged_through` |
 | `webhook_auto_disable` | every 5 minutes | with `[modules.notifications.webhooks]`: disables the endpoints failing for `webhooks.auto_disable_after` with at least 10 failed attempts since, and alerts ([Outgoing webhooks](#outgoing-webhooks)) |
-| `retention` | daily (03:29) | deletes notifications settled more than `retention.deliveries` ago, 100 per batch, with their deliveries and attempts (inbox items keep their own `inbox.retention`); deletes provider events received before then; keeps the newest `retention.captures` captures; then the webhook rows: nulls event bodies older than `retention.webhook_deliveries`, deletes events older than `retention.deliveries` with no open delivery (their deliveries and attempts with them), deletes audit rows older than 400 days, drops previous secrets whose rotation window closed, and with `secret_key_previous` set seals again under `secret_key` the secrets still under another key (by their key id), then records `merezha.webhook.secrets.previous_key` and `merezha.webhook.secrets.unreadable`; 500 rows per batch. Each step runs whatever the earlier ones did: a failing step is logged `notification.maintenance_step_failed` (`task`, `reason` = the step, `code`) and becomes the run's outcome after the others ran |
+| `retention` | daily (03:29), and again through continuation jobs while a backlog remains | deletes notifications settled more than `retention.deliveries` ago, 100 per transaction, with their deliveries and attempts (inbox items keep their own `inbox.retention`; each batch locks the deliveries in id order first, as `redeliver` does, and keeps a notification reopened meanwhile); deletes provider events received before then, 1,000 per transaction; keeps the newest `retention.captures` captures; batches go on until one comes back short or the job deadline is 3 s away, and a run that stopped with work left (here or in a webhook step) appends one more `notify.maintenance.retention` job (outbox key `retention:more:{ms}`); then the webhook rows: nulls event bodies older than `retention.webhook_deliveries`, deletes events older than `retention.deliveries` with no open delivery (their deliveries and attempts with them), deletes audit rows older than 400 days, drops previous secrets whose rotation window closed, and with `secret_key_previous` set seals again under `secret_key` the secrets still under another key (by their key id), then records `merezha.webhook.secrets.previous_key` and `merezha.webhook.secrets.unreadable`; 500 rows per batch. Each step runs whatever the earlier ones did: a failing step is logged `notification.maintenance_step_failed` (`task`, `reason` = the step, `code`) and becomes the run's outcome after the others ran |
 | `push_expire` | hourly (minute 43) | with `[modules.notifications.push]`: deletes subscriptions past `expires_at`, made with another VAPID key and unused for 7 days, or with 10 consecutive failures and no success in 30 days, 1,000 per batch; counts `merezha.notification.push_subscriptions_removed` (`expired`, `key_changed`, `failures`) |
 
 ### Brevo email
@@ -2157,7 +2159,7 @@ Keys and defaults are NT §7.2. Bounds and checks the block adds:
 | `secret_key`, `secret_key_previous` | secrets; base64 (standard or URL-safe) of 32 to 1024 bytes (`invalid_secret_key`) |
 | `public_base_url`, `templates.app_base_url`, `links.*` | `https`, or `http` to a loopback host; no userinfo or fragment (`invalid_url`) |
 | `limits` | `max_recipients` 1 to 100, `max_targets` 1 to 100000, `max_marketing_targets` 1 to 1000 and at most `max_targets`, `max_data_bytes` 1024 to 49152 |
-| `retention` | durations 1 h to 3650 d; `captures` 1 to 100000 |
+| `retention` | durations 1 h to 3650 d; `captures` 1 to 100000; `deliveries` at least `data_after_settled` (`shorter_than_data_after_settled`) |
 | `templates` | `locales` at most 32 of `^[a-z]{2,3}(-[A-Z]{2})?$`, `default_locale` among them (`default_locale_not_listed`); `app_name` defaults to `app.name`; `fuel` 1000 to 10000000 |
 | `email.from`, `email.reply_to` | `Name <local@domain>` or `local@domain` (`invalid_sender`); `from` required with `driver = "brevo"` |
 | `sms` | `sender` required unless disabled: at most 11 alphanumerics or 15 digits; `organisation_prefix` at most 32 characters, counted in the segments; `max_segments` 1 to 10 |
@@ -2167,7 +2169,7 @@ Keys and defaults are NT §7.2. Bounds and checks the block adds:
 | `inbox` | durations 1 d to 3650 d |
 | `sse` | `heartbeat` 1 s to 5 min, `reconcile_interval` 1 s to 10 min, `replay_max` 1 to 10000, `max_streams_per_user` 1 to 64, `max_streams` 1 to 100000, `max_lifetime` 1 min to 1 d, `reauth_interval` 10 s to 1 h |
 | `webhooks` | `max_endpoints_per_tenant` 1 to 1000, `max_payload_bytes` 1024 to 1048576, `timeout` 1 s to 60 s, `concurrency_per_endpoint` 1 to 64, `auto_disable_after` 1 h to 30 d; `event_types` names follow R11, at most 256 |
-| `topics."<name>"` | names follow R11 (`invalid_topic_name`); `category` and `channels` required for project topics; built-ins keep their category (`category_fixed`); security topics are never `user_configurable` (`security_not_configurable`) |
+| `topics."<name>"` | names follow R11 (`invalid_topic_name`); `category` and `channels` required for project topics; built-ins keep their category (`category_fixed`); security topics are never `user_configurable` (`security_not_configurable`), never take `max_per_target_per_hour` (`security_not_rate_limited`) and never default to no channel (`security_default_channels_empty`); identity's token mail topics keep `email` in `default_channels` (`token_mail_needs_email`) |
 | `quiet_hours` | refused in v1 (`unsupported_section`) |
 
 Checks across sections, reported with the rest: a declared topic channel

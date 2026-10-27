@@ -13,13 +13,10 @@ use merezha_notifications::{
     testkit::WebhookReceiver,
     webhooks::fanout::{self, MODULE_EVENT_KIND, SUBSCRIBED_EVENT_TYPES},
 };
-use merezha_platform::{
-    JobsRuntime,
-    ports::{
-        Address, Channel, ChannelSelection, Correlation, DedupeKey, EmailAddress, GrantSnapshot,
-        Grants, IntegrationEvent, MessageContext, NewEvent, NotificationRequest, OnDuplicate,
-        PermissionSet, Principal, PrincipalKind, Recipient, Source, SourceOutbox,
-    },
+use merezha_platform::ports::{
+    Address, Channel, ChannelSelection, Correlation, DedupeKey, EmailAddress, GrantSnapshot,
+    Grants, IntegrationEvent, NotificationRequest, PermissionSet, Principal, PrincipalKind,
+    Recipient,
 };
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
@@ -34,10 +31,16 @@ fn people() -> Arc<People> {
     people
 }
 
-/// `password_changed` for `user` (email and inbox) under `key`, from
-/// identity, which needs no membership.
+/// `tasks.assigned` for `user` (email and inbox) under `key`.
+fn assigned(user: &str, key: &str) -> NotificationRequest {
+    request("tasks.assigned", user, key)
+}
+/// `identity.password_changed` (security, email and inbox), which needs
+/// `display_name`.
 fn password_changed(user: &str, key: &str) -> NotificationRequest {
-    request("identity.password_changed", user, key)
+    let mut request = request("identity.password_changed", user, key);
+    request.data = json!({"display_name": "Ada"}).as_object().cloned().unwrap();
+    request
 }
 fn request(topic: &str, user: &str, key: &str) -> NotificationRequest {
     NotificationRequest {
@@ -45,7 +48,7 @@ fn request(topic: &str, user: &str, key: &str) -> NotificationRequest {
         recipients: vec![Recipient::User { id: id(user) }],
         channels: ChannelSelection::Only(vec![Channel::Email, Channel::Inbox]),
         template: None,
-        data: json!({"display_name": "Ada"}).as_object().cloned().unwrap(),
+        data: json!({"title": "Write docs"}).as_object().cloned().unwrap(),
         secret_data: Map::new(),
         locale: None,
         dedupe_key: DedupeKey::new(key).unwrap(),
@@ -61,9 +64,10 @@ fn request(topic: &str, user: &str, key: &str) -> NotificationRequest {
     }
 }
 
-/// Commit `requests` from identity in one transaction.
+/// Commit `requests` from the HTTP send source (no tenant, so no
+/// membership check) in one transaction.
 async fn commit(instance: &Instance, requests: Vec<NotificationRequest>) {
-    let notifier = instance.notifier("identity");
+    let notifier = instance.notifier("api");
     instance
         .db
         .transaction(soon(), move |tx| {
@@ -91,9 +95,40 @@ async fn of(world: &World, key: &str) -> Vec<String> {
         .await
 }
 
-/// The rate cap of NT §6, overriding a built-in topic.
-const CAPPED: &str = "[modules.notifications.topics.\"identity.password_changed\"]\n\
-    max_per_target_per_hour = 2\n";
+/// Two transactional project topics capped at two per target and hour
+/// (NT §6), and an uncapped one; security topics refuse a cap.
+const CAPPED: &str = "[modules.notifications.topics.\"tasks.assigned\"]\n\
+    category = \"transactional\"\nchannels = [\"inbox\", \"email\"]\n\
+    max_per_target_per_hour = 2\n\
+    [modules.notifications.topics.\"tasks.reminded\"]\n\
+    category = \"transactional\"\nchannels = [\"inbox\", \"email\"]\n\
+    max_per_target_per_hour = 2\n\
+    [modules.notifications.topics.\"tasks.digest\"]\n\
+    category = \"transactional\"\nchannels = [\"inbox\", \"email\"]\n";
+
+/// The capped section with the topics' templates.
+fn capped(prefix: &str) -> Options {
+    let mut options = Options::new(&format!("{prefix}{SECTION}{CAPPED}"), people());
+    for topic in ["tasks.assigned", "tasks.reminded", "tasks.digest"] {
+        let base = format!("notifications/templates/{topic}");
+        options.files.extend([
+            (
+                format!("{base}/template.toml"),
+                "description = \"Tasks\"\n[preview]\ntitle = \"T\"\n".to_owned(),
+            ),
+            (
+                format!("{base}/en/subject.txt"),
+                "Task: {{ title }}".to_owned(),
+            ),
+            (format!("{base}/en/body.txt"), "{{ title }}".to_owned()),
+            (
+                format!("{base}/en/inbox.toml"),
+                "title = \"{{ title }}\"\nbody = \"Task\"\n".to_owned(),
+            ),
+        ]);
+    }
+    options
+}
 
 /// NT-N8 `max_per_target_per_hour`: past two deliveries of the topic to one
 /// target within the hour, the next is `skipped` / `target_rate_limited`
@@ -104,13 +139,9 @@ async fn deliveries_past_the_per_target_cap_are_skipped() {
     let Some(world) = World::new().await else {
         return;
     };
-    let instance = Instance::start(
-        &world,
-        Options::new(&format!("{SECTION}{CAPPED}"), people()),
-    )
-    .await;
+    let instance = Instance::start(&world, capped("")).await;
     for key in ["k1", "k2", "k3"] {
-        commit(&instance, vec![password_changed("usr_ada", key)]).await;
+        commit(&instance, vec![assigned("usr_ada", key)]).await;
         instance.settle().await;
     }
     assert_eq!(
@@ -152,29 +183,33 @@ async fn deliveries_past_the_per_target_cap_are_skipped() {
         2,
         "no mail past the cap"
     );
-    // Another target and an uncapped topic are not held back.
-    commit(&instance, vec![password_changed("usr_bob", "b1")]).await;
-    commit(
-        &instance,
-        vec![request("identity.new_sign_in", "usr_ada", "s1")],
-    )
-    .await;
+    // Another target, an uncapped topic and another capped topic on the
+    // same target are not held back: the cap counts per topic.
+    commit(&instance, vec![assigned("usr_bob", "b1")]).await;
+    commit(&instance, vec![request("tasks.digest", "usr_ada", "s1")]).await;
+    for key in ["r1", "r2"] {
+        commit(&instance, vec![request("tasks.reminded", "usr_ada", key)]).await;
+        instance.settle().await;
+    }
     instance.settle().await;
     assert_eq!(
         of(&world, "b1").await,
         ["email:accepted:", "inbox:delivered:"]
     );
-    assert_eq!(
-        of(&world, "s1").await,
-        ["email:accepted:", "inbox:delivered:"]
-    );
+    for key in ["s1", "r1", "r2"] {
+        assert_eq!(
+            of(&world, key).await,
+            ["email:accepted:", "inbox:delivered:"],
+            "{key}"
+        );
+    }
     // An hour later the target is free again.
     world
         .execute(
             "UPDATE merezha_notify.deliveries SET created_at = created_at - interval '61 minutes'",
         )
         .await;
-    commit(&instance, vec![password_changed("usr_ada", "k4")]).await;
+    commit(&instance, vec![assigned("usr_ada", "k4")]).await;
     instance.settle().await;
     assert_eq!(
         of(&world, "k4").await,
@@ -191,10 +226,13 @@ async fn concurrent_expansions_respect_the_per_target_cap() {
     let Some(world) = World::new().await else {
         return;
     };
-    let section = format!("[jobs.queues.\"notify.expand\"]\nconcurrency = 8\n{SECTION}{CAPPED}");
-    let instance = Instance::start(&world, Options::new(&section, people())).await;
+    let instance = Instance::start(
+        &world,
+        capped("[jobs.queues.\"notify.expand\"]\nconcurrency = 8\n"),
+    )
+    .await;
     let requests: Vec<NotificationRequest> = (0..8)
-        .map(|n| password_changed("usr_ada", &format!("c{n}")))
+        .map(|n| assigned("usr_ada", &format!("c{n}")))
         .collect();
     commit(&instance, requests).await;
     instance.settle().await;
@@ -270,47 +308,6 @@ async fn endpoint(
         .await;
     assert_eq!(status.as_u16(), 201, "{body}");
     body["secret"].as_str().unwrap().to_owned()
-}
-
-/// Append one content event as content does (an `Event` record from
-/// source `content`, in its own committed transaction): content never
-/// calls the `Notifier`.
-async fn content_event(
-    instance: &Instance,
-    world: &World,
-    topic: &str,
-    key: &str,
-    tenant: Option<&str>,
-) {
-    let outbox = SourceOutbox::new(
-        Source::new("content").unwrap(),
-        instance.jobs.ports(&world.db).outbox,
-    );
-    let record = outbox.event(
-        id(topic),
-        NewEvent {
-            dedupe_key: DedupeKey::new(key).unwrap(),
-            version: 1,
-            occurred_at: jiff::Timestamp::from_second(1_800_000_000).unwrap(),
-            payload: json!({"scope": tenant.unwrap_or("application"), "type": "page", "id": key,
-                            "locale": "en", "revision": 1}),
-            context: MessageContext {
-                correlation_id: id("corr-content"),
-                causation_id: None,
-                tenant: tenant.map(id),
-            },
-        },
-    );
-    world
-        .db
-        .transaction(soon(), move |tx| {
-            Box::pin(async move {
-                outbox.append(tx, &[record], OnDuplicate::Fail).await?;
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
 }
 
 /// NT-N8 acceptance: publishing an entry delivers `content.entry_published`
@@ -690,6 +687,287 @@ async fn retention_deletes_settled_notifications_provider_events_and_old_capture
             .scalar("SELECT count(*) FROM merezha_notify.captures")
             .await,
         3
+    );
+    instance.stop().await;
+}
+
+/// NT-N8 review: only deliveries that were not skipped count toward the
+/// cap. An email skipped by the user's preference leaves room for two
+/// more emails, while the inbox, delivered each time, reaches its cap.
+#[tokio::test]
+async fn skipped_deliveries_do_not_count_toward_the_cap() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let instance = Instance::start(&world, capped("")).await;
+    world
+        .execute(
+            "INSERT INTO merezha_notify.preferences (user_id, topic, channel, enabled, updated_at) \
+             VALUES ('usr_ada', 'tasks.assigned', 'email', false, now())",
+        )
+        .await;
+    commit(&instance, vec![assigned("usr_ada", "p1")]).await;
+    instance.settle().await;
+    assert_eq!(
+        of(&world, "p1").await,
+        ["email:skipped:preference", "inbox:delivered:"]
+    );
+    world
+        .execute("DELETE FROM merezha_notify.preferences")
+        .await;
+    for key in ["p2", "p3"] {
+        commit(&instance, vec![assigned("usr_ada", key)]).await;
+        instance.settle().await;
+    }
+    assert_eq!(
+        of(&world, "p2").await,
+        ["email:accepted:", "inbox:delivered:"]
+    );
+    assert_eq!(
+        of(&world, "p3").await,
+        ["email:accepted:", "inbox:skipped:target_rate_limited"]
+    );
+    instance.stop().await;
+}
+
+/// NT-N8 review: an expansion with many targets takes a bounded number of
+/// cap locks (at most 64 buckets per channel, whatever the target count),
+/// so capped expansions cannot exhaust PostgreSQL's shared lock table,
+/// and it takes them in ascending key order.
+#[tokio::test]
+async fn cap_locks_are_bounded_per_channel_and_taken_in_order() {
+    use merezha_notifications::sql::{TARGET_LOCK_BUCKETS, TARGET_LOCK_CLASS, TARGET_LOCKS};
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let (channels, keys): (Vec<String>, Vec<String>) = (0..1000)
+        .flat_map(|n| {
+            [
+                ("email".to_owned(), format!("email:user{n}@example.com")),
+                ("inbox".to_owned(), format!("inbox:usr_{n}")),
+            ]
+        })
+        .unzip();
+    let db = world.db.clone();
+    let (locked, held): (Vec<i32>, i64) = world
+        .db
+        .transaction(soon(), move |tx| {
+            Box::pin(async move {
+                let locked: Vec<i32> = db
+                    .query(
+                        tx,
+                        &TARGET_LOCKS,
+                        &[
+                            &TARGET_LOCK_CLASS,
+                            &"tasks.assigned",
+                            &channels,
+                            &keys,
+                            &TARGET_LOCK_BUCKETS,
+                        ],
+                    )
+                    .await
+                    .map_err(|e| merezha_postgres::classify(&e))?
+                    .iter()
+                    .map(|row| row.get(0))
+                    .collect();
+                let held: i64 = (*tx)
+                    .query_one(
+                        "SELECT count(*) FROM pg_locks \
+                         WHERE locktype = 'advisory' AND pid = pg_backend_pid()",
+                        &[],
+                    )
+                    .await
+                    .map_err(|e| merezha_postgres::classify(&e))?
+                    .get(0);
+                Ok((locked, held))
+            })
+        })
+        .await
+        .unwrap();
+    assert!(
+        locked.len() <= 2 * TARGET_LOCK_BUCKETS as usize && locked.len() > 64,
+        "{} locks for 2,000 targets",
+        locked.len()
+    );
+    assert_eq!(held, locked.len() as i64, "one advisory lock per bucket");
+    let mut sorted = locked.clone();
+    sorted.sort_unstable();
+    assert_eq!(locked, sorted, "taken in ascending key order");
+}
+
+/// NT-N8 review (R11): content's event types arrive only through the
+/// subscription, so `emit_webhook` refuses them from any source, a
+/// reaction included; application types and `webhook.test` are accepted.
+#[tokio::test]
+async fn emit_webhook_refuses_another_modules_event_types() {
+    use merezha_platform::ports::{EventId, NotifyError, WebhookEvent};
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let section = format!(
+        "{}event_types = {{ \"tasks.task_completed\" = {{ description = \"Done\" }} }}\n",
+        webhooks_section()
+    );
+    let instance = Instance::start(&world, Options::new(&section, people())).await;
+    for (source, event_type, accepted) in [
+        ("application", "content.entry_published", false),
+        ("content", "content.entry_deleted", false),
+        ("application", "tasks.task_completed", true),
+        ("application", "webhook.test", true),
+    ] {
+        let notifier = instance.notifier(source);
+        let event = WebhookEvent {
+            tenant: Some(id("org_a")),
+            event_type: id(event_type),
+            source_event_id: EventId::new(format!("{source}-{event_type}")).unwrap(),
+            occurred_at: jiff::Timestamp::from_second(1_800_000_000).unwrap(),
+            data: json!({}),
+        };
+        let result = instance
+            .db
+            .transaction(soon(), move |tx| {
+                Box::pin(async move { Ok(notifier.emit_webhook(tx, event).await) })
+            })
+            .await
+            .unwrap();
+        match result {
+            Ok(_) => assert!(accepted, "{source} {event_type}"),
+            Err(error) => {
+                assert!(!accepted, "{source} {event_type}: {error:?}");
+                assert!(matches!(error, NotifyError::UnknownEventType), "{error:?}");
+            }
+        }
+    }
+    instance.stop().await;
+}
+
+/// NT-N8 review: `retention` keeps up with a backlog. With small batch
+/// bounds (100 per batch, 5 batches per run), 5,000 settled notifications
+/// past the cutoff all go: each run deletes its share in short
+/// transactions and chains a `notify.maintenance.retention` job while work
+/// remains, and the chain stops once the backlog is gone.
+#[tokio::test]
+async fn retention_drains_a_backlog_through_continuation_jobs() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let mut options = Options::new(SECTION, people());
+    options.retention = Some(maintenance::RetentionBounds {
+        notifications: 100,
+        rows: 100,
+        max_batches: 5,
+    });
+    let instance = Instance::start(&world, options).await;
+    world
+        .execute(
+            "INSERT INTO merezha_notify.notifications (id, source, dedupe_key, topic, template, \
+               category, priority, channels, status, target_count, requested_at, expanded_at, \
+               settled_at) \
+             SELECT gen_random_uuid(), 'api', 'bulk:' || g, 'identity.password_changed', \
+               'identity.password_changed', 'security', 'normal', '{email}', 'expanded', 1, \
+               now() - interval '100 days', now() - interval '100 days', \
+               now() - interval '100 days' - g * interval '1 second' \
+             FROM generate_series(1, 5000) AS g;
+             INSERT INTO merezha_notify.deliveries (id, notification_id, channel, target_key, \
+               locale, status, run_at, created_at, updated_at, settled_at) \
+             SELECT gen_random_uuid(), id, 'email', 'email:ada@example.com', 'en', 'accepted', \
+               settled_at, settled_at, settled_at, settled_at FROM merezha_notify.notifications;
+             INSERT INTO merezha_notify.provider_events (provider, channel, event, event_key, \
+               received_at) \
+             SELECT 'brevo', 'email', 'delivered', 'bulk-' || g, now() - interval '100 days' \
+             FROM generate_series(1, 1200) AS g;",
+        )
+        .await;
+    let core = instance.core();
+    let first = maintenance::run(&core, Task::Retention, soon())
+        .await
+        .unwrap();
+    assert_eq!(first, 500 + 500, "one run's share of each backlog");
+    instance
+        .until("SELECT count(*) FROM merezha_notify.notifications", 0)
+        .await;
+    instance
+        .until("SELECT count(*) FROM merezha_notify.provider_events", 0)
+        .await;
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.deliveries")
+            .await,
+        0
+    );
+    // Ten runs drain 5,000 notifications: the first and nine continuations,
+    // the last of which finds no more work and chains nothing.
+    instance
+        .until(
+            "SELECT count(*) FROM merezha_jobs.jobs WHERE kind = 'notify.maintenance.retention' \
+             AND idempotency_key LIKE '%retention:more:%' AND state = 'succeeded'",
+            10,
+        )
+        .await;
+    assert_eq!(
+        world
+            .scalar(
+                "SELECT count(*) FROM merezha_jobs.jobs WHERE kind = 'notify.maintenance.retention' \
+                 AND idempotency_key LIKE '%retention:more:%'"
+            )
+            .await,
+        10
+    );
+    instance.stop().await;
+}
+
+/// NT-N8 review (the reviewer's proof of concept): a redelivery reopens a
+/// settled notification (it locks the delivery, then sets `settled_at =
+/// NULL`) while `retention` picks that notification. Retention waits on
+/// the delivery, as redeliver takes it first, and then keeps the reopened
+/// notification instead of deleting it; neither deadlocks.
+#[tokio::test]
+async fn retention_keeps_a_notification_a_redelivery_reopened() {
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let instance = Instance::start(&world, Options::new(SECTION, people())).await;
+    commit(&instance, vec![password_changed("usr_ada", "reopen")]).await;
+    instance.settle().await;
+    world
+        .execute("UPDATE merezha_notify.notifications SET settled_at = now() - interval '91 days'")
+        .await;
+    // The redelivery's transaction, held open.
+    let redeliver = world.db.acquire(soon()).await.unwrap();
+    redeliver
+        .batch_execute(
+            "BEGIN; \
+             SELECT 1 FROM merezha_notify.deliveries WHERE channel = 'email' FOR UPDATE; \
+             UPDATE merezha_notify.notifications SET settled_at = NULL;",
+        )
+        .await
+        .unwrap();
+    let core = instance.core();
+    let retention = tokio::spawn(async move {
+        maintenance::run(
+            &core,
+            Task::Retention,
+            std::time::Instant::now() + std::time::Duration::from_secs(20),
+        )
+        .await
+    });
+    // Retention is now waiting on the delivery the redelivery holds.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!retention.is_finished(), "retention waits on the delivery");
+    redeliver.batch_execute("COMMIT").await.unwrap();
+    retention.await.unwrap().unwrap();
+    assert_eq!(
+        world
+            .text("SELECT dedupe_key FROM merezha_notify.notifications")
+            .await,
+        ["reopen"],
+        "the reopened notification stays"
+    );
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_notify.deliveries")
+            .await,
+        2
     );
     instance.stop().await;
 }

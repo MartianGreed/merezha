@@ -41,12 +41,15 @@ pub const EXPAND_QUEUE: &str = "notify.expand";
 pub const EXPAND_KIND: &str = "notify.expand";
 /// Kind of webhook fan-out jobs ([`crate::webhooks::fanout`]).
 pub const WEBHOOK_EVENT_KIND: &str = "notify.webhook_event";
-/// Event types other modules declare (NT §5.5) and the built-in test event.
+/// Event types endpoints may filter on beside the application's: the
+/// module events the block subscribes to (NT §5.5) and the built-in test
+/// event. `emit_webhook` accepts none of the module events: they arrive
+/// only through the subscription (R11, NT-N8 review).
 pub const MODULE_EVENT_TYPES: [&str; 4] = [
     "content.entry_published",
     "content.entry_unpublished",
     "content.entry_deleted",
-    "webhook.test",
+    crate::webhooks::TEST_EVENT_TYPE,
 ];
 
 /// Everything the block's handlers and routes share once it started.
@@ -73,6 +76,8 @@ pub struct Core {
     pub push: Option<Arc<crate::push::PushSender>>,
     /// The webhook sender, `None` without `[modules.notifications.webhooks]`.
     pub webhooks: Option<Arc<crate::webhooks::WebhookSender>>,
+    /// How much one `retention` run does before it chains another.
+    pub retention: crate::maintenance::RetentionBounds,
 }
 impl std::fmt::Debug for Core {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -259,8 +264,10 @@ impl BoundNotifier {
             .as_ref()
             .ok_or(NotifyError::WebhooksDisabled)?;
         let event_type = event.event_type.as_str();
+        // Another module's event types are refused: a reactor or a caller
+        // cannot forge `content.entry_published` (R11).
         if !webhooks.event_types.contains_key(event_type)
-            && !MODULE_EVENT_TYPES.contains(&event_type)
+            && event_type != crate::webhooks::TEST_EVENT_TYPE
         {
             return Err(NotifyError::UnknownEventType);
         }

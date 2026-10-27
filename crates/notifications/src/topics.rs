@@ -93,6 +93,16 @@ pub fn channel(name: &str) -> Option<Channel> {
     }
 }
 
+/// Identity's token mail (NT §3.3): its link reaches the user only by
+/// email, so email stays among these topics' default channels.
+pub const TOKEN_TOPICS: [&str; 5] = [
+    "identity.verify_email",
+    "identity.password_reset",
+    "identity.magic_link",
+    "identity.email_change_confirm",
+    "identity.invitation",
+];
+
 /// The predeclared topics: every identity topic of R2 and
 /// `notifications.webhook_disabled`.
 pub const BUILTIN: [(&str, Category, &[Channel], Priority, &str); 11] = [
@@ -343,6 +353,20 @@ pub(crate) fn parse(
         let max_per_target_per_hour = r
             .optional_integer("max_per_target_per_hour", 1, 10_000)
             .map(|n| n as u32);
+        // Security mail is always on (section 6, rule 1): a cap would let
+        // anyone who requests mail for an address use it up and silence
+        // that address's next reset.
+        if category == Category::Security && max_per_target_per_hour.is_some() {
+            r.issue("max_per_target_per_hour", "security_not_rate_limited");
+        }
+        if category == Category::Security && default_channels.is_empty() {
+            r.issue("default_channels", "security_default_channels_empty");
+        }
+        // Identity requests its token mail on the default channels; the
+        // link reaches the user only by email.
+        if TOKEN_TOPICS.contains(&name.as_str()) && !default_channels.contains(&Channel::Email) {
+            r.issue("default_channels", "token_mail_needs_email");
+        }
         r.finish();
         topics.insert(
             name.clone(),

@@ -455,7 +455,16 @@ retention). As built (N8), `retention` deletes notifications settled more
 than `retention.deliveries` ago with their deliveries and attempts (inbox
 items keep `inbox.retention`; a later request with the same key then makes
 a new notification), provider events received before then, and captures
-past the newest `retention.captures`, then runs N7's webhook part.
+past the newest `retention.captures`, then runs N7's webhook part. Each
+batch is a short transaction; a run goes on until a batch comes back short
+or its job deadline is 3 s away, and when work remains it appends one more
+`notify.maintenance.retention` job, so a backlog drains run after run
+(N8 review). A batch locks its notifications' deliveries in id order before
+deleting the notifications still settled before the cutoff, as `redeliver`
+locks a delivery before reopening its notification: a reopened
+notification is kept and the two never deadlock. `retention.deliveries`
+shorter than `retention.data_after_settled` fails startup
+(`shorter_than_data_after_settled`).
 `reclaim_stuck` is not built yet.
 
 ## 3. The `Notifier` port
@@ -1082,7 +1091,9 @@ verb>`). Valid types come from `[modules.notifications.webhooks.event_types]`
 (application events, emitted by reaction effects), from module declarations
 (content declares `content.entry_published`, `content.entry_unpublished` and
 `content.entry_deleted`), and the built-in `webhook.test`. `emit_webhook`
-rejects any other type. For module event types the block subscribes
+accepts only the application's types and `webhook.test` (N8 review): module
+event types arrive only through the subscription below, so a reaction
+cannot forge another module's event. For module event types the block subscribes
 `notify.module_event` through AP (2.5), which maps AP's envelope onto a webhook
 event (source = the owning module, `source_event_id` = the event id, `tenant`
 = the job's tenant, `data` = the payload) and runs the fan-out below.
@@ -1258,14 +1269,25 @@ guide asks operators to switch Brevo tracking off.
 
 **Per-recipient rate limit.** A topic may set `max_per_target_per_hour` (unset
 by default). A delivery over the limit is `skipped` / `target_rate_limited`; it
-guards against application bugs that loop. As built (N8), expansion checks it
-in its transaction: it takes a transaction advisory lock per `(topic,
-channel, target key)` of the targets it would send or deliver (class `ntfy`,
-ascending key order), counts that target's deliveries of the topic created in
-the last hour that were not skipped, and skips the target when the count has
-reached the cap. Concurrent expansions for one target therefore count one
-after the other. The cap applies at expansion only; redelivery is never
-capped.
+guards against application bugs that loop. Security topics refuse it at
+startup (`security_not_rate_limited`): rule 1 below keeps security mail on,
+and a cap would let anyone who requests mail for an address use it up and
+silence that address's next reset. As built (N8), expansion checks it in its
+transaction: it hashes each target it would send or deliver into one of 64
+buckets of its `(topic, channel)` and takes one transaction advisory lock
+per bucket (class `ntfy`, ascending key order), so an expansion holds at
+most 64 locks per channel whatever its target count; it then counts each
+target's deliveries of the topic created in the last hour that were not
+skipped, and skips the target when the count has reached the cap.
+Concurrent expansions for one target therefore count one after the other.
+The cap applies at expansion only; redelivery is never capped.
+
+A security topic cannot default to no channel
+(`security_default_channels_empty`), and identity's token mail
+(`verify_email`, `password_reset`, `magic_link`, `email_change_confirm`,
+`invitation`) keeps `email` among its default channels
+(`token_mail_needs_email`): identity requests the default channels, and
+the link reaches the user only by email.
 
 **Quiet hours** (slice N9, deferred from v1; on when
 `[modules.notifications.quiet_hours]` is present, which v1 refuses).

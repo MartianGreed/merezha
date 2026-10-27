@@ -18,7 +18,9 @@ merezha notifications check --config merezha.toml
 
 Exit 0 is valid (warnings such as `security_mail_disabled` are listed),
 2 is invalid. `merezha run` makes the same checks and refuses to start on
-the same errors.
+the same errors. Among them: security topics cannot be capped or left
+without a default channel, and identity's token mail must keep `email`
+among its default channels.
 
 **Keys.** `secret_key` (base64 of at least 32 bytes, from `env` or `file`,
 never a literal) derives the unsubscribe token key, the SMS status URL key
@@ -145,7 +147,10 @@ endpoints and a publish of application content the application-level ones.
 
 ## Rate cap per target
 
-A topic can set `max_per_target_per_hour` (1 to 10,000, unset by default).
+A transactional or marketing topic can set `max_per_target_per_hour` (1 to
+10,000, unset by default). Security topics refuse it at startup: security
+mail is always sent, so nobody can use up a cap on someone else's address
+and silence their password reset.
 Past that many deliveries of the topic to one target (an address, a phone
 number, a push subscription or a user's inbox, per channel) within an
 hour, further deliveries are `skipped` / `target_rate_limited`. It is a
@@ -166,13 +171,19 @@ max_per_target_per_hour = 20
 | --- | --- | --- |
 | Notification `data` and recipient names | until `data_after_settled` after every delivery settled (`purge_data`, every 5 minutes) | `retention.data_after_settled` (`7d`) |
 | Secret data (sign-in links, codes) | only in flagged outbox and job payloads, nulled at relay and at the job's end; never in the inbox | none |
-| Notifications, deliveries, attempts | until `deliveries` after settling (`retention`, daily) | `retention.deliveries` (`90d`) |
+| Notifications, deliveries, attempts | until `deliveries` after settling (`retention`, daily, chaining more runs while a backlog remains) | `retention.deliveries` (`90d`), at least `data_after_settled` |
 | Provider events | until `deliveries` after receipt (`retention`) | `retention.deliveries` |
 | Webhook bodies | `webhook_deliveries`, then nulled; a redelivery answers 410 `event_body_expired` | `retention.webhook_deliveries` (`30d`) |
 | Webhook events, deliveries, attempts | until `deliveries`, once no delivery is open | `retention.deliveries` |
 | Webhook audit rows | 400 days | none |
 | Inbox items | `inbox.retention` (`180d`), archived ones `inbox.archived_retention` (`30d`) | `[modules.notifications.inbox]` |
 | Captures (development) | the newest `captures` rows | `retention.captures` (`1000`) |
+
+`retention` deletes in short transactions and, when a run's deadline
+comes before the backlog is gone, queues another run at once, so a large
+backlog (after raising traffic or shortening a setting) drains within
+minutes rather than over days. A repeating `notification.maintenance_step_failed`
+with `task = retention` means it is not keeping up.
 
 A notification deleted by `retention` frees its `(source, dedupe_key)`: the
 same key requested again afterwards makes a new notification. Identity's

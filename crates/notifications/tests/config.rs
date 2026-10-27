@@ -652,3 +652,63 @@ fn the_organisation_prefix_is_bounded_in_characters_not_bytes() {
         "{issues:?}"
     );
 }
+
+/// NT-N8 review: security mail is always on (NT §6 rule 1). A rate cap on
+/// a security topic is refused, so nobody can use up a victim's reset
+/// mail; a security topic cannot default to no channel; identity's token
+/// mail keeps email among its default channels. A cap on a transactional
+/// topic, and a retention of deliveries shorter than the data purge, are
+/// checked too.
+#[test]
+fn security_topics_refuse_a_rate_cap_and_keep_their_mail() {
+    let issues = Project::new(&format!(
+        "{MINIMAL}\
+         [modules.notifications.retention]\ndata_after_settled = \"30d\"\ndeliveries = \"7d\"\n\
+         [modules.notifications.topics.\"identity.magic_link\"]\nmax_per_target_per_hour = 5\n\
+         [modules.notifications.topics.\"identity.password_changed\"]\ndefault_channels = []\n\
+         [modules.notifications.topics.\"identity.password_reset\"]\ndefault_channels = []\n\
+         [modules.notifications.topics.\"identity.invitation\"]\ndefault_channels = []\n"
+    ))
+    .issues();
+    for (key, code) in [
+        (
+            "topics.\"identity.magic_link\".max_per_target_per_hour",
+            "security_not_rate_limited",
+        ),
+        (
+            "topics.\"identity.password_changed\".default_channels",
+            "security_default_channels_empty",
+        ),
+        (
+            "topics.\"identity.password_reset\".default_channels",
+            "security_default_channels_empty",
+        ),
+        (
+            "topics.\"identity.password_reset\".default_channels",
+            "token_mail_needs_email",
+        ),
+        (
+            "topics.\"identity.invitation\".default_channels",
+            "token_mail_needs_email",
+        ),
+        ("retention.deliveries", "shorter_than_data_after_settled"),
+    ] {
+        let key = format!("{N}.{key}");
+        assert!(
+            issues.iter().any(|(k, c)| *k == key && *c == code),
+            "{key} {code} not in {issues:?}"
+        );
+    }
+    assert_eq!(issues.len(), 6, "{issues:?}");
+    // A transactional topic takes a cap; security topics keep theirs unset.
+    let checked = Project::new(&format!(
+        "{MINIMAL}\
+         [modules.notifications.topics.\"identity.invitation\"]\nmax_per_target_per_hour = 3\n"
+    ))
+    .configure()
+    .unwrap();
+    assert_eq!(
+        checked.settings.topics["identity.invitation"].max_per_target_per_hour,
+        Some(3)
+    );
+}
