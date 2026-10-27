@@ -963,6 +963,12 @@ fn parse_into(
             ),
             captures: l.integer("captures", 1000, 1, 100_000) as u32,
         };
+        // `retention` deletes a settled notification after `deliveries`;
+        // its data must be purged before, never with the row still
+        // needed for a redelivery (NT-N8 review).
+        if retention.deliveries < retention.data_after_settled {
+            l.issue("deliveries", "shorter_than_data_after_settled");
+        }
         l.finish();
         r.issues.extend(issues);
         retention

@@ -43,6 +43,10 @@ const EVENTS_CHECKSUM: &str = "f9e8fc57df4863cf4602682ada9bbe6f1fbf48932479852c3
 const PUSH_CHECKSUM: &str = "fac9a5a50789e1802a393c392d339db2923e1b8a82cd08740ba1ec364900d896";
 /// SHA-256 of migration 5 (NT-N7, webhooks), frozen the same way.
 const WEBHOOKS_CHECKSUM: &str = "7f8334e2762321989fc267c422d14623b71f0cfc78a39fbeba01a632e692be46";
+/// SHA-256 of migration 6 (NT-N8, the rate cap and retention indexes),
+/// frozen the same way.
+const INTEGRATIONS_CHECKSUM: &str =
+    "15de39892ceb48fa016353efb6c612f6f1486fa2b98c4686ce364bf473f20318";
 
 /// A distinct id per call.
 fn fresh() -> Uuid {
@@ -61,7 +65,7 @@ fn soon() -> Instant {
 
 #[test]
 fn migration_checksum_is_pinned() {
-    assert_eq!(MIGRATIONS.len(), 5);
+    assert_eq!(MIGRATIONS.len(), 6);
     assert_eq!((MIGRATIONS[0].version, MIGRATIONS[0].name), (1, "core"));
     assert_eq!(checksum(MIGRATIONS[0].sql), CORE_CHECKSUM);
     assert_eq!((MIGRATIONS[1].version, MIGRATIONS[1].name), (2, "inbox"));
@@ -75,6 +79,11 @@ fn migration_checksum_is_pinned() {
     assert_eq!(checksum(MIGRATIONS[3].sql), PUSH_CHECKSUM);
     assert_eq!((MIGRATIONS[4].version, MIGRATIONS[4].name), (5, "webhooks"));
     assert_eq!(checksum(MIGRATIONS[4].sql), WEBHOOKS_CHECKSUM);
+    assert_eq!(
+        (MIGRATIONS[5].version, MIGRATIONS[5].name),
+        (6, "integrations")
+    );
+    assert_eq!(checksum(MIGRATIONS[5].sql), INTEGRATIONS_CHECKSUM);
 }
 
 async fn migrated() -> Option<(TestDatabase, Database)> {
@@ -87,7 +96,7 @@ async fn migrated() -> Option<(TestDatabase, Database)> {
     let report = run_migrations(&db, &declared, MigrationMode::Apply, soon())
         .await
         .unwrap();
-    assert_eq!(report.applied.len(), 5);
+    assert_eq!(report.applied.len(), 6);
     Some((test, db))
 }
 

@@ -11,14 +11,17 @@
 //!    `''` for a tenantless event: the application-level endpoints) and
 //!    append its job record, at most 256 per append.
 //!
-//! [`fan_out`] takes an [`Event`], so NT-N8's module-event subscription
-//! (`notify.module_event`) maps AP's envelope onto one and reuses it.
+//! [`fan_out`] takes an [`Event`]: `notify.webhook_event` jobs carry one
+//! from `emit_webhook`, and the module-event subscription
+//! (`notify.module_event`, NT-N8) maps AP's integration event envelope onto
+//! one ([`module_event`]), so another module's domain events reach webhooks
+//! without that module calling the `Notifier` (R11).
 use super::{DELIVER_KIND, DELIVER_QUEUE, DeliverJob, delivery_id, sql};
 use crate::{handler::Outcome, notifier::Core};
 use merezha_domain::{Failure, Identity};
 use merezha_platform::ports::{
-    DedupeKey, MAX_RECORDS_PER_APPEND, MessageContext, OnDuplicate, OutboxRecord, OutboxTarget,
-    SourceOutbox,
+    DedupeKey, IntegrationEvent, MAX_RECORDS_PER_APPEND, MessageContext, OnDuplicate, OutboxRecord,
+    OutboxTarget, SourceOutbox,
 };
 use merezha_postgres::{Database, Tx, classify};
 use serde::Deserialize;
@@ -29,6 +32,18 @@ use uuid::Uuid;
 /// Most endpoints one event reaches: the largest registry the
 /// configuration allows.
 pub const MAX_FANOUT: i64 = 1000;
+/// Kind of the jobs AP's subscriptions fan module events out to, on queue
+/// `notify.expand` (NT §2.5, §5.5).
+pub const MODULE_EVENT_KIND: &str = "notify.module_event";
+/// The other modules' event types the block subscribes [`MODULE_EVENT_KIND`]
+/// to while webhooks are on: content's declared webhook events (NT §5.5).
+pub const SUBSCRIBED_EVENT_TYPES: [&str; 3] = [
+    "content.entry_published",
+    "content.entry_unpublished",
+    "content.entry_deleted",
+];
+/// Longest `source_event_id` the events table stores.
+const MAX_SOURCE_EVENT_ID: usize = 200;
 
 /// A webhook event to fan out. `Debug` shows ids and the type only.
 #[derive(Clone)]
@@ -91,6 +106,35 @@ impl From<EmitPayload> for Event {
             data: payload.data,
         }
     }
+}
+
+/// The webhook event of one integration event envelope (NT §5.5): source
+/// the owning module, `source_event_id` the envelope's `event_id`, tenant
+/// the envelope's (none: the application-level endpoints), data the
+/// payload. Fails permanent `unknown_event_type` for a type outside
+/// [`SUBSCRIBED_EVENT_TYPES`], and `invalid_job_payload` for an envelope
+/// whose type is not its source's (`<source>.…`, R11) or whose event id is
+/// too long to store.
+pub fn module_event(envelope: IntegrationEvent) -> Result<Event, Failure> {
+    let event_type = envelope.event_type.as_str();
+    if !SUBSCRIBED_EVENT_TYPES.contains(&event_type) {
+        return Err(Failure::permanent(super::code::UNKNOWN_EVENT_TYPE));
+    }
+    let owned = event_type
+        .strip_prefix(envelope.source.as_str())
+        .is_some_and(|rest| rest.starts_with('.'));
+    if !owned || envelope.event_id.is_empty() || envelope.event_id.len() > MAX_SOURCE_EVENT_ID {
+        return Err(Failure::permanent("invalid_job_payload"));
+    }
+    Ok(Event {
+        id: crate::ids::webhook_event_id(&envelope.source, &envelope.event_id),
+        tenant: envelope.tenant.map(|t| t.as_str().to_owned()),
+        event_type: envelope.event_type,
+        source: envelope.source,
+        source_event_id: envelope.event_id,
+        occurred_at: envelope.occurred_at,
+        data: envelope.payload,
+    })
 }
 
 /// The job record of one webhook delivery generation.
@@ -270,6 +314,39 @@ impl merezha_platform::ports::JobHandler for Handler {
             fan_out(
                 &core,
                 payload.into(),
+                ctx.correlation_id.clone(),
+                ctx.deadline.into_std(),
+            )
+            .await
+            .into_result()
+        })
+    }
+}
+
+/// `notify.module_event`: one integration event a subscription fanned out
+/// to this block, mapped by [`module_event`] and fanned out to its
+/// registry's endpoints. A second job for the same event finds the event
+/// row and writes nothing more.
+pub struct ModuleEventHandler(pub crate::notifier::Slot);
+impl merezha_platform::ports::JobHandler for ModuleEventHandler {
+    fn handle<'a>(
+        &'a self,
+        ctx: merezha_platform::ports::JobContext,
+        payload: Value,
+    ) -> merezha_platform::BoxFuture<'a, Result<(), merezha_platform::ports::JobFailure>> {
+        Box::pin(async move {
+            let Some(core) = self.0.get().cloned() else {
+                return Err(merezha_platform::ports::JobFailure::transient(
+                    "unavailable",
+                    None,
+                ));
+            };
+            let event = IntegrationEvent::from_value(&payload)
+                .and_then(module_event)
+                .map_err(|failure| merezha_platform::ports::JobFailure::permanent(&failure.code))?;
+            fan_out(
+                &core,
+                event,
                 ctx.correlation_id.clone(),
                 ctx.deadline.into_std(),
             )

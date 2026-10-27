@@ -11,6 +11,11 @@
 //! and the `OutboxTarget::Job` records of the email, SMS and push
 //! deliveries (R1), at most 256 per append.
 //!
+//! A topic with `max_per_target_per_hour` (NT §6, NT-N8) caps each
+//! target: inside the transaction, under a lock on the target's bucket of
+//! its `(topic, channel)` (at most 64 per channel), a target that already got that many of the topic's
+//! deliveries in the last hour is `skipped` / `target_rate_limited`.
+//!
 //! A push target is one subscription (NT-N6): a user gets one push delivery
 //! per live subscription made with the current VAPID key and in the
 //! notification's tenant scope, or one `skipped` / `no_subscription`
@@ -70,6 +75,7 @@ struct Person {
 }
 
 /// One delivery to write.
+#[derive(Clone)]
 struct Target {
     id: Uuid,
     channel: Channel,
@@ -146,10 +152,10 @@ async fn expand(core: &Core, deadline: Instant, payload: ExpandPayload) -> Outco
     {
         return Outcome::retry(&failure.code);
     }
-    let written = write(core, deadline, &payload, &topic, &targets, rejected, now).await;
+    let written = write(core, deadline, &payload, &topic, targets, rejected, now).await;
     match written {
-        Ok(false) => Outcome::Done,
-        Ok(true) => {
+        Ok(None) => Outcome::Done,
+        Ok(Some(targets)) => {
             report(core, &payload, &topic, &targets, rejected);
             core.faults.hit(faults::AFTER_EXPANSION_COMMIT).await;
             Outcome::Done
@@ -672,20 +678,129 @@ async fn decide(
     Ok(())
 }
 
-/// The transaction. `Ok(false)`: the notification existed, nothing written.
+/// The delivery job records of the queued targets.
+fn job_records(
+    payload: &ExpandPayload,
+    topic: &Topic,
+    targets: &[Target],
+) -> Result<Vec<OutboxRecord>, merezha_domain::Failure> {
+    let Some(correlation) = identity(&payload.correlation_id) else {
+        return Err(merezha_domain::Failure::permanent("invalid_job_payload"));
+    };
+    let causation = payload.causation_id.as_deref().and_then(identity);
+    let tenant = payload.tenant.as_deref().and_then(identity);
+    let has_secret = payload.secret_data.is_some();
+    let mut records = Vec::new();
+    for target in targets.iter().filter(|t| t.status == "queued") {
+        let Some((queue, kind)) = delivery_queue(target.channel) else {
+            continue;
+        };
+        let job = DeliverPayload {
+            delivery_id: target.id,
+            generation: 0,
+            secret_data: payload.secret_data.clone(),
+        };
+        records.push(OutboxRecord {
+            dedupe_key: DedupeKey::new(format!("deliver:{}:g0", target.id))?,
+            target: OutboxTarget::Job {
+                queue: Identity::new(queue)?,
+                kind: Identity::new(kind)?,
+            },
+            payload: job.to_value(),
+            contains_secret: has_secret,
+            run_at: None,
+            priority: priority(topic),
+            context: MessageContext {
+                correlation_id: correlation.clone(),
+                causation_id: causation.clone(),
+                tenant: tenant.clone(),
+            },
+        });
+    }
+    Ok(records)
+}
+
+/// The targets a topic's `max_per_target_per_hour` counts: those that will
+/// be sent (queued) or were just delivered (inbox).
+fn counted(target: &Target) -> bool {
+    matches!(target.status, "queued" | "delivered")
+}
+
+/// Apply `cap`, the topic's `max_per_target_per_hour` (NT §6), in the
+/// expansion transaction: lock the bucket of every counted target's
+/// `(topic, channel, target key)` (at most [`sql::TARGET_LOCK_BUCKETS`] per
+/// channel) in ascending key order, so concurrent expansions for one
+/// target count one after the other, then skip (`target_rate_limited`)
+/// each target that already has `cap` deliveries of the topic created in
+/// the last hour that were not skipped.
+async fn limit(
+    db: &merezha_postgres::Database,
+    tx: &mut merezha_postgres::Tx<'_>,
+    topic: &str,
+    cap: u32,
+    targets: &mut [Target],
+    now: jiff::Timestamp,
+) -> Result<(), merezha_domain::Failure> {
+    let (channels, keys): (Vec<String>, Vec<String>) = targets
+        .iter()
+        .filter(|t| counted(t))
+        .map(|t| (t.channel.as_str().to_owned(), t.key.clone()))
+        .unzip();
+    if keys.is_empty() {
+        return Ok(());
+    }
+    db.query(
+        tx,
+        &sql::TARGET_LOCKS,
+        &[
+            &sql::TARGET_LOCK_CLASS,
+            &topic,
+            &channels,
+            &keys,
+            &sql::TARGET_LOCK_BUCKETS,
+        ],
+    )
+    .await
+    .map_err(|e| classify(&e))?;
+    let since = now
+        .checked_sub(jiff::SignedDuration::from_hours(1))
+        .unwrap_or(now);
+    let rows = db
+        .query(tx, &sql::TARGET_RECENT, &[&channels, &keys, &since, &topic])
+        .await
+        .map_err(|e| classify(&e))?;
+    let sent: HashMap<(String, String), i64> = rows
+        .iter()
+        .map(|row| ((row.get(0), row.get(1)), row.get(2)))
+        .collect();
+    for target in targets.iter_mut().filter(|t| counted(t)) {
+        let recent = sent
+            .get(&(target.channel.as_str().to_owned(), target.key.clone()))
+            .copied()
+            .unwrap_or(0);
+        if recent >= i64::from(cap) {
+            target.status = "skipped";
+            target.reason = Some(reason::TARGET_RATE_LIMITED);
+            target.provider = None;
+            target.inbox = None;
+        }
+    }
+    Ok(())
+}
+
+/// The transaction, which returns the targets as written (the rate cap may
+/// skip some). `Ok(None)`: the notification existed, nothing written.
 async fn write(
     core: &Core,
     deadline: Instant,
     payload: &ExpandPayload,
     topic: &Topic,
-    targets: &[Target],
+    targets: Vec<Target>,
     rejected: bool,
     now: jiff::Timestamp,
-) -> Result<bool, merezha_domain::Failure> {
+) -> Result<Option<Vec<Target>>, merezha_domain::Failure> {
     let db = core.database.clone();
     let has_secret = payload.secret_data.is_some();
-    let queued: Vec<&Target> = targets.iter().filter(|t| t.status == "queued").collect();
-    let settled = (rejected || queued.is_empty()).then_some(now);
     let (status, status_reason) = if rejected {
         ("rejected", Some(reason::TOO_MANY_TARGETS))
     } else {
@@ -694,49 +809,6 @@ async fn write(
     let target_count = i32::try_from(targets.len()).unwrap_or(i32::MAX);
     let data = Value::Object(payload.data.clone());
     let channels = payload.channels.clone();
-    let correlation = identity(&payload.correlation_id);
-    let causation = payload.causation_id.as_deref().and_then(identity);
-    let tenant = payload.tenant.as_deref().and_then(identity);
-    // Delivery job records, built before the transaction.
-    let mut records = Vec::new();
-    if !rejected {
-        let Some(correlation) = correlation.clone() else {
-            return Err(merezha_domain::Failure::permanent("invalid_job_payload"));
-        };
-        for target in &queued {
-            let Some((queue, kind)) = delivery_queue(target.channel) else {
-                continue;
-            };
-            let job = DeliverPayload {
-                delivery_id: target.id,
-                generation: 0,
-                secret_data: payload.secret_data.clone(),
-            };
-            records.push(OutboxRecord {
-                dedupe_key: DedupeKey::new(format!("deliver:{}:g0", target.id))?,
-                target: OutboxTarget::Job {
-                    queue: Identity::new(queue)?,
-                    kind: Identity::new(kind)?,
-                },
-                payload: job.to_value(),
-                contains_secret: has_secret,
-                run_at: None,
-                priority: priority(topic),
-                context: MessageContext {
-                    correlation_id: correlation.clone(),
-                    causation_id: causation.clone(),
-                    tenant: tenant.clone(),
-                },
-            });
-        }
-    }
-    // Inbox items: one per user here, numbered in ascending user order.
-    let mut inbox_users: BTreeMap<String, (Uuid, InboxContent)> = BTreeMap::new();
-    for target in targets {
-        if let (Some(inbox), Some(user)) = (&target.inbox, &target.user) {
-            inbox_users.insert(user.clone(), (target.id, inbox.clone()));
-        }
-    }
     let payload = payload.clone();
     let outbox = core.outbox.clone();
     let expires = now
@@ -744,14 +816,34 @@ async fn write(
             jiff::SignedDuration::try_from(core.settings.inbox.retention).unwrap_or_default(),
         )
         .unwrap_or(now);
-    let columns = Columns::of(targets);
-    let topic_name = topic.name.clone();
-    let category = topic.category.as_str();
-    let priority_name = topic.priority.as_str();
+    let topic = topic.clone();
     let id = payload.notification_id;
     db.clone()
         .transaction(deadline, move |tx| {
             Box::pin(async move {
+                let mut targets = targets;
+                let topic_name = topic.name.clone();
+                let category = topic.category.as_str();
+                let priority_name = topic.priority.as_str();
+                if !rejected && let Some(cap) = topic.max_per_target_per_hour {
+                    limit(&db, tx, &topic_name, cap, &mut targets, now).await?;
+                }
+                let open = targets.iter().any(|t| t.status == "queued");
+                let settled = (rejected || !open).then_some(now);
+                let records = if rejected {
+                    Vec::new()
+                } else {
+                    job_records(&payload, &topic, &targets)?
+                };
+                // Inbox items: one per user here, numbered in ascending
+                // user order.
+                let mut inbox_users: BTreeMap<String, (Uuid, InboxContent)> = BTreeMap::new();
+                for target in &targets {
+                    if let (Some(inbox), Some(user)) = (&target.inbox, &target.user) {
+                        inbox_users.insert(user.clone(), (target.id, inbox.clone()));
+                    }
+                }
+                let columns = Columns::of(&targets);
                 let inserted = db
                     .query_opt(
                         tx,
@@ -785,10 +877,10 @@ async fn write(
                     .await
                     .map_err(|e| classify(&e))?;
                 if inserted.is_none() {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 if rejected {
-                    return Ok(true);
+                    return Ok(Some(targets));
                 }
                 let run_at = payload.not_before.unwrap_or(now);
                 db.execute(
@@ -862,7 +954,7 @@ async fn write(
                 for chunk in records.chunks(MAX_RECORDS_PER_APPEND) {
                     outbox.append(tx, chunk, OnDuplicate::Ignore).await?;
                 }
-                Ok(true)
+                Ok(Some(targets))
             })
         })
         .await

@@ -177,9 +177,12 @@ async fn batches(
     statement: &merezha_postgres::Statement,
     at: jiff::Timestamp,
     deadline: Instant,
-) -> Result<u64, Failure> {
+) -> Result<(u64, bool), Failure> {
     let mut total = 0;
     for _ in 0..MAX_BATCHES {
+        if Instant::now() + crate::maintenance::RETENTION_MARGIN >= deadline {
+            return Ok((total, true));
+        }
         let client = core.database.acquire(deadline).await?;
         let changed = core
             .database
@@ -188,14 +191,16 @@ async fn batches(
             .map_err(|e| classify(&e))?;
         total += changed;
         if changed < BATCH as u64 {
-            break;
+            return Ok((total, false));
         }
     }
-    Ok(total)
+    // Every batch came back full: the next `retention` run goes on.
+    Ok((total, true))
 }
 
-/// The webhook part of `retention`: the rows it changed.
-pub async fn retention(core: &Arc<Core>, deadline: Instant) -> Result<u64, Failure> {
+/// The webhook part of `retention`: the rows it changed, and whether a
+/// step stopped with work left (the caller then chains another run).
+pub async fn retention(core: &Arc<Core>, deadline: Instant) -> Result<(u64, bool), Failure> {
     let now = core.now();
     let retention = &core.settings.retention;
     // Each step runs whatever the earlier ones did, so a failing step never
@@ -203,8 +208,12 @@ pub async fn retention(core: &Arc<Core>, deadline: Instant) -> Result<u64, Failu
     // the task's outcome, every one is logged.
     let mut first_failure = None;
     let mut total = 0;
-    let mut step = |name: &'static str, result: Result<u64, Failure>| match result {
-        Ok(rows) => total += rows,
+    let mut more = false;
+    let mut step = |name: &'static str, result: Result<(u64, bool), Failure>| match result {
+        Ok((rows, left)) => {
+            total += rows;
+            more |= left;
+        }
         Err(failure) => {
             merezha_telemetry::event!(
                 WARN,
@@ -240,11 +249,11 @@ pub async fn retention(core: &Arc<Core>, deadline: Instant) -> Result<u64, Failu
         "reseal",
         reseal(core, deadline, ResealBounds::default())
             .await
-            .map(|r| r.resealed),
+            .map(|r| (r.resealed, false)),
     );
     match first_failure {
         Some(failure) => Err(failure),
-        None => Ok(total),
+        None => Ok((total, more)),
     }
 }
 

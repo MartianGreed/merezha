@@ -263,16 +263,57 @@ struct World {
     people: Arc<People>,
     db: Database,
 }
+/// A bearer token naming a user principal (`Bearer usr_ada@org_1` is
+/// `usr_ada` with active tenant `org_1`), as identity's session
+/// authenticator resolves a session.
+struct Bearers;
+impl merezha_platform::ports::Authenticator for Bearers {
+    fn authenticate<'a>(
+        &'a self,
+        request: &'a merezha_platform::ports::RequestHead,
+    ) -> BoxFuture<'a, Result<Option<Arc<merezha_platform::Principal>>, Failure>> {
+        let principal = request
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|token| {
+                let (user, tenant) = token.split_once('@').unwrap_or((token, ""));
+                Arc::new(merezha_platform::Principal {
+                    subject: id(user),
+                    kind: merezha_platform::ports::PrincipalKind::User,
+                    user: Some(id(user)),
+                    service_account: None,
+                    tenant: (!tenant.is_empty()).then(|| id(tenant)),
+                    grants: Arc::new(GrantSnapshot::empty()),
+                    session: None,
+                })
+            });
+        Box::pin(async move { Ok(principal) })
+    }
+}
+
 impl World {
     async fn start(hooks: RunHooks) -> Option<Self> {
+        Self::open(hooks, false).await
+    }
+    /// [`World::start`] with [`Bearers`] as the authenticator and the
+    /// grant policy, as a host with identity runs.
+    async fn start_authenticated(hooks: RunHooks) -> Option<Self> {
+        Self::open(hooks, true).await
+    }
+    async fn open(hooks: RunHooks, authenticated: bool) -> Option<Self> {
         let test = TestDatabase::create()?;
         let dir = tempfile::tempdir().unwrap();
         let input = project(dir.path(), test.url());
         let notifications: Vec<Box<dyn Module>> =
             vec![Box::new(Notifications::new(HostFacts::load(&input)))];
         let (config, mut modules) = host::configure(&input, notifications).unwrap();
-        let authorizer =
-            Arc::new(LoopbackAllowAll::new("127.0.0.1:8080".parse().unwrap()).unwrap());
+        let authorizer: Arc<dyn merezha_platform::ports::Authorizer> = if authenticated {
+            Arc::new(GrantPolicy)
+        } else {
+            Arc::new(LoopbackAllowAll::new("127.0.0.1:8080".parse().unwrap()).unwrap())
+        };
         let module = ApplicationModule::new(
             Config::parse(APPLICATION).unwrap(),
             Arc::new(Fake),
@@ -304,6 +345,8 @@ impl World {
             },
             HostOptions {
                 directory: Some(people.clone()),
+                authenticator: authenticated
+                    .then(|| Arc::new(Bearers) as Arc<dyn merezha_platform::ports::Authenticator>),
                 ..HostOptions::default()
             },
         )
@@ -901,4 +944,89 @@ async fn the_reactor_admin_routes_check_permissions_and_answer_their_documents()
                {"name": "task-notifier", "status": "active", "lag_events": 0}])
     );
     let _ = &world.test;
+}
+
+/// NT-N8's end-to-end test, from guest event to reaction to inbox item to
+/// SSE event: a user's open inbox stream receives the item a reactor's
+/// `notify` effect created, through the platform edge and its
+/// authenticator, the reactor checkpoint, the notifications block's
+/// expansion and its `LISTEN` fan-out. The guest is the in-process test
+/// application above; the wasm task board's `task-notifier` needs the
+/// stage 3 example application (`merezha new`) to run under a cargo test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_guest_event_reaches_an_open_inbox_stream_through_its_reaction() {
+    use merezha_notifications::testkit::EventReader;
+    let Some(world) = World::start_authenticated(RunHooks::default()).await else {
+        return;
+    };
+    world.people.member("usr_ada", "org_1");
+    let wait = Duration::from_secs(15);
+    let response = world
+        .host
+        .router()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/notifications/inbox/stream")
+                .header("authorization", "Bearer usr_ada@org_1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let mut reader = EventReader::new(response.into_body());
+    // The stream is live once it said `hello`.
+    loop {
+        let event = reader.next_event(wait).await.unwrap().unwrap();
+        if event.event.as_deref() == Some("hello") {
+            break;
+        }
+    }
+    // The guest decides `TaskCompleted`; its reactor answers with a notify
+    // effect for the completer, a member of the event's tenant.
+    world
+        .blocking(|app| {
+            app.command_as(
+                ada(),
+                completed("t-1", json!([notify("usr_ada", "tasks.completed")])),
+            )
+        })
+        .await
+        .unwrap();
+    // Both reactors notify the completer: two items, each once.
+    let mut items: Vec<Value> = Vec::new();
+    while items.len() < 2 {
+        let event = reader
+            .next_event(wait)
+            .await
+            .expect("the stream stays open")
+            .expect("an event before the wait ends");
+        if event.event.as_deref() == Some("item") {
+            items.push(serde_json::from_str(&event.data).unwrap());
+        }
+    }
+    for item in &items {
+        assert_eq!(item["topic"], "tasks.completed", "{item}");
+        assert_eq!(item["title"], "Write docs");
+        assert_eq!(item["tenant_id"], "org_1");
+    }
+    let mut streamed: Vec<String> = items
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().to_owned())
+        .collect();
+    streamed.sort();
+    assert_eq!(
+        streamed,
+        world
+            .texts(
+                "SELECT i.id::text FROM merezha_notify.inbox_items i \
+                 JOIN merezha_notify.notifications n ON n.id = i.notification_id \
+                 WHERE i.user_id = 'usr_ada' AND n.source = 'application' AND n.dedupe_key IN \
+                 ('reaction:task-notifier:event/1:0', 'reaction:auditor:event/1:0') ORDER BY 1",
+            )
+            .await
+    );
+    drop(reader);
+    drop(world.host);
 }

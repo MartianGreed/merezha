@@ -182,8 +182,9 @@ const CAPTURE_INSERT: Statement = Statement::new(
      VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5) \
      ON CONFLICT DO NOTHING RETURNING id",
 );
-/// Keep the newest `$1` captures.
-const CAPTURE_TRIM: Statement = Statement::new(
+/// Keep the newest `$1` captures; the capture drivers run it on every
+/// capture and the `retention` task daily.
+pub(crate) const CAPTURE_TRIM: Statement = Statement::new(
     "notify.capture.trim",
     "DELETE merezha_notify.captures",
     "DELETE FROM merezha_notify.captures WHERE id <= \

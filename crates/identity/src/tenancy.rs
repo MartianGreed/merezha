@@ -1482,7 +1482,7 @@ impl Core {
                     }
                     let mut data = Core::data(existing.as_ref(), Some(expires));
                     data.insert("organization_name".into(), Value::String(org_row.get(2)));
-                    core.notify(
+                    core.notify_in(
                         tx,
                         topic::INVITATION,
                         Core::address(email.display(), existing.as_ref())?,
@@ -1490,6 +1490,7 @@ impl Core {
                         Some((Core::link(&core.settings.links.invitation, &token), "invitation")),
                         id,
                         Some(expires),
+                        Some(org),
                         &who.client,
                     )
                     .await?;
