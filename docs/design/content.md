@@ -1602,18 +1602,32 @@ Management `GET /assets/{id}/file` always proxies with `attachment`.
   number of blobs a run deleted under its own lease; the event also
   carries `failed` and `lost`, and a run that only failed or lost blobs
   still logs it.
-- An object delete ends one of three ways. Deleted: the row goes.
-  Refused (the store answered with an error, so the object is still
-  there): the row is restored at once. Cut by the half-lease bound: the
-  outcome is unknown and the request may still land, so the sweep counts
-  it `failed` and leaves the row `deleting` under its renewed lease. A
-  restored `orphaned` row would read as "the object exists", and an
+- An object delete ends one of three ways.
+  - Deleted: the store answered success, or 404 (the object was already
+    gone). The row goes.
+  - Refused: the delete did not happen. The store answered a 3xx or a
+    4xx other than 404, 408 and 429 (`BlobError::Rejected`), or the
+    request never left (`BlobError::Invalid`). The row is restored at
+    once.
+  - Unknown: the request may have reached the store and may still apply.
+    That covers an answer that never came (`object_store` does not retry
+    a timed-out `DELETE`, which is not idempotent, so this fails after
+    one `media.s3.timeout`), a connection reset after sending, a 5xx,
+    408 or 429 that persisted through the retries (all
+    `BlobError::Unavailable`), and the half-lease bound. The sweep
+    counts it `failed` and leaves the row `deleting` under its renewed
+    lease.
+
+  A restored `orphaned` row would read as "the object exists", and an
   upload of the same bytes would reuse it without a put just before the
-  late delete removed the object. An upload that meets the row waits
-  (`blob_unavailable` after two seconds); once the lease is over it takes
-  the row over and puts, or cleanup claims it and deletes again. Either
-  way a late delete lands while the row is fenced. An upload's give-up
-  follows the same rule.
+  late delete removed the object; a restored `pending` row (the give-up)
+  would let the next upload put the bytes just before. An upload that
+  meets a `deleting` row waits (`blob_unavailable` after two seconds);
+  once the lease is over it takes the row over and puts, or cleanup
+  claims it and deletes again. Either way a late delete lands while the
+  row is fenced, as long as it lands within the lease. An upload's
+  give-up follows the same rule. On the local driver every I/O error is
+  `Unavailable`, so a failed unlink waits for the lease too.
 - Three fencing checks in SQL have a Rust check in front of them:
   `content.blobs.takeover` requires an expired lease, which the upload
   read just before under the same row lock (defence in depth);
@@ -1639,23 +1653,25 @@ Management `GET /assets/{id}/file` always proxies with `attachment`.
   noncurrent-version or soft-delete rule on the bucket to have one to
   restore) or the asset is deleted and uploaded again.
 - The mitigation is to keep the longest object delete far below the
-  lease, and the code bounds it twice. Each S3 request is bounded by
-  `media.s3.timeout`, with at most `MAX_RETRIES` (3) retries, none
-  started later than `RETRY_TIMEOUT` (10 s) after the first attempt, and
-  backoffs of at most a second. Content caps the timeout at 240 s
+  lease, and the code bounds it twice. A hung delete is not retried and
+  ends after one `media.s3.timeout` (default 30 s). Answers that ask for
+  a retry (5xx, 408, 429) are retried at most `MAX_RETRIES` (3) times,
+  none started later than `RETRY_TIMEOUT` (10 s) after the first
+  attempt, with backoffs of at most a second, so the longest delete is
+  10 s + 1 s + one timeout. Content caps the timeout at 240 s
   (`MAX_S3_TIMEOUT`; `out_of_range` past it, though the driver alone
-  allows 300 s), so a delete that gets no answer gives up after at most
-  10 s + 1 s + 240 s = 251 s. The whole object delete is also bounded by
-  half the lease (`DELETE_LEASE / 2`, five minutes), which a delete can
-  therefore reach only when the process or the network stalls. The lease
-  starts when the retake's statement runs, and the object delete starts
-  once that transaction commits, at most `limits.query_timeout` later.
-  So when the delete ends, by itself or by the bound, at least five
-  minutes of lease minus that commit time remain, and a delete cut by
-  the bound has that long to land while the row is still fenced. Only a
-  stall outside the process's control can use the rest. Keep
-  `media.s3.timeout` short, and run hosts where a pause of minutes is not
-  routine.
+  allows 300 s), which puts that upper bound at 251 s. The whole object
+  delete is also bounded by half the lease (`DELETE_LEASE / 2`, five
+  minutes), which a delete can therefore reach only when the process
+  stalls. The lease starts when the retake's statement runs, and the
+  object delete starts once that transaction commits, at most
+  `limits.query_timeout` later. So when the delete ends, by itself or by
+  the bound, at least five minutes of lease minus that commit time
+  remain, and a delete with an unknown outcome has that long to land
+  while the row is still fenced. Only a stall outside the process's
+  control, or a request that sits on the network for minutes, can use
+  the rest. Keep `media.s3.timeout` short, and run hosts where a pause
+  of minutes is not routine.
 
 ## 7. Events
 

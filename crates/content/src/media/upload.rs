@@ -381,10 +381,11 @@ impl Assets {
     /// steps are fenced on the delete lease the release returns. When the
     /// store refuses the object delete the row goes back to `pending` with
     /// a lease already over, so the next upload of these bytes joins it and
-    /// puts again (and cleanup may take it). A delete the half-lease bound
-    /// cut may still land, so its row stays `deleting` until the lease
-    /// expires, like a joined claim, a lost race or a failing database:
-    /// cleanup takes it then, or an upload takes it over.
+    /// puts again (and cleanup may take it). A delete whose outcome is
+    /// unknown (a timeout, a transport error, a 5xx, the half-lease bound)
+    /// may still land after such a put, so its row stays `deleting` until
+    /// the lease expires, like a joined claim, a lost race or a failing
+    /// database: cleanup takes it then, or an upload takes it over.
     async fn give_up(&self, scope: &str, sha256: &str, key: &BlobKey, claim: &Claim) {
         let Claim::Inserted(lease) = claim else {
             return;

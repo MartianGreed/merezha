@@ -3,10 +3,11 @@
 //! deletions a crash abandoned are claimed `deleting` (`FOR UPDATE SKIP
 //! LOCKED`) and committed; then each object is deleted and its row
 //! removed, each step fenced on the claim's delete lease (a worker whose
-//! lease expired and was taken over touches nothing). A refused delete
-//! restores the row's previous state; one whose outcome is unknown (cut by
-//! the half-lease bound) leaves the row `deleting` until its lease
-//! expires. At most
+//! lease expired and was taken over touches nothing). A delete the store
+//! refused restores the row's previous state; one whose outcome is unknown
+//! (a timeout, a transport error, a 5xx after the retries, or the
+//! half-lease bound) leaves the row `deleting` until its lease expires.
+//! At most
 //! [`CLEANUP_LIMIT`] blobs per run, declared as the cron schedule of the
 //! same name with `media.cleanup_cron` in UTC. Each run first purges the
 //! asset trash past `trash.retention`, which orphans the blobs it frees.
@@ -15,7 +16,7 @@ use crate::store::{Rejection, transaction};
 use merezha_blob::RETRY_TIMEOUT;
 use merezha_platform::{
     BoxFuture,
-    ports::{BlobKey, BlobStore, JobContext, JobFailure, JobHandler},
+    ports::{BlobError, BlobKey, BlobStore, JobContext, JobFailure, JobHandler},
 };
 use serde_json::Value;
 use std::time::Duration;
@@ -29,11 +30,14 @@ pub const CLEANUP_BATCH: i64 = 100;
 /// How long a claimed deletion is leased: past it, a deletion a crash
 /// abandoned is claimed again.
 pub const DELETE_LEASE: Duration = Duration::from_secs(600);
-/// The longest `media.s3.timeout` content accepts. An object delete that
-/// gets no answer gives up after at most `RETRY_TIMEOUT`, one backoff (at
-/// most a second) and one more `timeout`: with this cap that stays under
-/// half the delete lease, the bound on every object delete, so the bound
-/// cuts a delete only when the process or the network stalls.
+/// The longest `media.s3.timeout` content accepts. `object_store` treats a
+/// `DELETE` as not idempotent: one that gets no answer is not retried and
+/// fails after one `timeout`. Answers that ask for a retry (5xx, 408, 429)
+/// are retried, none later than `RETRY_TIMEOUT`, after a backoff of at most
+/// a second, so the longest delete is `RETRY_TIMEOUT` + 1 s + `timeout`.
+/// With this cap that stays under half the delete lease, the bound on
+/// every object delete, so the bound cuts a delete only when the process
+/// stalls.
 pub const MAX_S3_TIMEOUT: Duration = Duration::from_secs(240);
 const _: () =
     assert!(RETRY_TIMEOUT.as_secs() + 1 + MAX_S3_TIMEOUT.as_secs() < DELETE_LEASE.as_secs() / 2);
@@ -44,9 +48,9 @@ pub struct CleanupReport {
     /// Blobs whose object and row this pass deleted under its own lease
     /// (the `count` of the `content.blob_cleanup` event).
     pub deleted: usize,
-    /// Blobs whose object delete failed: refused (the row restored for a
-    /// later run) or cut by the half-lease bound (the row left `deleting`
-    /// until its lease expires).
+    /// Blobs whose object delete failed: refused by the store (the row
+    /// restored for a later run), or with an unknown outcome (the row left
+    /// `deleting` until its lease expires).
     pub failed: usize,
     /// Claimed blobs this pass no longer owned: its lease expired and
     /// another worker or an upload took the row, before the retake (left
@@ -78,11 +82,15 @@ enum Step {
 /// How one object delete ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Deletion {
-    /// The store answered: the object is gone.
+    /// The store answered success, or that the object does not exist.
     Deleted,
-    /// The store answered with an error: the object is still there.
+    /// The delete did not happen: the store answered a 3xx or a 4xx other
+    /// than 404, 408 and 429 (`BlobError::Rejected`), or the request never
+    /// left (`BlobError::Invalid`, a bad key).
     Refused,
-    /// The half-lease bound cut it: the request may still land.
+    /// The request may have reached the store and may still apply: a
+    /// timeout, a reset connection, a 5xx, 408 or 429 after the retries
+    /// (`BlobError::Unavailable`), or the half-lease bound cut it.
     Unknown,
 }
 
@@ -91,11 +99,11 @@ pub(crate) enum Deletion {
 pub enum Swept {
     /// The object and the row are gone.
     Deleted,
-    /// The object delete failed. Refused: the row is back as it was. Cut
-    /// by the half-lease bound, its outcome unknown: the row stays
-    /// `deleting` under the renewed lease, so a delete that still lands
-    /// does so while the row is fenced, and the next claim after the lease
-    /// deletes it again.
+    /// The object delete failed. Refused by the store: the row is back as
+    /// it was. With an unknown outcome (timeout, transport error, 5xx, the
+    /// half-lease bound): the row stays `deleting` under the renewed lease,
+    /// so a delete that still lands does so while the row is fenced, and
+    /// the next claim after the lease deletes it again.
     Failed,
     /// The claim was no longer this worker's: at the retake, nothing was
     /// touched; after the object delete, the row (not removed, or not
@@ -185,8 +193,8 @@ impl Assets {
     /// delete the object (bounded by half the lease) and the row, both
     /// fenced on the renewed token. A claim lost before the retake touches
     /// nothing; one lost while the object delete ran leaves the row (and
-    /// the count) to the worker that holds it now. A delete the bound cut
-    /// leaves the row `deleting` under the renewed lease.
+    /// the count) to the worker that holds it now. A delete whose outcome
+    /// is unknown leaves the row `deleting` under the renewed lease.
     pub async fn sweep(&self, blob: &ClaimedBlob) -> Result<Swept, Rejection> {
         let Some(token) = self.fenced(Step::Retake, blob, &blob.token).await? else {
             return Ok(Swept::Lost);
@@ -195,7 +203,7 @@ impl Assets {
             Deletion::Deleted => (Step::Forget, Swept::Deleted),
             Deletion::Refused => (Step::Restore, Swept::Failed),
             // Restoring now would let an upload reuse the row (`orphaned`
-            // means "the object exists") while the cut request may still
+            // means "the object exists") while the request may still
             // delete the object.
             Deletion::Unknown => return Ok(Swept::Failed),
         };
@@ -215,9 +223,9 @@ impl Assets {
             return Deletion::Refused;
         };
         match tokio::time::timeout(self.delete_lease / 2, self.blobs.delete(&key)).await {
-            Ok(Ok(())) => Deletion::Deleted,
-            Ok(Err(_)) => Deletion::Refused,
-            Err(_) => Deletion::Unknown,
+            Ok(Ok(()) | Err(BlobError::NotFound)) => Deletion::Deleted,
+            Ok(Err(BlobError::Rejected(_) | BlobError::Invalid(_))) => Deletion::Refused,
+            Ok(Err(BlobError::Unavailable(_))) | Err(_) => Deletion::Unknown,
         }
     }
 

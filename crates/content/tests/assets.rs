@@ -1877,6 +1877,73 @@ async fn a_delete_cut_by_the_half_lease_bound_stays_fenced_and_an_upload_puts_th
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_that_times_out_in_the_sdk_stays_fenced_until_its_lease_ends() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let mock = s3::MockS3::start().await;
+    let dirs = Dirs::new();
+    // `media.s3.timeout` is 5 s, far under the bound (30 s of a 60 s
+    // lease), as in production.
+    let fx = start(&test, &dirs.s3(&mock, ""), MODEL).await;
+    let bytes = b"timed out in the sdk, deleted late";
+    aged_orphan(&fx, bytes).await;
+    // The delete gets no answer; S3 applies it 7 s after it arrived, after
+    // the SDK gave up (`object_store` does not retry a timed-out DELETE).
+    mock.late_deletes(Some(Duration::from_secs(7)));
+    let assets = assets(&fx).with_delete_lease(Duration::from_secs(60));
+    let started = Instant::now();
+    let report = assets.cleanup(10).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        report,
+        CleanupReport {
+            deleted: 0,
+            failed: 1,
+            lost: 0
+        }
+    );
+    assert_eq!(
+        strings(
+            &fx.db,
+            "SELECT state || ':' || coalesce((pending_until > now())::text, 'no lease') \
+               FROM merezha_content.blobs"
+        )
+        .await,
+        ["deleting:true"]
+    );
+    // An upload of the same bytes meanwhile waits for the lease instead of
+    // taking the object as there.
+    let reply = upload(&fx, "again.txt", "text/plain", bytes).await;
+    assert_eq!(reply.code(), "blob_unavailable");
+    // The late delete lands while the row is still fenced.
+    tokio::time::sleep(Duration::from_secs(8).saturating_sub(started.elapsed())).await;
+    assert_eq!(mock.object_count(), 0);
+    // Past the lease, the next upload takes the row over and puts.
+    mock.late_deletes(None);
+    execute(
+        &fx.db,
+        "UPDATE merezha_content.blobs SET pending_until = now() - interval '1 second'",
+    )
+    .await;
+    let asset = uploaded(&fx, "again.txt", "text/plain", bytes).await;
+    assert_eq!(mock.object_count(), 1);
+    assert!(assets_keep_their_blobs(&fx).await);
+    let reply = raw(
+        &fx,
+        &format!("{ASSETS}/{}/file", asset["id"].as_str().unwrap()),
+        Some("media"),
+        &[],
+    )
+    .await;
+    assert_eq!(reply.body, bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_batch_stops_sweeping_once_half_its_lease_has_passed() {
     let Some(test) = TestDatabase::create() else {
         return;
@@ -2147,9 +2214,10 @@ async fn a_failed_give_up_leaves_the_blob_for_the_next_upload() {
     let mock = s3::MockS3::start().await;
     let dirs = Dirs::new();
     let fx = start(&test, &dirs.s3(&mock, ""), MODEL).await;
-    // The put fails, and so does the give-up's object delete.
+    // The put fails, and the store refuses the give-up's object delete
+    // (a 403: the delete did not happen).
     mock.fail_puts(&[500; merezha_blob::MAX_RETRIES + 1]);
-    mock.fail_deletes(&[500; merezha_blob::MAX_RETRIES + 1]);
+    mock.fail_deletes(&[403]);
     let bytes = b"put and delete both failed";
     let reply = upload(&fx, "f.txt", "text/plain", bytes).await;
     assert_eq!(reply.code(), "blob_unavailable");
@@ -2167,6 +2235,45 @@ async fn a_failed_give_up_leaves_the_blob_for_the_next_upload() {
     let started = Instant::now();
     let asset = uploaded(&fx, "f.txt", "text/plain", bytes).await;
     assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(mock.object_count(), 1);
+    assert!(assets_keep_their_blobs(&fx).await);
+    assert_eq!(asset["size"], bytes.len());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_give_up_whose_delete_may_still_land_keeps_the_row_fenced() {
+    let Some(test) = TestDatabase::create() else {
+        return;
+    };
+    let mock = s3::MockS3::start().await;
+    let dirs = Dirs::new();
+    let fx = start(&test, &dirs.s3(&mock, ""), MODEL).await;
+    // The put fails, and the give-up's delete gets 5xx answers through
+    // the retries: S3 may still apply it.
+    mock.fail_puts(&[500; merezha_blob::MAX_RETRIES + 1]);
+    mock.fail_deletes(&[500; merezha_blob::MAX_RETRIES + 1]);
+    let bytes = b"a give-up whose delete may land";
+    let reply = upload(&fx, "f.txt", "text/plain", bytes).await;
+    assert_eq!(reply.code(), "blob_unavailable");
+    // Not back to `pending`, where the next upload would put the bytes
+    // before the delete lands: `deleting` until the delete lease ends.
+    assert_eq!(
+        strings(
+            &fx.db,
+            "SELECT state || ':' || (pending_until > now())::text FROM merezha_content.blobs"
+        )
+        .await,
+        ["deleting:true"]
+    );
+    let reply = upload(&fx, "f.txt", "text/plain", bytes).await;
+    assert_eq!(reply.code(), "blob_unavailable");
+    // Once the lease is over, the next upload takes the row over and puts.
+    execute(
+        &fx.db,
+        "UPDATE merezha_content.blobs SET pending_until = now() - interval '1 second'",
+    )
+    .await;
+    let asset = uploaded(&fx, "f.txt", "text/plain", bytes).await;
     assert_eq!(mock.object_count(), 1);
     assert!(assets_keep_their_blobs(&fx).await);
     assert_eq!(asset["size"], bytes.len());

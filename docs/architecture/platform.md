@@ -3553,11 +3553,14 @@ touches nothing, so it never deletes an object uploaded again meanwhile;
 one that loses its lease while the object delete runs leaves the row to
 the new holder and counts the blob lost, not deleted
 (`content.blob_cleanup` logs `count`, the blobs deleted under the run's
-own lease, with `failed` and `lost`). An object delete cut by its bound
-(half the lease) may still land, so its row stays `deleting` until the
-lease expires instead of being restored; a refused one is restored at
-once. `media.s3.timeout` is capped at 240 s so an unanswered delete,
-retries included, ends before that bound. The fence lives in the
+own lease, with `failed` and `lost`). An object delete whose outcome is
+unknown (a timeout, a reset connection, a 5xx, 408 or 429 after the
+retries, or the half-lease bound) may still land, so its row stays
+`deleting` until the lease expires instead of being restored; only a
+delete the store refused (another 4xx or a 3xx) is restored at once.
+`media.s3.timeout` is capped at 240 s (`out_of_range` on
+`modules.content.media.s3.timeout` past it; the driver alone allows
+300 s) so a delete, retries included, ends before the half-lease bound. The fence lives in the
 database: a host stalled for longer than the whole ten-minute lease
 between renewing it and sending the object delete can still delete an
 object uploaded again with the same bytes (content design section 6,
