@@ -1759,7 +1759,10 @@ gauges report nothing before their first count and every instance counts
 at start and every 5 minutes, `GET webhook-secrets/status` counts live, the
 hand-off budget is per schedule step and due on PostgreSQL's clock,
 `endpoint_busy` attempts stay out of auto-disable, and the unreadable mark
-includes the ciphertext.
+includes the ciphertext. After the fourth look the counts compare a mark's whole
+key pair, `previous_key_removable` is `previous_key == 0` (unreadable rows,
+tried with exactly the configured keys, do not block it), and the periodic
+count stops at shutdown.
 
 **N8: integrations, operations.** *Scope:* the identity topics of
 R2, which can merge right after N3; the AP subscriptions to content events;

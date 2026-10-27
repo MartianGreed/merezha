@@ -173,7 +173,11 @@ async fn reschedule(
     db_now: jiff::Timestamp,
 ) -> Outcome {
     let doublings = busy.min(5);
-    let base = (BUSY_DELAY * 2u32.pow(doublings)).min(BUSY_MAX_DELAY);
+    let (first, cap) = core
+        .webhooks
+        .as_ref()
+        .map_or((BUSY_DELAY, BUSY_MAX_DELAY), |w| w.busy_delays);
+    let base = (first * 2u32.pow(doublings)).min(cap);
     let mut bytes = [0u8; 8];
     let share = match core.random.fill(&mut bytes) {
         Ok(()) => u64::from_le_bytes(bytes) as f64 / u64::MAX as f64,

@@ -273,6 +273,8 @@ pub struct WebhookSender {
     pub(crate) limiter: Limiter,
     pub(crate) settings: WebhookSettings,
     pub(crate) metrics: Metrics,
+    /// The first and the longest busy hand-off delay.
+    pub(crate) busy_delays: (Duration, Duration),
 }
 impl std::fmt::Debug for WebhookSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -301,6 +303,7 @@ impl WebhookSender {
             limiter: Limiter::new(webhooks.concurrency_per_endpoint),
             settings: webhooks.clone(),
             metrics,
+            busy_delays: (worker::BUSY_DELAY, worker::BUSY_MAX_DELAY),
         })
     }
     /// Take one of `endpoint`'s slots, as a request would (feature
@@ -308,6 +311,13 @@ impl WebhookSender {
     #[cfg(feature = "testkit")]
     pub fn occupy(&self, endpoint: Uuid) -> Option<OwnedSemaphorePermit> {
         self.limiter.try_acquire(endpoint)
+    }
+    /// Other busy hand-off delays (feature `testkit`), so tests need not
+    /// wait the production ones.
+    #[cfg(feature = "testkit")]
+    pub fn with_busy_delays(mut self, first: Duration, longest: Duration) -> Self {
+        self.busy_delays = (first, longest);
+        self
     }
     /// The registration check of `url` (NT §5.5).
     pub async fn check_url(&self, url: &str) -> Result<url::Url, &'static str> {

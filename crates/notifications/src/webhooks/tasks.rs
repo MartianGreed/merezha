@@ -383,8 +383,18 @@ pub struct SecretCounts {
     /// Endpoints with a secret still sealed under another key, unreadable
     /// ones left out: `secret_key_previous` may go only once this is 0.
     pub previous_key: u64,
-    /// Endpoints whose secret neither key opened.
+    /// Endpoints whose secret neither configured key opened (tried under
+    /// exactly these keys): already lost to both, so removing the previous
+    /// key loses nothing more of theirs.
     pub unreadable: u64,
+}
+impl SecretCounts {
+    /// Whether `secret_key_previous` can go without losing a secret: no
+    /// endpoint holds one only it may open. Unreadable endpoints do not
+    /// block it, since neither configured key opens them.
+    pub fn previous_key_removable(&self) -> bool {
+        self.previous_key == 0
+    }
 }
 
 /// Count the endpoints still on another key and the unreadable ones,
@@ -395,10 +405,15 @@ pub async fn count_secrets(core: &Core, deadline: Instant) -> Result<SecretCount
         core.settings.secret_key_previous.as_ref(),
     );
     let current = secrets.key_id();
+    let pair = secrets.key_pair();
     let row = {
         let client = core.database.acquire(deadline).await?;
         core.database
-            .query_one(&client, &sql::SECRET_COUNTS, &[&current.to_vec()])
+            .query_one(
+                &client,
+                &sql::SECRET_COUNTS,
+                &[&current.to_vec(), &pair.to_vec()],
+            )
             .await
             .map_err(|e| classify(&e))?
     };
@@ -419,13 +434,14 @@ pub const SECRET_COUNT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Count the secrets again every [`SECRET_COUNT_INTERVAL`] on this
 /// instance (the block counts once at start), so every instance's gauges
-/// show a count it made; a failed count keeps the last one.
-pub(crate) fn count_secrets_periodically(core: Arc<Core>) {
+/// show a count it made; a failed count keeps the last one. The block
+/// aborts the task at shutdown.
+pub(crate) fn count_secrets_periodically(core: Arc<Core>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(SECRET_COUNT_INTERVAL).await;
             let deadline = Instant::now() + Duration::from_secs(10);
             let _ = count_secrets(&core, deadline).await;
         }
-    });
+    })
 }

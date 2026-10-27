@@ -298,7 +298,7 @@ async fn secrets_status(
                 "previous_key_configured": counts.previous_key_configured,
                 "previous_key": counts.previous_key,
                 "unreadable": counts.unreadable,
-                "previous_key_removable": counts.previous_key == 0,
+                "previous_key_removable": counts.previous_key_removable(),
             }))
             .into_response()
         }

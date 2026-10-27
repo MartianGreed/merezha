@@ -1947,6 +1947,79 @@ async fn a_fresh_instance_reports_the_secrets_still_on_the_previous_key() {
         ),
         (json!(0), json!(true))
     );
+    // The periodic count stops with the block.
+    use merezha_platform::Module;
+    assert!(instance.module.counting_secrets());
+    instance.module.shutdown(soon()).await;
+    assert!(!instance.module.counting_secrets());
+    instance.stop().await;
+}
+
+/// The review's reproduction: a secret marked unreadable under another
+/// previous key is not counted as unreadable once its own key is the
+/// previous one again: it counts in `previous_key`, the previous key is not
+/// removable, and the next reseal recovers it.
+#[tokio::test]
+async fn a_mark_made_under_another_previous_key_does_not_hide_a_secret() {
+    const ZERO_KEY: &str = "emVyb3RoLWtleS1mb3Itd2ViaG9vay10ZXN0cy0wMDA=";
+    let Some(world) = World::new().await else {
+        return;
+    };
+    let receiver = WebhookReceiver::start().await;
+    let instance = start(&world, &section(true, "")).await;
+    create(
+        &instance,
+        "ada",
+        "/tenants/org_a",
+        json!({ "url": receiver.url("a") }),
+    )
+    .await;
+    instance.stop().await;
+    // Current K2 with the wrong previous key K0: the secret (K1) is unreadable.
+    let wrong = section(true, "").replace(
+        "secret_key = { env = \"NOTIFY_KEY\" }\n",
+        "secret_key = { env = \"NEW_KEY\" }\nsecret_key_previous = { env = \"ZERO_KEY\" }\n",
+    );
+    let instance = start_with(&world, &wrong, |o| {
+        o.env.push(("NEW_KEY".into(), NEW_KEY.into()));
+        o.env.push(("ZERO_KEY".into(), ZERO_KEY.into()));
+    })
+    .await;
+    let bounds = webhooks::tasks::ResealBounds::default();
+    let run = webhooks::tasks::reseal(&instance.core(), soon(), bounds)
+        .await
+        .unwrap();
+    assert_eq!((run.resealed, run.remaining, run.unreadable), (0, 0, 1));
+    instance.stop().await;
+    // Previous K1 again: the mark was made under another pair.
+    let instance = start_with(&world, &rotated_section(true), |o| {
+        o.env.push(("NEW_KEY".into(), NEW_KEY.into()));
+    })
+    .await;
+    instance
+        .tokens
+        .add("root", user("usr_root", &["notifications.admin"], None));
+    let (status, body) = instance
+        .call(
+            "GET",
+            "/v1/notifications/webhook-secrets/status",
+            Some("root"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        (
+            body["previous_key"].clone(),
+            body["unreadable"].clone(),
+            body["previous_key_removable"].clone()
+        ),
+        (json!(1), json!(0), json!(false))
+    );
+    let run = webhooks::tasks::reseal(&instance.core(), soon(), bounds)
+        .await
+        .unwrap();
+    assert_eq!((run.resealed, run.remaining, run.unreadable), (1, 0, 0));
     instance.stop().await;
 }
 
@@ -2050,7 +2123,13 @@ mod timing {
             "allow_http = true\n",
             "allow_http = true\nconcurrency_per_endpoint = 1\n",
         );
-        let instance = start(&world, &config).await;
+        // Hand-offs of 250 ms doubling to 2 s (at most 3 s with jitter) keep
+        // the run well inside the harness's 30 s wait, and 20 of them last
+        // longer than the 8 requests take, so no chain runs out.
+        let instance = start_with(&world, &config, |o| {
+            o.webhook_busy_delays = Some((Duration::from_millis(250), Duration::from_secs(2)));
+        })
+        .await;
         create(
             &instance,
             "ada",

@@ -370,14 +370,17 @@ pub const STALE_SECRETS: Statement = s(
      ORDER BY id LIMIT $3",
 );
 /// How many endpoints still hold a secret sealed under another key than
-/// `$1` (readable ones), and how many were found unreadable under it.
+/// `$1`, and how many were found unreadable under the current key pair
+/// `$2` with their current ciphertext. A row marked under another pair
+/// (another previous key) counts in the first: the keys now configured
+/// were not all tried on it.
 pub const SECRET_COUNTS: Statement = s(
     "notify.webhook.secret_counts",
     "SELECT merezha_notify.webhook_endpoints",
     "SELECT count(*) FILTER (WHERE (key_id <> $1 OR previous_key_id <> $1) AND NOT unreadable), \
      count(*) FILTER (WHERE unreadable) \
      FROM (SELECT key_id, previous_key_id, \
-       COALESCE(substring(unreadable_under FROM 1 FOR 8) = $1 \
+       COALESCE(substring(unreadable_under FROM 1 FOR 16) = $2 \
          AND substring(unreadable_under FROM 17 FOR 8) = substring(sha256(secret_ct) FROM 1 FOR 8), \
          false) AS unreadable \
        FROM merezha_notify.webhook_endpoints) AS e",

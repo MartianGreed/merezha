@@ -235,6 +235,11 @@ pub struct Notifications {
     /// The inbox stream registry, once [`Module::start`] ran.
     streams: Arc<OnceLock<stream::Streams>>,
     push_lookup: LookupOverride,
+    /// The periodic count of webhook secrets, stopped at shutdown.
+    secret_counter: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Busy hand-off delays in place of the production ones (feature
+    /// `testkit`).
+    busy_delays: Option<(std::time::Duration, std::time::Duration)>,
 }
 /// A resolver a test installs under the egress guard (feature `testkit`).
 #[derive(Clone, Default)]
@@ -281,6 +286,25 @@ impl Notifications {
     pub fn with_push_lookup(mut self, lookup: Arc<dyn egress::Lookup>) -> Self {
         self.push_lookup = LookupOverride(Some(lookup));
         self
+    }
+    /// The block with other busy hand-off delays for webhooks (feature
+    /// `testkit`): the first and the longest.
+    #[cfg(feature = "testkit")]
+    pub fn with_webhook_busy_delays(
+        mut self,
+        first: std::time::Duration,
+        longest: std::time::Duration,
+    ) -> Self {
+        self.busy_delays = Some((first, longest));
+        self
+    }
+    /// Whether the periodic count of webhook secrets runs (it starts with
+    /// the block when webhooks are on and stops at shutdown).
+    pub fn counting_secrets(&self) -> bool {
+        self.secret_counter
+            .lock()
+            .map(|h| h.as_ref().is_some_and(|h| !h.is_finished()))
+            .unwrap_or(false)
     }
     /// [`Notifications::with_push_lookup`]: one resolver serves both
     /// guarded destinations.
@@ -479,13 +503,17 @@ impl Module for Notifications {
                         .0
                         .clone()
                         .unwrap_or_else(|| Arc::new(egress::SystemLookup));
-                    Some(Arc::new(webhooks::WebhookSender::new(
+                    let mut sender = webhooks::WebhookSender::new(
                         &settings,
                         webhooks,
                         self.facts.no_egress,
                         lookup,
                         metrics.clone(),
-                    )?))
+                    )?;
+                    if let Some(delays) = self.busy_delays {
+                        sender.busy_delays = delays;
+                    }
+                    Some(Arc::new(sender))
                 }
                 None => None,
             };
@@ -563,7 +591,12 @@ impl Module for Notifications {
             if let Some(core) = self.core.get().filter(|c| c.webhooks.is_some()) {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 let _ = webhooks::tasks::count_secrets(core, deadline).await;
-                webhooks::tasks::count_secrets_periodically(core.clone());
+                let handle = webhooks::tasks::count_secrets_periodically(core.clone());
+                if let Ok(mut slot) = self.secret_counter.lock()
+                    && let Some(previous) = slot.replace(handle)
+                {
+                    previous.abort();
+                }
             }
             let streams =
                 stream::Streams::new(settings.sse.clone(), &ctx.telemetry().meter(METER_SCOPE));
@@ -617,6 +650,11 @@ impl Module for Notifications {
         Box::pin(async move {
             if let Some(streams) = self.streams.get() {
                 streams.shutdown(deadline).await;
+            }
+            let counter = self.secret_counter.lock().ok().and_then(|mut h| h.take());
+            if let Some(counter) = counter {
+                counter.abort();
+                let _ = tokio::time::timeout_at(deadline.into(), counter).await;
             }
         })
     }

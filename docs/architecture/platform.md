@@ -1979,11 +1979,18 @@ type of the catalog or `prefix.*`; an empty filter matches every type.
   at `Application`): it counts from the database on every call, whatever
   instance answers, `{current_key_id, previous_key_configured,
   previous_key, unreadable, previous_key_removable}`, and the previous key
-  may go only when `previous_key` is 0. The gauges
+  may go only when `previous_key` is 0 (`previous_key_removable`).
+  `previous_key` counts every endpoint with a secret still under another
+  key, including one found unreadable under another previous key, since
+  the keys now configured were not all tried on it. `unreadable` counts
+  only endpoints tried with exactly the configured pair: neither key opens
+  them, so they do not block removing the previous key, which loses
+  nothing of theirs. The gauges
   `merezha.webhook.secrets.previous_key` and
   `merezha.webhook.secrets.unreadable` show the same counts: every
-  instance counts at start, every 5 minutes and after a `retention` run,
-  and reports nothing before its first count. A secret neither key opens is marked
+  instance counts at start, every 5 minutes (a task stopped at shutdown)
+  and after a `retention` run, and reports nothing before its first
+  count. A secret neither key opens is marked
   with the pair of keys it was tried with and its ciphertext, skipped by
   later runs and left out of `previous_key`; `unreadable` counts these.
   Its deliveries fail `secret_unreadable`. To recover, configure the key
