@@ -133,6 +133,53 @@ pub fn check_catalogued(events: &[Recorded]) -> Result<(), String> {
     }
 }
 
+/// Check the JSON lines a `merezha` process wrote to stderr against the
+/// catalog: each line's `event` is listed (or is the fixed
+/// `dependency.log` of other crates) and its `level` is one of the event's
+/// catalog levels. Process tests read stderr rather than a [`Harness`], so
+/// this is their catalog test; the JSON formatter drops the fields a row
+/// does not list, so only names and levels can be checked here. Lines that
+/// are not JSON objects (`format = "text"`) are skipped.
+///
+/// ```
+/// use merezha_telemetry::testing::check_stderr_catalogued;
+/// assert!(check_stderr_catalogued(r#"{"event":"listener.ready","level":"info"}"#).is_ok());
+/// assert!(check_stderr_catalogued(r#"{"event":"listener.readied","level":"info"}"#).is_err());
+/// assert!(check_stderr_catalogued(r#"{"event":"listener.ready","level":"error"}"#).is_err());
+/// ```
+pub fn check_stderr_catalogued(stderr: &str) -> Result<(), String> {
+    let mut problems = Vec::new();
+    for line in stderr.lines() {
+        let Ok(serde_json::Value::Object(fields)) = serde_json::from_str(line) else {
+            continue;
+        };
+        let Some(name) = fields.get("event").and_then(|e| e.as_str()) else {
+            problems.push(format!("a line without an event name: {line}"));
+            continue;
+        };
+        if name == crate::json::DEPENDENCY_EVENT {
+            continue;
+        }
+        let Some(row) = names::event(name) else {
+            problems.push(format!("{name} is not in names::EVENTS"));
+            continue;
+        };
+        let level = fields.get("level").and_then(|l| l.as_str()).unwrap_or("");
+        if !row
+            .levels
+            .iter()
+            .any(|l| l.as_str().eq_ignore_ascii_case(level))
+        {
+            problems.push(format!("{name} at {level:?} is not a catalog level"));
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
+    }
+}
+
 /// One metric point: attributes and the value (sum or gauge value,
 /// histogram count), plus a histogram's sum of recorded values.
 #[derive(Clone, Debug, PartialEq)]

@@ -3,7 +3,7 @@ on:
   push:
     branches: [main, feat/component-runtime]
   pull_request:
-    paths: ['Cargo.toml', 'Cargo.lock', 'crates/**', 'wit/**', '.github/workflows/host.yml']
+    paths: ['Cargo.toml', 'Cargo.lock', 'crates/**', 'deploy/telemetry/**', 'wit/**', '.github/workflows/host.yml']
 permissions:
   contents: read
 jobs:

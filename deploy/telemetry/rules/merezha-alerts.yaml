@@ -1,0 +1,191 @@
+# Merezha alerts (docs/design/telemetry.md §7), over the series of
+# merezha-recording.yaml and the catalog metrics in their Prometheus 3 / Mimir
+# OTLP spelling. Load both files together.
+#
+# `severity: page` wants a person now; `severity: ticket` wants a look within
+# a working day. Route them in Alertmanager or Grafana alerting.
+# docs/operations/telemetry.md explains each alert and what to check first.
+groups:
+  # Multi-window burn rates over a 30-day SLO window (SRE workbook, chapter 5).
+  - name: merezha-slo
+    rules:
+      - alert: MerezhaHttpAvailabilityBudgetBurn
+        expr: |
+          (job:merezha_http_errors:ratio_rate1h > (14.4 * 0.001) and job:merezha_http_errors:ratio_rate5m > (14.4 * 0.001))
+          or
+          (job:merezha_http_errors:ratio_rate6h > (6 * 0.001) and job:merezha_http_errors:ratio_rate30m > (6 * 0.001))
+        labels:
+          severity: page
+          slo: http-availability
+        annotations:
+          summary: '{{ $labels.job }} is burning its 99.9% HTTP availability budget fast'
+          description: '{{ $labels.job }} answers 5xx to {{ $value | humanizePercentage }} of its requests (health routes excluded). At this rate the 30-day error budget is gone within days.'
+      - alert: MerezhaHttpAvailabilityBudgetBurnSlow
+        expr: |
+          job:merezha_http_errors:ratio_rate3d > 0.001 and job:merezha_http_errors:ratio_rate6h > 0.001
+        labels:
+          severity: ticket
+          slo: http-availability
+        annotations:
+          summary: '{{ $labels.job }} is spending its HTTP availability budget faster than it accrues'
+          description: '{{ $labels.job }} answered 5xx to {{ $value | humanizePercentage }} of its requests over 3 days, above the 0.1% budget.'
+      - alert: MerezhaHttpLatencyBudgetBurn
+        expr: |
+          (job:merezha_http_slow:ratio_rate1h > (14.4 * 0.01) and job:merezha_http_slow:ratio_rate5m > (14.4 * 0.01))
+          or
+          (job:merezha_http_slow:ratio_rate6h > (6 * 0.01) and job:merezha_http_slow:ratio_rate30m > (6 * 0.01))
+        labels:
+          severity: page
+          slo: http-latency
+        annotations:
+          summary: '{{ $labels.job }} is burning its HTTP latency budget fast'
+          description: '{{ $value | humanizePercentage }} of the requests of {{ $labels.job }} take longer than 500 ms; the objective is 1%.'
+      - alert: MerezhaHttpLatencyBudgetBurnSlow
+        expr: |
+          job:merezha_http_slow:ratio_rate3d > 0.01 and job:merezha_http_slow:ratio_rate6h > 0.01
+        labels:
+          severity: ticket
+          slo: http-latency
+        annotations:
+          summary: '{{ $labels.job }} is spending its HTTP latency budget faster than it accrues'
+          description: '{{ $value | humanizePercentage }} of the requests of {{ $labels.job }} took longer than 500 ms over 3 days; the objective is 1%.'
+
+  - name: merezha-application
+    rules:
+      - alert: MerezhaCommandFailures
+        expr: job:merezha_command_failures:ratio_rate10m > 0.01
+        labels:
+          severity: page
+        annotations:
+          summary: '{{ $labels.job }} fails {{ $value | humanizePercentage }} of its commands'
+          description: 'Commands end `failed` (transient, internal, timeout, guest trap or limit, storage failure). Rejections and conflicts are not counted. Check command.completed warnings and the guest and database panels.'
+      - alert: MerezhaCommandRejections
+        expr: job:merezha_command_rejections:ratio_rate30m > 0.5
+        labels:
+          severity: ticket
+        annotations:
+          summary: '{{ $labels.job }} rejects {{ $value | humanizePercentage }} of its commands'
+          description: 'More than half of the commands are rejected (validation or domain rules): likely a client bug.'
+      - alert: MerezhaProjectionLagging
+        expr: job:merezha_projection_lag_age_seconds:max > 60
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: 'Projection {{ $labels.merezha_projection_name }} of {{ $labels.job }} is {{ $value | humanizeDuration }} behind'
+          description: 'The oldest event the projection has not processed is older than 60 s. Check projection.failed logs and GET /v1/application/projections.'
+      - alert: MerezhaProjectionStalled
+        expr: job:merezha_projection_lag_age_seconds:max > 300
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: 'Projection {{ $labels.merezha_projection_name }} of {{ $labels.job }} is {{ $value | humanizeDuration }} behind'
+          description: 'Queries on this projection serve data more than 5 minutes old. Check projection.failed logs and GET /v1/application/projections.'
+      - alert: MerezhaReactorHalted
+        expr: max by (job, merezha_reactor_name) (merezha_reactor_halted_ratio) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: 'Reactor {{ $labels.merezha_reactor_name }} of {{ $labels.job }} is halted'
+          description: 'The reactor stopped at an event it cannot handle (reactor.halted). Fix the guest or skip the event through the reactors admin API, then resume it.'
+
+  - name: merezha-jobs
+    rules:
+      - alert: MerezhaOutboxLagging
+        expr: job:merezha_outbox_lag_seconds:max > 120
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: 'The outbox of {{ $labels.job }} is {{ $value | humanizeDuration }} behind'
+          description: 'Records wait in the outbox: events reach no subscriber and no job is enqueued from them. Check outbox.relay_failed logs and the database.'
+      - alert: MerezhaJobsLagging
+        expr: job:merezha_job_lag_seconds:max > 300
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: 'Queue {{ $labels.job_queue }} of {{ $labels.job }} is {{ $value | humanizeDuration }} behind'
+          description: 'The oldest due job has waited more than 5 minutes. Raise the queue concurrency or look for slow handlers (merezha.job.duration).'
+      - alert: MerezhaJobsDeadLettered
+        expr: sum by (job, job_queue) (increase(merezha_job_dead_lettered_total[15m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: 'Jobs of queue {{ $labels.job_queue }} of {{ $labels.job }} were dead-lettered'
+          description: 'A job exhausted its attempts or failed permanently (job.dead_lettered). Inspect it with the jobs admin API and replay it once fixed.'
+
+  - name: merezha-notifications
+    rules:
+      - alert: MerezhaNotificationDeliveryFailures
+        expr: job:merezha_notification_delivery_failures:ratio_rate30m > 0.05
+        labels:
+          severity: ticket
+        annotations:
+          summary: '{{ $value | humanizePercentage }} of {{ $labels.notify_channel }} deliveries of {{ $labels.job }} fail'
+          description: 'Deliveries end failed, bounced or expired. Check the provider account (notification.provider_account_error) and the recipients.'
+      - alert: MerezhaNotificationDeliveryFailuresHigh
+        expr: job:merezha_notification_delivery_failures:ratio_rate15m > 0.25
+        labels:
+          severity: page
+        annotations:
+          summary: '{{ $value | humanizePercentage }} of {{ $labels.notify_channel }} deliveries of {{ $labels.job }} fail'
+          description: 'A quarter of the deliveries fail: the provider or its credentials are likely broken. Check notification.provider_account_error and notification.failed logs.'
+
+  - name: merezha-resources
+    rules:
+      - alert: MerezhaDatabasePoolSaturated
+        expr: max by (job, instance, db_client_connection_pool_name) (db_client_connection_pending_requests) > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: 'Requests wait for database connections on {{ $labels.instance }} ({{ $labels.job }})'
+          description: 'The {{ $labels.db_client_connection_pool_name }} pool has had waiters for 5 minutes. Raise database.pool_size within the server''s connection limit, or look for long transactions.'
+      - alert: MerezhaDatabasePoolTimeouts
+        expr: sum by (job, instance, db_client_connection_pool_name) (increase(db_client_connection_timeouts_total[5m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: 'Database connection waits time out on {{ $labels.instance }} ({{ $labels.job }})'
+          description: 'Callers gave up waiting for a {{ $labels.db_client_connection_pool_name }} connection (db.pool_timeout).'
+      - alert: MerezhaGuestLimits
+        expr: job:merezha_guest_limit_outcomes:ratio_rate15m > 0.01
+        labels:
+          severity: ticket
+        annotations:
+          summary: '{{ $value | humanizePercentage }} of {{ $labels.merezha_guest_service }} invocations of {{ $labels.job }} hit a limit'
+          description: 'Guest calls stop on fuel, memory or time limits. Check the guest for expensive inputs or raise the [limits] of the runtime manifest.'
+
+  - name: merezha-telemetry
+    rules:
+      # Every exporting instance reports merezha.telemetry.exported. A
+      # service that reported within the last hour and stopped has gone
+      # away. For a service that must always run, add
+      # `absent_over_time(merezha_telemetry_exported_total{job="<service>"}[10m])`.
+      - alert: MerezhaInstanceAbsent
+        expr: |
+          group by (job) (last_over_time(merezha_telemetry_exported_total[1h]))
+          unless
+          group by (job) (last_over_time(merezha_telemetry_exported_total[10m]))
+        labels:
+          severity: page
+        annotations:
+          summary: '{{ $labels.job }} has reported no telemetry for 10 minutes'
+          description: 'No instance of {{ $labels.job }} exported metrics for 10 minutes: every instance is down or cannot reach the collector.'
+      - alert: MerezhaTelemetryDropped
+        expr: sum by (job, merezha_telemetry_signal, merezha_reason) (increase(merezha_telemetry_dropped_total[15m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: '{{ $labels.job }} dropped {{ $labels.merezha_telemetry_signal }} ({{ $labels.merezha_reason }})'
+          description: 'Telemetry items were lost: queue_full means the collector is slow or the queue too small, export_failed that the collector refuses or is unreachable (telemetry.export_failed on stderr).'
+      - alert: MerezhaMetricOverflow
+        expr: count by (job) ({otel_metric_overflow="true"}) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: 'A metric of {{ $labels.job }} overflowed its cardinality limit'
+          description: '{{ $value }} series of {{ $labels.job }} carry otel_metric_overflow="true": an instrument exceeded 2000 attribute sets, so an attribute value is not from a closed set. Query {otel_metric_overflow="true"} to find the instrument.'

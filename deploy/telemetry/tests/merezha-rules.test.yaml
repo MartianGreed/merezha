@@ -1,0 +1,257 @@
+# promtool unit tests for the rule files:
+#   promtool test rules deploy/telemetry/tests/merezha-rules.test.yaml
+# scripts/check-telemetry-artifacts.sh runs them in CI. Series use the names
+# the Prometheus 3 OTLP translation gives the catalog metrics.
+rule_files:
+  - ../rules/merezha-recording.yaml
+  - ../rules/merezha-alerts.yaml
+evaluation_interval: 1m
+tests:
+  # 5% of the application requests fail: both availability alerts fire.
+  # Health probes answering 503 stay out of the ratio.
+  - interval: 1m
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/v1/application/commands", http_response_status_code="200"}'
+        values: '0+95x120'
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/v1/application/commands", http_response_status_code="500"}'
+        values: '0+5x120'
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/health/ready", http_response_status_code="503"}'
+        values: '0+1000x120'
+    promql_expr_test:
+      - expr: job:merezha_http_errors:ratio_rate5m
+        eval_time: 30m
+        exp_samples:
+          - labels: 'job:merezha_http_errors:ratio_rate5m{job="tasks"}'
+            value: 0.05
+    alert_rule_test:
+      - alertname: MerezhaHttpAvailabilityBudgetBurn
+        eval_time: 65m
+        exp_alerts:
+          - exp_labels: {job: tasks, severity: page, slo: http-availability}
+            exp_annotations:
+              summary: 'tasks is burning its 99.9% HTTP availability budget fast'
+              description: 'tasks answers 5xx to 5% of its requests (health routes excluded). At this rate the 30-day error budget is gone within days.'
+      - alertname: MerezhaHttpAvailabilityBudgetBurnSlow
+        eval_time: 65m
+        exp_alerts:
+          - exp_labels: {job: tasks, severity: ticket, slo: http-availability}
+            exp_annotations:
+              summary: 'tasks is spending its HTTP availability budget faster than it accrues'
+              description: 'tasks answered 5xx to 5% of its requests over 3 days, above the 0.1% budget.'
+
+  # Only health probes fail: no availability alert.
+  - interval: 1m
+    input_series:
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/v1/application/queries", http_response_status_code="200"}'
+        values: '0+100x120'
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/health/ready", http_response_status_code="503"}'
+        values: '0+100x120'
+    alert_rule_test:
+      - alertname: MerezhaHttpAvailabilityBudgetBurn
+        eval_time: 65m
+        exp_alerts: []
+      - alertname: MerezhaHttpAvailabilityBudgetBurnSlow
+        eval_time: 65m
+        exp_alerts: []
+
+  # 20% of requests take longer than 500 ms: the latency page fires.
+  - interval: 1m
+    input_series:
+      - series: 'http_server_request_duration_seconds_bucket{job="tasks", instance="a", http_route="/v1/application/queries", le="0.5"}'
+        values: '0+80x120'
+      - series: 'http_server_request_duration_seconds_bucket{job="tasks", instance="a", http_route="/v1/application/queries", le="+Inf"}'
+        values: '0+100x120'
+      - series: 'http_server_request_duration_seconds_count{job="tasks", instance="a", http_route="/v1/application/queries"}'
+        values: '0+100x120'
+    alert_rule_test:
+      - alertname: MerezhaHttpLatencyBudgetBurn
+        eval_time: 65m
+        exp_alerts:
+          - exp_labels: {job: tasks, severity: page, slo: http-latency}
+            exp_annotations:
+              summary: 'tasks is burning its HTTP latency budget fast'
+              description: '20% of the requests of tasks take longer than 500 ms; the objective is 1%.'
+
+  # 2% of commands fail and 60% are rejected.
+  - interval: 1m
+    input_series:
+      - series: 'merezha_command_duration_seconds_count{job="tasks", instance="a", merezha_command_tag="CreateTask", merezha_outcome="accepted"}'
+        values: '0+38x60'
+      - series: 'merezha_command_duration_seconds_count{job="tasks", instance="a", merezha_command_tag="CreateTask", merezha_outcome="failed"}'
+        values: '0+2x60'
+      - series: 'merezha_command_duration_seconds_count{job="tasks", instance="a", merezha_command_tag="CompleteTask", merezha_outcome="rejected"}'
+        values: '0+60x60'
+    alert_rule_test:
+      - alertname: MerezhaCommandFailures
+        eval_time: 40m
+        exp_alerts:
+          - exp_labels: {job: tasks, severity: page}
+            exp_annotations:
+              summary: 'tasks fails 2% of its commands'
+              description: 'Commands end `failed` (transient, internal, timeout, guest trap or limit, storage failure). Rejections and conflicts are not counted. Check command.completed warnings and the guest and database panels.'
+      - alertname: MerezhaCommandRejections
+        eval_time: 40m
+        exp_alerts:
+          - exp_labels: {job: tasks, severity: ticket}
+            exp_annotations:
+              summary: 'tasks rejects 60% of its commands'
+              description: 'More than half of the commands are rejected (validation or domain rules): likely a client bug.'
+
+  # A projection 100 s behind on two instances: a ticket after 10 minutes,
+  # no page. The maximum over instances is the lag.
+  - interval: 1m
+    input_series:
+      - series: 'merezha_projection_lag_age_seconds{job="tasks", instance="a", merezha_projection_name="tasks.board"}'
+        values: '100x30'
+      - series: 'merezha_projection_lag_age_seconds{job="tasks", instance="b", merezha_projection_name="tasks.board"}'
+        values: '20x30'
+    alert_rule_test:
+      - alertname: MerezhaProjectionLagging
+        eval_time: 5m
+        exp_alerts: []
+      - alertname: MerezhaProjectionLagging
+        eval_time: 15m
+        exp_alerts:
+          - exp_labels: {job: tasks, merezha_projection_name: tasks.board, severity: ticket}
+            exp_annotations:
+              summary: 'Projection tasks.board of tasks is 1m 40s behind'
+              description: 'The oldest event the projection has not processed is older than 60 s. Check projection.failed logs and GET /v1/application/projections.'
+      - alertname: MerezhaProjectionStalled
+        eval_time: 15m
+        exp_alerts: []
+
+  # A reactor halts at minute 2 and pages after 5 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'merezha_reactor_halted_ratio{job="tasks", instance="a", merezha_reactor_name="task-notifier"}'
+        values: '0 0 1x20'
+    alert_rule_test:
+      - alertname: MerezhaReactorHalted
+        eval_time: 5m
+        exp_alerts: []
+      - alertname: MerezhaReactorHalted
+        eval_time: 8m
+        exp_alerts:
+          - exp_labels: {job: tasks, merezha_reactor_name: task-notifier, severity: page}
+            exp_annotations:
+              summary: 'Reactor task-notifier of tasks is halted'
+              description: 'The reactor stopped at an event it cannot handle (reactor.halted). Fix the guest or skip the event through the reactors admin API, then resume it.'
+
+  # The outbox and a queue fall behind; a job is dead-lettered.
+  - interval: 1m
+    input_series:
+      - series: 'merezha_outbox_lag_seconds{job="tasks", instance="a"}'
+        values: '200x30'
+      - series: 'merezha_job_lag_seconds{job="tasks", instance="a", job_queue="notify.email"}'
+        values: '400x30'
+      - series: 'merezha_job_dead_lettered_total{job="tasks", instance="a", job_queue="notify.email", job_kind="notify.email"}'
+        values: '0 0 0 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - alertname: MerezhaOutboxLagging
+        eval_time: 12m
+        exp_alerts:
+          - exp_labels: {job: tasks, severity: page}
+            exp_annotations:
+              summary: 'The outbox of tasks is 3m 20s behind'
+              description: 'Records wait in the outbox: events reach no subscriber and no job is enqueued from them. Check outbox.relay_failed logs and the database.'
+      - alertname: MerezhaJobsLagging
+        eval_time: 12m
+        exp_alerts: []
+      - alertname: MerezhaJobsLagging
+        eval_time: 17m
+        exp_alerts:
+          - exp_labels: {job: tasks, job_queue: notify.email, severity: ticket}
+            exp_annotations:
+              summary: 'Queue notify.email of tasks is 6m 40s behind'
+              description: 'The oldest due job has waited more than 5 minutes. Raise the queue concurrency or look for slow handlers (merezha.job.duration).'
+      - alertname: MerezhaJobsDeadLettered
+        eval_time: 5m
+        exp_alerts:
+          - exp_labels: {job: tasks, job_queue: notify.email, severity: ticket}
+            exp_annotations:
+              summary: 'Jobs of queue notify.email of tasks were dead-lettered'
+              description: 'A job exhausted its attempts or failed permanently (job.dead_lettered). Inspect it with the jobs admin API and replay it once fixed.'
+
+  # 10% of email deliveries fail: a ticket, not a page. `accepted` is not a
+  # terminal status and stays out of the ratio.
+  - interval: 1m
+    input_series:
+      - series: 'merezha_notification_deliveries_total{job="tasks", instance="a", notify_channel="email", notify_topic="tasks.completed", notify_status="accepted", notify_reason="none"}'
+        values: '0+500x60'
+      - series: 'merezha_notification_deliveries_total{job="tasks", instance="a", notify_channel="email", notify_topic="tasks.completed", notify_status="delivered", notify_reason="none"}'
+        values: '0+90x60'
+      - series: 'merezha_notification_deliveries_total{job="tasks", instance="a", notify_channel="email", notify_topic="tasks.completed", notify_status="bounced", notify_reason="hard_bounce"}'
+        values: '0+10x60'
+    alert_rule_test:
+      - alertname: MerezhaNotificationDeliveryFailures
+        eval_time: 40m
+        exp_alerts:
+          - exp_labels: {job: tasks, notify_channel: email, severity: ticket}
+            exp_annotations:
+              summary: '10% of email deliveries of tasks fail'
+              description: 'Deliveries end failed, bounced or expired. Check the provider account (notification.provider_account_error) and the recipients.'
+      - alertname: MerezhaNotificationDeliveryFailuresHigh
+        eval_time: 40m
+        exp_alerts: []
+
+  # Pool waiters for 5 minutes, and guests hitting their fuel limit.
+  - interval: 1m
+    input_series:
+      - series: 'db_client_connection_pending_requests{job="tasks", instance="a", db_client_connection_pool_name="merezha"}'
+        values: '3x10'
+      - series: 'merezha_guest_invocation_duration_seconds_count{job="tasks", instance="a", merezha_guest_service="task-domain", merezha_guest_operation="decide", merezha_guest_outcome="ok"}'
+        values: '0+95x30'
+      - series: 'merezha_guest_invocation_duration_seconds_count{job="tasks", instance="a", merezha_guest_service="task-domain", merezha_guest_operation="decide", merezha_guest_outcome="fuel_exhausted"}'
+        values: '0+5x30'
+    alert_rule_test:
+      - alertname: MerezhaDatabasePoolSaturated
+        eval_time: 7m
+        exp_alerts:
+          - exp_labels: {job: tasks, instance: a, db_client_connection_pool_name: merezha, severity: ticket}
+            exp_annotations:
+              summary: 'Requests wait for database connections on a (tasks)'
+              description: 'The merezha pool has had waiters for 5 minutes. Raise database.pool_size within the server''s connection limit, or look for long transactions.'
+      - alertname: MerezhaGuestLimits
+        eval_time: 20m
+        exp_alerts:
+          - exp_labels: {job: tasks, merezha_guest_service: task-domain, severity: ticket}
+            exp_annotations:
+              summary: '5% of task-domain invocations of tasks hit a limit'
+              description: 'Guest calls stop on fuel, memory or time limits. Check the guest for expensive inputs or raise the [limits] of the runtime manifest.'
+
+  # An instance stops exporting at minute 20; the telemetry alerts.
+  - interval: 1m
+    input_series:
+      - series: 'merezha_telemetry_exported_total{job="tasks", instance="a", merezha_telemetry_signal="metrics", merezha_outcome="ok"}'
+        values: '0+10x20 _x40'
+      - series: 'merezha_telemetry_exported_total{job="billing", instance="b", merezha_telemetry_signal="metrics", merezha_outcome="ok"}'
+        values: '0+10x60'
+      - series: 'merezha_telemetry_dropped_total{job="billing", instance="b", merezha_telemetry_signal="traces", merezha_reason="queue_full"}'
+        values: '0x30 5x30'
+      - series: 'merezha_command_duration_seconds_count{job="billing", instance="b", otel_metric_overflow="true"}'
+        values: '1x60'
+    alert_rule_test:
+      - alertname: MerezhaInstanceAbsent
+        eval_time: 25m
+        exp_alerts: []
+      - alertname: MerezhaInstanceAbsent
+        eval_time: 35m
+        exp_alerts:
+          - exp_labels: {job: tasks, severity: page}
+            exp_annotations:
+              summary: 'tasks has reported no telemetry for 10 minutes'
+              description: 'No instance of tasks exported metrics for 10 minutes: every instance is down or cannot reach the collector.'
+      - alertname: MerezhaTelemetryDropped
+        eval_time: 35m
+        exp_alerts:
+          - exp_labels: {job: billing, merezha_telemetry_signal: traces, merezha_reason: queue_full, severity: ticket}
+            exp_annotations:
+              summary: 'billing dropped traces (queue_full)'
+              description: 'Telemetry items were lost: queue_full means the collector is slow or the queue too small, export_failed that the collector refuses or is unreachable (telemetry.export_failed on stderr).'
+      - alertname: MerezhaMetricOverflow
+        eval_time: 35m
+        exp_alerts:
+          - exp_labels: {job: billing, severity: ticket}
+            exp_annotations:
+              summary: 'A metric of billing overflowed its cardinality limit'
+              description: '1 series of billing carry otel_metric_overflow="true": an instrument exceeded 2000 attribute sets, so an attribute value is not from a closed set. Query {otel_metric_overflow="true"} to find the instrument.'

@@ -103,6 +103,12 @@ where the role can create databases; otherwise they print a skip message.
 [platform guide](docs/architecture/platform.md) has the full configuration
 reference, the module and port contracts, and both local database setups.
 
+With `[telemetry] endpoint` set, the host exports traces, metrics and logs
+over OTLP. `merezha telemetry export --out ops/telemetry` writes the Grafana
+dashboards and Prometheus alert rules that match the host's metrics; the
+[telemetry operations guide](docs/operations/telemetry.md) covers production
+backends, collector topology, sampling and the alerts.
+
 ## License
 
 [MIT](LICENSE)
