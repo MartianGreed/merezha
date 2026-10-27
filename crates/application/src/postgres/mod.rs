@@ -19,6 +19,7 @@
 //! ([`crate::status`]) read the same rows.
 mod admin;
 mod reactor;
+mod retention;
 mod runner;
 mod scheduler;
 mod sql;
@@ -38,12 +39,16 @@ pub use admin::REJECTIONS_COUNTED;
 #[doc(hidden)]
 pub use reactor::ReactorOutcome;
 pub use reactor::{
-    COMMAND_KIND, COMMAND_QUEUE, CommandJob, EffectBody, EffectRequest, Effects, SOURCE,
+    COMMAND_KIND, COMMAND_QUEUE, CommandJob, EffectBody, EffectRequest, Effects,
+    MAX_MEMBERS_PER_CALL, SOURCE,
 };
+pub use retention::{RETENTION_INTERVAL, ReactorRetention};
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub use runner::FailOnce;
-pub use runner::{BackgroundOptions, CatchUp, INTERVAL, MAX_CONCURRENT, RUN_TIMEOUT};
+pub use runner::{
+    BackgroundOptions, CatchUp, INTERVAL, MAX_CONCURRENT, REACTOR_RETENTION, RUN_TIMEOUT,
+};
 #[doc(hidden)]
 pub use runner::{Pause, RunHooks};
 pub use scheduler::{EVENTS_CHANNEL, Scheduler};
@@ -83,6 +88,26 @@ pub const MIGRATIONS: &[Migration] = &[
         include_str!("migrations/0002_partitions.sql"),
     ),
     Migration::new(3, "reactors", include_str!("migrations/0003_reactors.sql")),
+    Migration::new(
+        4,
+        "reactor_guest_failures",
+        include_str!("migrations/0004_reactor_guest_failures.sql"),
+    ),
+    // Retention deletes the oldest rows first (`[application.reactors]
+    // retention`); built concurrently, so a large table keeps taking
+    // writes meanwhile (R15).
+    Migration::non_transactional(
+        5,
+        "reactor_rejections_by_age",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS reactor_rejections_by_age \
+         ON merezha_app.reactor_rejections (rejected_at)",
+    ),
+    Migration::non_transactional(
+        6,
+        "reactor_skips_by_age",
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS reactor_skips_by_age \
+         ON merezha_app.reactor_skips (skipped_at)",
+    ),
 ];
 /// Every statement the store runs, registered with `merezha-postgres`
 /// (TE §1.3): `app.*` names, the append `app.events.append`.

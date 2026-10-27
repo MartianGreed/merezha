@@ -24,8 +24,8 @@ use merezha_platform::{
     edge::Authenticated,
     host,
     ports::{
-        Contact, Directory, GrantSnapshot, Grants, JobContext, JobHandler, LoopbackAllowAll, Page,
-        PageRequest, PermissionSet, RoleKey, TenantId, UserId,
+        CaptureNotifications, Contact, Directory, GrantSnapshot, Grants, JobContext, JobHandler,
+        LoopbackAllowAll, Page, PageRequest, PermissionSet, RoleKey, TenantId, UserId,
     },
 };
 use merezha_postgres::{Database, TestDatabase};
@@ -207,7 +207,9 @@ start = "beginning"
 /// The project: the notifications block with topic `tasks.completed`
 /// (inbox and email, capture driver), webhooks with the event type
 /// `tasks.task_completed`, and the queues.
-fn project(dir: &Path, url: &str) -> ConfigInput {
+/// Without the notifications block (`notifications` false), the capture
+/// fallback takes the notify and webhook effects.
+fn project(dir: &Path, url: &str, notifications: bool) -> ConfigInput {
     let templates = dir.join("templates/tasks.completed");
     std::fs::create_dir_all(templates.join("en")).unwrap();
     std::fs::write(
@@ -227,14 +229,22 @@ fn project(dir: &Path, url: &str) -> ConfigInput {
     )
     .unwrap();
     let path = dir.join("merezha.toml");
+    let base = "[app]\nid = \"reactions\"\n[database]\nurl = { env = \"APP_DATABASE_URL\" }\nmigrate = true\n\
+             pool_size = 16\n[runtime]\nmanifest = \"runtime.toml\"\n\
+             [jobs]\npoll_interval_ms = 100\n[jobs.relay]\ninterval_ms = 100\n\
+             [jobs.queues.application]\nconcurrency = 2\nbackoff_base_ms = 100\n";
+    if !notifications {
+        std::fs::write(&path, base).unwrap();
+        return ConfigInput {
+            path,
+            env: vec![("APP_DATABASE_URL".into(), url.into())],
+            overrides: Vec::new(),
+        };
+    }
     std::fs::write(
         &path,
         format!(
-            "[app]\nid = \"reactions\"\n[database]\nurl = {{ env = \"APP_DATABASE_URL\" }}\nmigrate = true\n\
-             pool_size = 16\n[runtime]\nmanifest = \"runtime.toml\"\n\
-             [jobs]\npoll_interval_ms = 100\n[jobs.relay]\ninterval_ms = 100\n\
-             [jobs.queues.application]\nconcurrency = 2\nbackoff_base_ms = 100\n\
-             [jobs.queues.\"notify.webhook\"]\nbackoff_max_ms = 86400000\n\
+            "{base}[jobs.queues.\"notify.webhook\"]\nbackoff_max_ms = 86400000\n\
              [modules.notifications]\nsecret_key = {{ env = \"NOTIFY_KEY\" }}\n\
              [modules.notifications.templates]\ndir = \"{}\"\n\
              [modules.notifications.webhooks]\n\
@@ -262,6 +272,17 @@ struct World {
     application: Arc<OnceLock<Application>>,
     people: Arc<People>,
     db: Database,
+}
+/// Provides the capture fallback as the notifier factory, so a test reads
+/// what it kept.
+struct Capturing(Arc<CaptureNotifications>);
+impl Module for Capturing {
+    fn name(&self) -> &'static str {
+        "capturing"
+    }
+    fn notifier(&self) -> Option<Arc<dyn merezha_platform::ports::NotifierFactory>> {
+        Some(self.0.clone())
+    }
 }
 /// A bearer token naming a user principal (`Bearer usr_ada@org_1` is
 /// `usr_ada` with active tenant `org_1`), as identity's session
@@ -303,12 +324,28 @@ impl World {
         Self::open(hooks, true).await
     }
     async fn open(hooks: RunHooks, authenticated: bool) -> Option<Self> {
+        Self::open_with(hooks, authenticated, None).await
+    }
+    /// [`World::open`], or with `capture` as the notifier factory and no
+    /// notifications block, as a host without `[modules.notifications]`.
+    async fn open_with(
+        hooks: RunHooks,
+        authenticated: bool,
+        capture: Option<Arc<CaptureNotifications>>,
+    ) -> Option<Self> {
         let test = TestDatabase::create()?;
         let dir = tempfile::tempdir().unwrap();
-        let input = project(dir.path(), test.url());
-        let notifications: Vec<Box<dyn Module>> =
-            vec![Box::new(Notifications::new(HostFacts::load(&input)))];
+        let input = project(dir.path(), test.url(), capture.is_none());
+        let notifications: Vec<Box<dyn Module>> = match capture {
+            None => vec![Box::new(Notifications::new(HostFacts::load(&input)))],
+            Some(_) => Vec::new(),
+        };
         let (config, mut modules) = host::configure(&input, notifications).unwrap();
+        // Configured modules only come back with a section; this one has
+        // none.
+        if let Some(factory) = capture {
+            modules.push(Box::new(Capturing(factory)));
+        }
         let authorizer: Arc<dyn merezha_platform::ports::Authorizer> = if authenticated {
             Arc::new(GrantPolicy)
         } else {
@@ -1029,4 +1066,62 @@ async fn a_guest_event_reaches_an_open_inbox_stream_through_its_reaction() {
     );
     drop(reader);
     drop(world.host);
+}
+
+/// Issue #69: without the notifications block the capture fallback keeps
+/// (and logs) a reaction's records only once the checkpoint transaction
+/// committed, so a batch rolled back and run again captures each effect
+/// once, not once per attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_capture_fallback_records_a_rolled_back_batch_once_after_commit() {
+    let fail = Arc::new(FailOnce::default());
+    fail.arm("task-notifier");
+    let hooks = RunHooks {
+        reactor_fail: Some(fail.clone()),
+        ..RunHooks::default()
+    };
+    let capture = Arc::new(CaptureNotifications::default());
+    let Some(world) = World::open_with(hooks, false, Some(capture.clone())).await else {
+        return;
+    };
+    world
+        .blocking(|app| {
+            app.command(Command {
+                tag: id("Emit"),
+                stream: id("t-1"),
+                payload: json!({"tag": "TaskCompleted", "payload": {"effects": [
+                    {"effect": "webhook", "event_type": "tasks.task_completed", "data": {}},
+                    notify("usr_ada", "tasks.completed"),
+                ]}}),
+                metadata: metadata(),
+                idempotency_key: None,
+                expected_version: None,
+            })
+        })
+        .await
+        .unwrap();
+    world
+        .until(
+            "SELECT count(*) FROM merezha_app.reactors WHERE name = 'task-notifier' AND checkpoint = 1",
+            1,
+        )
+        .await;
+    assert!(fail.fired(), "the first checkpoint transaction rolled back");
+    let mut kept: Vec<(String, &str)> = capture
+        .captured()
+        .into_iter()
+        .filter(|c| c.dedupe_key.starts_with("reaction:task-notifier:"))
+        .map(|c| (c.dedupe_key, c.kind))
+        .collect();
+    kept.sort();
+    assert_eq!(
+        kept,
+        [
+            ("reaction:task-notifier:event/1:0".to_owned(), "webhook"),
+            (
+                "reaction:task-notifier:event/1:1".to_owned(),
+                "notification"
+            ),
+        ]
+    );
 }

@@ -423,6 +423,91 @@ async fn is_member_leaves_out_disabled_and_unverified_users() {
     assert!(!directory.is_member(&ada, &tenant).await.unwrap());
 }
 
+/// Issue #69: `members_among` answers what `is_member` answers, for a set
+/// of users in one query: members only, active and verified, each id as
+/// given, at most `MAX_USERS_PER_CALL` ids.
+#[tokio::test]
+async fn members_among_answers_is_member_for_a_set_of_users() {
+    let Some(world) = World::new(&base()).await else {
+        return;
+    };
+    let i = world.instance().await;
+    let mut owner = user(&world, &i, "owner@example.com").await;
+    let mut ada = user(&world, &i, "ada@example.com").await;
+    let _bob = user(&world, &i, "bob@example.com").await;
+    let k = organization(&i, &mut owner, "kappa").await;
+    join(
+        &world,
+        &i,
+        &mut owner,
+        &k,
+        &mut ada,
+        "ada@example.com",
+        &[MEMBER_ROLE],
+    )
+    .await;
+    let id_of = async |email: &str| {
+        let client = world.db.acquire(soon()).await.unwrap();
+        let hex: String = client
+            .query_one(
+                "SELECT replace(id::text, '-', '') FROM merezha_identity.users \
+                 WHERE email_normalized = $1",
+                &[&email],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        merezha_domain::Identity::new(format!("usr_{hex}")).unwrap()
+    };
+    let (owner, ada, bob) = (
+        id_of("owner@example.com").await,
+        id_of("ada@example.com").await,
+        id_of("bob@example.com").await,
+    );
+    let directory = i.handle.directory();
+    let tenant = merezha_domain::Identity::new(k.clone()).unwrap();
+    let asked = [
+        bob.clone(),
+        ada.clone(),
+        merezha_domain::Identity::new("not-a-user").unwrap(),
+        owner.clone(),
+        ada.clone(),
+    ];
+    let mut members = directory.members_among(&tenant, &asked).await.unwrap();
+    members.sort();
+    let mut expected = vec![ada.clone(), owner.clone()];
+    expected.sort();
+    assert_eq!(members, expected);
+    for user in [&owner, &ada, &bob] {
+        assert_eq!(
+            directory.is_member(user, &tenant).await.unwrap(),
+            expected.contains(user)
+        );
+    }
+    world.execute("UPDATE merezha_identity.users SET status = 'disabled' WHERE email_normalized = 'ada@example.com'").await;
+    assert_eq!(
+        directory.members_among(&tenant, &asked).await.unwrap(),
+        std::slice::from_ref(&owner)
+    );
+    let other = merezha_domain::Identity::new("org_00000000000000000000000000").unwrap();
+    assert!(
+        directory
+            .members_among(&other, &asked)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let many = vec![owner; merezha_platform::ports::MAX_USERS_PER_CALL + 1];
+    assert_eq!(
+        directory
+            .members_among(&tenant, &many)
+            .await
+            .unwrap_err()
+            .code,
+        "too_many_ids"
+    );
+}
+
 /// Admin X with a service account holding `admin` and a key on it listing
 /// every admin permission: the owner, X, X's membership, the
 /// organization, the key.

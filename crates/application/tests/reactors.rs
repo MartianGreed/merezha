@@ -234,16 +234,20 @@ impl Fake {
 /// refuses topic `unknown.topic` (`unknown_topic`, as the notifications
 /// block's `validate`); `write` refuses a `user` recipient missing from
 /// `members` on a tenant event (`recipient_not_in_tenant`, as
-/// `Notifier::request`). `is_member` answers from `members` and records a
-/// call made while a checkpoint transaction is open.
+/// `Notifier::request`). `members` answers from `members` and records a
+/// call made while a checkpoint transaction is open. `committed` records
+/// the dedupe keys of every batch that committed.
 struct TestEffects {
     db: Database,
     members: Mutex<BTreeSet<(String, String)>>,
     directory_down: AtomicBool,
     unavailable: AtomicBool,
-    /// `is_member` calls made while a reactor session was in a transaction.
+    /// `members` calls made while a reactor session was in a transaction.
     tripped: AtomicUsize,
+    /// `members` calls, and the users they asked about.
     asked: AtomicUsize,
+    asked_users: AtomicUsize,
+    committed: Mutex<Vec<String>>,
 }
 impl TestEffects {
     fn new(db: Database) -> Arc<Self> {
@@ -254,6 +258,8 @@ impl TestEffects {
             unavailable: AtomicBool::new(false),
             tripped: AtomicUsize::new(0),
             asked: AtomicUsize::new(0),
+            asked_users: AtomicUsize::new(0),
+            committed: Mutex::default(),
         })
     }
     fn member(&self, user: &str, tenant: &str) {
@@ -272,13 +278,17 @@ impl Effects for TestEffects {
             _ => Ok(()),
         }
     }
-    fn is_member<'a>(
+    fn members<'a>(
         &'a self,
-        user: &'a Identity,
         tenant: &'a Identity,
-    ) -> BoxFuture<'a, Result<bool, Failure>> {
+        users: &'a [Identity],
+    ) -> BoxFuture<'a, Result<Vec<Identity>, Failure>> {
         Box::pin(async move {
             self.asked.fetch_add(1, Ordering::SeqCst);
+            self.asked_users.fetch_add(users.len(), Ordering::SeqCst);
+            assert!(
+                (1..=merezha_application::postgres::MAX_MEMBERS_PER_CALL).contains(&users.len())
+            );
             // A checkpoint transaction runs on a session named after its
             // reactor; none may be open while the Directory is asked.
             let client = self.db.acquire(deadline()).await?;
@@ -297,12 +307,19 @@ impl Effects for TestEffects {
             if self.directory_down.load(Ordering::SeqCst) {
                 return Err(Failure::transient("directory_unavailable"));
             }
-            Ok(self
-                .members
-                .lock()
-                .unwrap()
-                .contains(&(user.as_str().into(), tenant.as_str().into())))
+            let members = self.members.lock().unwrap();
+            Ok(users
+                .iter()
+                .filter(|user| members.contains(&(user.as_str().into(), tenant.as_str().into())))
+                .cloned()
+                .collect())
         })
+    }
+    fn committed(&self, written: &[EffectRequest]) {
+        self.committed
+            .lock()
+            .unwrap()
+            .extend(written.iter().map(|r| r.dedupe_key.clone()));
     }
     fn write<'a>(
         &'a self,
@@ -361,6 +378,7 @@ struct Pg {
 }
 struct Instance {
     app: Application,
+    store: Arc<PostgresStore>,
     effects: Arc<TestEffects>,
     scheduler: Option<Scheduler>,
 }
@@ -436,10 +454,11 @@ impl Pg {
             config,
             Arc::new(Fake(probe.clone())),
             Arc::new(AllowAll),
-            store,
+            store.clone(),
         )?;
         Ok(Instance {
             app,
+            store,
             effects,
             scheduler: None,
         })
@@ -1246,11 +1265,13 @@ fn the_directory_is_never_asked_inside_a_checkpoint_transaction_and_an_outage_re
         .directory_down
         .store(false, Ordering::SeqCst);
     instance.effects.asked.store(0, Ordering::SeqCst);
+    instance.effects.asked_users.store(0, Ordering::SeqCst);
     pg.execute("UPDATE merezha_app.reactors SET retry_at = NULL");
     react(&instance, "notifier");
     assert_eq!(pg.reactor("notifier").0, 2);
-    // Two pairs for the whole batch: (ada, org_1) and (bob, org_1).
-    assert_eq!(instance.effects.asked.load(Ordering::SeqCst), 2);
+    // One set query for the whole batch: (ada, bob) in org_1.
+    assert_eq!(instance.effects.asked.load(Ordering::SeqCst), 1);
+    assert_eq!(instance.effects.asked_users.load(Ordering::SeqCst), 2);
     assert_eq!(instance.effects.tripped.load(Ordering::SeqCst), 0);
     assert_eq!(pg.effects().len(), 4);
     assert_eq!(pg.rejections("notifier").len(), 2);
@@ -1549,6 +1570,320 @@ fn rejections_are_counted_up_to_a_cap_and_skips_record_their_range() {
     );
 }
 
+/// `(failures, guest_failures)` of a reactor.
+fn failure_counts(pg: &Pg, name: &str) -> (i32, i32) {
+    let row = &pg.rows(&format!(
+        "SELECT failures, guest_failures FROM merezha_app.reactors WHERE name = '{name}'"
+    ))[0];
+    (row.get(0), row.get(1))
+}
+/// Make the reactors due now.
+fn due(pg: &Pg) {
+    pg.execute("UPDATE merezha_app.reactors SET retry_at = NULL");
+}
+
+/// Issue #69, the PoC: two Directory outages and then one `overloaded`
+/// blip of the runtime are three failures of the batch, but none is the
+/// guest's own, so the healthy four-event batch still commits in one guest
+/// call instead of going into one-at-a-time isolation.
+#[test]
+fn host_failures_never_send_a_healthy_batch_into_isolation() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let instance = pg
+        .open(notifier(), &probe, Pg::background(RunHooks::default()))
+        .unwrap();
+    instance.effects.member("usr_ada", "org_1");
+    let ada = member("usr_ada", "org_1");
+    for i in 1..=4 {
+        tenant_completed(
+            &instance,
+            &ada,
+            &format!("t-{i}"),
+            json!([notify("usr_ada")]),
+        );
+    }
+    instance
+        .effects
+        .directory_down
+        .store(true, Ordering::SeqCst);
+    for _ in 0..2 {
+        assert!(matches!(
+            react(&instance, "notifier"),
+            ReactorOutcome::Waiting(Some(_))
+        ));
+        due(&pg);
+    }
+    instance
+        .effects
+        .directory_down
+        .store(false, Ordering::SeqCst);
+    // The runtime refuses the call: the host is short of capacity.
+    probe.transient.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        react(&instance, "notifier"),
+        ReactorOutcome::Waiting(Some(_))
+    ));
+    assert_eq!(pg.reactor("notifier"), (0, "active".into(), None, 3));
+    probe.transient.store(false, Ordering::SeqCst);
+    due(&pg);
+    assert_eq!(
+        react(&instance, "notifier"),
+        ReactorOutcome::Finished { behind: false }
+    );
+    let calls = probe.reacts.lock().unwrap().clone();
+    assert_eq!(
+        calls.last().unwrap(),
+        &vec![1, 2, 3, 4],
+        "the healthy batch commits whole: {calls:?}"
+    );
+    assert!(calls.iter().all(|batch| batch.len() == 4), "{calls:?}");
+    assert_eq!(pg.reactor("notifier"), (4, "active".into(), None, 0));
+    assert_eq!(pg.effects().len(), 4);
+}
+
+/// Issue #69: `guest_failures` counts the consecutive transient failures
+/// of the guest itself. The guest answering clears it even when the
+/// Directory then fails; the runtime's `overloaded` leaves it; three in a
+/// row isolate the batch, whatever host failures came between.
+#[test]
+fn only_the_guests_own_transient_failures_count_toward_isolation() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let instance = pg
+        .open(notifier(), &probe, Pg::background(RunHooks::default()))
+        .unwrap();
+    instance.effects.member("usr_ada", "org_1");
+    let ada = member("usr_ada", "org_1");
+    for i in 1..=3 {
+        let mut command = completed(&format!("t-{i}"), json!([notify("usr_ada")]));
+        command.tag = id("TenantEmit");
+        command.payload["payload"]["stall"] = json!(i == 2);
+        instance.app.command_as(ada.clone(), command).unwrap();
+    }
+    let attempt = |pg: &Pg| {
+        assert!(matches!(
+            react(&instance, "notifier"),
+            ReactorOutcome::Waiting(Some(_))
+        ));
+        due(pg);
+    };
+    // The guest times out on its own budget: counted.
+    probe.stall.store(true, Ordering::SeqCst);
+    attempt(&pg);
+    assert_eq!(failure_counts(&pg, "notifier"), (1, 1));
+    // The guest answers, the Directory fails: the streak is over.
+    probe.stall.store(false, Ordering::SeqCst);
+    instance
+        .effects
+        .directory_down
+        .store(true, Ordering::SeqCst);
+    attempt(&pg);
+    assert_eq!(failure_counts(&pg, "notifier"), (2, 0));
+    instance
+        .effects
+        .directory_down
+        .store(false, Ordering::SeqCst);
+    // Guest, host overload, guest: two in a row, the overload in between
+    // says nothing about the guest.
+    probe.stall.store(true, Ordering::SeqCst);
+    attempt(&pg);
+    probe.transient.store(true, Ordering::SeqCst);
+    attempt(&pg);
+    probe.transient.store(false, Ordering::SeqCst);
+    assert_eq!(failure_counts(&pg, "notifier"), (4, 1));
+    attempt(&pg);
+    assert_eq!(failure_counts(&pg, "notifier"), (5, 2));
+    let whole = probe.reacts.lock().unwrap().len();
+    // The third in a row isolates: one event at a time from here on, so
+    // the event before the failing one commits.
+    attempt(&pg);
+    assert_eq!(failure_counts(&pg, "notifier"), (6, 3));
+    react(&instance, "notifier");
+    let calls = probe.reacts.lock().unwrap().clone();
+    assert!(
+        calls[..=whole].iter().all(|batch| batch.len() == 3),
+        "{calls:?}"
+    );
+    assert_eq!(calls[whole + 1..].to_vec(), [vec![1], vec![2]]);
+    assert_eq!(pg.reactor("notifier").0, 1);
+    // A committed batch clears both counts.
+    probe.stall.store(false, Ordering::SeqCst);
+    due(&pg);
+    react(&instance, "notifier");
+    assert_eq!(pg.reactor("notifier"), (3, "active".into(), None, 0));
+    assert_eq!(failure_counts(&pg, "notifier"), (0, 0));
+}
+
+/// Issue #69: the batch's memberships go to the Directory as set queries,
+/// one per tenant and at most `MAX_MEMBERS_PER_CALL` users, never one
+/// call per `(user, tenant)` pair.
+#[test]
+fn memberships_are_asked_per_tenant_in_bounded_sets() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let instance = pg
+        .open(notifier(), &probe, Pg::background(RunHooks::default()))
+        .unwrap();
+    let users: Vec<String> = (0..150).map(|n| format!("usr_{n:03}")).collect();
+    for user in &users {
+        instance.effects.member(user, "org_1");
+    }
+    instance.effects.member("usr_bob", "org_2");
+    let everyone = json!({"effect": "notify", "topic": "tasks.completed",
+        "recipients": users.iter().map(|u| json!({"user": {"id": u}})).collect::<Vec<_>>()});
+    tenant_completed(
+        &instance,
+        &member("usr_000", "org_1"),
+        "t-1",
+        json!([everyone, notify("usr_001"), notify("usr_bob")]),
+    );
+    tenant_completed(
+        &instance,
+        &member("usr_bob", "org_2"),
+        "t-2",
+        json!([notify("usr_bob")]),
+    );
+    assert_eq!(
+        react(&instance, "notifier"),
+        ReactorOutcome::Finished { behind: false }
+    );
+    // org_1: 151 distinct users (bob among them) in two calls; org_2: one.
+    assert_eq!(instance.effects.asked.load(Ordering::SeqCst), 3);
+    assert_eq!(instance.effects.asked_users.load(Ordering::SeqCst), 152);
+    assert_eq!(instance.effects.tripped.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        pg.effects(),
+        [
+            "reaction:notifier:event/1:0 notify org_1",
+            "reaction:notifier:event/1:1 notify org_1",
+            "reaction:notifier:event/2:0 notify org_2",
+        ]
+    );
+    assert_eq!(
+        pg.rejections("notifier"),
+        ["1.2 notify recipient_not_in_tenant"]
+    );
+    let members: Value = serde_json::from_str(
+        &pg.rows(
+            "SELECT body::text FROM reactor_test.effects \
+             WHERE dedupe_key = 'reaction:notifier:event/1:0'",
+        )[0]
+        .get::<_, String>(0),
+    )
+    .unwrap();
+    assert_eq!(members["members"].as_array().unwrap().len(), 150);
+}
+
+/// Issue #69: the port hears of a batch's effects only once its checkpoint
+/// transaction committed; the forced rollback's attempt is never reported,
+/// the rerun's once.
+#[test]
+fn the_port_hears_of_written_effects_only_after_commit() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let fail = Arc::new(FailOnce::default());
+    let instance = pg
+        .open(
+            notifier(),
+            &probe,
+            Pg::background(RunHooks {
+                reactor_fail: Some(fail.clone()),
+                ..RunHooks::default()
+            }),
+        )
+        .unwrap();
+    instance
+        .app
+        .command(completed(
+            "t-1",
+            json!([notify("usr_ada"), archive("t-1", 0)]),
+        ))
+        .unwrap();
+    fail.arm("notifier");
+    assert!(matches!(
+        react(&instance, "notifier"),
+        ReactorOutcome::Waiting(Some(_))
+    ));
+    assert!(fail.fired());
+    assert!(instance.effects.committed.lock().unwrap().is_empty());
+    due(&pg);
+    react(&instance, "notifier");
+    assert_eq!(
+        *instance.effects.committed.lock().unwrap(),
+        ["reaction:notifier:event/1:0", "reaction:notifier:event/1:1"]
+    );
+}
+
+/// Issue #69: retention deletes rejections and skips older than
+/// `[application.reactors] retention` in bounded batches, oldest first,
+/// keeps the newer ones, and stops when another instance holds the
+/// retention lock.
+#[test]
+fn retention_deletes_old_rejections_and_skips_in_batches() {
+    let Some(pg) = Pg::new() else { return };
+    let probe = Arc::new(Probe::default());
+    let mut background = Pg::background(RunHooks::default());
+    background.reactor_retention = Duration::from_secs(7 * 86_400);
+    let instance = pg.open(notifier(), &probe, background).unwrap();
+    pg.execute(
+        "INSERT INTO merezha_app.reactor_rejections (name, position, index, effect, code, rejected_at) \
+         SELECT 'notifier', p, 0, 'notify', 'unknown_topic', now() - interval '8 days' \
+           FROM generate_series(1, 2500) AS p; \
+         INSERT INTO merezha_app.reactor_rejections (name, position, index, effect, code) \
+         SELECT 'notifier', p, 0, 'notify', 'unknown_topic' FROM generate_series(2501, 2510) AS p; \
+         INSERT INTO merezha_app.reactor_skips (name, position, first_position, reason, skipped_at) \
+         SELECT 'notifier', p, p, 'admin', now() - interval '8 days' FROM generate_series(1, 1200) AS p; \
+         INSERT INTO merezha_app.reactor_skips (name, position, first_position, reason) \
+         VALUES ('notifier', 5000, 5000, 'on_error_skip')",
+    );
+    // Another instance purging: this pass stops at once.
+    let held = pg.runtime.block_on(async {
+        let client = pg.admin.acquire(deadline()).await.unwrap();
+        client
+            .batch_execute("BEGIN; SELECT pg_advisory_xact_lock(1297760594, hashtext('retention'))")
+            .await
+            .unwrap();
+        client
+    });
+    let report = pg
+        .runtime
+        .block_on(instance.store.purge_reactor_records())
+        .unwrap();
+    assert!(report.skipped);
+    assert_eq!((report.rejections, report.skips), (0, 0));
+    pg.runtime.block_on(held.batch_execute("ROLLBACK")).unwrap();
+    drop(held);
+    let report = pg
+        .runtime
+        .block_on(instance.store.purge_reactor_records())
+        .unwrap();
+    assert_eq!(
+        report,
+        merezha_application::postgres::ReactorRetention {
+            rejections: 2500,
+            skips: 1200,
+            skipped: false
+        }
+    );
+    assert_eq!(
+        pg.count("SELECT min(position) FROM merezha_app.reactor_rejections"),
+        2501
+    );
+    assert_eq!(
+        pg.count("SELECT count(*) FROM merezha_app.reactor_rejections"),
+        10
+    );
+    assert_eq!(
+        pg.count("SELECT min(position) FROM merezha_app.reactor_skips"),
+        5000
+    );
+    assert_eq!(
+        pg.count("SELECT count(*) FROM merezha_app.reactor_skips"),
+        1
+    );
+}
+
 /// Tests that wait on background runs or race them (issue #37): CI runs
 /// them alone, one at a time (`cargo test -- --test-threads=1 timing::`).
 mod timing {
@@ -1587,6 +1922,34 @@ mod timing {
             pg.reactor("notifier") == (2, "active".into(), None, 0)
         });
         assert_eq!(pg.effects().len(), 2);
+        pg.stop(&instance);
+    }
+
+    /// Issue #69: the scheduler runs a retention pass when it starts.
+    #[test]
+    fn the_scheduler_purges_old_reactor_records_at_start() {
+        let Some(pg) = Pg::new() else { return };
+        let probe = Arc::new(Probe::default());
+        // Creates the reactor row the records belong to.
+        drop(
+            pg.open(notifier(), &probe, Pg::background(RunHooks::default()))
+                .unwrap(),
+        );
+        pg.execute(
+            "INSERT INTO merezha_app.reactor_rejections (name, position, index, effect, code, rejected_at) \
+             VALUES ('notifier', 1, 0, 'notify', 'unknown_topic', now() - interval '31 days'), \
+                    ('notifier', 2, 0, 'notify', 'unknown_topic', now()); \
+             INSERT INTO merezha_app.reactor_skips (name, position, first_position, reason, skipped_at) \
+             VALUES ('notifier', 1, 1, 'admin', now() - interval '31 days')",
+        );
+        let instance = pg.start(notifier(), &probe, Pg::background(RunHooks::default()));
+        until(Duration::from_secs(10), "the retention pass", || {
+            pg.count("SELECT count(*) FROM merezha_app.reactor_skips") == 0
+        });
+        assert_eq!(
+            pg.count("SELECT count(*) FROM merezha_app.reactor_rejections"),
+            1
+        );
         pg.stop(&instance);
     }
 

@@ -1450,6 +1450,16 @@ pub const DIRECTORY_IS_MEMBER: Statement = Statement::new(
                      WHERE m.user_id = $1 AND m.organization_id = $2
                        AND u.status = 'active' AND u.email_verified_at IS NOT NULL)",
 );
+/// The users among `$1` that are members of `$2`, counted as
+/// [`DIRECTORY_IS_MEMBER`] counts them.
+pub const DIRECTORY_MEMBERS_AMONG: Statement = Statement::new(
+    "identity.directory.members_among",
+    "SELECT merezha_identity.memberships",
+    "SELECT m.user_id FROM merezha_identity.memberships m
+       JOIN merezha_identity.users u ON u.id = m.user_id
+      WHERE m.user_id = ANY($1) AND m.organization_id = $2
+        AND u.status = 'active' AND u.email_verified_at IS NOT NULL",
+);
 
 // ----- audit listings -----
 
@@ -1647,6 +1657,7 @@ pub const STATEMENTS: &[Statement] = &[
     DIRECTORY_TENANT_MEMBERS,
     DIRECTORY_APPLICATION_MEMBERS,
     DIRECTORY_IS_MEMBER,
+    DIRECTORY_MEMBERS_AMONG,
     AUDIT_LIST_ORG,
     CLEANUP_SESSIONS,
     CLEANUP_TOKENS,

@@ -1680,6 +1680,9 @@ pub trait Directory: Send + Sync {
         -> BoxFuture<'a, Result<Page<Contact>, Failure>>;
     fn is_member<'a>(&'a self, user: &'a UserId, tenant: &'a TenantId)
         -> BoxFuture<'a, Result<bool, Failure>>;
+    // Issue #69: `is_member` for at most 100 users in one query.
+    fn members_among<'a>(&'a self, tenant: &'a TenantId, users: &'a [UserId])
+        -> BoxFuture<'a, Result<Vec<UserId>, Failure>>;
 }
 pub struct Contact { pub user: UserId, pub email: String, pub display_name: Option<String>, pub locale: Option<String> }
 ```
@@ -1688,7 +1691,8 @@ Only active users with a verified email are returned; other ids are absent
 and NT skips them. No phone numbers (ID10). `users` takes at most 100 ids.
 Role filters match organization-scope tenant roles or application roles;
 `None` (or `user`) means everyone. Pages are keyset-ordered by user id, at
-most 500. Service accounts never appear. `is_member` counts memberships
+most 500. Service accounts never appear. `is_member` (and
+`members_among`, which answers it for a set of users) counts memberships
 only, not application grants, and only of active users with a verified
 address like the other calls, so NT's `recipient_not_in_tenant` check (R4)
 stays a membership check.

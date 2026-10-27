@@ -76,6 +76,10 @@ pub struct BackgroundOptions {
     /// The reactors' equal-jitter retry backoff, from `retry_base_ms` up
     /// to `retry_max_ms` (AP §C.5).
     pub reactor_retry: (Duration, Duration),
+    /// How long `reactor_rejections` and `reactor_skips` rows are kept
+    /// (`[application.reactors] retention`, [`REACTOR_RETENTION`]); an
+    /// hourly pass deletes older ones in batches.
+    pub reactor_retention: Duration,
     /// Test hooks; production leaves the default (none).
     #[doc(hidden)]
     pub hooks: RunHooks,
@@ -91,6 +95,7 @@ impl Default for BackgroundOptions {
             instance_id: String::new(),
             reactor_interval: Duration::from_secs(5),
             reactor_retry: (Duration::from_secs(1), Duration::from_secs(300)),
+            reactor_retention: Duration::from_secs(30 * 86_400),
             hooks: RunHooks::default(),
         }
     }
@@ -99,8 +104,14 @@ impl Default for BackgroundOptions {
 pub const INTERVAL: (Duration, Duration) = (Duration::from_millis(100), Duration::from_secs(600));
 pub const RUN_TIMEOUT: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(300));
 pub const MAX_CONCURRENT: (usize, usize) = (1, 16);
+/// Bounds of [`BackgroundOptions::reactor_retention`]: 1 hour to 3650
+/// days, as `[jobs.retention]`.
+pub const REACTOR_RETENTION: (Duration, Duration) = (
+    Duration::from_secs(3_600),
+    Duration::from_secs(3_650 * 86_400),
+);
 /// A `database_timeout` this close to the run's deadline is the deadline.
-const DEADLINE_SLACK: Duration = Duration::from_millis(50);
+pub(super) const DEADLINE_SLACK: Duration = Duration::from_millis(50);
 /// A background run's statements end this long after `run_timeout`.
 const HARD_MARGIN: Duration = Duration::from_secs(5);
 impl BackgroundOptions {
@@ -110,6 +121,7 @@ impl BackgroundOptions {
             || !in_range(self.reactor_interval, INTERVAL)
             || self.reactor_retry.0 > self.reactor_retry.1
             || self.reactor_retry.1 > Duration::from_secs(86_400)
+            || !in_range(self.reactor_retention, REACTOR_RETENTION)
             || !in_range(self.run_timeout, RUN_TIMEOUT)
             || !(MAX_CONCURRENT.0..=MAX_CONCURRENT.1).contains(&self.max_concurrent)
             || self.instance_id.len() > 256

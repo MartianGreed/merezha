@@ -340,6 +340,22 @@ host codes such as `handler_not_found`, `idempotency_mismatch` and
 | `projection_failed` | transient | faulty view | The faulty revision met `TaskRenamed` |
 | `unsupported_operation` | permanent | both | `project`/`query` sent to the domain, `decide` to the view |
 
+### Rolling upgrades
+
+The owner field is schema version 2 of `TaskCreated` and `TaskCompleted`.
+A `task-view` or `task-domain` build from before it knows only version 1,
+so while instances run mixed builds (a rolling deploy, or a `/v1/reload` on
+some instances only), an old build refuses every owned event a new build
+wrote with `unsupported_schema_version`: an owned `TaskCompleted` exactly
+as an owned `TaskCreated`. On an old instance the `tasks` projection stops
+at the first such event and retries with backoff (its checkpoint stays, so
+nothing is lost), and commands on a stream holding one fail 422. Reactors
+are not affected: `task-notifier` reads only `TaskCompleted.owner` and
+accepts both versions. Expect those refusals while the rollout runs; they
+clear by themselves once the last old instance is gone. Only a command with
+an authenticated principal writes an owned event, so upgrading every
+instance's guests before any of them serves such commands avoids them.
+
 ### Scenario
 
 ```sh

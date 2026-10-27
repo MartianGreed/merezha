@@ -29,7 +29,10 @@ use std::{
 
 /// The effect ports of one platform host, bound to the source
 /// `application`. Without the notifications block the notifier is the
-/// capture fallback, which logs a redacted record and delivers nothing.
+/// capture fallback, which delivers nothing: inside the checkpoint
+/// transaction it only checks each effect, and the redacted record is kept
+/// and logged once the transaction committed ([`Effects::committed`]), so
+/// a batch rolled back and run again logs once.
 pub struct PlatformEffects {
     notifier: Arc<dyn Notifier>,
     outbox: SourceOutbox,
@@ -136,6 +139,20 @@ fn notification(request: &EffectRequest) -> Result<Option<NotificationRequest>, 
         },
     }))
 }
+/// The webhook event of a webhook effect, or `None` for another effect
+/// type. Every failure here is permanent: the effect is rejected.
+fn webhook(request: &EffectRequest) -> Result<Option<WebhookEvent>, Failure> {
+    let EffectBody::Webhook { event_type, data } = &request.body else {
+        return Ok(None);
+    };
+    Ok(Some(WebhookEvent {
+        tenant: request.tenant.clone(),
+        event_type: event_type.clone(),
+        source_event_id: EventId::new(request.dedupe_key.clone())?,
+        occurred_at: timestamp(request.accepted_unix_ms)?,
+        data: data.clone(),
+    }))
+}
 /// A permanent failure keeps its code, so the effect is rejected with it;
 /// anything else rolls the checkpoint transaction back.
 fn notify_failure(error: merezha_platform::ports::NotifyError) -> Failure {
@@ -152,12 +169,12 @@ impl Effects for PlatformEffects {
             None => Ok(()),
         }
     }
-    fn is_member<'a>(
+    fn members<'a>(
         &'a self,
-        user: &'a Identity,
         tenant: &'a Identity,
-    ) -> BoxFuture<'a, Result<bool, Failure>> {
-        self.directory.is_member(user, tenant)
+        users: &'a [Identity],
+    ) -> BoxFuture<'a, Result<Vec<Identity>, Failure>> {
+        self.directory.members_among(tenant, users)
     }
     fn write<'a>(
         &'a self,
@@ -169,20 +186,22 @@ impl Effects for PlatformEffects {
                 EffectBody::Notify { .. } => {
                     let notification = notification(request)?
                         .ok_or_else(|| Failure::permanent("invalid_effect"))?;
+                    // The capture fallback keeps its record after commit.
+                    if let Some(capture) = self.notifier.as_capture() {
+                        return capture.check(&notification).map_err(notify_failure);
+                    }
                     self.notifier
                         .request(tx, notification)
                         .await
                         .map(|_| ())
                         .map_err(notify_failure)
                 }
-                EffectBody::Webhook { event_type, data } => {
-                    let event = WebhookEvent {
-                        tenant: request.tenant.clone(),
-                        event_type: event_type.clone(),
-                        source_event_id: EventId::new(request.dedupe_key.clone())?,
-                        occurred_at: timestamp(request.accepted_unix_ms)?,
-                        data: data.clone(),
-                    };
+                EffectBody::Webhook { .. } => {
+                    let event =
+                        webhook(request)?.ok_or_else(|| Failure::permanent("invalid_effect"))?;
+                    if self.notifier.as_capture().is_some() {
+                        return Ok(());
+                    }
                     self.notifier
                         .emit_webhook(tx, event)
                         .await
@@ -216,6 +235,22 @@ impl Effects for PlatformEffects {
                 }
             }
         })
+    }
+    /// The capture fallback's records of the effects a committed batch
+    /// wrote; nothing with the notifications block, which wrote them in
+    /// the transaction.
+    fn committed(&self, written: &[EffectRequest]) {
+        let Some(capture) = self.notifier.as_capture() else {
+            return;
+        };
+        for request in written {
+            // Both were built and checked inside the transaction.
+            if let Ok(Some(notification)) = notification(request) {
+                let _ = capture.capture(notification);
+            } else if let Ok(Some(event)) = webhook(request) {
+                capture.capture_webhook(&event);
+            }
+        }
     }
 }
 

@@ -2,8 +2,9 @@
 //! and memberships, which notifications reads to resolve `User`, `Tenant`
 //! and `Application` recipients. Users that are disabled or unverified are
 //! simply absent; service accounts never appear; pages are keyset-ordered
-//! by user id and bounded; `is_member` counts memberships only, of active
-//! users with a verified address, like the other calls.
+//! by user id and bounded; `is_member` and `members_among` count
+//! memberships only, of active users with a verified address, like the
+//! other calls.
 use crate::{core::Core, core::sql, ids, rbac::USER};
 use merezha_domain::Failure;
 use merezha_platform::{
@@ -169,6 +170,46 @@ impl Directory for IdentityDirectory {
                 .await
                 .map_err(sql)?
                 .get(0))
+        })
+    }
+    fn members_among<'a>(
+        &'a self,
+        tenant: &'a TenantId,
+        users: &'a [UserId],
+    ) -> BoxFuture<'a, Result<Vec<UserId>, Failure>> {
+        Box::pin(async move {
+            if users.len() > MAX_USERS_PER_CALL {
+                return Err(Failure::permanent("too_many_ids"));
+            }
+            let core = self.core()?;
+            let wanted = user_ids(users);
+            let Ok(org) = ids::parse(ids::ORGANIZATION, tenant.as_str()) else {
+                return Ok(Vec::new());
+            };
+            if wanted.is_empty() {
+                return Ok(Vec::new());
+            }
+            let session = core.db().acquire(core.deadline()).await?;
+            let rows = core
+                .db()
+                .query(
+                    &session,
+                    &crate::sql::DIRECTORY_MEMBERS_AMONG,
+                    &[&wanted, &org],
+                )
+                .await
+                .map_err(sql)?;
+            let mut found: std::collections::BTreeSet<Uuid> =
+                rows.iter().map(|r| r.get(0)).collect();
+            // Each id as the caller gave it, once; ids that are no user id
+            // are absent, like unknown users.
+            Ok(users
+                .iter()
+                .filter(|user| {
+                    ids::parse(ids::USER, user.as_str()).is_ok_and(|id| found.remove(&id))
+                })
+                .cloned()
+                .collect())
         })
     }
 }
