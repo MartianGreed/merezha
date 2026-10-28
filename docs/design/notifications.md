@@ -1964,7 +1964,7 @@ The owner answered this design's open questions on 2026-10-24. The record is
   (3.2).
 - **NT7** (2026-10-28) SMS answers that Brevo may already have processed,
   5xx (including a gateway's 502 or 504) and 400 `duplicate_request`, stay
-  transient and are retried, as the classification table in 5.1 says. SMS has
+  transient and are retried, as the classification table in 5.2 says. SMS has
   no idempotency key, so the owner accepts that such a retry can occasionally
   send a duplicate SMS. NT1 still holds: a send that is ambiguous after a crash
   is never resent.
