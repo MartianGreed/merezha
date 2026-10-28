@@ -1962,6 +1962,12 @@ The owner answered this design's open questions on 2026-10-24. The record is
   registry (5.5, 7.1).
 - **ID10** No phone numbers on users in v1: SMS goes to explicit addresses
   (3.2).
+- **NT7** (2026-10-28) SMS answers that Brevo may already have processed,
+  5xx (including a gateway's 502 or 504) and 400 `duplicate_request`, stay
+  transient and are retried, as the classification table in 5.2 says. SMS has
+  no idempotency key, so the owner accepts that such a retry can occasionally
+  send a duplicate SMS. NT1 still holds: a send that is ambiguous after a crash
+  is never resent.
 - **Decided internally:** webhook effects target registered endpoints only;
   Brevo idempotency is verified in a sandbox before N3 merges (if a failed
   request consumes the key, the block uses one key per attempt); no CSS

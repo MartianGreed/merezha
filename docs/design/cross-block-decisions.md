@@ -2,7 +2,8 @@
 
 This record settles where the block designs disagreed with each other or with
 [framework.md](../architecture/framework.md), and records the owner's answers to
-their open questions (2026-10-24). When a design and this record differ, this
+their open questions (2026-10-24; later answers carry their own date). When a
+design and this record differ, this
 record wins. Each design keeps the detail; this file names the owner of every
 shared contract.
 
@@ -299,6 +300,10 @@ Notifications:
   templates deferred.
 - NT6 application-level webhooks: yes, through an application-level endpoint
   registry (R11).
+- NT7 (2026-10-28) SMS answers Brevo may already have processed (5xx,
+  including 502 and 504, and 400 `duplicate_request`) stay transient and are
+  retried; with no SMS idempotency key, an occasional duplicate SMS is accepted.
+  NT1 still holds for a send that is ambiguous after a crash.
 
 Content:
 
@@ -317,6 +322,15 @@ Application platform:
 - AP4 the HTTP adapter fills in missing correlation and message ids.
 
 Telemetry: TE1 user ids off in traces by default, tenant ids on.
+
+Scaffold (2026-10-28): SC-Q1 to SC-Q10 are decided as
+[scaffold.md §9](scaffold.md#9-open-questions) recommends: `cargo install --git --rev`
+now and release binaries at the first tag; `merezha-domain` by git revision until
+guest protocol 2 ships in a tag; two configuration files, no layering in v1; a
+relative `media.local.root`; `.env` written by default with `--no-secrets`; GitHub
+Actions only; Web Push and webhooks on in the starter; `services/task-notifier`
+retired once `teamboard` lands; copied files dual-licensed `MIT OR MIT-0`; a
+`path` pin compared with the checkout's `HEAD` and only ever warned about.
 
 Decided internally, with the designs' recommendations: receipts kept forever;
 roles not stored in event metadata; no per-key FIFO jobs; asynchronous rebuild

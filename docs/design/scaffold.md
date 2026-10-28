@@ -1438,9 +1438,10 @@ says to delete `[http.cors]` then, but separate origins are the common deploymen
 
 ## 9. Open questions
 
-Each has a recommended answer; the slices assume it until the owner decides.
+The owner accepted every recommendation on 2026-10-28, so each row is now a decision; the
+slices follow it. The record is [cross-block-decisions.md](cross-block-decisions.md#owner-answers).
 
-| Id | Question | Recommendation |
+| Id | Question | Decision (owner, 2026-10-28) |
 | --- | --- | --- |
 | SC-Q1 | How is the prebuilt `merezha` host distributed? Nothing is released today. | Now: `cargo install --locked --git ... --rev`, which the scaffold and generated CI already use. With the first tag: a release workflow publishing Linux x86_64 and aarch64 and macOS aarch64 binaries with SHA-256 checksums, then an OCI image for the PaaS. That image would also let Contremaitre run the host as an `app` service. |
 | SC-Q2 | Publish `merezha-domain` to crates.io, or keep git revisions? | Keep git revisions until guest protocol 2 has shipped in a tagged release; then publish `merezha-domain` with the WIT inside it, and switch the scaffold to a version requirement. The four names were free on 2026-10-27. |
