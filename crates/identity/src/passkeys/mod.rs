@@ -40,8 +40,8 @@ pub const MAX_VERIFY_BODY: usize = 64 * 1024;
 /// Longest passkey label, in scalar values.
 pub const MAX_LABEL: usize = 64;
 
-/// The relying party of `settings`: RP id, name and every origin, built
-/// once at start.
+/// The relying party of `settings`: RP id, name and every origin, web then
+/// native, built once at start.
 pub fn relying_party(settings: &PasskeySettings) -> Result<Webauthn, Failure> {
     let invalid = |_| Failure::permanent("passkeys_config");
     let primary = Url::parse(
@@ -55,12 +55,38 @@ pub fn relying_party(settings: &PasskeySettings) -> Result<Webauthn, Failure> {
         .map_err(|_| Failure::permanent("passkeys_config"))?
         .rp_name(&settings.rp_name)
         .timeout(settings.ceremony_ttl);
-    for origin in settings.origins.iter().skip(1) {
+    for origin in settings
+        .origins
+        .iter()
+        .skip(1)
+        .chain(&settings.android_origins)
+    {
         builder = builder.append_allowed_origin(&Url::parse(origin).map_err(invalid)?);
     }
     builder
         .build()
         .map_err(|_| Failure::permanent("passkeys_config"))
+}
+
+/// The client data origin check the library leaves loose: it compares
+/// parsed URLs, and an `android:` origin with another scheme case or with
+/// stray whitespace parses to a configured one. A native origin must be
+/// an `android_origins` entry byte for byte; web origins stay the
+/// library's. The signed client data is read, never rewritten.
+fn native_origin(android_origins: &[String], client_data_json: &[u8]) -> Result<(), WebauthnError> {
+    #[derive(serde::Deserialize)]
+    struct ClientData {
+        origin: String,
+    }
+    // The library refuses client data without a readable origin as well.
+    let ClientData { origin } =
+        serde_json::from_slice(client_data_json).map_err(|_| WebauthnError::InvalidRPOrigin)?;
+    match Url::parse(&origin) {
+        Ok(url) if url.scheme() == "android" && !android_origins.contains(&origin) => {
+            Err(WebauthnError::InvalidRPOrigin)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A `passkeys` row.
@@ -425,7 +451,8 @@ impl Core {
         label: Option<String>,
     ) -> Result<Reply, ApiError> {
         let webauthn = self.relying()?;
-        let max = i64::from(self.passkey_settings()?.max_per_user);
+        let settings = self.passkey_settings()?;
+        let max = i64::from(settings.max_per_user);
         self.require_recent(caller)?;
         let ceremony = self
             .take_ceremony(ceremony, &["registration"])
@@ -434,9 +461,12 @@ impl Core {
             .ok_or_else(invalid_ceremony)?;
         let state: PasskeyRegistration =
             serde_json::from_value(ceremony.state).map_err(|_| invalid_ceremony())?;
-        let passkey = webauthn
-            .finish_passkey_registration(&credential, &state)
-            .map_err(|_| ApiError::code("passkey_rejected"))?;
+        let passkey = native_origin(
+            &settings.android_origins,
+            credential.response.client_data_json.as_ref(),
+        )
+        .and_then(|()| webauthn.finish_passkey_registration(&credential, &state))
+        .map_err(|_| ApiError::code("passkey_rejected"))?;
         let value = serde_json::to_value(&passkey).map_err(internal)?;
         let credential_id: Vec<u8> = passkey.cred_id().as_ref().to_vec();
         let discoverable = credential.extensions.cred_props.as_ref().and_then(|p| p.rk);
@@ -629,6 +659,10 @@ impl Core {
         credential: &PublicKeyCredential,
     ) -> Result<(PasskeyRow, AuthenticationResult), ApiError> {
         let webauthn = self.relying()?;
+        let origin = native_origin(
+            &self.passkey_settings()?.android_origins,
+            credential.response.client_data_json.as_ref(),
+        );
         let (rows, result) = match ceremony.purpose.as_str() {
             "discoverable" => {
                 let state: DiscoverableAuthentication =
@@ -657,7 +691,9 @@ impl Core {
                 }
                 let row = passkey_row(&row)?;
                 let key = DiscoverableKey::from(&row.passkey);
-                let result = webauthn.finish_discoverable_authentication(credential, state, &[key]);
+                let result = origin.and_then(|()| {
+                    webauthn.finish_discoverable_authentication(credential, state, &[key])
+                });
                 (vec![row], result)
             }
             _ => {
@@ -667,7 +703,8 @@ impl Core {
                     return Err(invalid_credentials());
                 };
                 let rows = self.read_passkeys(user).await?;
-                let result = webauthn.finish_passkey_authentication(credential, &state);
+                let result = origin
+                    .and_then(|()| webauthn.finish_passkey_authentication(credential, &state));
                 (rows, result)
             }
         };
@@ -1054,5 +1091,55 @@ mod tests {
         assert_eq!(aaguid(&none), None);
         let zero = json!({"cred": {"attestation": {"metadata": {"Packed": {"aaguid": "00000000-0000-0000-0000-000000000000"}}}}});
         assert_eq!(aaguid(&zero), None);
+    }
+
+    #[test]
+    fn native_origins_match_byte_for_byte() {
+        let hash = |byte: u8| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([byte; 32]);
+        let configured = format!("android:apk-key-hash:{}", hash(1));
+        let android_origins = [configured.clone()];
+        let client_data = |origin: &str| {
+            serde_json::to_vec(
+                &json!({"type": "webauthn.get", "challenge": "AA", "origin": origin}),
+            )
+            .unwrap()
+        };
+        assert!(native_origin(&android_origins, &client_data(&configured)).is_ok());
+        // Web origins stay the library's to check.
+        assert!(native_origin(&android_origins, &client_data("https://app.example")).is_ok());
+        assert!(native_origin(&[], &client_data("https://app.example")).is_ok());
+
+        // The library matches parsed URLs: these spellings parse to the
+        // configured origin, an opaque one, so it would accept them.
+        let url = Url::parse(&configured).unwrap();
+        assert!(!url.origin().is_tuple());
+        let spellings = [
+            format!("ANDROID:apk-key-hash:{}", hash(1)),
+            format!("Android:apk-key-hash:{}", hash(1)),
+            format!(" {configured}"),
+            format!("{configured} "),
+            format!("{configured}\n"),
+            format!("android:apk-key-\thash:{}", hash(1)),
+        ];
+        for spelling in &spellings {
+            assert_eq!(Url::parse(spelling).unwrap(), url, "{spelling:?}");
+        }
+        let other = format!("android:apk-key-hash:{}", hash(2));
+        assert_ne!(Url::parse(&other).unwrap(), url);
+        for origin in spellings.iter().chain([&other]) {
+            assert!(
+                matches!(
+                    native_origin(&android_origins, &client_data(origin)),
+                    Err(WebauthnError::InvalidRPOrigin)
+                ),
+                "{origin:?}"
+            );
+        }
+        // No configured native origin refuses every native client.
+        assert!(native_origin(&[], &client_data(&configured)).is_err());
+        // Client data without a readable origin is refused, as the library
+        // refuses it.
+        assert!(native_origin(&android_origins, b"not json").is_err());
+        assert!(native_origin(&android_origins, br#"{"origin": 7}"#).is_err());
     }
 }

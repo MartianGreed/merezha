@@ -10,7 +10,9 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use serde_json::{Value, json};
 use std::time::Duration;
 use support::*;
-use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
+use webauthn_authenticator_rs::{
+    AuthenticatorBackend, WebauthnAuthenticator, softpasskey::SoftPasskey,
+};
 use webauthn_rs::prelude::{CreationChallengeResponse, RequestChallengeResponse, Url};
 
 const PASSKEYS: &str = "[modules.identity.passkeys]\n";
@@ -921,4 +923,210 @@ async fn a_registered_passkey_sends_a_notice() {
         .to("identity.sign_in_method_added", &format!("user:{id}"));
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].data["method"], "passkey");
+}
+
+/// A native Android app's origin, for a signing certificate digest of
+/// `byte` repeated: what Credential Manager puts in the client data.
+fn android(byte: u8) -> String {
+    format!("android:apk-key-hash:{}", B64.encode([byte; 32]))
+}
+
+async fn android_world(origins: &[String]) -> Option<(World, Instance)> {
+    let tables = format!("{PASSKEYS}android_origins = {origins:?}\n");
+    let world = World::new(&section("", &[], &tables)).await?;
+    let node = world.instance().await;
+    Some((world, node))
+}
+
+/// A native registration: the app's platform signs client data with the
+/// app's `origin`, for `rp_id` when it differs from the options' RP.
+async fn native_registration(
+    node: &Instance,
+    browser: &mut Browser,
+    key: &mut SoftPasskey,
+    origin: &str,
+    rp_id: Option<&str>,
+) -> Answer {
+    let options = browser
+        .send(node, "POST", "/passkeys/registrations/options", None)
+        .await;
+    assert_eq!(options.status, 200, "{options:?}");
+    let mut public_key = options.body["public_key"].clone();
+    if let Some(rp_id) = rp_id {
+        public_key["rp"]["id"] = json!(rp_id);
+    }
+    let challenge: CreationChallengeResponse =
+        serde_json::from_value(json!({ "publicKey": public_key })).unwrap();
+    let credential = key
+        .perform_register(Url::parse(origin).unwrap(), challenge.public_key, 60_000)
+        .unwrap();
+    browser
+        .post(
+            node,
+            "/passkeys/registrations/verify",
+            json!({"ceremony_id": options.body["ceremony_id"], "credential": credential}),
+        )
+        .await
+}
+
+/// A native email-first sign-in with the app's `origin`, for `rp_id`
+/// when it differs from the options' RP.
+async fn native_sign_in(
+    node: &Instance,
+    key: &mut SoftPasskey,
+    email: &str,
+    origin: &str,
+    rp_id: Option<&str>,
+) -> Answer {
+    let mut browser = Browser::new("198.51.100.61");
+    let options = browser
+        .post(
+            node,
+            "/passkeys/authentications/options",
+            json!({ "email": email }),
+        )
+        .await;
+    assert_eq!(options.status, 200, "{options:?}");
+    let mut public_key = options.body["public_key"].clone();
+    if let Some(rp_id) = rp_id {
+        public_key["rpId"] = json!(rp_id);
+    }
+    let challenge: RequestChallengeResponse =
+        serde_json::from_value(json!({ "publicKey": public_key })).unwrap();
+    let credential = key
+        .perform_auth(Url::parse(origin).unwrap(), challenge.public_key, 60_000)
+        .unwrap();
+    let credential = serde_json::to_value(credential).unwrap();
+    sign_in(
+        node,
+        &mut browser,
+        options.body["ceremony_id"].clone(),
+        credential,
+    )
+    .await
+}
+
+async fn sessions(world: &World) -> i64 {
+    world
+        .scalar("SELECT count(*) FROM merezha_identity.sessions")
+        .await
+}
+
+/// A configured native origin registers and signs in through the HTTP
+/// flow; web passkeys keep working beside it.
+#[tokio::test]
+async fn a_configured_android_origin_registers_and_signs_in() {
+    let Some((world, node)) = android_world(&[android(1), android(2)]).await else {
+        return;
+    };
+    let mut ada = user(&world, &node, "ada@example.com").await;
+    let mut key = SoftPasskey::new(true);
+    let answer = native_registration(&node, &mut ada, &mut key, &android(2), None).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    let answer = native_sign_in(&node, &mut key, "ada@example.com", &android(2), None).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    assert_eq!(answer.body["session"]["method"], "passkey");
+    assert_eq!(answer.body["user"]["email"], "ada@example.com");
+    assert_eq!(counter(&world).await, 1);
+
+    let mut web = authenticator();
+    register(&node, &mut ada, &mut web, None).await;
+    let mut browser = Browser::new("198.51.100.62");
+    let (ceremony, credential) =
+        assertion(&node, &mut browser, &mut web, Some("ada@example.com"), None).await;
+    let answer = sign_in(&node, &mut browser, ceremony, credential).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+}
+
+/// A well-formed but unconfigured native origin, or the native origin
+/// as an HTTP `Origin`, is refused.
+#[tokio::test]
+async fn an_unconfigured_android_origin_is_refused() {
+    let Some((world, node)) = android_world(&[android(1)]).await else {
+        return;
+    };
+    let mut ada = user(&world, &node, "ada@example.com").await;
+    let mut key = SoftPasskey::new(true);
+    let answer = native_registration(&node, &mut ada, &mut key, &android(2), None).await;
+    assert_eq!(
+        (answer.status.as_u16(), answer.code()),
+        (422, "passkey_rejected"),
+        "{answer:?}"
+    );
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_identity.passkeys")
+            .await,
+        0
+    );
+
+    let answer = native_registration(&node, &mut ada, &mut key, &android(1), None).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    let before = sessions(&world).await;
+    let answer = native_sign_in(&node, &mut key, "ada@example.com", &android(2), None).await;
+    assert_eq!(
+        (answer.status.as_u16(), answer.code()),
+        (401, "invalid_credentials"),
+        "{answer:?}"
+    );
+    assert_eq!(sessions(&world).await, before);
+    assert_eq!(counter(&world).await, 0);
+
+    // Native origins are WebAuthn origins only, never HTTP ones.
+    let mut app = Browser::new("198.51.100.63");
+    app.origin = Some(android(1));
+    let answer = app
+        .post(
+            &node,
+            "/passkeys/authentications/options",
+            json!({ "email": "ada@example.com" }),
+        )
+        .await;
+    assert_eq!(
+        (answer.status.as_u16(), answer.code()),
+        (403, "origin_rejected"),
+        "{answer:?}"
+    );
+}
+
+/// A native credential minted for another RP id is refused at
+/// registration and at sign-in.
+#[tokio::test]
+async fn a_native_authenticator_for_another_rp_is_refused() {
+    let Some((world, node)) = android_world(&[android(1)]).await else {
+        return;
+    };
+    let mut ada = user(&world, &node, "ada@example.com").await;
+    let mut key = SoftPasskey::new(true);
+    let answer = native_registration(
+        &node,
+        &mut ada,
+        &mut key,
+        &android(1),
+        Some("other.example"),
+    )
+    .await;
+    assert_eq!(
+        (answer.status.as_u16(), answer.code()),
+        (422, "passkey_rejected"),
+        "{answer:?}"
+    );
+
+    let answer = native_registration(&node, &mut ada, &mut key, &android(1), None).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    let before = sessions(&world).await;
+    let answer = native_sign_in(
+        &node,
+        &mut key,
+        "ada@example.com",
+        &android(1),
+        Some("other.example"),
+    )
+    .await;
+    assert_eq!(
+        (answer.status.as_u16(), answer.code()),
+        (401, "invalid_credentials"),
+        "{answer:?}"
+    );
+    assert_eq!(sessions(&world).await, before);
 }

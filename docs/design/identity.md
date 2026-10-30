@@ -1320,7 +1320,8 @@ Unlinking requires a recent session and that another credential remains
 ### Passkeys with webauthn-rs
 
 Configuration builds one `Webauthn` at startup with `rp_id`, `rp_name`, the
-first origin, and `append_allowed_origin` for the others. RP id and origins
+first origin, and `append_allowed_origin` for the other web origins and
+then each `android_origins` entry. RP id and origins
 are configuration only, never request input. The passkey API is used, which
 fixes user verification to `required`, attestation conveyance to `none`, and
 algorithms to ES256 and RS256 (webauthn-rs defaults).
@@ -1372,6 +1373,60 @@ out of scope for this version.
 
 Limits: `max_per_user = 20` passkeys. Removing the last credential fails
 `last_credential`.
+
+#### Native Android apps
+
+An Android app using Credential Manager signs client data whose `origin`
+is `android:apk-key-hash:<hash>`, where `<hash>` is the unpadded base64url
+SHA-256 of the app's DER signing certificate. `passkeys.android_origins`
+lists the accepted apps, at most 16. Each entry is added to the
+`Webauthn` allowed origins and to nothing else: not `allowed_origins`,
+CORS, the `Origin` check or CSRF. The app still sends
+`Origin: <app_origin>` on anonymous identity requests.
+
+Matching is exact. webauthn-rs compares parsed URLs, and parsing an
+`android:` origin lowercases its scheme and drops tabs, newlines and
+surrounding spaces. So before the library runs, both verify routes read
+the origin string from the signed client data, and an `android:` origin
+must equal an entry byte for byte. Otherwise registration answers
+`passkey_rejected` and sign-in `invalid_credentials`, as for any other
+origin mismatch. The client data is never rewritten. The RP id and its
+`rpIdHash` check are unchanged, so a credential created for another RP id
+fails both ceremonies.
+
+To ship an app:
+
+1. Compute the hash from the certificate that signs the installed app,
+   which under Play App Signing is the app signing key, not the upload
+   key: `keytool -exportcert -alias <alias> -keystore <keystore> | openssl
+   dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '='`.
+   From a colon-separated SHA-256 fingerprint, drop the colons and decode
+   the hex instead (`xxd -r -p`) before the base64url step.
+2. Serve `https://<rp_id>/.well-known/assetlinks.json` with the relation
+   `delegate_permission/common.get_login_creds`, the app's package name and
+   its colon-separated SHA-256 certificate fingerprints:
+
+   ```json
+   [{
+     "relation": ["delegate_permission/common.get_login_creds"],
+     "target": {
+       "namespace": "android_app",
+       "package_name": "com.example.app",
+       "sha256_cert_fingerprints": ["<AB:CD:...>"]
+     }
+   }]
+   ```
+
+   Credential Manager uses this file to let the app create and use
+   passkeys for the RP id.
+3. To rotate a signing key, add the new hash to `android_origins` and the
+   new fingerprint to `assetlinks.json` before shipping an app signed with
+   it. Remove the old ones once no supported install still uses the old
+   key.
+
+The server accepting an origin is not proof of a deployed association.
+Nothing on the server checks `assetlinks.json`, and an app the file does
+not cover cannot use the RP id's passkeys on the device.
 
 ### Email tokens
 
@@ -1602,7 +1657,7 @@ identity defines none. Spans are TE's `identity {operation}`.
 | WebAuthn ceremony replay | State stored server-side, consumed once, bound to user and session, 5-minute TTL. |
 | Cloned authenticator | Counter regression check for nonzero counters. The check runs against the counter read before verification, so two assertions verified concurrently can both pass; the stored counter keeps the maximum. |
 | A credential added by a session that is revoked meanwhile | Passkey registration and OAuth linking re-check their session, share-locked, under the user lock before storing anything; a credential removed mid sign-in signs nobody in. A new method sends `identity.sign_in_method_added`. |
-| WebAuthn origin spoofing | RP id and origins from configuration. webauthn-rs checks origin and RP id hash. |
+| WebAuthn origin spoofing | RP id and origins from configuration. webauthn-rs checks origin and RP id hash. Native app origins must equal a configured entry byte for byte. |
 | Privilege escalation through roles, keys or service accounts | Escalation check on every grant path at the target scope, owner-only owner assignment, `platform_admin` CLI-only and unreachable from keys, key power intersected live with the owner's, scope rules in foreign keys, custom roles bound to their organization. |
 | Cross-tenant access (IDOR) | Organization in every scoped check, tenant match required unless an application grant matches, tenant keys pinned, 404 for foreign ids. |
 | Last owner lockout | Sole-owner invariant under row lock. |

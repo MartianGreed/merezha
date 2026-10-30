@@ -305,6 +305,9 @@ pub struct PasskeySettings {
     pub rp_name: String,
     /// Allowed WebAuthn origins, the first one primary.
     pub origins: Vec<String>,
+    /// Native Android app origins (`android:apk-key-hash:...`): client
+    /// data origins only, matched byte for byte, never HTTP origins.
+    pub android_origins: Vec<String>,
     pub ceremony_ttl: Duration,
     /// Usernameless (conditional UI) authentication.
     pub discoverable: bool,
@@ -436,6 +439,8 @@ const MAX_DECLARED_ROLES: usize = 64;
 const MAX_GRANTS: usize = 256;
 /// Most `allowed_origins`.
 const MAX_ORIGINS: usize = 32;
+/// Most `passkeys.android_origins`.
+const MAX_ANDROID_ORIGINS: usize = 16;
 /// Shortest `secret_key`.
 pub const MIN_SECRET_BYTES: usize = 32;
 
@@ -595,6 +600,15 @@ pub fn parse_origin(text: &str) -> Option<String> {
                         .all(|b| b.is_ascii_alphanumeric() || b == b'-')
             }));
     host_ok.then(|| text.to_owned())
+}
+/// A native Android app origin, as Credential Manager writes it into the
+/// client data: `android:apk-key-hash:` and the unpadded base64url SHA-256
+/// of the app's signing certificate, 43 characters; `None` otherwise.
+pub fn parse_android_origin(text: &str) -> Option<String> {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let hash = text.strip_prefix("android:apk-key-hash:")?;
+    let digest = URL_SAFE_NO_PAD.decode(hash).ok()?;
+    (digest.len() == 32).then(|| text.to_owned())
 }
 /// `http://localhost`, `http://127.0.0.1` or `http://[::1]`, any port.
 pub fn loopback_origin(origin: &str) -> bool {
@@ -1406,6 +1420,7 @@ fn passkeys(
             "rp_id",
             "rp_name",
             "origins",
+            "android_origins",
             "ceremony_ttl",
             "discoverable",
             "max_per_user",
@@ -1465,10 +1480,32 @@ fn passkeys(
             r.issue("passkeys.origins", "rp_id_mismatch");
         }
     }
+    // Native app origins join no HTTP origin list; the RP id stays the
+    // check that ties a credential to this site.
+    let mut android_origins: Vec<String> = Vec::new();
+    match t.and_then(|t| t.get("android_origins")) {
+        None => {}
+        Some(toml::Value::Array(items)) => {
+            if items.len() > MAX_ANDROID_ORIGINS {
+                r.issue("passkeys.android_origins", "out_of_range");
+            }
+            for item in items {
+                match item.as_str().and_then(parse_android_origin) {
+                    Some(origin) if android_origins.contains(&origin) => {
+                        r.issue("passkeys.android_origins", "duplicate_android_origin")
+                    }
+                    Some(origin) => android_origins.push(origin),
+                    None => r.issue("passkeys.android_origins", "invalid_android_origin"),
+                }
+            }
+        }
+        Some(_) => r.issue("passkeys.android_origins", "expected_string_list"),
+    }
     Some(PasskeySettings {
         rp_id,
         rp_name,
         origins,
+        android_origins,
         ceremony_ttl: r.duration(
             t,
             "passkeys",
