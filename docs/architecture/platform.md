@@ -1445,7 +1445,17 @@ client_secret = { file = "/run/secrets/acme_sso" }
 | `.allowed_hosted_domains` | `[]` (any) | Google only, lowercase domains | Google's `hd` claim must be one of them |
 | `passkeys.rp_id`, `passkeys.rp_name` | the host of `app_origin`, `app.name` | `app_origin`'s host or a registrable suffix of it (`rp_id_mismatch`) | The WebAuthn relying party |
 | `passkeys.origins` | `[app_origin]` | each one of `allowed_origins` (`origin_not_allowed`) under the RP id | Accepted WebAuthn origins |
+| `passkeys.android_origins` | `[]` | at most 16 (`out_of_range`), each once (`duplicate_android_origin`), each `android:apk-key-hash:` and the unpadded base64url SHA-256 of a signing certificate, 43 characters (`invalid_android_origin`) | Native Android apps accepted as WebAuthn client data origins, matched byte for byte |
 | `passkeys.ceremony_ttl`, `passkeys.discoverable`, `passkeys.max_per_user` | `5m`, `true`, `20` | 30 s to 30 min, 1 to 100 | Ceremony lifetime; usernameless (conditional UI) sign-in; passkeys per user (`passkey_limit`) |
+
+A native Android app signs in through Credential Manager, which writes
+`android:apk-key-hash:<hash>` into the client data instead of a web
+origin. `passkeys.android_origins` names the apps whose passkey
+ceremonies verify; a client data origin must equal an entry exactly.
+These origins never join `allowed_origins`, CORS, the `Origin` check or
+CSRF, so the app still sends `Origin: <app_origin>` on anonymous identity
+requests. The RP id check is unchanged. Identity §6, "Native Android
+apps", covers the hash, the Digital Asset Links file and key rotation.
 
 A build without the `passkeys` feature of `merezha-identity` refuses the
 `passkeys` table (`passkeys_unavailable`); the prebuilt `merezha` host has

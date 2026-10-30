@@ -7,10 +7,21 @@
 mod support;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
+use openssl::{
+    bn::{BigNum, BigNumContext},
+    ec::{EcGroup, EcKey},
+    hash::MessageDigest,
+    nid::Nid,
+    pkey::{PKey, Private},
+    sha::sha256,
+    sign::Signer,
+};
 use serde_json::{Value, json};
 use std::time::Duration;
 use support::*;
-use webauthn_authenticator_rs::{WebauthnAuthenticator, softpasskey::SoftPasskey};
+use webauthn_authenticator_rs::{
+    AuthenticatorBackend, WebauthnAuthenticator, softpasskey::SoftPasskey,
+};
 use webauthn_rs::prelude::{CreationChallengeResponse, RequestChallengeResponse, Url};
 
 const PASSKEYS: &str = "[modules.identity.passkeys]\n";
@@ -921,4 +932,522 @@ async fn a_registered_passkey_sends_a_notice() {
         .to("identity.sign_in_method_added", &format!("user:{id}"));
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].data["method"], "passkey");
+}
+
+/// A native Android app's origin, for a signing certificate digest of
+/// `byte` repeated: what Credential Manager puts in the client data.
+fn android(byte: u8) -> String {
+    format!("android:apk-key-hash:{}", B64.encode([byte; 32]))
+}
+
+async fn android_world(origins: &[String]) -> Option<(World, Instance)> {
+    let tables = format!("{PASSKEYS}android_origins = {origins:?}\n");
+    let world = World::new(&section("", &[], &tables)).await?;
+    let node = world.instance().await;
+    Some((world, node))
+}
+
+/// A native registration: the app's platform signs client data with the
+/// app's `origin`, for `rp_id` when it differs from the options' RP.
+async fn native_registration(
+    node: &Instance,
+    browser: &mut Browser,
+    key: &mut SoftPasskey,
+    origin: &str,
+    rp_id: Option<&str>,
+) -> Answer {
+    let options = browser
+        .send(node, "POST", "/passkeys/registrations/options", None)
+        .await;
+    assert_eq!(options.status, 200, "{options:?}");
+    let mut public_key = options.body["public_key"].clone();
+    if let Some(rp_id) = rp_id {
+        public_key["rp"]["id"] = json!(rp_id);
+    }
+    let challenge: CreationChallengeResponse =
+        serde_json::from_value(json!({ "publicKey": public_key })).unwrap();
+    let credential = key
+        .perform_register(Url::parse(origin).unwrap(), challenge.public_key, 60_000)
+        .unwrap();
+    browser
+        .post(
+            node,
+            "/passkeys/registrations/verify",
+            json!({"ceremony_id": options.body["ceremony_id"], "credential": credential}),
+        )
+        .await
+}
+
+/// A native email-first sign-in with the app's `origin`, for `rp_id`
+/// when it differs from the options' RP.
+async fn native_sign_in(
+    node: &Instance,
+    key: &mut SoftPasskey,
+    email: &str,
+    origin: &str,
+    rp_id: Option<&str>,
+) -> Answer {
+    let mut browser = Browser::new("198.51.100.61");
+    let options = browser
+        .post(
+            node,
+            "/passkeys/authentications/options",
+            json!({ "email": email }),
+        )
+        .await;
+    assert_eq!(options.status, 200, "{options:?}");
+    let mut public_key = options.body["public_key"].clone();
+    if let Some(rp_id) = rp_id {
+        public_key["rpId"] = json!(rp_id);
+    }
+    let challenge: RequestChallengeResponse =
+        serde_json::from_value(json!({ "publicKey": public_key })).unwrap();
+    let credential = key
+        .perform_auth(Url::parse(origin).unwrap(), challenge.public_key, 60_000)
+        .unwrap();
+    let credential = serde_json::to_value(credential).unwrap();
+    sign_in(
+        node,
+        &mut browser,
+        options.body["ceremony_id"].clone(),
+        credential,
+    )
+    .await
+}
+
+async fn sessions(world: &World) -> i64 {
+    world
+        .scalar("SELECT count(*) FROM merezha_identity.sessions")
+        .await
+}
+
+/// A configured native origin registers and signs in through the HTTP
+/// flow; web passkeys keep working beside it.
+#[tokio::test]
+async fn a_configured_android_origin_registers_and_signs_in() {
+    let Some((world, node)) = android_world(&[android(1), android(2)]).await else {
+        return;
+    };
+    let mut ada = user(&world, &node, "ada@example.com").await;
+    let mut key = SoftPasskey::new(true);
+    let answer = native_registration(&node, &mut ada, &mut key, &android(2), None).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    let answer = native_sign_in(&node, &mut key, "ada@example.com", &android(2), None).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    assert_eq!(answer.body["session"]["method"], "passkey");
+    assert_eq!(answer.body["user"]["email"], "ada@example.com");
+    assert_eq!(counter(&world).await, 1);
+
+    let mut web = authenticator();
+    register(&node, &mut ada, &mut web, None).await;
+    let mut browser = Browser::new("198.51.100.62");
+    let (ceremony, credential) =
+        assertion(&node, &mut browser, &mut web, Some("ada@example.com"), None).await;
+    let answer = sign_in(&node, &mut browser, ceremony, credential).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+}
+
+/// A well-formed but unconfigured native origin, or the native origin
+/// as an HTTP `Origin`, is refused.
+#[tokio::test]
+async fn an_unconfigured_android_origin_is_refused() {
+    let Some((world, node)) = android_world(&[android(1)]).await else {
+        return;
+    };
+    let mut ada = user(&world, &node, "ada@example.com").await;
+    let mut key = SoftPasskey::new(true);
+    let answer = native_registration(&node, &mut ada, &mut key, &android(2), None).await;
+    assert_eq!(
+        (answer.status.as_u16(), answer.code()),
+        (422, "passkey_rejected"),
+        "{answer:?}"
+    );
+    assert_eq!(
+        world
+            .scalar("SELECT count(*) FROM merezha_identity.passkeys")
+            .await,
+        0
+    );
+
+    let answer = native_registration(&node, &mut ada, &mut key, &android(1), None).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    let before = sessions(&world).await;
+    let answer = native_sign_in(&node, &mut key, "ada@example.com", &android(2), None).await;
+    assert_eq!(
+        (answer.status.as_u16(), answer.code()),
+        (401, "invalid_credentials"),
+        "{answer:?}"
+    );
+    assert_eq!(sessions(&world).await, before);
+    assert_eq!(counter(&world).await, 0);
+
+    // Native origins are WebAuthn origins only, never HTTP ones.
+    let mut app = Browser::new("198.51.100.63");
+    app.origin = Some(android(1));
+    let answer = app
+        .post(
+            &node,
+            "/passkeys/authentications/options",
+            json!({ "email": "ada@example.com" }),
+        )
+        .await;
+    assert_eq!(
+        (answer.status.as_u16(), answer.code()),
+        (403, "origin_rejected"),
+        "{answer:?}"
+    );
+}
+
+/// A native credential minted for another RP id is refused at
+/// registration and at sign-in.
+#[tokio::test]
+async fn a_native_authenticator_for_another_rp_is_refused() {
+    let Some((world, node)) = android_world(&[android(1)]).await else {
+        return;
+    };
+    let mut ada = user(&world, &node, "ada@example.com").await;
+    let mut key = SoftPasskey::new(true);
+    let answer = native_registration(
+        &node,
+        &mut ada,
+        &mut key,
+        &android(1),
+        Some("other.example"),
+    )
+    .await;
+    assert_eq!(
+        (answer.status.as_u16(), answer.code()),
+        (422, "passkey_rejected"),
+        "{answer:?}"
+    );
+
+    let answer = native_registration(&node, &mut ada, &mut key, &android(1), None).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    let before = sessions(&world).await;
+    let answer = native_sign_in(
+        &node,
+        &mut key,
+        "ada@example.com",
+        &android(1),
+        Some("other.example"),
+    )
+    .await;
+    assert_eq!(
+        (answer.status.as_u16(), answer.code()),
+        (401, "invalid_credentials"),
+        "{answer:?}"
+    );
+    assert_eq!(sessions(&world).await, before);
+}
+
+/// A native app's platform authenticator, built by hand so that its
+/// client data can carry any origin spelling: SoftPasskey writes the
+/// origin back from a parsed `Url`. ES256 over P-256, attestation `none`.
+struct NativeKey {
+    key: PKey<Private>,
+    id: [u8; 16],
+    /// The user handle of the registration options, for assertions.
+    handle: Value,
+    counter: u32,
+}
+
+impl NativeKey {
+    fn new() -> Self {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        Self {
+            key,
+            id: [9; 16],
+            handle: Value::Null,
+            counter: 0,
+        }
+    }
+
+    /// The public key as a COSE key.
+    fn cose_key(&self) -> Vec<u8> {
+        let key = self.key.ec_key().unwrap();
+        let (mut x, mut y) = (BigNum::new().unwrap(), BigNum::new().unwrap());
+        key.public_key()
+            .affine_coordinates(
+                key.group(),
+                &mut x,
+                &mut y,
+                &mut BigNumContext::new().unwrap(),
+            )
+            .unwrap();
+        // A map of five: kty (1) EC2 (2), alg (3) ES256 (-7), crv (-1)
+        // P-256 (1), then x (-2) and y (-3).
+        let mut cose = vec![0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21];
+        cbor(&mut cose, 2, &x.to_vec_padded(32).unwrap());
+        cose.push(0x22);
+        cbor(&mut cose, 2, &y.to_vec_padded(32).unwrap());
+        cose
+    }
+
+    /// The credential answering creation options `public_key`, with
+    /// `origin` in its client data.
+    fn register(&mut self, public_key: &Value, origin: &str) -> Value {
+        self.handle = public_key["user"]["id"].clone();
+        // RP id hash, flags UP | UV | AT, counter 0, then the attested
+        // credential data: a zero AAGUID, the id and the public key.
+        let mut auth_data = rp_id_hash(&public_key["rp"]["id"]);
+        auth_data.push(0x45);
+        auth_data.extend(0u32.to_be_bytes());
+        auth_data.extend([0; 16]);
+        auth_data.extend(16u16.to_be_bytes());
+        auth_data.extend(self.id);
+        auth_data.extend(self.cose_key());
+        // {"fmt": "none", "attStmt": {}, "authData": auth_data}
+        let mut object = vec![0xa3];
+        for text in ["fmt", "none", "attStmt"] {
+            cbor(&mut object, 3, text.as_bytes());
+        }
+        object.push(0xa0);
+        cbor(&mut object, 3, b"authData");
+        cbor(&mut object, 2, &auth_data);
+        json!({
+            "id": B64.encode(self.id),
+            "rawId": B64.encode(self.id),
+            "type": "public-key",
+            "response": {
+                "attestationObject": B64.encode(object),
+                "clientDataJSON": B64.encode(client_data_json("webauthn.create", public_key, origin)),
+            },
+        })
+    }
+
+    /// The assertion answering request options `public_key`, with
+    /// `origin` in its client data, signed over the authenticator data
+    /// and the SHA-256 of the client data.
+    fn assert(&mut self, public_key: &Value, origin: &str) -> Value {
+        self.counter += 1;
+        // RP id hash, flags UP | UV, the counter.
+        let mut auth_data = rp_id_hash(&public_key["rpId"]);
+        auth_data.push(0x05);
+        auth_data.extend(self.counter.to_be_bytes());
+        let client_data = client_data_json("webauthn.get", public_key, origin);
+        let mut signer = Signer::new(MessageDigest::sha256(), &self.key).unwrap();
+        signer.update(&auth_data).unwrap();
+        signer.update(&sha256(&client_data)).unwrap();
+        json!({
+            "id": B64.encode(self.id),
+            "rawId": B64.encode(self.id),
+            "type": "public-key",
+            "response": {
+                "authenticatorData": B64.encode(auth_data),
+                "clientDataJSON": B64.encode(client_data),
+                "signature": B64.encode(signer.sign_to_vec().unwrap()),
+                "userHandle": self.handle,
+            },
+        })
+    }
+}
+
+fn rp_id_hash(rp_id: &Value) -> Vec<u8> {
+    sha256(rp_id.as_str().unwrap().as_bytes()).to_vec()
+}
+
+/// Client data of ceremony `kind` for the challenge of `public_key`.
+fn client_data_json(kind: &str, public_key: &Value, origin: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "type": kind,
+        "challenge": public_key["challenge"],
+        "origin": origin,
+        "crossOrigin": false,
+    }))
+    .unwrap()
+}
+
+/// Append a CBOR byte (`major` 2) or text (`major` 3) string shorter
+/// than 256 bytes.
+fn cbor(out: &mut Vec<u8>, major: u8, bytes: &[u8]) {
+    let len = u8::try_from(bytes.len()).unwrap();
+    if len < 24 {
+        out.push((major << 5) | len);
+    } else {
+        out.extend([(major << 5) | 24, len]);
+    }
+    out.extend(bytes);
+}
+
+/// Spellings of the native origin `origin` that parse to its URL, so the
+/// library alone would take them: scheme case, a leading or trailing
+/// space, an embedded tab.
+fn spellings(origin: &str) -> [String; 4] {
+    let spellings = [
+        origin.replacen("android:", "ANDROID:", 1),
+        format!(" {origin}"),
+        format!("{origin} "),
+        origin.replacen("apk-key-hash", "apk-key-\thash", 1),
+    ];
+    for spelling in &spellings {
+        assert_eq!(Url::parse(spelling).unwrap(), Url::parse(origin).unwrap());
+    }
+    spellings
+}
+
+/// A signed native registration with `origin` in its client data.
+async fn signed_registration(
+    node: &Instance,
+    browser: &mut Browser,
+    key: &mut NativeKey,
+    origin: &str,
+) -> Answer {
+    let options = browser
+        .send(node, "POST", "/passkeys/registrations/options", None)
+        .await;
+    assert_eq!(options.status, 200, "{options:?}");
+    let credential = key.register(&options.body["public_key"], origin);
+    browser
+        .post(
+            node,
+            "/passkeys/registrations/verify",
+            json!({"ceremony_id": options.body["ceremony_id"], "credential": credential}),
+        )
+        .await
+}
+
+/// A signed native sign-in with `origin` in its client data: email-first
+/// for `email`, discoverable without.
+async fn signed_sign_in(
+    node: &Instance,
+    key: &mut NativeKey,
+    email: Option<&str>,
+    origin: &str,
+) -> Answer {
+    let mut browser = Browser::new("198.51.100.65");
+    let body = email.map_or_else(|| json!({}), |email| json!({ "email": email }));
+    let options = browser
+        .post(node, "/passkeys/authentications/options", body)
+        .await;
+    assert_eq!(options.status, 200, "{options:?}");
+    let discoverable = options.body["mediation"] == "conditional";
+    assert_eq!(discoverable, email.is_none(), "{options:?}");
+    let credential = key.assert(&options.body["public_key"], origin);
+    sign_in(
+        node,
+        &mut browser,
+        options.body["ceremony_id"].clone(),
+        credential,
+    )
+    .await
+}
+
+/// A signed native reauthentication of `browser`'s session with `origin`
+/// in its client data.
+async fn signed_reauthentication(
+    node: &Instance,
+    browser: &mut Browser,
+    key: &mut NativeKey,
+    origin: &str,
+) -> Answer {
+    let options = browser
+        .send(
+            node,
+            "POST",
+            "/session/reauthenticate/passkey/options",
+            None,
+        )
+        .await;
+    assert_eq!(options.status, 200, "{options:?}");
+    let credential = key.assert(&options.body["public_key"], origin);
+    browser
+        .post(
+            node,
+            "/session/reauthenticate/passkey/verify",
+            json!({"ceremony_id": options.body["ceremony_id"], "credential": credential}),
+        )
+        .await
+}
+
+/// Registration verify takes the native origin exactly as configured: a
+/// signed ceremony with another spelling of it stores no passkey.
+#[tokio::test]
+async fn a_signed_registration_needs_the_exact_native_origin() {
+    let Some((world, node)) = android_world(&[android(1)]).await else {
+        return;
+    };
+    let mut ada = user(&world, &node, "ada@example.com").await;
+    let mut key = NativeKey::new();
+    let passkeys = "SELECT count(*) FROM merezha_identity.passkeys";
+    for spelling in spellings(&android(1)) {
+        let answer = signed_registration(&node, &mut ada, &mut key, &spelling).await;
+        assert_eq!(
+            (answer.status.as_u16(), answer.code()),
+            (422, "passkey_rejected"),
+            "{spelling:?}: {answer:?}"
+        );
+        assert_eq!(world.scalar(passkeys).await, 0);
+    }
+    let answer = signed_registration(&node, &mut ada, &mut key, &android(1)).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    assert_eq!(world.scalar(passkeys).await, 1);
+}
+
+/// Sign-in, email-first for `email` or discoverable without, takes the
+/// native origin exactly as configured: a signed assertion with another
+/// spelling creates no session and leaves the counter.
+async fn signed_sign_in_needs_the_exact_native_origin(email: Option<&str>) {
+    let Some((world, node)) = android_world(&[android(1)]).await else {
+        return;
+    };
+    let mut ada = user(&world, &node, "ada@example.com").await;
+    let mut key = NativeKey::new();
+    let answer = signed_registration(&node, &mut ada, &mut key, &android(1)).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    let before = sessions(&world).await;
+    for spelling in spellings(&android(1)) {
+        let answer = signed_sign_in(&node, &mut key, email, &spelling).await;
+        assert_eq!(
+            (answer.status.as_u16(), answer.code()),
+            (401, "invalid_credentials"),
+            "{spelling:?}: {answer:?}"
+        );
+        assert_eq!(sessions(&world).await, before);
+        assert_eq!(counter(&world).await, 0);
+    }
+    let answer = signed_sign_in(&node, &mut key, email, &android(1)).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    assert_eq!(answer.body["session"]["method"], "passkey");
+    assert_eq!(answer.body["user"]["email"], "ada@example.com");
+    assert_eq!(counter(&world).await, i64::from(key.counter));
+}
+
+#[tokio::test]
+async fn a_signed_email_first_sign_in_needs_the_exact_native_origin() {
+    signed_sign_in_needs_the_exact_native_origin(Some("ada@example.com")).await;
+}
+
+#[tokio::test]
+async fn a_signed_discoverable_sign_in_needs_the_exact_native_origin() {
+    signed_sign_in_needs_the_exact_native_origin(None).await;
+}
+
+/// Reauthentication takes the native origin exactly as configured: a
+/// signed assertion with another spelling leaves the session unrotated.
+#[tokio::test]
+async fn a_signed_reauthentication_needs_the_exact_native_origin() {
+    let Some((world, node)) = android_world(&[android(1)]).await else {
+        return;
+    };
+    let mut ada = user(&world, &node, "ada@example.com").await;
+    let mut key = NativeKey::new();
+    let answer = signed_registration(&node, &mut ada, &mut key, &android(1)).await;
+    assert_eq!(answer.status, 201, "{answer:?}");
+    let bearer = ada.bearer.clone();
+    for spelling in spellings(&android(1)) {
+        let answer = signed_reauthentication(&node, &mut ada, &mut key, &spelling).await;
+        assert_eq!(
+            (answer.status.as_u16(), answer.code()),
+            (401, "invalid_credentials"),
+            "{spelling:?}: {answer:?}"
+        );
+        assert_eq!(ada.bearer, bearer);
+        assert_eq!(counter(&world).await, 0);
+    }
+    let answer = signed_reauthentication(&node, &mut ada, &mut key, &android(1)).await;
+    assert_eq!(answer.status, 200, "{answer:?}");
+    assert_eq!(answer.body["session"]["method"], "passkey");
+    assert_ne!(ada.bearer, bearer);
+    assert_eq!(counter(&world).await, i64::from(key.counter));
 }

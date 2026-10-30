@@ -210,6 +210,109 @@ permissions = ["identity.*"]
     assert_eq!(found, expected);
 }
 
+/// `passkeys.android_origins` (section 6): at most 16 distinct native app
+/// origins, each `android:apk-key-hash:` and the unpadded base64url of a
+/// 32-byte certificate digest, never a web origin.
+#[test]
+fn android_origins_are_exact_apk_key_hashes() {
+    use base64::{
+        Engine,
+        engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+    };
+    let android = |byte: u8| {
+        format!(
+            "android:apk-key-hash:{}",
+            URL_SAFE_NO_PAD.encode([byte; 32])
+        )
+    };
+    let check = |value: &str| -> Vec<(String, String)> {
+        let table = format!("[modules.identity.passkeys]\nandroid_origins = {value}\n");
+        issues(&section("", &[], &table), Some(HostFacts::loopback()))
+            .into_iter()
+            .filter(|(_, code)| code != "passkeys_unavailable")
+            .collect()
+    };
+    let list = |origins: &[String]| format!("{origins:?}");
+    let issue = |code: &str| {
+        vec![(
+            "modules.identity.passkeys.android_origins".to_owned(),
+            code.to_owned(),
+        )]
+    };
+
+    assert_eq!(check("[]"), Vec::new());
+    assert_eq!(check(&list(&[android(1), android(2)])), Vec::new());
+    let sixteen: Vec<String> = (0..16).map(android).collect();
+    assert_eq!(check(&list(&sixteen)), Vec::new());
+
+    let hash = URL_SAFE_NO_PAD.encode([1; 32]);
+    for bad in [
+        format!("android:apk-key-hash:{}", URL_SAFE.encode([1; 32])),
+        format!(
+            "android:apk-key-hash:{}",
+            STANDARD_NO_PAD.encode([0xfb; 32])
+        ),
+        format!("android:apk-key-hash:{}", URL_SAFE_NO_PAD.encode([1; 31])),
+        format!("android:apk-key-hash:{}", URL_SAFE_NO_PAD.encode([1; 33])),
+        format!("android:apk-key-hash:{}", &hash[..42]),
+        format!("ANDROID:apk-key-hash:{hash}"),
+        format!("android:apk-key-hash: {hash}"),
+        format!("{}\t", android(1)),
+        format!("android:apk-hash:{hash}"),
+        format!("ios:apk-key-hash:{hash}"),
+        "android:apk-key-hash:*".to_owned(),
+        "android:*".to_owned(),
+        "android:apk-key-hash:".to_owned(),
+        "https://app.example".to_owned(),
+        "http://localhost:5173".to_owned(),
+    ] {
+        assert_eq!(
+            check(&list(std::slice::from_ref(&bad))),
+            issue("invalid_android_origin"),
+            "{bad}"
+        );
+    }
+    assert_eq!(check("[7]"), issue("invalid_android_origin"));
+    assert_eq!(
+        check(&format!("{:?}", android(1))),
+        issue("expected_string_list")
+    );
+    let seventeen: Vec<String> = (0..17).map(android).collect();
+    assert_eq!(check(&list(&seventeen)), issue("out_of_range"));
+    assert_eq!(
+        check(&list(&[android(1), android(2), android(1)])),
+        issue("duplicate_android_origin")
+    );
+
+    // A native origin is no web origin: `origins` and `allowed_origins`
+    // keep refusing it.
+    let table = format!(
+        "[modules.identity.passkeys]\norigins = [{:?}]\n",
+        android(1)
+    );
+    let found: Vec<(String, String)> =
+        issues(&section("", &[], &table), Some(HostFacts::loopback()))
+            .into_iter()
+            .filter(|(_, code)| code != "passkeys_unavailable")
+            .collect();
+    assert!(
+        found.contains(&(
+            "modules.identity.passkeys.origins".to_owned(),
+            "invalid_origin".to_owned()
+        )),
+        "{found:?}"
+    );
+    let top = format!("allowed_origins = [{:?}]\n", android(1));
+    let found = issues(&section(&top, &[], ""), Some(HostFacts::loopback()));
+    assert!(
+        found.contains(&(
+            "modules.identity.allowed_origins".to_owned(),
+            "invalid_origin".to_owned()
+        )),
+        "{found:?}"
+    );
+}
+
 /// The implicit `user` role holds in every organization, so it takes no
 /// wildcard inside a block namespace; `admin` and `member` may.
 #[test]
